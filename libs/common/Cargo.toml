@@ -1,0 +1,25 @@
+[package]
+name = "on-common"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/mod.rs"
+
+[dependencies]
+serde_json = "1.0.151"
+serde = { version = "1.0.229", features = ["derive"] }
+chrono = "0.4.45"
+indexmap = { version = "2.14.0", features = ["serde"] }
+lazy_static = "1.5.0"
+futures-util = "0.3.34"
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt-multi-thread",
+    "sync",
+    "macros",
+    "time",
+    "io-util",
+    "fs",
+    "net",
+] }
+threadpool = "1.8.1"

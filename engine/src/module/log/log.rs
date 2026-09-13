@@ -1,0 +1,1 @@
+pub type DebugLogListener = Arc<dyn Fn(Log) + Send + Sync + 'static>;

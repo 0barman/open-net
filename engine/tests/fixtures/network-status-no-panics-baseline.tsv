@@ -1,0 +1,287 @@
+# Existing source operations predating network-status integration. Source commit: 000a3943a56d458463552230fd19b8538b055061
+# Each row is count, exact engine-relative file, operation, and exact trimmed original source line.
+# New files and additional or changed operations receive no allowance. Remove obsolete rows when cleaning legacy code.
+2	src/module/net_status/inner/inner_net_status_client.rs	assert	assert!(
+1	src/module/net_status/inner/inner_net_status_client.rs	assert	assert!(!client.is_started());
+1	src/module/net_status/inner/inner_net_status_client.rs	assert	assert!(*receiver.borrow());
+1	src/module/net_status/inner/inner_net_status_client.rs	assert	assert!(dropped.load(Ordering::SeqCst));
+1	src/module/net_status/inner/inner_net_status_client.rs	assert	assert!(old.listeners.is_empty());
+4	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(client.ip_stack(), Ok(IpStack::None));
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(client.ip_stack(), Ok(IpStack::V6Only));
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(client.lifecycle.lock().unwrap().stopping.len(), 1);
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(client.start().await, Err(NetError::EngineDropped));
+2	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(guard.ip_stack, IpStack::DualStack);
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(guard.ip_stack, IpStack::V6Only);
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(guard.reachability, NetworkStatus::Unavailable);
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(old.ip_stack, IpStack::None);
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(old.reachability, NetworkStatus::Unavailable);
+1	src/module/net_status/inner/inner_net_status_client.rs	assert_eq	assert_eq!(stopped.try_recv(), Ok(()));
+1	src/module/net_status/inner/inner_net_status_client.rs	borrow	assert!(*receiver.borrow());
+1	src/module/net_status/inner/inner_net_status_client.rs	borrow	if !*initial_state.borrow() {
+2	src/module/net_status/inner/inner_net_status_client.rs	borrow	lifecycle.stopping.retain(|finished| !*finished.borrow());
+1	src/module/net_status/inner/inner_net_status_client.rs	expect	.expect("build test runtime")
+1	src/module/net_status/inner/inner_net_status_client.rs	expect	.expect("first state update should succeed");
+1	src/module/net_status/inner/inner_net_status_client.rs	expect	.expect("observed status lock should remain healthy")
+1	src/module/net_status/inner/inner_net_status_client.rs	expect	.expect("observed status lock should remain healthy"),
+1	src/module/net_status/inner/inner_net_status_client.rs	expect	.expect("repeated state update should succeed");
+1	src/module/net_status/inner/inner_net_status_client.rs	expect	.expect("state update should succeed");
+2	src/module/net_status/inner/inner_net_status_client.rs	expect	let guard = state.lock().expect("test state lock should remain healthy");
+1	src/module/net_status/inner/inner_net_status_client.rs	expect	let mut guard = state.lock().expect("test state lock should remain healthy");
+1	src/module/net_status/inner/inner_net_status_client.rs	panic	_ = &mut destroy => panic!("destroy must also await the cancelled shutdown's monitor"),
+1	src/module/net_status/inner/inner_net_status_client.rs	panic	_ = &mut shutdown => panic!("shutdown must await the monitor completion"),
+1	src/module/net_status/inner/inner_net_status_client.rs	panic	panic!("listener blew up");
+1	src/module/net_status/inner/inner_net_status_client.rs	unsafe	let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+2	src/module/net_status/inner/inner_net_status_client.rs	unsafe	unsafe {
+1	src/module/net_status/inner/inner_net_status_client.rs	unsafe	unsafe { CoUninitialize() };
+1	src/module/net_status/inner/inner_net_status_client.rs	unwrap	.unwrap()
+5	src/module/net_status/inner/inner_net_status_client.rs	unwrap	.unwrap();
+1	src/module/net_status/inner/inner_net_status_client.rs	unwrap	assert_eq!(client.lifecycle.lock().unwrap().stopping.len(), 1);
+1	src/module/net_status/inner/inner_net_status_client.rs	unwrap	client.lifecycle.lock().unwrap().monitor = Some(MonitorRuntime {
+1	src/module/net_status/inner/inner_net_status_client.rs	unwrap	let active = Arc::clone(&state.lock().unwrap().active);
+3	src/module/net_status/inner/inner_net_status_client.rs	unwrap	let engine = Arc::new(CommonEngine::new(16, 16).unwrap());
+1	src/module/net_status/inner/inner_net_status_client.rs	unwrap	let mut old = old_state.lock().unwrap();
+1	src/module/net_status/inner/inner_net_status_client.rs	unwrap	let old = old_state.lock().unwrap();
+1	src/module/net_status/inner/inner_net_status_client.rs	unwrap	new_state.lock().unwrap().reachability,
+1	src/module/net_status/inner/platform/macos.rs	assert_eq	assert_eq!(initial, RefreshTriggerEvent::Notified);
+1	src/module/net_status/inner/platform/macos.rs	expect	.expect("NWPathMonitor should deliver its initial path");
+1	src/module/net_status/inner/platform/macos.rs	expect	.expect("PathMonitor drop should release its callback sender");
+1	src/module/net_status/inner/platform/mod.rs	panic	_ = monitor.changed() => panic!("non-macOS platform monitor must remain pending"),
+1	src/module/net_status/inner/refresh_trigger.rs	assert	assert!(!request_was_polled.load(std::sync::atomic::Ordering::SeqCst));
+5	src/module/net_status/inner/refresh_trigger.rs	assert_eq	assert_eq!(
+1	src/module/net_status/inner/refresh_trigger.rs	assert_eq	assert_eq!(outcome, RefreshWorkOutcome::Stopped);
+2	src/module/net_status/inner/refresh_trigger.rs	assert_eq	assert_eq!(receiver.recv().await, RefreshTriggerEvent::ChannelClosed);
+7	src/module/net_status/inner/refresh_trigger.rs	assert_eq	assert_eq!(receiver.recv().await, RefreshTriggerEvent::Notified);
+2	src/module/net_status/inner/refresh_trigger.rs	assert_eq	assert_eq!(trigger.notify(), TriggerOutcome::Closed);
+2	src/module/net_status/inner/refresh_trigger.rs	assert_eq	assert_eq!(trigger.notify(), TriggerOutcome::Coalesced);
+7	src/module/net_status/inner/refresh_trigger.rs	assert_eq	assert_eq!(trigger.notify(), TriggerOutcome::Queued);
+1	src/module/net_status/inner/refresh_trigger.rs	expect	.map(|worker| worker.join().expect("native callback worker should join"))
+1	src/module/net_status/inner/refresh_trigger.rs	expect	refresh.await.expect("refresh task should join");
+1	src/module/net_status/inner/refresh_trigger.rs	expect	started_receiver.await.expect("refresh work should start");
+1	src/module/net_status/inner/refresh_trigger.rs	expect	started_rx.await.expect("refresh should start");
+1	src/module/net_status/inner/refresh_trigger.rs	expect	task.await.expect("refresh/stop task should join"),
+1	src/module/net_status/inner/refresh_trigger.rs	panic	_ = receiver.recv() => panic!("a fused receiver must not busy-loop after closure"),
+1	src/module/net_status/inner/refresh_trigger.rs	panic	_ = receiver.recv() => panic!("an empty receiver must remain pending"),
+1	src/module/net_status/inner/refresh_trigger.rs	unreachable	_ = std::future::pending::<()>() => unreachable!(),
+1	src/module/net_status/ip_stack.rs	assert	assert!(!IpStack::None.has_ipv4());
+1	src/module/net_status/ip_stack.rs	assert	assert!(!IpStack::None.has_ipv6());
+1	src/module/net_status/ip_stack.rs	assert	assert!(!IpStack::None.is_dual_stack());
+1	src/module/net_status/ip_stack.rs	assert	assert!(!IpStack::V4Only.has_ipv6());
+1	src/module/net_status/ip_stack.rs	assert	assert!(!IpStack::V4Only.is_dual_stack());
+1	src/module/net_status/ip_stack.rs	assert	assert!(!IpStack::V6Only.has_ipv4());
+1	src/module/net_status/ip_stack.rs	assert	assert!(!IpStack::V6Only.is_dual_stack());
+1	src/module/net_status/ip_stack.rs	assert	assert!(IpStack::DualStack.has_ipv4());
+1	src/module/net_status/ip_stack.rs	assert	assert!(IpStack::DualStack.has_ipv6());
+1	src/module/net_status/ip_stack.rs	assert	assert!(IpStack::DualStack.is_dual_stack());
+1	src/module/net_status/ip_stack.rs	assert	assert!(IpStack::V4Only.has_ipv4());
+1	src/module/net_status/ip_stack.rs	assert	assert!(IpStack::V6Only.has_ipv6());
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(IpStack::DualStack.name(), "DualStack");
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(IpStack::default(), IpStack::None);
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(IpStack::from_flags(false, false), IpStack::None);
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(IpStack::from_flags(false, true), IpStack::V6Only);
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(IpStack::from_flags(true, false), IpStack::V4Only);
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(IpStack::from_flags(true, true), IpStack::DualStack);
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(variant.name(), expected);
+1	src/module/net_status/ip_stack.rs	assert_eq	assert_eq!(variant.name(), variant.to_string());
+1	src/module/net_status/lan_addr.rs	assert	assert!(classify_lan_ipv4(Ipv4Addr::new(198, 19, 255, 1)).is_none());
+8	src/module/net_status/lan_addr.rs	assert_eq	assert_eq!(
+1	src/module/net_status/lan_addr.rs	assert_eq	assert_eq!(pick_lan_ipv4_from(&ifaces), None);
+1	tests/net_status_integration.rs	assert	assert!(!client.is_shutdown());
+2	tests/net_status_integration.rs	assert	assert!(!client.is_started());
+1	tests/net_status_integration.rs	assert	assert!(!client.unregister(handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(!first.unregister(first_handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(!first.unregister(handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(!first.unregister(second_handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(!fresh.unregister(old_handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(!old.is_started());
+1	tests/net_status_integration.rs	assert	assert!(!retrieved.unregister(previous_handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(!second.unregister(first_handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(client.is_shutdown());
+2	tests/net_status_integration.rs	assert	assert!(client.is_started());
+1	tests/net_status_integration.rs	assert	assert!(client.register(listener).unwrap().is_some());
+2	tests/net_status_integration.rs	assert	assert!(cloned.is_shutdown());
+1	tests/net_status_integration.rs	assert	assert!(first.unregister(first_handle).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(fresh.is_started());
+1	tests/net_status_integration.rs	assert	assert!(fresh.unregister(fresh_handle).unwrap());
+6	tests/net_status_integration.rs	assert	assert!(matches!(
+2	tests/net_status_integration.rs	assert	assert!(second.is_started());
+1	tests/net_status_integration.rs	assert	assert!(second.unregister(fresh).unwrap());
+1	tests/net_status_integration.rs	assert	assert!(second.unregister(second_handle).unwrap());
+2	tests/net_status_integration.rs	assert	assert!(status.is_started());
+4	tests/net_status_integration.rs	assert_eq	assert_eq!(
+1	tests/net_status_integration.rs	assert_eq	assert_eq!((created, duplicates), (1, CALLERS - 1));
+3	tests/net_status_integration.rs	assert_eq	assert_eq!(bounded(client.start()).await, Err(NetError::EngineDropped));
+2	tests/net_status_integration.rs	assert_eq	assert_eq!(bounded(cloned.start()).await, Err(NetError::EngineDropped));
+2	tests/net_status_integration.rs	assert_eq	assert_eq!(bounded(old.start()).await, Err(NetError::EngineDropped));
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.clear_all_listener(), Err(NetError::NotStarted));
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.get_current_network_name(), Ok(None));
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.has_ipv4(), Ok(false));
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.has_ipv6(), Ok(false));
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.ip_stack(), Ok(IpStack::None));
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.is_shutdown(), !starting);
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.is_started(), starting);
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(client.register(Box::new(|_| {})), Ok(None));
+1	tests/net_status_integration.rs	assert_eq	assert_eq!(handles.len(), 32);
+1	tests/net_status_integration.rs	assert_ne	assert_ne!(first_handle, second_handle);
+1	tests/net_status_integration.rs	assert_ne	assert_ne!(fresh_handle, old_handle);
+1	tests/net_status_integration.rs	assert_ne	assert_ne!(handle, previous_handle);
+1	tests/net_status_integration.rs	expect	.expect("network status operation timed out")
+1	tests/net_status_integration.rs	panic	Err(error) => panic!("unexpected create error: {error}"),
+2	tests/net_status_integration.rs	unwrap	.map(|_| first.register(Box::new(|_| {})).unwrap().unwrap())
+20	tests/net_status_integration.rs	unwrap	.unwrap();
+1	tests/net_status_integration.rs	unwrap	assert!(!client.unregister(handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(!first.unregister(first_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(!first.unregister(handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(!first.unregister(second_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(!fresh.unregister(old_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(!retrieved.unregister(previous_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(!second.unregister(first_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(client.register(listener).unwrap().is_some());
+1	tests/net_status_integration.rs	unwrap	assert!(first.unregister(first_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(fresh.unregister(fresh_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(second.unregister(fresh).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert!(second.unregister(second_handle).unwrap());
+1	tests/net_status_integration.rs	unwrap	assert_stopped(&net.get_net_status_client("\tstatus ").unwrap());
+1	tests/net_status_integration.rs	unwrap	assert_stopped(&net.get_net_status_client("shared").unwrap());
+4	tests/net_status_integration.rs	unwrap	bounded(client.shutdown()).await.unwrap();
+4	tests/net_status_integration.rs	unwrap	bounded(client.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(cloned.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(first.shutdown()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(first.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(fresh.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(net.destroy_ws_client("websocket")).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(old.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(retrieved.shutdown()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(retrieved.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(second.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	bounded(status.start()).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	client.get_current_network_name().unwrap();
+1	tests/net_status_integration.rs	unwrap	client.has_ipv4().unwrap();
+1	tests/net_status_integration.rs	unwrap	client.has_ipv6().unwrap();
+1	tests/net_status_integration.rs	unwrap	client.ip_stack().unwrap();
+1	tests/net_status_integration.rs	unwrap	client.local_network_reachability().unwrap();
+1	tests/net_status_integration.rs	unwrap	client.shutdown().await.unwrap();
+1	tests/net_status_integration.rs	unwrap	client.start().await.unwrap();
+2	tests/net_status_integration.rs	unwrap	first.clear_all_listener().unwrap();
+2	tests/net_status_integration.rs	unwrap	let first_handle = first.register(Box::new(|_| {})).unwrap().unwrap();
+2	tests/net_status_integration.rs	unwrap	let fresh = second.register(Box::new(|_| {})).unwrap().unwrap();
+2	tests/net_status_integration.rs	unwrap	let fresh_handle = fresh.register(Box::new(|_| {})).unwrap().unwrap();
+2	tests/net_status_integration.rs	unwrap	let handle = client.register(Box::new(|_| {})).unwrap().unwrap();
+1	tests/net_status_integration.rs	unwrap	let net = Arc::new(OpenNet::new().unwrap());
+8	tests/net_status_integration.rs	unwrap	let net = OpenNet::new().unwrap();
+2	tests/net_status_integration.rs	unwrap	let old_handle = old.register(Box::new(|_| {})).unwrap().unwrap();
+1	tests/net_status_integration.rs	unwrap	let retrieved = net.get_net_status_client("restart").unwrap();
+2	tests/net_status_integration.rs	unwrap	let second_handle = second.register(Box::new(|_| {})).unwrap().unwrap();
+1	tests/net_status_integration.rs	unwrap	let websocket = bounded(net.create_ws_client("websocket")).await.unwrap();
+1	tests/net_status_integration.rs	unwrap	match result.unwrap() {
+2	tests/net_status_integration.rs	unwrap	result.unwrap().unwrap();
+1	tests/net_status_integration.rs	unwrap	result.unwrap();
+3	tests/ws_client_integration.rs	assert	assert!(
+3	tests/ws_client_integration.rs	assert	assert!(client.pending_requests().is_empty());
+6	tests/ws_client_integration.rs	assert	assert!(matches!(
+1	tests/ws_client_integration.rs	assert	assert!(matches!(duplicate, Err(NetError::ClientAlreadyExists)));
+1	tests/ws_client_integration.rs	assert	assert!(matches!(duplicate, Err(NetError::DuplicateRequestId)));
+1	tests/ws_client_integration.rs	assert	assert!(matches!(invalid, Err(NetError::ConfigError)));
+1	tests/ws_client_integration.rs	assert	assert!(observed.contains(&ConnectionStatus::Reconnecting));
+7	tests/ws_client_integration.rs	assert_eq	assert_eq!(
+3	tests/ws_client_integration.rs	assert_eq	assert_eq!(client.connection_status(), ConnectionStatus::Closed);
+3	tests/ws_client_integration.rs	assert_eq	assert_eq!(client.pending_requests().len(), 1);
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(completion.wait().await, Err(NetError::TimeoutError));
+3	tests/ws_client_integration.rs	assert_eq	assert_eq!(completion.wait().await, Ok(()));
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(echoed, payload);
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(first_result, Ok(()));
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(matched.as_deref(), Some("request-1"));
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(receipt.request_id(), "runtime-free");
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(received_payload.as_slice(), payload.as_ref());
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(second_result, Ok(()));
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(shared_completion.wait().await, Ok(()));
+1	tests/ws_client_integration.rs	assert_eq	assert_eq!(shared_matched.as_deref(), Some("request-2"));
+2	tests/ws_client_integration.rs	expect	*released.lock().expect("callback gate lock") = true;
+1	tests/ws_client_integration.rs	expect	.expect("bind echo server");
+1	tests/ws_client_integration.rs	expect	.expect("blocked callback must not hold worker runtime open")
+1	tests/ws_client_integration.rs	expect	.expect("callback start waiter")
+1	tests/ws_client_integration.rs	expect	.expect("callback starts");
+1	tests/ws_client_integration.rs	expect	.expect("client registered before creation returns")
+1	tests/ws_client_integration.rs	expect	.expect("completion timeout"),
+3	tests/ws_client_integration.rs	expect	.expect("connect client");
+5	tests/ws_client_integration.rs	expect	.expect("connect");
+13	tests/ws_client_integration.rs	expect	.expect("create client");
+12	tests/ws_client_integration.rs	expect	.expect("destroy client");
+1	tests/ws_client_integration.rs	expect	.expect("destroy joined client");
+1	tests/ws_client_integration.rs	expect	.expect("destroy the single registered client");
+1	tests/ws_client_integration.rs	expect	.expect("detached provider must not hold worker runtime")
+1	tests/ws_client_integration.rs	expect	.expect("disconnect status timeout");
+1	tests/ws_client_integration.rs	expect	.expect("echo binary");
+1	tests/ws_client_integration.rs	expect	.expect("echo response");
+1	tests/ws_client_integration.rs	expect	.expect("echo timeout")
+1	tests/ws_client_integration.rs	expect	.expect("fill pending table");
+1	tests/ws_client_integration.rs	expect	.expect("fragmented send timed out")
+1	tests/ws_client_integration.rs	expect	.expect("get client")
+1	tests/ws_client_integration.rs	expect	.expect("initial connect");
+1	tests/ws_client_integration.rs	expect	.expect("matched callback channel")
+1	tests/ws_client_integration.rs	expect	.expect("matched callback timeout")
+1	tests/ws_client_integration.rs	expect	.expect("non-runtime sender thread")
+1	tests/ws_client_integration.rs	expect	.expect("nonblocking enqueue");
+1	tests/ws_client_integration.rs	expect	.expect("provider starts");
+1	tests/ws_client_integration.rs	expect	.expect("queued request write");
+1	tests/ws_client_integration.rs	expect	.expect("raw peer protocol");
+1	tests/ws_client_integration.rs	expect	.expect("raw peer task")
+1	tests/ws_client_integration.rs	expect	.expect("raw peer timed out")
+1	tests/ws_client_integration.rs	expect	.expect("reconnect data timeout")
+1	tests/ws_client_integration.rs	expect	.expect("reconnect data");
+2	tests/ws_client_integration.rs	expect	.expect("request frame")
+2	tests/ws_client_integration.rs	expect	.expect("request");
+1	tests/ws_client_integration.rs	expect	.expect("response callback and disconnect status");
+1	tests/ws_client_integration.rs	expect	.expect("response channel"),
+1	tests/ws_client_integration.rs	expect	.expect("response channel");
+2	tests/ws_client_integration.rs	expect	.expect("response timeout")
+1	tests/ws_client_integration.rs	expect	.expect("retry with valid config");
+1	tests/ws_client_integration.rs	expect	.expect("send callback message");
+1	tests/ws_client_integration.rs	expect	.expect("send echo response");
+2	tests/ws_client_integration.rs	expect	.expect("send fragmented binary");
+1	tests/ws_client_integration.rs	expect	.expect("send pong");
+1	tests/ws_client_integration.rs	expect	.expect("send reconnect notification");
+2	tests/ws_client_integration.rs	expect	.expect("send request");
+1	tests/ws_client_integration.rs	expect	.expect("send response");
+1	tests/ws_client_integration.rs	expect	.expect("send shared request");
+1	tests/ws_client_integration.rs	expect	.expect("send untracked message");
+7	tests/ws_client_integration.rs	expect	.expect("server stop timeout")
+7	tests/ws_client_integration.rs	expect	.expect("server task");
+1	tests/ws_client_integration.rs	expect	.expect("shared response channel");
+1	tests/ws_client_integration.rs	expect	.expect("shared response timeout")
+6	tests/ws_client_integration.rs	expect	.expect("upgrade connection");
+1	tests/ws_client_integration.rs	expect	.expect("upgrade echo connection");
+1	tests/ws_client_integration.rs	expect	.expect("upgrade first connection");
+1	tests/ws_client_integration.rs	expect	.expect("upgrade second connection");
+2	tests/ws_client_integration.rs	expect	.expect("write request");
+1	tests/ws_client_integration.rs	expect	client.connect(url.as_str()).await.expect("connect client");
+1	tests/ws_client_integration.rs	expect	connect.await.expect("connect task"),
+1	tests/ws_client_integration.rs	expect	destroy_result.expect("destroy client");
+1	tests/ws_client_integration.rs	expect	first.close(None).await.expect("close first connection");
+1	tests/ws_client_integration.rs	expect	let (first, _) = listener.accept().await.expect("accept first connection");
+1	tests/ws_client_integration.rs	expect	let (second, _) = listener.accept().await.expect("accept second connection");
+6	tests/ws_client_integration.rs	expect	let (stream, _) = listener.accept().await.expect("accept connection");
+1	tests/ws_client_integration.rs	expect	let (stream, _) = listener.accept().await.expect("accept echo connection");
+1	tests/ws_client_integration.rs	expect	let address = listener.local_addr().expect("echo server address");
+8	tests/ws_client_integration.rs	expect	let address = listener.local_addr().expect("server address");
+8	tests/ws_client_integration.rs	expect	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+2	tests/ws_client_integration.rs	expect	let mut released = released.lock().expect("callback gate lock");
+1	tests/ws_client_integration.rs	expect	let observed = statuses.lock().expect("status lock").clone();
+16	tests/ws_client_integration.rs	expect	let open_net = OpenNet::new().expect("create open net");
+1	tests/ws_client_integration.rs	expect	let request: Value = serde_json::from_str(request.as_str()).expect("request JSON");
+2	tests/ws_client_integration.rs	expect	let request_id = value["request_id"].as_str().expect("request id");
+1	tests/ws_client_integration.rs	expect	let value: Value = serde_json::from_str(text.as_str()).expect("request JSON");
+2	tests/ws_client_integration.rs	expect	let value: Value = serde_json::from_str(text.as_str()).expect("response JSON");
+1	tests/ws_client_integration.rs	expect	match message.expect("read echo message") {
+1	tests/ws_client_integration.rs	expect	match message.expect("read message") {
+1	tests/ws_client_integration.rs	expect	pong_elapsed.expect("loop requires Pong"),
+2	tests/ws_client_integration.rs	expect	released = wake.wait(released).expect("callback gate wait");
+1	tests/ws_client_integration.rs	expect	server.await.expect("server task"),
+1	tests/ws_client_integration.rs	expect	server.await.expect("server task");
+1	tests/ws_client_integration.rs	expect	socket.close(None).await.expect("close connection");
+1	tests/ws_client_integration.rs	expect	socket.close(None).await.expect("send peer Close");
+2	tests/ws_client_integration.rs	expect	status_sink.lock().expect("status lock").push(status);
+1	tests/ws_client_integration.rs	expect	statuses.lock().expect("status lock").last().copied(),
+1	tests/ws_client_integration.rs	panic	panic!("expected text request");
+1	tests/ws_client_integration.rs	unreachable	_ => unreachable!(),
