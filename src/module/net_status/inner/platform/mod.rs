@@ -13,7 +13,7 @@ use super::refresh_trigger::{self, RefreshTriggerEvent, RefreshTriggerReceiver};
 #[derive(Debug)]
 pub(crate) struct PlatformNetworkMonitor {
     #[cfg(target_os = "macos")]
-    _native: macos::NativeNetworkMonitor,
+    _native: Option<macos::NativeNetworkMonitor>,
     #[cfg(target_os = "macos")]
     changes: RefreshTriggerReceiver,
 }
@@ -23,6 +23,25 @@ impl PlatformNetworkMonitor {
     pub(crate) fn start() -> Self {
         let (trigger, changes) = refresh_trigger::channel();
         let native = macos::NativeNetworkMonitor::start(trigger);
+        Self::from_native(native, changes)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn from_native(
+        native: std::io::Result<macos::NativeNetworkMonitor>,
+        changes: RefreshTriggerReceiver,
+    ) -> Self {
+        let native = match native {
+            Ok(native) => Some(native),
+            Err(error) => {
+                // Native events are supplementary hints. Keep netwatch and
+                // its existing status semantics alive if this source fails.
+                crate::log_e!(crate::common::log::log_def::LogType::Engine;
+                    "network_status_native_monitor_start", "error",
+                    crate::common::log::summary::error(&error));
+                None
+            }
+        };
         Self {
             _native: native,
             changes,
@@ -62,3 +81,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "platform_tests.rs"]
+mod platform_tests;

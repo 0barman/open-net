@@ -1,0 +1,35 @@
+# Reviewed native macOS FFI boundary; this is separate from the historical baseline.
+# Rust requires unsafe to declare/call the C ABI and to read its opaque context.
+# Production clauses are reviewed beside their SAFETY comments in macos.rs:
+# ABI declarations/signatures match path_monitor.h; Send/Sync require a unique
+# owner and synchronous cancellation; start/stop preserve the boxed context;
+# notify checks null and borrows only until the native cancellation barrier.
+# Mock clauses mirror the same ABI: output pointers are caller-owned, each
+# handle has one Box owner, and callbacks only borrow a live adapter context.
+# Lifecycle tests cover failure/null handles, callbacks during cancellation,
+# initial delivery, coalescing, receiver closure, repeated and cross-thread drop.
+# Every token in both reviewed files is fingerprinted to detect body changes;
+# comments/formatting are normalized. FNV-1a64 is a change detector, not crypto.
+# Rows: count<TAB>exact file<TAB>unsafe<TAB>exact trimmed source line.
+fingerprint	src/module/net_status/inner/platform/macos.rs	bee0531596671836
+1	src/module/net_status/inner/platform/macos.rs	unsafe	let status = unsafe { (api.start)(Some(notify), context, &mut handle) };
+1	src/module/net_status/inner/platform/macos.rs	unsafe	let trigger = unsafe { &*context.cast::<RefreshTrigger>() };
+1	src/module/net_status/inner/platform/macos.rs	unsafe	start: unsafe extern "C" fn(Option<NativeCallback>, *mut c_void, *mut *mut c_void) -> c_int,
+1	src/module/net_status/inner/platform/macos.rs	unsafe	stop: unsafe extern "C" fn(*mut c_void),
+1	src/module/net_status/inner/platform/macos.rs	unsafe	type NativeCallback = unsafe extern "C" fn(*mut c_void);
+1	src/module/net_status/inner/platform/macos.rs	unsafe	unsafe extern "C" fn notify(context: *mut c_void) {
+1	src/module/net_status/inner/platform/macos.rs	unsafe	unsafe extern "C" {
+1	src/module/net_status/inner/platform/macos.rs	unsafe	unsafe impl Send for NativeNetworkMonitor {}
+1	src/module/net_status/inner/platform/macos.rs	unsafe	unsafe impl Sync for NativeNetworkMonitor {}
+1	src/module/net_status/inner/platform/macos.rs	unsafe	unsafe { (api.stop)(handle) };
+1	src/module/net_status/inner/platform/macos.rs	unsafe	unsafe { (self.api.stop)(self.handle.as_ptr()) };
+fingerprint	src/module/net_status/inner/platform/macos_tests.rs	d47425b985278170
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	let handle = unsafe { Box::from_raw(handle.cast::<MockHandle>()) };
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	type NativeCallback = unsafe extern "C" fn(*mut c_void);
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	unsafe extern "C" fn mock_start(
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	unsafe extern "C" fn mock_stop(handle: *mut c_void) {
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	unsafe { (handle.callback)(handle.context) };
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	unsafe { callback(context) };
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	unsafe { callback(ptr::null_mut()) };
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	unsafe { output.write(Box::into_raw(handle).cast()) };
+1	src/module/net_status/inner/platform/macos_tests.rs	unsafe	unsafe { output.write(ptr::null_mut()) };

@@ -568,8 +568,8 @@ impl InnerNetStatusClient {
             }
         }
 
-        // On macOS this drops PathMonitor first. Its binding cancels the
-        // monitor and drains the serial callback queue before releasing the
+        // On macOS the native source waits for cancellation completion and
+        // drains the serial callback queue before releasing the
         // callback sender, preventing a late native hint from reaching state
         // reset or a later client generation.
         #[cfg(target_os = "macos")]

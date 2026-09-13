@@ -125,6 +125,95 @@ fn read_legacy_baseline() -> TestResult<LegacyBaseline> {
     Ok(baseline)
 }
 
+struct ReviewedFfiAudit {
+    operations: LegacyBaseline,
+    fingerprints: BTreeMap<String, u64>,
+}
+
+fn is_reviewed_ffi_file(path: &str) -> bool {
+    matches!(
+        path,
+        "src/module/net_status/inner/platform/macos.rs"
+            | "src/module/net_status/inner/platform/macos_tests.rs"
+    )
+}
+
+fn source_fingerprint(source: &str) -> TestResult<u64> {
+    // FNV-1a is a deterministic change detector, not a security signature.
+    // Token normalization ignores comments/formatting but includes FFI bodies.
+    let normalized = source.parse::<TokenStream>()?.to_string();
+    Ok(normalized.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    }))
+}
+
+fn parse_reviewed_ffi_audit(source: &str) -> TestResult<ReviewedFfiAudit> {
+    let mut audit = ReviewedFfiAudit {
+        operations: LegacyBaseline::new(),
+        fingerprints: BTreeMap::new(),
+    };
+    for line in source.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(metadata) = line.strip_prefix("fingerprint\t") {
+            let (path, value) = metadata.split_once('\t').ok_or("invalid FFI fingerprint")?;
+            if !is_reviewed_ffi_file(path)
+                || value.len() != 16
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("invalid FFI fingerprint file or value".into());
+            }
+            let fingerprint = u64::from_str_radix(value, 16)?;
+            if audit
+                .fingerprints
+                .insert(path.to_owned(), fingerprint)
+                .is_some()
+            {
+                return Err("duplicate FFI file fingerprint".into());
+            }
+            continue;
+        }
+        let (count, key) = line.split_once('\t').ok_or("invalid FFI audit row")?;
+        let count: usize = count.parse()?;
+        let mut fields = key.splitn(3, '\t');
+        let path = fields.next().ok_or("missing FFI audit path")?;
+        let operation = fields.next().ok_or("missing FFI audit operation")?;
+        let statement = fields.next().ok_or("missing FFI audit statement")?;
+        if !is_reviewed_ffi_file(path)
+            || operation != "unsafe"
+            || statement.trim().is_empty()
+            || count == 0
+            || audit.operations.insert(key.to_owned(), count).is_some()
+        {
+            return Err("invalid or duplicate reviewed FFI allowance".into());
+        }
+    }
+    for key in audit.operations.keys() {
+        let (path, _) = key.split_once('\t').ok_or("invalid FFI allowance key")?;
+        if !audit.fingerprints.contains_key(path) {
+            return Err("reviewed FFI allowance has no file fingerprint".into());
+        }
+    }
+    Ok(audit)
+}
+
+fn remove_reviewed_ffi_findings(
+    relative_path: &str,
+    source: &str,
+    findings: Vec<String>,
+    audit: &ReviewedFfiAudit,
+) -> TestResult<Vec<String>> {
+    if let Some(reviewed) = audit.fingerprints.get(relative_path) {
+        if source_fingerprint(source)? != *reviewed {
+            return Err(format!("reviewed macOS FFI source changed: {relative_path}").into());
+        }
+    }
+    // The count-limited matcher also keys each entry by exact file, operation
+    // and source line. A reviewed unsafe token cannot hide unwrap/panic/etc.
+    remove_legacy_findings(relative_path, source, findings, &audit.operations)
+}
+
 #[test]
 fn legacy_baseline_matches_only_the_original_operation_and_file() -> TestResult {
     let original = "let value = old.unwrap();";
@@ -146,6 +235,113 @@ fn legacy_baseline_matches_only_the_original_operation_and_file() -> TestResult 
         if remove_legacy_findings(path, &source, scan(&source)?, &baseline)?.len() != expected {
             return Err(format!("legacy baseline hid a new operation in {path}: {source}").into());
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn reviewed_ffi_audit_matches_only_exact_statements_within_the_reviewed_count() -> TestResult {
+    let path = "src/module/net_status/inner/platform/macos.rs";
+    let original = "unsafe { invoke(context) };";
+    let audit = test_ffi_audit(path, original, original)?;
+    if !remove_reviewed_ffi_findings(path, original, scan(original)?, &audit)?.is_empty() {
+        return Err("a reviewed FFI operation did not match".into());
+    }
+    for (file, source, expected) in [
+        ("src/other.rs", original.to_owned(), 1),
+        (
+            "src/module/net_status/inner/platform/macos_tests.rs",
+            original.to_owned(),
+            1,
+        ),
+        (path, "unsafe { invoke(other_context) };".to_owned(), 1),
+        (path, format!("{original}\n{original}"), 1),
+        (path, format!("{original}\nlet value = result.unwrap();"), 1),
+        (path, "unsafe { invoke(context).unwrap() };".to_owned(), 2),
+    ] {
+        // Keep the source fingerprint valid here to independently prove the
+        // statement, operation, file and count checks cannot broaden an audit.
+        let audit = test_ffi_audit(path, &source, original)?;
+        if remove_reviewed_ffi_findings(file, &source, scan(&source)?, &audit)?.len() != expected {
+            return Err(
+                format!("FFI audit hid an unreviewed operation in {file}: {source}").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn test_ffi_audit(path: &str, source: &str, reviewed_line: &str) -> TestResult<ReviewedFfiAudit> {
+    parse_reviewed_ffi_audit(&format!(
+        "fingerprint\t{path}\t{:016x}\n1\t{path}\tunsafe\t{reviewed_line}",
+        source_fingerprint(source)?
+    ))
+}
+
+#[test]
+fn reviewed_ffi_audit_rejects_body_changes_but_fingerprint_ignores_comments() -> TestResult {
+    let path = "src/module/net_status/inner/platform/macos.rs";
+    let original = "unsafe {\ninvoke(context);\n}";
+    let audit = test_ffi_audit(path, original, "unsafe {")?;
+    for changed in [
+        "unsafe {\ninvoke(other_context);\n}",
+        "unsafe {\ninvoke(context); other_operation();\n}",
+        "unsafe {\ninvoke(context).unwrap();\n}",
+    ] {
+        if remove_reviewed_ffi_findings(path, changed, scan(changed)?, &audit).is_ok() {
+            return Err("FFI body changed without invalidating the reviewed fingerprint".into());
+        }
+    }
+    let documented = "unsafe {\n// Context remains live.\n  invoke ( context ) ;\n}";
+    if !remove_reviewed_ffi_findings(path, documented, scan(documented)?, &audit)?.is_empty() {
+        return Err("comments or whitespace changed the normalized FFI fingerprint".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn reviewed_ffi_fingerprint_and_line_never_exempt_panicking_operations() -> TestResult {
+    let path = "src/module/net_status/inner/platform/macos.rs";
+    let source = "unsafe { invoke(context).unwrap() };";
+    let audit = test_ffi_audit(path, source, source)?;
+    let remaining = remove_reviewed_ffi_findings(path, source, scan(source)?, &audit)?;
+    if remaining.len() != 1
+        || !remaining
+            .iter()
+            .any(|finding| finding.ends_with(": unwrap"))
+    {
+        return Err(
+            "reviewed unsafe syntax exempted a panicking operation on the same line".into(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reviewed_ffi_audit_rejects_unrelated_files_operations_and_invalid_counts() -> TestResult {
+    let path = "src/module/net_status/inner/platform/macos.rs";
+    let row = format!("1\t{path}\tunsafe\tunsafe {{ invoke(context) }};");
+    for fixture in [
+        "1\tsrc/other.rs\tunsafe\tunsafe {};".to_owned(),
+        "1\tsrc/module/net_status/inner/platform/../platform/macos.rs\tunsafe\tunsafe {};"
+            .to_owned(),
+        format!("1\t{path}\tunwrap\tvalue.unwrap();"),
+        format!("1\t{path}\tpanic\tpanic!();"),
+        format!("0\t{path}\tunsafe\tunsafe {{}};"),
+        format!("-1\t{path}\tunsafe\tunsafe {{}};"),
+        format!("1\t{path}\tunsafe\t"),
+        format!("1\t{path}\tunsafe"),
+        format!("{row}\n{row}"),
+        format!("fingerprint\t{path}\tnot-a-hash\n{row}"),
+        format!("fingerprint\tsrc/other.rs\t0000000000000000\n{row}"),
+    ] {
+        let fixture = format!("fingerprint\t{path}\t0000000000000000\n{fixture}");
+        if parse_reviewed_ffi_audit(&fixture).is_ok() {
+            return Err(format!("FFI audit accepted an invalid allowance: {fixture}").into());
+        }
+    }
+    if parse_reviewed_ffi_audit(&row).is_ok() {
+        return Err("FFI source allowances were accepted without a file fingerprint".into());
     }
     Ok(())
 }
@@ -235,14 +431,17 @@ fn ws_client_sources_do_not_contain_panicking_operations() -> TestResult {
     files.sort();
     files.dedup();
     let baseline = read_legacy_baseline()?;
+    let ffi_audit = parse_reviewed_ffi_audit(include_str!("fixtures/macos-ffi-unsafe-audit.tsv"))?;
     let mut findings = Vec::new();
     for file in files {
         let source = std::fs::read_to_string(&file)?;
         let relative = file
             .strip_prefix(manifest)
             .unwrap_or(&file)
-            .to_string_lossy();
-        for finding in remove_legacy_findings(&relative, &source, scan(&source)?, &baseline)? {
+            .to_string_lossy()
+            .replace('\\', "/");
+        let new_findings = remove_legacy_findings(&relative, &source, scan(&source)?, &baseline)?;
+        for finding in remove_reviewed_ffi_findings(&relative, &source, new_findings, &ffi_audit)? {
             findings.push(format!("{}:{finding}", file.display()));
         }
     }

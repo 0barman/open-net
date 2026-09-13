@@ -1,43 +1,42 @@
-use std::path::PathBuf;
-use std::process::Command;
+#[path = "src/module/net_status/inner/platform/native/build_config.rs"]
+mod macos_config;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=SDKROOT");
     println!("cargo:rerun-if-env-changed=TOOLCHAINS");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
         || std::env::var_os("DOCS_RS").is_some()
     {
-        return;
+        return Ok(());
     }
 
-    // networkframework's C shim uses Clang's availability checks. Rust links
-    // with -nodefaultlibs, so Clang does not add its platform-version helpers.
-    // Export the native library dependency (not a final-binary link argument)
-    // so applications using open-net receive these helpers as well.
-    let output = Command::new("xcrun")
-        .args([
-            "--sdk",
-            "macosx",
-            "clang",
-            "--print-file-name=libclang_rt.osx.a",
-        ])
-        .output()
-        .expect("macOS network monitoring requires the Xcode command line tools");
-    assert!(
-        output.status.success(),
-        "failed to locate Clang's macOS runtime"
-    );
-    let runtime = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    assert!(
-        runtime.is_absolute() && runtime.is_file(),
-        "Clang's macOS runtime is missing: {}",
-        runtime.display()
-    );
-    let runtime_dir = runtime
-        .parent()
-        .expect("Clang runtime must have a parent directory");
-    println!("cargo:rustc-link-search=native={}", runtime_dir.display());
-    println!("cargo:rustc-link-lib=static=clang_rt.osx");
+    let native = "src/module/net_status/inner/platform/native";
+    println!("cargo:rerun-if-changed={native}/path_monitor.c");
+    println!("cargo:rerun-if-changed={native}/path_monitor.h");
+    println!("cargo:rerun-if-changed={native}/build_config.rs");
+    let requested = match std::env::var("MACOSX_DEPLOYMENT_TARGET") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    // cc otherwise derives the native deployment target from the installed
+    // SDK. Use the API floor consistently across Xcode versions and honor a
+    // caller's higher deployment target without changing process environment.
+    let deployment = macos_config::deployment_target(
+        &std::env::var("CARGO_CFG_TARGET_ARCH")?,
+        requested.as_deref(),
+    )?;
+    cc::Build::new()
+        .env("MACOSX_DEPLOYMENT_TARGET", deployment)
+        .file(format!("{native}/path_monitor.c"))
+        .flag("-fblocks")
+        .std("c11")
+        .warnings(true)
+        .extra_warnings(true)
+        .try_compile("open_net_path_monitor")?;
+    println!("cargo:rustc-link-lib=framework=Network");
+    Ok(())
 }

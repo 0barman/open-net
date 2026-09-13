@@ -36,7 +36,7 @@ open-net = { version = "0.1.0-beta.1", default-features = false }
 
 本目录是独立的 Cargo package。`src/` 保存网络实现和公共 API，`libs/common/src/` 保存编译进同一个 `open-net` crate 的公共运行时与日志模块，`tests/` 保存集成测试及其测试数据。无需单独安装或发布 `on-common`。
 
-安装 Rust 和 Cargo 后，在本目录执行以下命令。macOS 构建还需要 Xcode Command Line Tools。
+安装 Rust 和 Cargo 后，在本目录执行以下命令。macOS 构建还需要 Xcode Command Line Tools 提供的 Clang 和 macOS SDK；原生网络变化监听通过 C 接口调用 Network.framework，无需 Swift 编译器。
 
 ```bash
 cargo check --all-targets --all-features
