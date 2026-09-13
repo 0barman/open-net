@@ -1,7 +1,7 @@
-use crate::log::listener::LogListener;
-use crate::log::log_def::{format_tag, timestamp_millis, LogType};
-use crate::log::log_info::LogInfo;
-use crate::log::log_level::LogLevel;
+use crate::common::log::listener::LogListener;
+use crate::common::log::log_def::{format_tag, timestamp_millis, LogType};
+use crate::common::log::log_info::LogInfo;
+use crate::common::log::log_level::LogLevel;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io;
@@ -219,7 +219,3 @@ impl Logger {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

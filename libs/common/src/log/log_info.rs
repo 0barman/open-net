@@ -1,5 +1,5 @@
-use crate::log::log_def::LogType;
-use crate::log::log_level::LogLevel;
+use crate::common::log::log_def::LogType;
+use crate::common::log::log_level::LogLevel;
 
 #[derive(Debug, Clone)]
 pub struct LogInfo {

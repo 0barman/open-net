@@ -1,6 +1,6 @@
-use crate::log::log_info::LogInfo;
-use crate::log::log_level::LogLevel;
-use crate::log::logger::Logger;
+use crate::common::log::log_info::LogInfo;
+use crate::common::log::log_level::LogLevel;
+use crate::common::log::logger::Logger;
 use indexmap::IndexMap;
 use serde_json::Value;
 
@@ -91,9 +91,9 @@ macro_rules! location {
 macro_rules! internal_log {
     ($log_type:expr, $level:expr, $suffix:expr, $tag:expr, $first_field:expr $(, $value:expr)* $(,)?) => {{
         let log_type = $log_type;
-        if $crate::log::logger::Logger::is_enabled(log_type) {
+        if $crate::Logger::is_enabled(log_type) {
             let values = vec![$($crate::__serde_json::json!($value)),*];
-            $crate::log::log_def::on_log(
+            $crate::__log::on_log(
                 $crate::location!(), $level, log_type, $tag,
                 Some($first_field), Some(values), $suffix,
             );
@@ -101,8 +101,8 @@ macro_rules! internal_log {
     }};
     ($log_type:expr, $level:expr, $suffix:expr, $tag:expr $(,)?) => {{
         let log_type = $log_type;
-        if $crate::log::logger::Logger::is_enabled(log_type) {
-            $crate::log::log_def::on_log(
+        if $crate::Logger::is_enabled(log_type) {
+            $crate::__log::on_log(
                 $crate::location!(), $level, log_type, $tag, None, None, $suffix,
             );
         }
@@ -114,10 +114,10 @@ macro_rules! internal_log {
 #[macro_export]
 macro_rules! log_t {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::log::log_level::LogLevel::Info, "T", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Info, "T", $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::log::log_def::LogType::Engine, $crate::log::log_level::LogLevel::Info, "T", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Info, "T", $($arg),+)
     };
 }
 
@@ -126,10 +126,10 @@ macro_rules! log_t {
 #[macro_export]
 macro_rules! log_r {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::log::log_level::LogLevel::Debug, "R", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Debug, "R", $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::log::log_def::LogType::Engine, $crate::log::log_level::LogLevel::Debug, "R", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Debug, "R", $($arg),+)
     };
 }
 
@@ -138,10 +138,10 @@ macro_rules! log_r {
 #[macro_export]
 macro_rules! log_s {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::log::log_level::LogLevel::Debug, "S", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Debug, "S", $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::log::log_def::LogType::Engine, $crate::log::log_level::LogLevel::Debug, "S", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Debug, "S", $($arg),+)
     };
 }
 
@@ -150,10 +150,10 @@ macro_rules! log_s {
 #[macro_export]
 macro_rules! log_e {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::log::log_level::LogLevel::Error, "E", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Error, "E", $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::log::log_def::LogType::Engine, $crate::log::log_level::LogLevel::Error, "E", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Error, "E", $($arg),+)
     };
 }
 
@@ -221,7 +221,7 @@ macro_rules! impl_display_json {
 macro_rules! err {
     ($err:expr) => {{
         let error = $err;
-        $crate::log_e!("err", "error", $crate::log::summary::error(&error));
+        $crate::log_e!("err", "error", $crate::__log::error_summary(&error));
         error
     }};
 }

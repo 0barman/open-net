@@ -1,5 +1,8 @@
 //! Cross-platform helpers for task spawning and time.
 
+// These internal helpers are available independently of enabled network features.
+#![allow(unused_imports)]
+
 /// Spawns a future on the current platform runtime.
 pub use spawn::spawn;
 /// Returns the current Unix timestamp in milliseconds.

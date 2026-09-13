@@ -1,4 +1,4 @@
-use crate::log::log_def::LogType;
+use crate::common::log::log_def::LogType;
 use std::future::Future;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -21,15 +21,6 @@ use wasm_bindgen_futures::spawn_local;
 /// # Returns
 ///
 /// A [`tokio::task::JoinHandle`] that can be awaited for the future output.
-///
-/// # Examples
-///
-/// ```no_run
-/// # async fn demo() {
-/// let handle = on_common::platform::spawn(async { 7 });
-/// assert_eq!(handle.await.expect("task joins"), 7);
-/// # }
-/// ```
 pub fn spawn<T>(future: T) -> JoinHandle<T::Output>
 where
     T: Future + Send + 'static,
