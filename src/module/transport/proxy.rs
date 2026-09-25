@@ -1,9 +1,8 @@
-use super::failure;
-use crate::api::net_error::NetError;
+use super::{failure, TransportFailure};
 use crate::api::network_config::ProxyBasicAuth;
-use crate::api::wsc::web_socket_connection_event::{
-    WebSocketConnectStage, WebSocketConnectionFailure,
-};
+use crate::error::NetError;
+use crate::module::transport::failure::{ConnectStage, ConnectionFailure};
+use crate::ws::{HandshakeDiagnostic, HandshakeDiagnosticKind, HandshakeDiagnosticOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -11,12 +10,50 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_HEADERS: usize = 64;
 const MAX_INFORMATIONAL_RESPONSES: usize = 4;
 
+pub(super) async fn establish_tunnel_with_diagnostics(
+    socket: &mut TcpStream,
+    host: &str,
+    port: u16,
+    auth: Option<&ProxyBasicAuth>,
+    options: Option<&HandshakeDiagnosticOptions>,
+) -> Result<(), TransportFailure> {
+    establish_tunnel_inner(socket, host, port, auth, options)
+        .await
+        .map_err(|mut error| {
+            if error.diagnostic.is_none() {
+                error.diagnostic = options.map(|_| {
+                    if error.failure.error().kind() == crate::error::ErrorKind::HandshakeRejected
+                        && error.failure.http_status().is_none()
+                    {
+                        HandshakeDiagnostic::new(HandshakeDiagnosticKind::Protocol)
+                    } else {
+                        HandshakeDiagnostic::from_failure(error.failure.clone())
+                    }
+                });
+            }
+            error
+        })
+}
+
+#[cfg(test)]
 pub(super) async fn establish_tunnel(
     socket: &mut TcpStream,
     host: &str,
     port: u16,
     auth: Option<&ProxyBasicAuth>,
-) -> Result<(), WebSocketConnectionFailure> {
+) -> Result<(), ConnectionFailure> {
+    establish_tunnel_with_diagnostics(socket, host, port, auth, None)
+        .await
+        .map_err(|error| error.failure)
+}
+
+async fn establish_tunnel_inner(
+    socket: &mut TcpStream,
+    host: &str,
+    port: u16,
+    auth: Option<&ProxyBasicAuth>,
+    options: Option<&HandshakeDiagnosticOptions>,
+) -> Result<(), TransportFailure> {
     let authority = if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -32,12 +69,12 @@ pub(super) async fn establish_tunnel(
     socket
         .write_all(request.as_bytes())
         .await
-        .map_err(|_| proxy_io())?;
+        .map_err(|error| TransportFailure::io(error, ConnectStage::ProxyConnect, options))?;
     let mut remaining_bytes = MAX_RESPONSE_BYTES;
     let mut remaining_headers = MAX_RESPONSE_HEADERS;
     let mut informational_responses = 0usize;
     loop {
-        let response = read_header_exactly(socket, remaining_bytes).await?;
+        let response = read_header_exactly(socket, remaining_bytes, options).await?;
         remaining_bytes = remaining_bytes
             .checked_sub(response.len())
             .ok_or_else(proxy_protocol)?;
@@ -45,7 +82,7 @@ pub(super) async fn establish_tunnel(
         let mut parsed = httparse::Response::new(&mut headers);
         let complete = parsed.parse(&response).map_err(|_| proxy_protocol())?;
         if !matches!(complete, httparse::Status::Complete(size) if size == response.len()) {
-            return Err(proxy_protocol());
+            return Err(proxy_protocol().into());
         }
         remaining_headers = remaining_headers
             .checked_sub(parsed.headers.len())
@@ -55,7 +92,7 @@ pub(super) async fn establish_tunnel(
             // CONNECT does not request a protocol Upgrade. All interim responses
             // share the outer attempt deadline and one cumulative parsing budget.
             if code == 101 || informational_responses >= MAX_INFORMATIONAL_RESPONSES {
-                return Err(proxy_protocol());
+                return Err(proxy_protocol().into());
             }
             informational_responses = informational_responses
                 .checked_add(1)
@@ -66,12 +103,26 @@ pub(super) async fn establish_tunnel(
             // RFC 9110: successful CONNECT has no HTTP body; CL and TE are ignored.
             return Ok(());
         }
-        return Err(WebSocketConnectionFailure::new(
-            NetError::ConnectError,
-            WebSocketConnectStage::ProxyConnect,
-            Some(code),
-            code == 408 || code == 429 || (500..600).contains(&code),
-        ));
+        return Err(TransportFailure {
+            failure: ConnectionFailure::new(
+                NetError::from(crate::error::ErrorKind::HandshakeRejected),
+                ConnectStage::ProxyConnect,
+                Some(code),
+                code == 408 || code == 429 || (500..600).contains(&code),
+            ),
+            // CONNECT rejection bodies have never been read by this parser.
+            // Preserve that contract and the original cumulative header budget.
+            diagnostic: options.map(|options| {
+                HandshakeDiagnostic::http(
+                    options,
+                    parsed
+                        .headers
+                        .iter()
+                        .map(|header| (header.name, header.value)),
+                    None,
+                )
+            }),
+        });
     }
 }
 
@@ -81,7 +132,8 @@ pub(super) async fn establish_tunnel(
 async fn read_header_exactly(
     socket: &mut TcpStream,
     max_bytes: usize,
-) -> Result<Vec<u8>, WebSocketConnectionFailure> {
+    options: Option<&HandshakeDiagnosticOptions>,
+) -> Result<Vec<u8>, TransportFailure> {
     let mut response = Vec::new();
     response
         .try_reserve(max_bytes)
@@ -95,9 +147,16 @@ async fn read_header_exactly(
             .ok_or_else(proxy_protocol)?
             .min(scratch.len());
         let buffer = scratch.get_mut(..available).ok_or_else(proxy_protocol)?;
-        let peeked = socket.peek(buffer).await.map_err(|_| proxy_io())?;
+        let peeked = socket
+            .peek(buffer)
+            .await
+            .map_err(|error| TransportFailure::io(error, ConnectStage::ProxyConnect, options))?;
         if peeked == 0 {
-            return Err(proxy_io());
+            return Err(TransportFailure::io(
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+                ConnectStage::ProxyConnect,
+                options,
+            ));
         }
         response.extend_from_slice(buffer.get(..peeked).ok_or_else(proxy_protocol)?);
         let search_start = previous.saturating_sub(3);
@@ -118,25 +177,17 @@ async fn read_header_exactly(
         socket
             .read_exact(scratch.get_mut(..consume).ok_or_else(proxy_protocol)?)
             .await
-            .map_err(|_| proxy_io())?;
+            .map_err(|error| TransportFailure::io(error, ConnectStage::ProxyConnect, options))?;
         if found.is_some() {
             return Ok(response);
         }
     }
 }
 
-fn proxy_io() -> WebSocketConnectionFailure {
+fn proxy_protocol() -> ConnectionFailure {
     failure(
-        NetError::NetworkError,
-        WebSocketConnectStage::ProxyConnect,
-        true,
-    )
-}
-
-fn proxy_protocol() -> WebSocketConnectionFailure {
-    failure(
-        NetError::ConnectError,
-        WebSocketConnectStage::ProxyConnect,
+        NetError::from(crate::error::ErrorKind::HandshakeRejected),
+        ConnectStage::ProxyConnect,
         false,
     )
 }

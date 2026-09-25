@@ -1,12 +1,5 @@
-//! Network reachability, IP-stack capability and LAN address selection.
-//!
-//! Available in every open-net build; create a client through `OpenNet`.
+//! Internal network monitoring and LAN address selection.
 pub(crate) mod inner;
-mod ip_stack;
-mod lan_addr;
-mod net_status_client;
-mod network_status;
+pub(crate) mod lan_addr;
 
-pub use ip_stack::IpStack;
-pub use net_status_client::{NetStatusClient, NetworkStatusListener, NetworkStatusListenerHandle};
-pub use network_status::NetworkStatus;
+pub(crate) use crate::api::net_status::{IpStack, NetworkStatus};

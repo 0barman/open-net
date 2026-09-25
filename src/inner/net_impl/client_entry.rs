@@ -1,4 +1,4 @@
-use crate::api::web_socket_client::WebSocketClient;
+use crate::ws::WebSocketClient;
 use std::thread::JoinHandle;
 
 pub(super) struct ClientEntry {

@@ -3,24 +3,28 @@ use std::io;
 #[path = "../src/module/net_status/inner/platform/native/build_config.rs"]
 mod build_config;
 
+#[track_caller]
 fn check_target(arch: &str, requested: Option<&str>, expected: &str) -> io::Result<()> {
     let actual = build_config::deployment_target(arch, requested)?;
     if actual != expected {
+        let location = std::panic::Location::caller();
         return Err(io::Error::other(format!(
-            "{arch} target {requested:?}: expected {expected}, received {actual}"
+            "{location}: {arch} target {requested:?}: expected {expected}, received {actual}"
         )));
     }
     Ok(())
 }
 
+#[track_caller]
 fn check_rejected(arch: &str, requested: Option<&str>) -> io::Result<()> {
+    let location = std::panic::Location::caller();
     match build_config::deployment_target(arch, requested) {
         Ok(actual) => Err(io::Error::other(format!(
-            "{arch} target {requested:?} unexpectedly accepted as {actual}"
+            "{location}: {arch} target {requested:?} unexpectedly accepted as {actual}"
         ))),
-        Err(error) if error.to_string().is_empty() => Err(io::Error::other(
-            "deployment target error has no diagnostic",
-        )),
+        Err(error) if error.to_string().is_empty() => Err(io::Error::other(format!(
+            "{location}: deployment target error has no diagnostic",
+        ))),
         Err(_) => Ok(()),
     }
 }

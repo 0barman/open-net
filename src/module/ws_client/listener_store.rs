@@ -1,44 +1,89 @@
-use crate::{ConnectionStatus, WSCResponse};
-use std::sync::{Arc, RwLock};
-use tokio_util::sync::CancellationToken;
+use crate::error::NetError;
+use crate::module::ws_client::listener_executor::ListenerExecutor;
+use crate::ws::WebSocketClientConfig;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
-/// 可在线程间共享的数据响应监听器。
-///
-/// 回调取得 `WSCResponse` 的所有权，以便按 UUID 原子认领关联的原请求。
-pub(crate) type DataListener = Arc<dyn Fn(WSCResponse) + Send + Sync + 'static>;
-
-/// 可在线程间共享的连接状态监听器。
-pub(crate) type StatusListener = Arc<dyn Fn(ConnectionStatus) + Send + Sync + 'static>;
-
-/// A registration owns its initial-delivery barrier independently of replacements.
-pub(crate) struct StatusRegistration {
-    pub(crate) listener: StatusListener,
-    pub(crate) initial_done: CancellationToken,
-    /// Replacement/removal wakes a lane waiting for this registration's initial call.
-    pub(crate) retired: CancellationToken,
+/// Client-wide quotas and lazy executors shared by each native session.
+pub(crate) struct ListenerStore {
+    state_quota: Arc<Semaphore>,
+    state_executor: Arc<ListenerExecutor>,
+    event_quota: Arc<Semaphore>,
+    event_executor: Arc<ListenerExecutor>,
 }
 
-impl StatusRegistration {
-    pub(crate) fn new(listener: StatusListener) -> Self {
-        Self {
-            listener,
-            initial_done: CancellationToken::new(),
-            retired: CancellationToken::new(),
+#[derive(Clone)]
+pub(crate) struct ConnectionObservers {
+    pub(crate) state_executor: Arc<dyn crate::subscription::CallbackExecutor>,
+    pub(crate) state_quota: Arc<Semaphore>,
+    pub(crate) event_executor: Arc<dyn crate::subscription::CallbackExecutor>,
+    pub(crate) event_quota: Arc<Semaphore>,
+}
+
+impl ListenerStore {
+    pub(crate) fn new(config: &WebSocketClientConfig) -> Result<Self, NetError> {
+        config.dispatch.validate()?;
+        Ok(Self {
+            state_quota: Arc::new(Semaphore::new(config.dispatch.state_subscriptions)),
+            state_executor: ListenerExecutor::new(
+                "open-net-ws-status",
+                config.dispatch.state_callback_workers,
+                config.dispatch.state_subscriptions,
+            )?,
+            event_quota: Arc::new(Semaphore::new(config.dispatch.event_subscriptions)),
+            event_executor: ListenerExecutor::new(
+                "open-net-ws-events",
+                config.dispatch.event_callback_workers,
+                config.dispatch.event_subscriptions,
+            )?,
+        })
+    }
+
+    pub(crate) fn connection_observers(&self) -> ConnectionObservers {
+        ConnectionObservers {
+            state_executor: self.state_executor.clone(),
+            state_quota: self.state_quota.clone(),
+            event_executor: self.event_executor.clone(),
+            event_quota: self.event_quota.clone(),
         }
+    }
+
+    pub(crate) fn clear(&self) -> Result<(), NetError> {
+        let mut result = Ok(());
+        for (lane, closing) in [
+            ("state", self.state_executor.close()),
+            ("event", self.event_executor.close()),
+        ] {
+            if let Err(error) = closing {
+                crate::log_e!(crate::LogType::WSC; "listener_store_close", "lane|kind", lane, format!("{:?}", error.kind()));
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
+        result
     }
 }
 
-/// WebSocket 客户端当前注册的回调集合。
-///
-/// 注册、替换和注销可与回调任务并发。回调任务只在读锁内克隆 `Arc`，随后释放锁再执行
-/// 用户代码，因此慢回调不会持锁阻塞监听器更新；已经克隆的旧监听器不受随后注销影响。
-/// 任一锁中毒时，对应监听器的读取或更新会被当作不存在/失败处理。
-#[derive(Default)]
-pub(crate) struct ListenerStore {
-    /// 当前客户端的 WSC/Common 日志订阅；替换、注销和 worker 终态清理会释放句柄。
-    pub(crate) log: std::sync::Mutex<Option<crate::common::log::logger::LogSubscription>>,
-    /// 至多一个数据响应监听器。
-    pub(crate) data: RwLock<Option<DataListener>>,
-    /// 至多一个连接状态监听器。
-    pub(crate) status: RwLock<Option<Arc<StatusRegistration>>>,
+#[cfg(test)]
+#[path = "listener_store_lazy_tests.rs"]
+mod lazy_tests;
+
+#[cfg(test)]
+#[path = "listener_store_resource_tests.rs"]
+mod resource_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::module::ws_client::test_support::{check_eq, TestResult};
+    #[test]
+    fn connection_observers_reuse_client_quotas() -> TestResult {
+        let store = ListenerStore::new(&WebSocketClientConfig::default())?;
+        let first = store.connection_observers();
+        let second = store.connection_observers();
+        check_eq!(Arc::ptr_eq(&first.state_quota, &second.state_quota), true)?;
+        check_eq!(Arc::ptr_eq(&first.event_quota, &second.event_quota), true)?;
+        Ok(())
+    }
 }

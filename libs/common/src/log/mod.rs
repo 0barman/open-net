@@ -5,8 +5,8 @@ pub mod log_level;
 pub mod logger;
 pub mod summary;
 
-pub use listener::LogListener;
-pub use log_def::LogType;
-pub use log_info::LogInfo;
-pub use log_level::LogLevel;
-pub use logger::{LogSubscription, Logger};
+// Internal compatibility paths point to the canonical API definitions.
+#[allow(unused_imports)]
+pub(crate) use crate::api::log::{
+    LogInfo, LogLevel, LogListener, LogSubscription, LogType, Logger,
+};

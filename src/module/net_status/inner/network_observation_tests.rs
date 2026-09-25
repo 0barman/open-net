@@ -1,183 +1,202 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use super::InnerNetStatusClient;
-use crate::api::net_error::NetError;
-use crate::module::net_status::inner::monitor_runtime::MonitorRuntime;
-use crate::module::net_status::inner::monitor_state::{Dispatcher, MonitorState};
+use crate::error::NetError;
+use crate::module::net_status::inner::monitor_runtime::{MonitorInitialization, MonitorRuntime};
+use crate::module::net_status::inner::monitor_state::MonitorState;
 use crate::module::net_status::inner::network_status_snapshot::{
     NetworkStatusMonitorGuard, NetworkStatusSource,
 };
-use crate::module::net_status::{IpStack, NetworkStatus};
+use crate::net_status::{IpStack, MonitorState as PublicMonitorState, NetworkStatus};
+use crate::subscription::CallbackExecutor;
 
-type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-#[test]
-fn initial_unavailable_updates_internal_source_without_public_callback() -> TestResult {
-    let source = NetworkStatusSource::new();
-    let mut receiver = source.subscribe();
+type TestResult = Result<(), crate::BoxError>;
+fn source_and_state() -> Result<(NetworkStatusSource, Arc<Mutex<MonitorState>>), crate::BoxError> {
+    let source = NetworkStatusSource::for_test()?;
+    let (publisher, publication) = source.begin_generation()?;
+    publication.dispatch()?;
     let state = Arc::new(Mutex::new(MonitorState {
-        observation: Some(source.begin_generation()?),
+        observation: Some(publisher),
         ..MonitorState::default()
     }));
-    let dispatched = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&dispatched);
-    let dispatcher: Dispatcher = Arc::new(move |_, _| {
-        counted.fetch_add(1, Ordering::SeqCst);
-    });
-    InnerNetStatusClient::update_state_inner(
-        &state,
-        &dispatcher,
-        NetworkStatus::Unavailable,
-        IpStack::None,
-    )?;
-    let snapshot = *receiver.borrow_and_update();
-    if snapshot.status != Some(NetworkStatus::Unavailable)
-        || snapshot.loss_epoch != 1
-        || dispatched.load(Ordering::SeqCst) != 0
+    Ok((source, state))
+}
+#[test]
+fn initial_unavailable_updates_public_and_internal_snapshot_without_false_default() -> TestResult {
+    let (source, state) = source_and_state()?;
+    let mut receiver = source.observe()?;
+    InnerNetStatusClient::update_state_inner(&state, NetworkStatus::Unavailable, IpStack::None)?;
+    let current = source.snapshot()?;
+    let gate = *::tokio::sync::watch::Receiver::borrow(&source.subscribe());
+    if current.reachability != Some(NetworkStatus::Unavailable)
+        || current.ip_stack != Some(IpStack::None)
+        || current.loss_epoch != 1
+        || gate.loss_epoch != 1
     {
-        return Err(
-            "initial Unavailable must reach internal subscribers without a public replay".into(),
-        );
+        return Err("initial Unavailable was not a coherent observation".into());
+    }
+    let initial =
+        futures::executor::block_on(receiver.recv())?.ok_or("initial snapshot missing")?;
+    if !matches!(initial.state, PublicMonitorState::Starting) || initial.reachability.is_some() {
+        return Err("initial observation replaced subscription-time unknown state".into());
     }
     Ok(())
 }
-
+struct HeldExecutor(Mutex<Vec<Box<dyn FnOnce() + Send>>>);
+impl CallbackExecutor for HeldExecutor {
+    fn ensure_ready(&self) -> Result<(), NetError> {
+        Ok(())
+    }
+    fn submit(&self, job: Box<dyn FnOnce() + Send>) -> Result<(), NetError> {
+        self.0.lock().map_err(NetError::from_poison)?.push(job);
+        Ok(())
+    }
+}
 #[test]
 fn internal_observation_does_not_wait_for_public_callbacks() -> TestResult {
-    let source = NetworkStatusSource::new();
-    let mut receiver = source.subscribe();
-    let mut state = MonitorState {
-        observation: Some(source.begin_generation()?),
+    let executor = Arc::new(HeldExecutor(Mutex::new(Vec::new())));
+    let source = NetworkStatusSource::new(executor, 4)?;
+    let _subscription = source.observe()?.into_callback(|_, _| {})?;
+    let (publisher, publication) = source.begin_generation()?;
+    publication.dispatch()?;
+    let state = Arc::new(Mutex::new(MonitorState {
+        observation: Some(publisher),
         ..MonitorState::default()
-    };
-    let handle = state.next_listener_handle();
-    state.listeners.insert(handle, Arc::new(|_| {}));
-    let state = Arc::new(Mutex::new(state));
-    // Model a callback executor accepting work without executing any callback.
-    let dispatcher: Dispatcher = Arc::new(|_, _| {});
-    InnerNetStatusClient::update_reachability_inner(&state, &dispatcher, NetworkStatus::Available)?;
-    InnerNetStatusClient::update_reachability_inner(
-        &state,
-        &dispatcher,
+    }));
+    for status in [
+        NetworkStatus::Available,
         NetworkStatus::Unavailable,
-    )?;
-    InnerNetStatusClient::update_reachability_inner(&state, &dispatcher, NetworkStatus::Available)?;
-    let snapshot = *receiver.borrow_and_update();
-    if snapshot.status != Some(NetworkStatus::Available) || snapshot.loss_epoch != 1 {
-        return Err("public callback scheduling must not delay internal observations".into());
+        NetworkStatus::Available,
+    ] {
+        InnerNetStatusClient::update_state_inner(&state, status, IpStack::DualStack)?;
+    }
+    let gate = *::tokio::sync::watch::Receiver::borrow(&source.subscribe());
+    if gate.status != Some(NetworkStatus::Available)
+        || gate.loss_epoch != 1
+        || source.snapshot()?.loss_epoch != 1
+    {
+        return Err("held callback delayed internal gate or lost outage history".into());
     }
     Ok(())
 }
-
 #[test]
 fn inactive_monitor_cannot_publish_internal_observation() -> TestResult {
-    let source = NetworkStatusSource::new();
-    let mut receiver = source.subscribe();
-    let state = MonitorState {
-        observation: Some(source.begin_generation()?),
-        ..MonitorState::default()
-    };
-    state.active.store(false, Ordering::Release);
-    let state = Arc::new(Mutex::new(state));
-    let dispatcher: Dispatcher = Arc::new(|_, _| {});
-    InnerNetStatusClient::update_state_inner(
-        &state,
-        &dispatcher,
-        NetworkStatus::Unavailable,
-        IpStack::None,
-    )?;
-    if receiver.borrow_and_update().status.is_some() {
-        return Err("retired monitor published a network state".into());
+    let (source, state) = source_and_state()?;
+    state
+        .lock()
+        .map_err(NetError::from_poison)?
+        .active
+        .store(false, Ordering::Release);
+    InnerNetStatusClient::update_state_inner(&state, NetworkStatus::Unavailable, IpStack::None)?;
+    let gate = *::tokio::sync::watch::Receiver::borrow(&source.subscribe());
+    if gate.status.is_some() || source.snapshot()?.reachability.is_some() {
+        return Err("inactive monitor published a state".into());
     }
     Ok(())
 }
-
 #[test]
 fn dropping_unpolled_monitor_task_clears_known_state() -> TestResult {
-    let source = NetworkStatusSource::new();
-    let mut receiver = source.subscribe();
-    let publisher = source.begin_generation()?;
-    publisher.publish(Some(NetworkStatus::Unavailable))?;
+    let source = NetworkStatusSource::for_test()?;
+    let (publisher, publication) = source.begin_generation()?;
+    publication.dispatch()?;
+    publisher
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+        .dispatch()?;
     let completion = NetworkStatusMonitorGuard(publisher);
     let future = async move {
         let _completion = completion;
         std::future::pending::<()>().await;
     };
     drop(future);
-    let snapshot = *receiver.borrow_and_update();
-    if snapshot.status.is_some() || snapshot.loss_epoch != 1 {
-        return Err(
-            "an unpolled monitor task must clear its observation without manufacturing loss".into(),
-        );
+    let snapshot = source.snapshot()?;
+    if !matches!(snapshot.state, PublicMonitorState::Stopped)
+        || snapshot.reachability.is_some()
+        || snapshot.loss_epoch != 1
+    {
+        return Err("unpolled task did not retire observation".into());
     }
     Ok(())
 }
-
 #[test]
 fn stopped_generation_completion_cannot_clear_new_generation() -> TestResult {
-    let source = NetworkStatusSource::new();
-    let mut receiver = source.subscribe();
-    let completion = NetworkStatusMonitorGuard(source.begin_generation()?);
-    let fresh = source.begin_generation()?;
-    fresh.publish(Some(NetworkStatus::Available))?;
+    let source = NetworkStatusSource::for_test()?;
+    let (old, publication) = source.begin_generation()?;
+    publication.dispatch()?;
+    let completion = NetworkStatusMonitorGuard(old);
+    let (fresh, publication) = source.begin_generation()?;
+    publication.dispatch()?;
+    fresh
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?
+        .dispatch()?;
     drop(completion);
-    if receiver.borrow_and_update().status != Some(NetworkStatus::Available) {
-        return Err("retiring completion cleared a replacement monitor".into());
+    if source.snapshot()?.reachability != Some(NetworkStatus::Available) {
+        return Err("old completion cleared replacement monitor".into());
     }
     Ok(())
 }
-
 #[test]
 fn completed_monitor_cannot_republish_a_late_platform_query() -> TestResult {
-    let source = NetworkStatusSource::new();
-    let mut receiver = source.subscribe();
-    let publisher = source.begin_generation()?;
-    publisher.publish(Some(NetworkStatus::Unavailable))?;
+    let source = NetworkStatusSource::for_test()?;
+    let (publisher, publication) = source.begin_generation()?;
+    publication.dispatch()?;
+    publisher
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+        .dispatch()?;
     drop(NetworkStatusMonitorGuard(publisher.clone()));
-    publisher.publish(Some(NetworkStatus::Available))?;
-    if receiver.borrow_and_update().status.is_some() {
-        return Err("a completed monitor must not publish late platform observations".into());
+    publisher
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only), None)?
+        .dispatch()?;
+    if source.snapshot()?.reachability.is_some() {
+        return Err("completed monitor accepted a late query".into());
     }
     Ok(())
 }
-
 #[test]
-fn public_default_state_remains_unavailable_without_internal_observation() -> TestResult {
-    let state = Mutex::new(MonitorState::default());
-    if state.lock().map_err(NetError::from_poison)?.reachability != NetworkStatus::Unavailable {
-        return Err("public stopped-state compatibility changed".into());
+fn public_default_snapshot_is_stopped_without_a_network_observation() -> TestResult {
+    let source = NetworkStatusSource::for_test()?;
+    let snapshot = source.snapshot()?;
+    if !matches!(snapshot.state, PublicMonitorState::Stopped)
+        || snapshot.reachability.is_some()
+        || snapshot.ip_stack.is_some()
+    {
+        return Err("default snapshot manufactured an observation".into());
     }
     Ok(())
 }
-
+fn client() -> Result<InnerNetStatusClient, crate::BoxError> {
+    Ok(InnerNetStatusClient::new(Arc::new(
+        crate::common::CommonEngine::new_with_runtime_worker_threads(4, 4, Some(1))?,
+    ))?)
+}
 #[test]
 fn subscribe_before_start_is_unknown_and_does_not_start_a_monitor() -> TestResult {
-    let client = InnerNetStatusClient::new(Arc::new(
-        crate::common::CommonEngine::new(16, 16).map_err(NetError::from)?,
-    ));
-    let mut receiver = client.subscribe();
-    if client.is_started() || receiver.borrow_and_update().status.is_some() {
-        return Err("subscribing must neither start monitoring nor manufacture Unavailable".into());
+    let client = client()?;
+    let receiver = client.subscribe_state()?;
+    if client.is_started()
+        || receiver.current().reachability.is_some()
+        || !matches!(receiver.current().state, PublicMonitorState::Stopped)
+    {
+        return Err("subscribing started a monitor or manufactured an observation".into());
     }
     Ok(())
 }
-
 #[test]
 fn stop_publishes_unknown_before_native_resource_completion() -> TestResult {
-    let client = InnerNetStatusClient::new(Arc::new(
-        crate::common::CommonEngine::new(16, 16).map_err(NetError::from)?,
-    ));
-    let mut receiver = client.subscribe();
-    let publisher = client.observations.begin_generation()?;
-    publisher.publish(Some(NetworkStatus::Unavailable))?;
+    let client = client()?;
+    let (publisher, publication) = client.observations.begin_generation()?;
+    publication.dispatch()?;
+    publisher
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+        .dispatch()?;
     let state = MonitorState {
         observation: Some(publisher),
         ..MonitorState::default()
     };
-    let active = Arc::clone(&state.active);
+    let active = state.active.clone();
     let (stop_sender, mut stop_receiver) = tokio::sync::oneshot::channel();
-    let (_initial_sender, initial_state) = tokio::sync::watch::channel(true);
+    let (_initial_sender, initial_state) =
+        tokio::sync::watch::channel(MonitorInitialization::Ready);
     let (finished_sender, finished) = tokio::sync::watch::channel(false);
     client
         .lifecycle
@@ -194,13 +213,32 @@ fn stop_publishes_unknown_before_native_resource_completion() -> TestResult {
     if let Some(error) = error {
         return Err(error.into());
     }
-    let stopped = *receiver.borrow_and_update();
-    if stopped.status.is_some() || stopped.loss_epoch != 1 || pending_completion.len() != 1 {
-        return Err(
-            "stop must clear the source immediately while resource cleanup is pending".into(),
-        );
+    let stopped = client.snapshot()?;
+    if stopped.reachability.is_some()
+        || stopped.loss_epoch != 1
+        || pending_completion.len() != 1
+        || !matches!(stopped.state, PublicMonitorState::Stopped)
+    {
+        return Err("stop did not invalidate state before resource completion".into());
     }
     stop_receiver.try_recv()?;
     finished_sender.send_replace(true);
+    Ok(())
+}
+#[test]
+fn public_callback_runs_after_originating_monitor_lock_is_released() -> TestResult {
+    let (source, state) = source_and_state()?;
+    let callback_state = state.clone();
+    let (sent, received) = std::sync::mpsc::channel();
+    let subscription = source.observe()?.into_callback(move |_, value| {
+        if matches!(value, Ok(snapshot) if snapshot.reachability.is_some()) {
+            let _ = sent.send(callback_state.try_lock().is_ok());
+        }
+    })?;
+    InnerNetStatusClient::update_state_inner(&state, NetworkStatus::Available, IpStack::V4Only)?;
+    if !received.try_recv()? {
+        return Err("public callback entered under monitor lock".into());
+    }
+    futures::executor::block_on(subscription.close())?;
     Ok(())
 }

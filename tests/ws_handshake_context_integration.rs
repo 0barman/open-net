@@ -1,10 +1,16 @@
 #![cfg(feature = "ws-client")]
 
-use open_net::{
-    ConnectionStatus, NetError, OpenNet, ReconnectPolicy, WebSocketClient, WebSocketClientConfig,
-    WebSocketConnectOptions, WebSocketConnectionEvent, WebSocketConnectionEventKind as Kind,
-    WebSocketConnectionEvents, WebSocketContextConnectOptions, WebSocketHandshakeSnapshot,
-};
+#[path = "support/session.rs"]
+mod session;
+use open_net::ws::ConnectionEvent;
+use open_net::ws::ConnectionEventKind as Kind;
+use session::SessionGuard;
+
+use open_net::error::ErrorStage;
+use open_net::ws::{ConnectOptions, ReconnectPolicy, WebSocketClientConfig};
+use open_net::{NetError, OpenNet, WebSocketClient};
+use session::ObservedSession;
+
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,9 +23,13 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
+#[track_caller]
 fn error(message: impl Into<String>) -> TestError {
-    std::io::Error::other(message.into()).into()
+    let location = std::panic::Location::caller();
+    let message = message.into();
+    std::io::Error::other(format!("{location}: {message}")).into()
 }
+#[track_caller]
 fn check(condition: bool, message: &str) -> TestResult {
     if condition {
         Ok(())
@@ -33,32 +43,52 @@ async fn bounded<T>(label: &str, future: impl Future<Output = T>) -> TestResult<
         .map_err(|e| error(format!("{label}: {e}")))
 }
 fn policy(retries: usize) -> ReconnectPolicy {
-    ReconnectPolicy {
-        enabled: retries > 0,
-        max_retries: retries,
-        initial_delay: Duration::from_millis(1),
-        max_delay: Duration::from_millis(1),
-        max_elapsed: Some(Duration::from_secs(3)),
-        handshake_timeout: Duration::from_secs(2),
+    if retries > 0 {
+        ReconnectPolicy::Backoff(open_net::ws::BackoffConfig {
+            max_retries: retries,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            max_elapsed: Some(Duration::from_secs(3)),
+        })
+    } else {
+        ReconnectPolicy::Disabled
     }
 }
 async fn make_client(net: &OpenNet, name: &str) -> TestResult<WebSocketClient> {
     Ok(bounded(
         "create client",
-        net.create_ws_client_with_config(
-            name,
-            WebSocketClientConfig {
-                close_timeout: Duration::from_millis(30),
-                ..WebSocketClientConfig::default()
-            },
-        ),
+        net.create_ws_client_with_config(name, {
+            let mut config = WebSocketClientConfig::default();
+            config.close_timeout = Duration::from_millis(30);
+            config
+        }),
     )
     .await??)
 }
-fn options(url: &str, session: u64, attempt: u64) -> WebSocketContextConnectOptions {
-    WebSocketContextConnectOptions::new(url, session)
-        .with_headers(Vec::new(), attempt)
-        .with_reconnect(policy(0))
+async fn make_single_provider_client(net: &OpenNet, name: &str) -> TestResult<WebSocketClient> {
+    let mut config = WebSocketClientConfig::default();
+    config.close_timeout = Duration::from_millis(30);
+    config.dispatch.blocking_handshake_jobs = 1;
+    Ok(bounded(
+        "create one-slot provider client",
+        net.create_ws_client_with_config(name, config),
+    )
+    .await??)
+}
+
+fn options(url: &str) -> ConnectOptions {
+    let mut connect_options = {
+        let mut options = {
+            let mut options = ConnectOptions::new(url);
+            options.headers = open_net::HeaderMap::new();
+            options
+        };
+        options.reconnect = policy(0);
+        options
+    };
+    connect_options.handshake_timeout = Duration::from_secs(2);
+    connect_options.connect_timeout = Some(Duration::from_secs(3));
+    connect_options
 }
 fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
     request
@@ -116,9 +146,14 @@ impl Peer {
                 let response = if status == 101 {
                     let key = header(&request, "sec-websocket-key")
                         .ok_or_else(|| error("missing WebSocket key"))?;
-                    format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\n\r\n", derive_accept_key(key.as_bytes()))
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                        derive_accept_key(key.as_bytes())
+                    )
                 } else {
-                    format!("HTTP/1.1 {status} Test Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    format!(
+                        "HTTP/1.1 {status} Test Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
                 };
                 tx.send(request)?;
                 if status != 0 {
@@ -151,35 +186,91 @@ impl Drop for Peer {
         self.task.abort();
     }
 }
-async fn next(events: &mut WebSocketConnectionEvents) -> TestResult<WebSocketConnectionEvent> {
+async fn next(events: &mut ObservedSession) -> TestResult<ConnectionEvent> {
     bounded("receive event", events.recv())
         .await??
         .ok_or_else(|| error("events ended early"))
 }
-async fn drain(
-    events: &mut WebSocketConnectionEvents,
-) -> TestResult<Vec<WebSocketConnectionEvent>> {
+async fn next_attempt_result(events: &mut ObservedSession) -> TestResult<ConnectionEvent> {
+    let started = next(events).await?;
+    let Kind::AttemptStarted { attempt } = &started.kind else {
+        return Err(error("attempt omitted Started"));
+    };
+    let event = next(events).await?;
+    check(
+        Some(event.sequence) == started.sequence.checked_add(1)
+            && started.client_id == attempt.client_id
+            && started.session_id == attempt.session_id
+            && event.client_id == attempt.client_id
+            && event.session_id == attempt.session_id,
+        "attempt result lost Started sequence or envelope identity",
+    )?;
+    let (cycle, id) = match &event.kind {
+        Kind::Established { connection } => (connection.cycle_id, connection.attempt_id),
+        Kind::AttemptFailed { attempt, .. } => (attempt.cycle_id, attempt.attempt_id),
+        _ => {
+            return Err(error(
+                "Started did not have exactly one establishment/failure result",
+            ))
+        }
+    };
+    check(
+        cycle == attempt.cycle_id && id == attempt.attempt_id,
+        "attempt result changed its Started identity",
+    )?;
+    Ok(event)
+}
+async fn drain(events: &mut ObservedSession) -> TestResult<Vec<ConnectionEvent>> {
     let mut result = Vec::new();
     let mut sequence: Option<u64> = None;
     let mut terminal = false;
+    let mut started = None;
     while let Some(event) = bounded("drain events", events.recv()).await?? {
         check(!terminal, "event appeared after SessionTerminated")?;
         if let Some(previous) = sequence {
             check(
-                previous.checked_add(1) == Some(event.sequence()),
+                previous.checked_add(1) == Some(event.sequence),
                 "event sequence is not contiguous",
             )?;
         }
-        sequence = Some(event.sequence());
-        terminal = event.kind() == Kind::SessionTerminated;
+        match &event.kind {
+            Kind::AttemptStarted { attempt } => {
+                check(
+                    started
+                        .replace((attempt.cycle_id, attempt.attempt_id))
+                        .is_none(),
+                    "attempt started before prior outcome",
+                )?;
+                check(
+                    event.client_id == attempt.client_id && event.session_id == attempt.session_id,
+                    "Started identity changed",
+                )?;
+            }
+            Kind::AttemptFailed { attempt, .. } => {
+                check(
+                    started.take() == Some((attempt.cycle_id, attempt.attempt_id)),
+                    "failure omitted its own Started",
+                )?;
+            }
+            Kind::Established { connection } => {
+                check(
+                    started.take() == Some((connection.cycle_id, connection.attempt_id)),
+                    "Established omitted its own Started",
+                )?;
+            }
+            Kind::Closed { .. } => check(started.is_none(), "Closed discarded a Started outcome")?,
+            _ => {}
+        }
+        sequence = Some(event.sequence);
+        terminal = matches!(event.kind, Kind::Closed { .. });
         result.push(event);
         check(result.len() <= 100, "unbounded event production")?;
     }
     check(terminal, "event stream omitted SessionTerminated")?;
     Ok(result)
 }
-fn count(events: &[WebSocketConnectionEvent], kind: Kind) -> usize {
-    events.iter().filter(|event| event.kind() == kind).count()
+fn count(events: &[ConnectionEvent], predicate: impl Fn(&Kind) -> bool) -> usize {
+    events.iter().filter(|event| predicate(&event.kind)).count()
 }
 #[derive(Clone)]
 struct Gate(Arc<(Mutex<bool>, Condvar)>);
@@ -189,11 +280,13 @@ impl Gate {
     }
     fn wait(&self) -> Result<(), NetError> {
         let (lock, condition) = self.0.as_ref();
-        let mut released = lock.lock().map_err(|_| NetError::InternalError)?;
+        let mut released = lock
+            .lock()
+            .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
         while !*released {
             released = condition
                 .wait(released)
-                .map_err(|_| NetError::InternalError)?;
+                .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
         }
         Ok(())
     }
@@ -214,39 +307,46 @@ impl Drop for Release {
 }
 
 #[tokio::test]
-async fn request_scope_cancel_stops_a_blocked_provider_before_its_deadline() -> TestResult {
+async fn session_cancel_stops_a_blocked_provider_before_its_deadline() -> TestResult {
     let peer = Peer::start(vec![101]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "scope-provider-cancel").await?;
-    let scope = open_net::api::wsc::RequestScope::new();
     let gate = Gate::new();
     let release = Release(gate.clone());
     let (started, mut starts) = mpsc::unbounded_channel();
-    let mut connect_options = options(&peer.url, 200, 201)
-        .with_request_scope(scope.clone())
-        .with_header_provider(Arc::new(move |_| {
-            started.send(()).map_err(|_| NetError::InternalError)?;
+    let mut connect_options = {
+        let mut options = options(&peer.url);
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+            started
+                .send(())
+                .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
             gate.wait()?;
-            Ok(WebSocketHandshakeSnapshot::new(Vec::new(), 201))
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((201).to_string()),
+            })
         }));
-    let mut long_attempt = policy(0);
-    long_attempt.handshake_timeout = Duration::from_secs(60);
-    connect_options = connect_options.with_reconnect(long_attempt);
-    let mut events = client.start_connect_with_context(connect_options).await?;
+        options
+    };
+    connect_options.handshake_timeout = Duration::from_secs(60);
+    let mut events = session::observe(&client, connect_options).await?;
     check(
         bounded("provider starts", starts.recv()).await?.is_some(),
         "provider never started",
     )?;
-    scope.cancel();
+    events.session.cancel();
     let seen = tokio::time::timeout(Duration::from_millis(500), drain(&mut events))
         .await
         .map_err(|e| error(format!("scope did not interrupt provider: {e}")))??;
     check(
-        count(&seen, Kind::Established) == 0,
+        count(&seen, |kind| matches!(kind, Kind::Established { .. })) == 0,
         "cancelled provider established a connection",
     )?;
     check(
-        client.connection_status() == ConnectionStatus::Idle,
+        matches!(
+            events.session.state()?.state,
+            open_net::ws::ConnectionState::Closed(_)
+        ),
         "scope did not retire the connection session",
     )?;
     release.0.release();
@@ -260,43 +360,42 @@ async fn request_scope_cancel_stops_a_blocked_provider_before_its_deadline() -> 
 }
 
 #[tokio::test]
-async fn request_scope_cancel_stops_upgrade_and_cannot_revoke_the_next_scope() -> TestResult {
+async fn session_cancel_stops_upgrade_and_cannot_revoke_the_next_session() -> TestResult {
     let mut peer = Peer::start(vec![0, 101]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "scope-upgrade-cancel").await?;
-    let first_scope = open_net::api::wsc::RequestScope::new();
-    let mut first = client
-        .start_connect_with_context(
-            options(&peer.url, 202, 203).with_request_scope(first_scope.clone()),
-        )
-        .await?;
+    let mut first = session::observe(&client, options(&peer.url)).await?;
     peer.request().await?;
-    first_scope.cancel();
+    first.session.cancel();
     let seen = tokio::time::timeout(Duration::from_millis(500), drain(&mut first))
         .await
         .map_err(|e| error(format!("scope did not interrupt Upgrade: {e}")))??;
     check(
-        count(&seen, Kind::Established) == 0,
+        count(&seen, |kind| matches!(kind, Kind::Established { .. })) == 0,
         "retired Upgrade was established",
     )?;
-    let second_scope = open_net::api::wsc::RequestScope::new();
-    let mut second = client
-        .start_connect_with_context(
-            options(&peer.url, 202, 204).with_request_scope(second_scope.clone()),
-        )
-        .await?;
-    let established = next(&mut second).await?;
+    let mut second = session::observe(&client, options(&peer.url)).await?;
+    let established = next_attempt_result(&mut second).await?;
     check(
-        established.kind() == Kind::Established,
+        matches!(established.kind, Kind::Established { .. }),
         "new scope did not establish",
     )?;
-    first_scope.cancel();
-    check(!second_scope.is_cancelled(), "old scope revoked new owner")?;
+    first.session.cancel();
     check(
-        client.connection_status() == ConnectionStatus::Connected,
+        !matches!(
+            second.session.state()?.state,
+            open_net::ws::ConnectionState::Closed(_)
+        ),
+        "old session revoked new owner",
+    )?;
+    check(
+        matches!(
+            second.session.state()?.state,
+            open_net::ws::ConnectionState::Connected(_)
+        ),
         "old scope retired new connection",
     )?;
-    bounded("cancel new scoped session", second.cancel()).await??;
+    second.session.cancel();
     drain(&mut second).await?;
     bounded(
         "destroy scoped client",
@@ -313,22 +412,30 @@ async fn new_context_connection_entry_returns_a_cancellable_event_handle() -> Te
     let client = make_client(&net, "context-entry").await?;
     let mut events = bounded(
         "accept session before Upgrade",
-        client.start_connect_with_context(options(&peer.url, 7, 11)),
+        session::observe(&client, {
+            let mut options = options(&peer.url);
+            options
+                .metadata
+                .insert("session_context".into(), "7".into());
+            options
+        }),
     )
     .await??;
     peer.request().await?;
-    bounded("cancel session", events.cancel()).await??;
+    events.session.cancel();
     let seen = drain(&mut events).await?;
     check(
-        count(&seen, Kind::AttemptFailed) == 1,
+        count(&seen, |kind| matches!(kind, Kind::AttemptFailed { .. })) == 1,
         "cancelled attempt omitted its result",
     )?;
     check(
-        count(&seen, Kind::SessionTerminated) == 1,
+        count(&seen, |kind| matches!(kind, Kind::Closed { .. })) == 1,
         "session ended more than once",
     )?;
     check(
-        seen.iter().all(|e| e.session_context_id() == 7),
+        matches!(seen.first(), Some(ConnectionEvent { kind: Kind::AttemptStarted { attempt }, .. })
+            if attempt.metadata.get("session_context").map(String::as_str) == Some("7")
+                && seen.iter().all(|event| event.session_id == attempt.session_id)),
         "session context changed",
     )?;
     bounded("destroy client", net.destroy_ws_client("context-entry")).await??;
@@ -341,7 +448,7 @@ async fn six_headers_dynamic_override_empty_region_and_path_query_reach_peer() -
     let net = OpenNet::new()?;
     let client = make_client(&net, "complete-headers").await?;
     let url = format!("{}/cloud/path?mode=test", peer.url);
-    let headers: Vec<(String, String)> = [
+    let headers: open_net::HeaderMap = [
         ("authorization", "Bearer fake-token"),
         ("x-md-global-app-version", "1.2.3"),
         ("x-md-global-language", "zh-CN"),
@@ -350,39 +457,53 @@ async fn six_headers_dynamic_override_empty_region_and_path_query_reach_peer() -
         ("x-md-global-device-fp", "fake-device"),
     ]
     .into_iter()
-    .map(|(k, v)| (k.into(), v.into()))
-    .collect();
+    .map(|(k, v)| {
+        Ok((
+            open_net::HeaderName::from_bytes(k.as_bytes())?,
+            open_net::HeaderValue::from_str(v)?,
+        ))
+    })
+    .collect::<Result<_, TestError>>()?;
     let expected = headers.clone();
-    let mut events = client
-        .start_connect_with_context(
-            options(&url, 20, 21)
-                .with_headers(vec![("Authorization".into(), "old".into())], 21)
-                .with_header_provider(Arc::new(move |_| {
-                    Ok(WebSocketHandshakeSnapshot::new(headers.clone(), 22))
-                })),
-        )
-        .await?;
+    let mut events = session::observe(&client, {
+        let mut options = {
+            let mut options = options(&url);
+            options.headers = open_net::HeaderMap::from_iter([(
+                open_net::HeaderName::from_bytes(("Authorization").as_bytes())?,
+                open_net::HeaderValue::from_str("old")?,
+            )]);
+            options
+        };
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: headers.clone(),
+                credential_version: Some((22).to_string()),
+            })
+        }));
+        options
+    })
+    .await?;
     let request = peer.request().await?;
     check(
         request.starts_with("GET /cloud/path?mode=test HTTP/1.1\r\n"),
         "path/query changed",
     )?;
-    for (name, value) in expected {
+    for (name, value) in &expected {
         check(
-            header(&request, &name) == Some(value.as_str()),
+            header(&request, name.as_str()) == Some(value.to_str()?),
             "business header missing or changed",
         )?;
     }
-    let established = next(&mut events).await?;
+    let established = next_attempt_result(&mut events).await?;
     check(
-        established.kind() == Kind::Established,
+        matches!(established.kind, Kind::Established { .. }),
         "header handshake did not establish",
     )?;
     check(
-        established.attempt_context_id() == Some(22),
+        matches!(&established.kind, Kind::Established { connection } if connection.credential_version.as_deref() == Some("22")),
         "headers and context diverged",
     )?;
-    bounded("cancel session", events.cancel()).await??;
+    events.session.cancel();
     drain(&mut events).await?;
     bounded("destroy client", net.destroy_ws_client("complete-headers")).await??;
     Ok(())
@@ -391,43 +512,70 @@ async fn six_headers_dynamic_override_empty_region_and_path_query_reach_peer() -
 #[tokio::test]
 async fn local_provider_errors_never_open_network_and_anonymous_connections_remain_valid(
 ) -> TestResult {
-    for failure in [NetError::NotLoggedInError, NetError::ConfigError] {
+    for failure in [
+        NetError::from(open_net::error::ErrorKind::ProviderFailed),
+        NetError::from(open_net::error::ErrorKind::InvalidConfig),
+    ] {
+        let failure_kind = failure.kind();
         let peer = Peer::start(vec![101]).await?;
         let net = OpenNet::new()?;
         let client = make_client(&net, "provider-local-error").await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_calls = Arc::clone(&calls);
-        let mut events = client
-            .start_connect_with_context(
-                options(&peer.url, 30, 31)
-                    .with_reconnect(policy(3))
-                    .with_header_provider(Arc::new(move |_| {
-                        provider_calls.fetch_add(1, Ordering::SeqCst);
-                        Err(failure)
-                    })),
-            )
-            .await?;
+        let mut events = session::observe(&client, {
+            let mut options = {
+                let mut options = options(&peer.url);
+                options.reconnect = policy(3);
+                options
+            };
+            options.handshake_provider =
+                Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+                    provider_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(failure.clone().into())
+                }));
+            options
+        })
+        .await?;
         let seen = drain(&mut events).await?;
         check(
             peer.count() == 0 && calls.load(Ordering::SeqCst) == 1,
             "local failure reached network or retried",
         )?;
         check(
-            count(&seen, Kind::AttemptFailed) == 1,
+            count(&seen, |kind| matches!(kind, Kind::AttemptFailed { .. })) == 1,
             "local failure completed incorrectly",
         )?;
         let details = seen
             .iter()
-            .find_map(WebSocketConnectionEvent::failure)
+            .find_map(|event| match &event.kind {
+                Kind::AttemptFailed { error, .. } => Some(error),
+                _ => None,
+            })
             .ok_or_else(|| error("missing local failure details"))?;
         check(
-            details.error() == failure && details.http_status().is_none(),
+            details.kind() == open_net::error::ErrorKind::ProviderFailed
+                && std::error::Error::source(details)
+                    .and_then(|source| source.downcast_ref::<NetError>())
+                    .is_some_and(|source| source.kind() == failure_kind)
+                && details
+                    .context()
+                    .http_status
+                    .map(|status| status.as_u16())
+                    .is_none(),
             "wrong local failure details",
         )?;
         check(
             seen.iter()
-                .filter(|e| e.kind() == Kind::AttemptFailed)
-                .all(|e| e.attempt_context_id().is_none()),
+                .filter(|e| matches!(e.kind, Kind::AttemptFailed { .. }))
+                .all(|e| {
+                    matches!(
+                        &e.kind,
+                        Kind::AttemptFailed {
+                            credential_version: None,
+                            ..
+                        }
+                    )
+                }),
             "failed provider used stale context",
         )?;
         bounded(
@@ -439,25 +587,26 @@ async fn local_provider_errors_never_open_network_and_anonymous_connections_rema
     let mut peer = Peer::start(vec![101]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "anonymous-context").await?;
-    let mut events = client
-        .start_connect_with_context(options(&peer.url, 32, 33))
-        .await?;
+    let mut events = session::observe(&client, options(&peer.url)).await?;
     check(
         header(&peer.request().await?, "authorization").is_none(),
         "anonymous connection gained Authorization",
     )?;
     check(
-        next(&mut events).await?.kind() == Kind::Established,
+        matches!(
+            next_attempt_result(&mut events).await?.kind,
+            Kind::Established { .. }
+        ),
         "anonymous connection rejected",
     )?;
-    bounded("cancel session", events.cancel()).await??;
+    events.session.cancel();
     drain(&mut events).await?;
     bounded("destroy client", net.destroy_ws_client("anonymous-context")).await??;
     Ok(())
 }
 
 #[tokio::test]
-async fn illegal_headers_fail_locally_without_retry() -> TestResult {
+async fn invalid_typed_header_input_fails_in_provider_without_network_or_retry() -> TestResult {
     for invalid in [
         ("bad header", "value"),
         ("x-good", "value\r\ninjected: yes"),
@@ -465,23 +614,57 @@ async fn illegal_headers_fail_locally_without_retry() -> TestResult {
         let peer = Peer::start(vec![101]).await?;
         let net = OpenNet::new()?;
         let client = make_client(&net, "invalid-context-headers").await?;
-        let mut events = client
-            .start_connect_with_context(
-                options(&peer.url, 40, 41)
-                    .with_headers(vec![(invalid.0.into(), invalid.1.into())], 41)
-                    .with_reconnect(policy(3)),
-            )
-            .await?;
+        let mut events = session::observe(&client, {
+            let mut options = {
+                let mut options = options(&peer.url);
+                options.handshake_provider =
+                    Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+                        let name = open_net::HeaderName::from_bytes(invalid.0.as_bytes())?;
+                        let value = open_net::HeaderValue::from_str(invalid.1)?;
+                        Ok(open_net::ws::HandshakeHeaders::new(
+                            open_net::HeaderMap::from_iter([(name, value)]),
+                        ))
+                    }));
+                options
+            };
+            options.reconnect = policy(3);
+            options
+        })
+        .await?;
         let seen = drain(&mut events).await?;
         check(
-            peer.count() == 0 && count(&seen, Kind::AttemptFailed) == 1,
+            peer.count() == 0
+                && count(&seen, |kind| matches!(kind, Kind::AttemptFailed { .. })) == 1,
             "invalid header reached network or retried",
         )?;
         check(
             seen.iter()
-                .filter_map(WebSocketConnectionEvent::failure)
-                .all(|f| f.http_status().is_none()),
+                .filter_map(|event| match &event.kind {
+                    Kind::AttemptFailed { error, .. } => Some(error),
+                    _ => None,
+                })
+                .all(|f| f.context().http_status.is_none()),
             "local error gained HTTP status",
+        )?;
+        let failure = seen
+            .iter()
+            .find_map(|event| match &event.kind {
+                Kind::AttemptFailed { error, .. } => Some(error),
+                _ => None,
+            })
+            .ok_or("invalid typed header omitted provider failure")?;
+        let cause = failure.clone();
+        let source = std::error::Error::source(&cause)
+            .ok_or("provider dropped the original HTTP parsing error")?;
+        check(
+            cause.kind() == open_net::error::ErrorKind::ProviderFailed
+                && failure.context().stage == Some(ErrorStage::Provider)
+                && if invalid.0 == "bad header" {
+                    source.is::<http::header::InvalidHeaderName>()
+                } else {
+                    source.is::<http::header::InvalidHeaderValue>()
+                },
+            "typed header parse failure lost its boundary or original source",
         )?;
         bounded(
             "destroy client",
@@ -503,35 +686,48 @@ async fn refreshed_headers_bind_actual_context_to_each_attempt_even_with_delayed
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
     let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel();
-    let mut events = client
-        .start_connect_with_context(
-            options(&peer.url, 50, 51)
-                .with_reconnect(policy(2))
-                .with_header_provider(Arc::new(move |attempt| {
-                    let call = provider_calls.fetch_add(1, Ordering::SeqCst);
-                    if attempt.session_context_id() != 50
-                        || tokio::runtime::Handle::try_current().is_ok()
-                    {
-                        return Err(NetError::ConfigError);
-                    }
-                    attempt_tx
-                        .send(attempt)
-                        .map_err(|_| NetError::InternalError)?;
-                    if call > 0 {
-                        gate.wait()?;
-                    }
-                    let (token, context) = if call == 0 {
-                        ("Bearer fake-T1", 51)
-                    } else {
-                        ("Bearer fake-T2", 52)
-                    };
-                    Ok(WebSocketHandshakeSnapshot::new(
-                        vec![("Authorization".into(), token.into())],
-                        context,
-                    ))
-                })),
-        )
-        .await?;
+    let mut events = session::observe(&client, {
+        let mut options = {
+            let mut options = {
+                let mut options = options(&peer.url);
+                options
+                    .metadata
+                    .insert("session_context".to_owned(), "50".to_owned());
+                options
+            };
+            options.reconnect = policy(2);
+            options
+        };
+        options.handshake_provider =
+            Some(open_net::ws::HandshakeProvider::blocking(move |attempt| {
+                let call = provider_calls.fetch_add(1, Ordering::SeqCst);
+                if attempt.metadata.get("session_context").map(String::as_str) != Some("50")
+                    || tokio::runtime::Handle::try_current().is_ok()
+                {
+                    return Err(NetError::from(open_net::error::ErrorKind::InvalidConfig).into());
+                }
+                attempt_tx
+                    .send(attempt)
+                    .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
+                if call > 0 {
+                    gate.wait()?;
+                }
+                let (token, context) = if call == 0 {
+                    ("Bearer fake-T1", 51)
+                } else {
+                    ("Bearer fake-T2", 52)
+                };
+                Ok(open_net::ws::HandshakeHeaders {
+                    headers: open_net::HeaderMap::from_iter([(
+                        open_net::HeaderName::from_bytes(("Authorization").as_bytes())?,
+                        open_net::HeaderValue::from_str(token)?,
+                    )]),
+                    credential_version: Some((context).to_string()),
+                })
+            }));
+        options
+    })
+    .await?;
     check(
         header(&peer.request().await?, "authorization") == Some("Bearer fake-T1"),
         "wrong first credential",
@@ -544,7 +740,7 @@ async fn refreshed_headers_bind_actual_context_to_each_attempt_even_with_delayed
     let seen = drain(&mut events).await?;
     let failed: Vec<_> = seen
         .iter()
-        .filter(|e| e.kind() == Kind::AttemptFailed)
+        .filter(|e| matches!(e.kind, Kind::AttemptFailed { .. }))
         .collect();
     check(
         failed.len() == 2 && calls.load(Ordering::SeqCst) == 2,
@@ -560,31 +756,61 @@ async fn refreshed_headers_bind_actual_context_to_each_attempt_even_with_delayed
         let supplied = bounded("provider attempt metadata", attempt_rx.recv())
             .await?
             .ok_or_else(|| error("missing provider attempt metadata"))?;
+        let Kind::AttemptFailed { attempt, .. } = &event.kind else {
+            return Err(error("expected per-attempt failure"));
+        };
         check(
-            event.client_instance_id() == supplied.client_instance_id()
-                && event.session_id() == supplied.session_id()
-                && event.cycle_id() == Some(supplied.cycle_id())
-                && event.attempt_id() == Some(supplied.attempt_id()),
+            event.client_id == supplied.client_id
+                && event.session_id == supplied.session_id
+                && attempt.cycle_id == supplied.cycle_id
+                && attempt.attempt_id == supplied.attempt_id,
             "event metadata does not match the actual provider invocation",
         )?;
     }
+    let Kind::AttemptFailed {
+        attempt: first_attempt,
+        credential_version: first_version,
+        error: first_error,
+        ..
+    } = &first.kind
+    else {
+        return Err(error("missing first AttemptFailed data"));
+    };
+    let Kind::AttemptFailed {
+        attempt: second_attempt,
+        credential_version: second_version,
+        error: second_error,
+        ..
+    } = &second.kind
+    else {
+        return Err(error("missing second AttemptFailed data"));
+    };
     check(
-        first.attempt_context_id() == Some(51) && second.attempt_context_id() == Some(52),
+        first_version.as_deref() == Some("51") && second_version.as_deref() == Some("52"),
         "events lost credential revisions",
     )?;
     check(
-        first.attempt_id() != second.attempt_id() && first.cycle_id() == second.cycle_id(),
+        first_attempt.attempt_id != second_attempt.attempt_id
+            && first_attempt.cycle_id == second_attempt.cycle_id,
         "wrong cycle/attempt identities",
     )?;
     check(
-        first.failure().and_then(|f| f.http_status()) == Some(503),
+        first_error
+            .context()
+            .http_status
+            .map(|status| status.as_u16())
+            == Some(503),
         "first HTTP status changed",
     )?;
     check(
-        second.failure().and_then(|f| f.http_status()) == Some(401),
+        second_error
+            .context()
+            .http_status
+            .map(|status| status.as_u16())
+            == Some(401),
         "second HTTP status changed",
     )?;
-    client.notify_network_available();
+    events.session.notify_network_available();
     check(
         bounded("terminal events", events.recv()).await??.is_none(),
         "terminal session produced another event",
@@ -610,23 +836,27 @@ async fn status_matrix_stops_auth_failures_and_retries_transient_http_failures()
         let peer = Peer::start(vec![status, status]).await?;
         let net = OpenNet::new()?;
         let client = make_client(&net, "handshake-status-matrix").await?;
-        let mut events = client
-            .start_connect_with_context(options(&peer.url, 60, 61).with_reconnect(policy(1)))
-            .await?;
+        let mut events = session::observe(&client, {
+            let mut options = options(&peer.url);
+            options.reconnect = policy(1);
+            options
+        })
+        .await?;
         let seen = drain(&mut events).await?;
         let expected = if matches!(status, 401 | 403) { 1 } else { 2 };
         check(
-            peer.count() == expected && count(&seen, Kind::AttemptFailed) == expected,
+            peer.count() == expected
+                && count(&seen, |kind| matches!(kind, Kind::AttemptFailed { .. })) == expected,
             "wrong HTTP retry count",
         )?;
         check(
-            count(&seen, Kind::SessionTerminated) == 1,
+            count(&seen, |kind| matches!(kind, Kind::Closed { .. })) == 1,
             "HTTP session terminated incorrectly",
         )?;
         check(
             seen.iter()
-                .filter(|e| e.kind() == Kind::AttemptFailed)
-                .all(|e| e.failure().and_then(|f| f.http_status()) == Some(status)),
+                .filter(|e| matches!(e.kind, Kind::AttemptFailed { .. }))
+                .all(|e| matches!(&e.kind, Kind::AttemptFailed { error, .. } if error.context().http_status.map(|status| status.as_u16()) == Some(status))),
             "HTTP result status lost",
         )?;
         bounded(
@@ -645,31 +875,45 @@ async fn transient_http_then_local_provider_error_does_not_inherit_http_status()
     let client = make_client(&net, "no-stale-http-status").await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
-    let mut events = client
-        .start_connect_with_context(
-            options(&peer.url, 70, 71)
-                .with_reconnect(policy(2))
-                .with_header_provider(Arc::new(move |_| {
-                    if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Ok(WebSocketHandshakeSnapshot::new(Vec::new(), 71))
-                    } else {
-                        Err(NetError::NotLoggedInError)
-                    }
-                })),
-        )
-        .await?;
+    let mut events = session::observe(&client, {
+        let mut options = {
+            let mut options = options(&peer.url);
+            options.reconnect = policy(2);
+            options
+        };
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+            if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(open_net::ws::HandshakeHeaders {
+                    headers: open_net::HeaderMap::new(),
+                    credential_version: Some((71).to_string()),
+                })
+            } else {
+                Err(NetError::from(open_net::error::ErrorKind::ProviderFailed).into())
+            }
+        }));
+        options
+    })
+    .await?;
     let seen = drain(&mut events).await?;
     let failures: Vec<_> = seen
         .iter()
-        .filter(|e| e.kind() == Kind::AttemptFailed)
+        .filter(|e| matches!(e.kind, Kind::AttemptFailed { .. }))
         .collect();
     check(failures.len() == 2, "missing local second attempt")?;
     let last = failures
         .last()
-        .and_then(|e| e.failure())
+        .and_then(|event| match &event.kind {
+            Kind::AttemptFailed { error, .. } => Some(error),
+            _ => None,
+        })
         .ok_or_else(|| error("missing last failure"))?;
     check(
-        last.error() == NetError::NotLoggedInError && last.http_status().is_none(),
+        last.kind() == open_net::error::ErrorKind::ProviderFailed
+            && last
+                .context()
+                .http_status
+                .map(|status| status.as_u16())
+                .is_none(),
         "local error inherited HTTP status",
     )?;
     check(peer.count() == 1, "local second attempt opened socket")?;
@@ -686,13 +930,19 @@ async fn event_capacity_backpressure_allows_cancel_and_exactly_one_terminal_even
     let mut peer = Peer::start(vec![503, 503]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "bounded-context-events").await?;
-    let mut events = client
-        .start_connect_with_context(
-            options(&peer.url, 80, 81)
-                .with_reconnect(policy(20))
-                .with_event_capacity(3),
-        )
-        .await?;
+    let mut events = session::observe_with(
+        &client,
+        {
+            let mut options = options(&peer.url);
+            options.reconnect = policy(20);
+            options
+        },
+        open_net::ws::JournalOptions {
+            max_events: 4,
+            ..Default::default()
+        },
+    )
+    .await?;
     peer.request().await?;
     check(
         tokio::time::timeout(Duration::from_millis(60), peer.requests.recv())
@@ -700,17 +950,17 @@ async fn event_capacity_backpressure_allows_cancel_and_exactly_one_terminal_even
             .is_err(),
         "minimum event capacity allowed another handshake before consumption",
     )?;
-    bounded("cancel full event queue", events.cancel()).await??;
+    events.session.cancel();
     let seen = drain(&mut events).await?;
     check(
-        count(&seen, Kind::SessionTerminated) == 1,
+        count(&seen, |kind| matches!(kind, Kind::Closed { .. })) == 1,
         "full queue lost or duplicated terminal",
     )?;
     check(
         peer.count() == 1,
         "full queue started another network attempt",
     )?;
-    bounded("repeat cancel", events.cancel()).await??;
+    events.session.cancel();
     check(events.recv().await?.is_none(), "repeat cancel added events")?;
     bounded(
         "destroy client",
@@ -729,24 +979,32 @@ async fn blocked_provider_cancel_is_bounded_and_late_snapshot_cannot_open_networ
     let release = Release(gate.clone());
     let (start_tx, mut start_rx) = mpsc::unbounded_channel();
     let (finish_tx, mut finish_rx) = mpsc::unbounded_channel();
-    let mut events = client
-        .start_connect_with_context(options(&peer.url, 90, 91).with_header_provider(Arc::new(
-            move |_| {
-                start_tx.send(()).map_err(|_| NetError::InternalError)?;
-                gate.wait()?;
-                finish_tx.send(()).map_err(|_| NetError::InternalError)?;
-                Ok(WebSocketHandshakeSnapshot::new(Vec::new(), 91))
-            },
-        )))
-        .await?;
+    let mut events = session::observe(&client, {
+        let mut options = options(&peer.url);
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+            start_tx
+                .send(())
+                .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
+            gate.wait()?;
+            finish_tx
+                .send(())
+                .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((91).to_string()),
+            })
+        }));
+        options
+    })
+    .await?;
     check(
         bounded("provider starts", start_rx.recv()).await?.is_some(),
         "provider did not start",
     )?;
-    bounded("cancel provider", events.cancel()).await??;
+    events.session.cancel();
     let seen = drain(&mut events).await?;
     check(
-        count(&seen, Kind::Established) == 0,
+        count(&seen, |kind| matches!(kind, Kind::Established { .. })) == 0,
         "cancelled provider established",
     )?;
     release.0.release();
@@ -769,38 +1027,35 @@ async fn old_receiver_drop_does_not_cancel_new_session_and_recreation_changes_in
     let mut peer = Peer::start(vec![101, 101, 101]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "context-instance").await?;
-    let mut old = client
-        .start_connect_with_context(options(&peer.url, 100, 101))
-        .await?;
+    let mut old = session::observe(&client, options(&peer.url)).await?;
     peer.request().await?;
-    let original = next(&mut old).await?;
-    bounded("cancel session", old.cancel()).await??;
+    let original = next_attempt_result(&mut old).await?;
+    old.session.cancel();
     drain(&mut old).await?;
-    let mut current = client
-        .start_connect_with_context(options(&peer.url, 102, 103))
-        .await?;
+    let mut current = session::observe(&client, options(&peer.url)).await?;
     peer.request().await?;
-    let established = next(&mut current).await?;
+    let established = next_attempt_result(&mut current).await?;
     check(
-        established.session_id() != original.session_id(),
+        established.session_id != original.session_id,
         "session ID reused",
     )?;
     drop(old);
     check(
-        client.connection_status() == ConnectionStatus::Connected,
+        matches!(
+            current.session.state()?.state,
+            open_net::ws::ConnectionState::Connected(_)
+        ),
         "old handle cancelled new session",
     )?;
-    bounded("cancel session", current.cancel()).await??;
+    current.session.cancel();
     drain(&mut current).await?;
     bounded("destroy client", net.destroy_ws_client("context-instance")).await??;
     let recreated = make_client(&net, "context-instance").await?;
-    let mut last = recreated
-        .start_connect_with_context(options(&peer.url, 104, 105))
-        .await?;
+    let mut last = session::observe(&recreated, options(&peer.url)).await?;
     peer.request().await?;
-    let final_established = next(&mut last).await?;
+    let final_established = next_attempt_result(&mut last).await?;
     check(
-        final_established.client_instance_id() != original.client_instance_id(),
+        final_established.client_id != original.client_id,
         "recreated instance ID reused",
     )?;
     drop(last);
@@ -817,28 +1072,22 @@ async fn invalid_context_options_fail_before_session_acceptance() -> TestResult 
     let peer = Peer::start(vec![101]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "invalid-context-options").await?;
-    for invalid in [
-        WebSocketContextConnectOptions::new(&peer.url, 1),
-        options(&peer.url, 1, 2).with_event_capacity(0),
-        options(&peer.url, 1, 2).with_event_capacity(2),
-        options(&peer.url, 1, 2).with_event_capacity(usize::MAX),
-        options(&peer.url, 1, 2).with_reconnect(ReconnectPolicy {
-            handshake_timeout: Duration::MAX,
-            ..policy(0)
-        }),
-    ] {
+    for max_events in [0, 2, usize::MAX] {
+        let invalid = open_net::ws::JournalOptions {
+            max_events,
+            ..Default::default()
+        };
         check(
-            matches!(
-                bounded(
-                    "invalid options",
-                    client.start_connect_with_context(invalid)
-                )
-                .await?,
-                Err(NetError::ConfigError)
-            ),
-            "invalid options accepted",
+            matches!(bounded("invalid journal", session::observe_with(&client, options(&peer.url), invalid)).await?, Err(error) if error.kind() == open_net::error::ErrorKind::InvalidConfig),
+            "invalid journal accepted",
         )?;
     }
+    let mut invalid = options(&peer.url);
+    invalid.handshake_timeout = Duration::MAX;
+    check(
+        matches!(bounded("invalid options", session::observe(&client, invalid)).await?, Err(error) if error.kind() == open_net::error::ErrorKind::InvalidConfig),
+        "invalid options accepted",
+    )?;
     check(peer.count() == 0, "invalid options reached TCP")?;
     bounded(
         "destroy client",
@@ -849,33 +1098,34 @@ async fn invalid_context_options_fail_before_session_acceptance() -> TestResult 
 }
 
 #[tokio::test]
-async fn legacy_static_headers_keep_the_same_value_on_retry() -> TestResult {
+async fn static_headers_keep_the_same_value_on_retry() -> TestResult {
     let mut peer = Peer::start(vec![503, 101]).await?;
     let net = OpenNet::new()?;
-    let client = make_client(&net, "legacy-static-headers").await?;
-    bounded(
-        "legacy static retry",
-        client.connect_with_options(
-            &peer.url,
-            WebSocketConnectOptions {
-                headers: vec![("authorization".into(), "Bearer fake-static".into())],
-                header_provider: None,
-                reconnect: policy(1),
-            },
-        ),
+    let client = make_client(&net, "static-headers").await?;
+    let session = bounded(
+        "static header session retry",
+        SessionGuard::establish(&client, {
+            let mut options = {
+                let mut options = options(&peer.url);
+                options.headers = open_net::HeaderMap::from_iter([(
+                    open_net::HeaderName::from_bytes(("authorization").as_bytes())?,
+                    open_net::HeaderValue::from_str("Bearer fake-static")?,
+                )]);
+                options
+            };
+            options.reconnect = policy(1);
+            options
+        }),
     )
     .await??;
     for _ in 0..2 {
         check(
             header(&peer.request().await?, "authorization") == Some("Bearer fake-static"),
-            "legacy static header changed",
+            "static header changed on retry",
         )?;
     }
-    bounded(
-        "destroy client",
-        net.destroy_ws_client("legacy-static-headers"),
-    )
-    .await??;
+    bounded("destroy client", net.destroy_ws_client("static-headers")).await??;
+    session.finish().await?;
     Ok(())
 }
 
@@ -884,18 +1134,20 @@ async fn transient_http_then_upgrade_timeout_does_not_inherit_previous_status() 
     let peer = Peer::start(vec![503, 0]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "http-then-timeout").await?;
-    let mut events = client
-        .start_connect_with_context(
-            options(&peer.url, 110, 111).with_reconnect(ReconnectPolicy {
-                handshake_timeout: Duration::from_millis(80),
-                ..policy(1)
-            }),
-        )
-        .await?;
+    let mut events = session::observe(&client, {
+        let mut connect_options = {
+            let mut options = options(&peer.url);
+            options.reconnect = policy(1);
+            options
+        };
+        connect_options.handshake_timeout = Duration::from_millis(80);
+        connect_options
+    })
+    .await?;
     let seen = drain(&mut events).await?;
     let failed: Vec<_> = seen
         .iter()
-        .filter(|event| event.kind() == Kind::AttemptFailed)
+        .filter(|event| matches!(event.kind, Kind::AttemptFailed { .. }))
         .collect();
     check(
         failed.len() == 2 && peer.count() == 2,
@@ -903,10 +1155,18 @@ async fn transient_http_then_upgrade_timeout_does_not_inherit_previous_status() 
     )?;
     let last = failed
         .last()
-        .and_then(|event| event.failure())
+        .and_then(|event| match &event.kind {
+            Kind::AttemptFailed { error, .. } => Some(error),
+            _ => None,
+        })
         .ok_or_else(|| error("missing timeout details"))?;
     check(
-        last.error() == NetError::TimeoutError && last.http_status().is_none(),
+        last.kind() == open_net::error::ErrorKind::TimedOut
+            && last
+                .context()
+                .http_status
+                .map(|status| status.as_u16())
+                .is_none(),
         "timeout inherited earlier HTTP status",
     )?;
     bounded("destroy client", net.destroy_ws_client("http-then-timeout")).await??;
@@ -914,25 +1174,29 @@ async fn transient_http_then_upgrade_timeout_does_not_inherit_previous_status() 
 }
 
 #[tokio::test]
-async fn receiver_drop_revokes_an_in_progress_handshake_without_a_followup_command() -> TestResult {
+async fn session_owner_drop_revokes_an_in_progress_handshake_without_a_followup_command(
+) -> TestResult {
     let mut peer = Peer::start(vec![0]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "receiver-drop-cancel").await?;
-    let events = client
-        .start_connect_with_context(options(&peer.url, 120, 121))
-        .await?;
+    let events = session::observe(&client, options(&peer.url)).await?;
     peer.request().await?;
+    let mut state = events.session.watch_state()?;
     drop(events);
-    bounded("receiver drop reaches worker", async {
-        while client.connection_status() != ConnectionStatus::Idle {
-            tokio::task::yield_now().await;
+    bounded("Session owner drop reaches worker", async {
+        loop {
+            if matches!(
+                state.current().state,
+                open_net::ws::ConnectionState::Closed(_)
+            ) {
+                return Ok::<(), TestError>(());
+            }
+            if state.recv().await?.is_none() {
+                return Err(error("state ended without Closed"));
+            }
         }
     })
-    .await?;
-    check(
-        client.connection_status() == ConnectionStatus::Idle,
-        "receiver drop did not stop session",
-    )?;
+    .await??;
     bounded(
         "destroy client",
         net.destroy_ws_client("receiver-drop-cancel"),
@@ -946,13 +1210,19 @@ async fn shutdown_with_unconsumed_event_capacity_preserves_terminal_delivery() -
     let mut peer = Peer::start(vec![503]).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "shutdown-full-events").await?;
-    let mut events = client
-        .start_connect_with_context(
-            options(&peer.url, 130, 131)
-                .with_reconnect(policy(20))
-                .with_event_capacity(3),
-        )
-        .await?;
+    let mut events = session::observe_with(
+        &client,
+        {
+            let mut options = options(&peer.url);
+            options.reconnect = policy(20);
+            options
+        },
+        open_net::ws::JournalOptions {
+            max_events: 4,
+            ..Default::default()
+        },
+    )
+    .await?;
     peer.request().await?;
     bounded(
         "shutdown full events",
@@ -961,7 +1231,7 @@ async fn shutdown_with_unconsumed_event_capacity_preserves_terminal_delivery() -
     .await??;
     let seen = drain(&mut events).await?;
     check(
-        count(&seen, Kind::SessionTerminated) == 1,
+        count(&seen, |kind| matches!(kind, Kind::Closed { .. })) == 1,
         "shutdown lost terminal result",
     )?;
     check(
@@ -976,43 +1246,72 @@ async fn cancelled_provider_retains_its_client_quota_until_the_actual_closure_ex
 {
     let peer = Peer::start(vec![101]).await?;
     let net = OpenNet::new()?;
-    let client = make_client(&net, "provider-quota").await?;
+    let client = make_single_provider_client(&net, "provider-quota").await?;
     let gate = Gate::new();
     let release = Release(gate.clone());
     let (first_tx, mut first_rx) = mpsc::unbounded_channel();
     let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
-    let mut first = client
-        .start_connect_with_context(options(&peer.url, 140, 141).with_header_provider(Arc::new(
-            move |_| {
-                first_tx.send(()).map_err(|_| NetError::InternalError)?;
-                gate.wait()?;
-                finished_tx.send(()).map_err(|_| NetError::InternalError)?;
-                Ok(WebSocketHandshakeSnapshot::new(Vec::new(), 141))
-            },
-        )))
-        .await?;
+    let mut first = session::observe(&client, {
+        let mut options = options(&peer.url);
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+            first_tx
+                .send(())
+                .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
+            gate.wait()?;
+            finished_tx
+                .send(())
+                .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((141).to_string()),
+            })
+        }));
+        options
+    })
+    .await?;
     check(
         bounded("first provider started", first_rx.recv())
             .await?
             .is_some(),
         "first provider did not start",
     )?;
-    bounded("cancel first provider session", first.cancel()).await??;
+    first.session.cancel();
     drain(&mut first).await?;
     let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-    let mut second = client
-        .start_connect_with_context(options(&peer.url, 142, 143).with_header_provider(Arc::new(
-            move |_| {
-                second_tx.send(()).map_err(|_| NetError::InternalError)?;
-                Ok(WebSocketHandshakeSnapshot::new(Vec::new(), 143))
-            },
-        )))
-        .await?;
+    let replacement = open_net::ws::HandshakeProvider::blocking(move |_| {
+        second_tx
+            .send(())
+            .map_err(|_| error("second provider observer closed"))?;
+        Ok(open_net::ws::HandshakeHeaders {
+            headers: open_net::HeaderMap::new(),
+            credential_version: Some("143".to_owned()),
+        })
+    });
+    let mut rejected = session::observe(&client, {
+        let mut options = options(&peer.url);
+        options.handshake_provider = Some(replacement.clone());
+        options
+    })
+    .await?;
+    let rejected_events = drain(&mut rejected).await?;
+    let failure = rejected_events
+        .iter()
+        .find_map(|event| match &event.kind {
+            Kind::AttemptFailed { error, .. } => Some(error),
+            _ => None,
+        })
+        .ok_or("occupied provider slot did not produce a failure")?;
     check(
-        tokio::time::timeout(Duration::from_millis(60), second_rx.recv())
-            .await
-            .is_err(),
-        "cancelled provider released quota before closure exited",
+        failure.kind() == open_net::error::ErrorKind::ResourceExhausted
+            && failure.context().stage == Some(ErrorStage::Provider)
+            && failure
+                .context()
+                .http_status
+                .map(|status| status.as_u16())
+                .is_none()
+            && matches!(second_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty))
+            && peer.count() == 0,
+        "cancelled provider released its slot before the closure exited",
     )?;
     release.0.release();
     check(
@@ -1021,22 +1320,48 @@ async fn cancelled_provider_retains_its_client_quota_until_the_actual_closure_ex
             .is_some(),
         "first provider did not exit",
     )?;
+    // The closure's completion signal precedes the worker's permit destructor.
+    // Observe admission itself rather than assuming a scheduler timing delay.
+    let mut second = bounded("admit after the actual blocking job retires", async {
+        loop {
+            let mut events = session::observe(&client
+                ,
+                    { let mut options = options(&peer.url); options.handshake_provider = Some(replacement.clone()); options },
+                )
+                .await?;
+            let event = next_attempt_result(&mut events).await?;
+            if matches!(event.kind, Kind::Established { .. }) {
+                check(
+                    matches!(&event.kind, Kind::Established { connection } if connection.credential_version.as_deref() == Some("143")),
+                    "replacement credential changed",
+                )?;
+                return Ok::<_, TestError>(events);
+            }
+            let Kind::AttemptFailed { error: failure, .. } = &event.kind else {
+                return Err(error("replacement omitted AttemptFailed details"));
+            };
+            check(
+                matches!(event.kind, Kind::AttemptFailed { .. })
+                    && failure.kind() == open_net::error::ErrorKind::ResourceExhausted
+                    && failure.context().stage == Some(ErrorStage::Provider),
+                "replacement failed for a reason other than the retiring permit",
+            )?;
+            drain(&mut events).await?;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
     check(
-        bounded("second provider starts", second_rx.recv())
+        bounded("second provider started", second_rx.recv())
             .await?
             .is_some(),
-        "released quota did not wake next provider",
-    )?;
-    let established = next(&mut second).await?;
-    check(
-        established.kind() == Kind::Established && established.attempt_context_id() == Some(143),
-        "second provider result is incorrectly attributed",
+        "released quota did not admit the replacement provider",
     )?;
     check(
         peer.count() == 1,
         "cancelled first provider opened a stale socket",
     )?;
-    bounded("cancel session", second.cancel()).await??;
+    second.session.cancel();
     drain(&mut second).await?;
     bounded("destroy client", net.destroy_ws_client("provider-quota")).await??;
     Ok(())
@@ -1045,10 +1370,21 @@ async fn cancelled_provider_retains_its_client_quota_until_the_actual_closure_ex
 #[test]
 fn context_option_and_snapshot_debug_do_not_expose_credentials_or_full_urls() -> TestResult {
     const SECRET: &str = "fake-secret-that-must-not-appear-in-debug";
-    let config = options(&format!("wss://localhost/path?token={SECRET}"), 150, 151)
-        .with_headers(vec![("Authorization".into(), SECRET.into())], 151);
-    let snapshot =
-        WebSocketHandshakeSnapshot::new(vec![("Authorization".into(), SECRET.into())], 151);
+    let config = {
+        let mut options = options(&format!("wss://localhost/path?token={SECRET}"));
+        options.headers = open_net::HeaderMap::from_iter([(
+            open_net::HeaderName::from_bytes(("Authorization").as_bytes())?,
+            open_net::HeaderValue::from_str(SECRET)?,
+        )]);
+        options
+    };
+    let snapshot = open_net::ws::HandshakeHeaders {
+        headers: open_net::HeaderMap::from_iter([(
+            open_net::HeaderName::from_bytes(("Authorization").as_bytes())?,
+            open_net::HeaderValue::from_str(SECRET)?,
+        )]),
+        credential_version: Some((151).to_string()),
+    };
     check(
         !format!("{config:?}").contains(SECRET),
         "options Debug exposed a secret",
@@ -1068,61 +1404,90 @@ async fn automatic_reconnect_preserves_session_and_refreshes_context_for_a_new_c
     let client = make_client(&net, "context-automatic-reconnect").await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
-    let mut events = client
-        .start_connect_with_context(
-            options(&peer.url, 160, 161)
-                .with_reconnect(policy(2))
-                .with_header_provider(Arc::new(move |_| {
-                    let context = match provider_calls.fetch_add(1, Ordering::SeqCst) {
-                        0 => 161,
-                        _ => 162,
-                    };
-                    Ok(WebSocketHandshakeSnapshot::new(Vec::new(), context))
-                })),
-        )
-        .await?;
+    let mut events = session::observe(&client, {
+        let mut options = {
+            let mut options = options(&peer.url);
+            options.reconnect = policy(2);
+            options
+        };
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+            let context = match provider_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => 161,
+                _ => 162,
+            };
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((context).to_string()),
+            })
+        }));
+        options
+    })
+    .await?;
     peer.request().await?;
-    let first = next(&mut events).await?;
+    let first = next_attempt_result(&mut events).await?;
     check(
-        first.kind() == Kind::Established,
+        matches!(first.kind, Kind::Established { .. }),
         "initial session did not establish",
     )?;
     peer.close_connections.send(())?;
     let ended = next(&mut events).await?;
     check(
-        ended.kind() == Kind::ConnectionTerminated,
+        matches!(ended.kind, Kind::Disconnected { .. }),
         "physical close omitted its event",
     )?;
     peer.request().await?;
-    let second = next(&mut events).await?;
+    let second = next_attempt_result(&mut events).await?;
     check(
-        second.kind() == Kind::Established,
+        matches!(second.kind, Kind::Established { .. }),
         "automatic reconnect did not establish",
     )?;
+    let Kind::Established {
+        connection: first_connection,
+    } = &first.kind
+    else {
+        return Err(error("first Established payload missing"));
+    };
+    let Kind::Established {
+        connection: second_connection,
+    } = &second.kind
+    else {
+        return Err(error("second Established payload missing"));
+    };
+    let Kind::Disconnected {
+        connection: ended_connection,
+        ..
+    } = &ended.kind
+    else {
+        return Err(error("Disconnected payload missing"));
+    };
     check(
-        first.client_instance_id() == second.client_instance_id()
-            && first.session_id() == second.session_id()
-            && first.session_context_id() == second.session_context_id(),
+        ended_connection.connection_id == first_connection.connection_id,
+        "disconnect changed physical identity",
+    )?;
+    check(
+        first.client_id == second.client_id && first.session_id == second.session_id,
         "automatic reconnect changed session identity",
     )?;
     check(
-        first.cycle_id() != second.cycle_id(),
+        first_connection.cycle_id != second_connection.cycle_id
+            && first_connection.connection_id != second_connection.connection_id,
         "automatic reconnect reused old cycle",
     )?;
     check(
-        first.attempt_context_id() == Some(161) && second.attempt_context_id() == Some(162),
+        first_connection.credential_version.as_deref() == Some("161")
+            && second_connection.credential_version.as_deref() == Some("162"),
         "automatic reconnect did not refresh provider context",
     )?;
     check(
-        first.sequence().checked_add(1) == Some(ended.sequence())
-            && ended.sequence().checked_add(1) == Some(second.sequence()),
+        first.sequence.checked_add(1) == Some(ended.sequence)
+            && ended.sequence.checked_add(2) == Some(second.sequence),
         "automatic reconnect event sequence skipped",
     )?;
     check(
         calls.load(Ordering::SeqCst) == 2,
         "provider was not called once per physical attempt",
     )?;
-    bounded("cancel auto reconnect session", events.cancel()).await??;
+    events.session.cancel();
     drain(&mut events).await?;
     bounded(
         "destroy auto reconnect",
@@ -1138,25 +1503,23 @@ async fn established_event_allows_immediate_reject_policy_send_without_state_pol
     let mut peer = Peer::start(Vec::new()).await?;
     let net = OpenNet::new()?;
     let client = make_client(&net, "established-send-ready").await?;
-    for round in 0..16 {
-        let mut events = client
-            .start_connect_with_context(options(&peer.url, 170, round))
-            .await?;
-        let established = next(&mut events).await?;
+    for _ in 0..16 {
+        let mut events = session::observe(&client, options(&peer.url)).await?;
+        let established = next_attempt_result(&mut events).await?;
         check(
-            established.kind() == Kind::Established,
+            matches!(established.kind, Kind::Established { .. }),
             "session did not establish",
         )?;
         // The default disconnected policy is Reject. Do not poll status or
         // yield before this first enqueue: Established must already mean ready.
-        client.try_send_message(open_net::WsBody::Text("immediate-enqueue".into()))?;
+        let _receipt = events.session.sender().try_enqueue("immediate-enqueue")?;
         bounded(
             "write immediately after Established",
-            client.send_message(open_net::WsBody::Text("immediate-write".into())),
+            events.session.sender().send("immediate-write"),
         )
         .await??;
         peer.request().await?;
-        bounded("cancel send-ready session", events.cancel()).await??;
+        events.session.cancel();
         drain(&mut events).await?;
     }
     bounded(
@@ -1168,44 +1531,68 @@ async fn established_event_allows_immediate_reject_policy_send_without_state_pol
 }
 
 #[tokio::test]
-async fn timed_out_provider_and_waiting_quota_sessions_cannot_accumulate_threads() -> TestResult {
+async fn timed_out_provider_and_rejected_quota_sessions_cannot_accumulate_threads() -> TestResult {
     let peer = Peer::start(vec![101]).await?;
     let net = OpenNet::new()?;
-    let client = make_client(&net, "timed-out-provider-quota").await?;
+    let client = make_single_provider_client(&net, "timed-out-provider-quota").await?;
     let gate = Gate::new();
     let release = Release(gate.clone());
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
     let (finish_tx, mut finish_rx) = mpsc::unbounded_channel();
-    let provider: open_net::WebSocketHandshakeProvider = Arc::new(move |_| {
-        provider_calls.fetch_add(1, Ordering::SeqCst);
-        gate.wait()?;
-        finish_tx.send(()).map_err(|_| NetError::InternalError)?;
-        Ok(WebSocketHandshakeSnapshot::new(Vec::new(), 181))
-    });
+    let provider: open_net::ws::HandshakeProvider =
+        open_net::ws::HandshakeProvider::blocking(move |_| {
+            provider_calls.fetch_add(1, Ordering::SeqCst);
+            gate.wait()?;
+            finish_tx
+                .send(())
+                .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))?;
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((181).to_string()),
+            })
+        });
     for session in 180..183 {
-        let mut events = client
-            .start_connect_with_context(
-                options(&peer.url, session, 181)
-                    .with_reconnect(ReconnectPolicy {
-                        handshake_timeout: Duration::from_millis(60),
-                        ..policy(0)
-                    })
-                    .with_header_provider(Arc::clone(&provider)),
-            )
-            .await?;
+        let mut events = session::observe(&client, {
+            let mut options = {
+                let mut connect_options = {
+                    let mut options = options(&peer.url);
+                    options.reconnect = policy(0);
+                    options
+                };
+                connect_options.handshake_timeout = Duration::from_millis(60);
+                connect_options
+            };
+            options.handshake_provider = Some(provider.clone());
+            options
+        })
+        .await?;
         let seen = drain(&mut events).await?;
         check(
-            count(&seen, Kind::AttemptFailed) == 1,
+            count(&seen, |kind| matches!(kind, Kind::AttemptFailed { .. })) == 1,
             "provider timeout omitted attempt result",
         )?;
         let failure = seen
             .iter()
-            .find_map(WebSocketConnectionEvent::failure)
+            .find_map(|event| match &event.kind {
+                Kind::AttemptFailed { error, .. } => Some(error),
+                _ => None,
+            })
             .ok_or_else(|| error("missing provider timeout details"))?;
         check(
-            failure.error() == NetError::TimeoutError && failure.http_status().is_none(),
-            "provider quota timeout has wrong error",
+            failure.kind()
+                == if session == 180 {
+                    open_net::error::ErrorKind::TimedOut
+                } else {
+                    open_net::error::ErrorKind::ResourceExhausted
+                }
+                && failure.context().stage == Some(ErrorStage::Provider)
+                && failure
+                    .context()
+                    .http_status
+                    .map(|status| status.as_u16())
+                    .is_none(),
+            "provider deadline or full-quota rejection has wrong error",
         )?;
     }
     check(
@@ -1232,77 +1619,100 @@ async fn timed_out_provider_and_waiting_quota_sessions_cannot_accumulate_threads
 }
 
 #[tokio::test]
-async fn legacy_dynamic_provider_refresh_and_local_rejection_keep_their_original_contract(
-) -> TestResult {
+async fn dynamic_provider_refresh_and_local_rejection_use_observed_sessions() -> TestResult {
     let mut peer = Peer::start(vec![503, 101]).await?;
     let net = OpenNet::new()?;
-    let client = make_client(&net, "legacy-dynamic-provider").await?;
+    let client = make_client(&net, "dynamic-provider").await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
-    bounded(
-        "legacy dynamic connect",
-        client.connect_with_options(
-            &peer.url,
-            WebSocketConnectOptions {
-                headers: vec![("Authorization".into(), "fake-static".into())],
-                header_provider: Some(Arc::new(move || {
-                    if tokio::runtime::Handle::try_current().is_ok() {
-                        return Err(NetError::RuntimeError);
-                    }
-                    let token = if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        "fake-dynamic-T1"
-                    } else {
-                        "fake-dynamic-T2"
-                    };
-                    Ok(vec![("authorization".into(), token.into())])
-                })),
-                reconnect: policy(1),
-            },
-        ),
+    let session = bounded(
+        "dynamic session",
+        SessionGuard::establish(&client, {
+            let mut options = {
+                let mut options = {
+                    let mut options = options(&peer.url);
+                    options.headers = open_net::HeaderMap::from_iter([(
+                        open_net::HeaderName::from_bytes(("Authorization").as_bytes())?,
+                        open_net::HeaderValue::from_str("fake-static")?,
+                    )]);
+                    options
+                };
+                options.handshake_provider =
+                    Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+                        if tokio::runtime::Handle::try_current().is_ok() {
+                            return Err(NetError::from(
+                                open_net::error::ErrorKind::RuntimeUnavailable,
+                            )
+                            .into());
+                        }
+                        let token = if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            "fake-dynamic-T1"
+                        } else {
+                            "fake-dynamic-T2"
+                        };
+                        Ok(open_net::ws::HandshakeHeaders {
+                            headers: open_net::HeaderMap::from_iter([(
+                                open_net::HeaderName::from_bytes(("authorization").as_bytes())?,
+                                open_net::HeaderValue::from_str(token)?,
+                            )]),
+                            credential_version: Some((183).to_string()),
+                        })
+                    }));
+                options
+            };
+            options.reconnect = policy(1);
+            options
+        }),
     )
     .await??;
     check(
         header(&peer.request().await?, "authorization") == Some("fake-dynamic-T1"),
-        "legacy first credential changed",
+        "first credential changed",
     )?;
     check(
         header(&peer.request().await?, "authorization") == Some("fake-dynamic-T2"),
-        "legacy dynamic provider did not refresh",
+        "dynamic provider did not refresh",
     )?;
     check(
         calls.load(Ordering::SeqCst) == 2,
-        "legacy provider invocation count changed",
+        "provider invocation count changed",
     )?;
     bounded(
-        "destroy legacy dynamic client",
-        net.destroy_ws_client("legacy-dynamic-provider"),
+        "destroy dynamic client",
+        net.destroy_ws_client("dynamic-provider"),
     )
     .await??;
+    session.finish().await?;
     let untouched = Peer::start(vec![101]).await?;
-    let rejected = make_client(&net, "legacy-local-provider").await?;
-    let result = bounded(
-        "legacy local provider error",
-        rejected.connect_with_options(
-            &untouched.url,
-            WebSocketConnectOptions {
-                headers: Vec::new(),
-                header_provider: Some(Arc::new(|| Err(NetError::NotLoggedInError))),
-                reconnect: policy(3),
-            },
-        ),
-    )
+    let rejected = make_client(&net, "local-provider").await?;
+    let mut events = session::observe(&rejected, {
+        let mut options = {
+            let mut options = options(&untouched.url);
+            options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(|_| {
+                Err(NetError::from(open_net::error::ErrorKind::ProviderFailed).into())
+            }));
+            options
+        };
+        options.reconnect = policy(3);
+        options
+    })
     .await?;
+    let received = drain(&mut events).await?;
+    let terminal = received
+        .last()
+        .ok_or_else(|| error("provider rejection omitted terminal event"))?;
     check(
-        result == Err(NetError::NotLoggedInError),
-        "legacy provider rejection error changed",
+        matches!(&terminal.kind, Kind::Closed { result: Err(error) } if error.kind() == open_net::error::ErrorKind::ProviderFailed),
+        "provider rejection lost its actual error",
     )?;
     check(
-        untouched.count() == 0 && rejected.last_handshake_http_status().is_none(),
-        "legacy local rejection reached network or gained HTTP status",
+        untouched.count() == 0
+            && matches!(&terminal.kind, Kind::Closed { result: Err(error) } if error.context().http_status.is_none()),
+        "local rejection reached network or gained HTTP status",
     )?;
     bounded(
-        "destroy rejected legacy client",
-        net.destroy_ws_client("legacy-local-provider"),
+        "destroy rejected client",
+        net.destroy_ws_client("local-provider"),
     )
     .await??;
     Ok(())

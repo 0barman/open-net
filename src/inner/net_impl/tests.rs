@@ -18,7 +18,7 @@ fn empty_destroy_guard_reports_error_without_panicking() -> Result<(), Box<dyn s
         cleanup_handed_off: false,
     };
     match guard.client() {
-        Err(NetError::InternalError) => Ok(()),
+        Err(error) if error.kind() == crate::error::ErrorKind::Internal => Ok(()),
         _ => Err("an empty destroy guard must report InternalError".into()),
     }
 }
@@ -113,7 +113,7 @@ fn invalid_empty_trust_override() -> NetworkConfig {
     // Public PEM builders reject empty bundles already. Construct this state
     // internally to exercise compilation failure after reserving the client name.
     NetworkConfig::default().with_tls(TlsConfig {
-        root_mode: RootCertificateMode::Only,
+        root_mode: RootCertificateMode::Replace,
         ..TlsConfig::default()
     })
 }
@@ -131,14 +131,13 @@ async fn client_network_override_compile_failure_releases_name_and_preserves_dup
             )
             .await;
         check!(
-            matches!(invalid, Err(NetError::ConfigError)),
+            matches!(invalid, Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), crate::error::ErrorKind::InvalidConfig)),
             "empty explicit trust must fail compilation"
         )?;
         factory_queue_fence(&engine).await?;
         check!(matches!(
             engine.get_ws_client("reusable-override-name"),
-            Err(NetError::ClientNotFound)
-        ))?;
+            Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), crate::error::ErrorKind::ClientNotFound)))?;
         check!(
             !engine
                 .inner
@@ -165,7 +164,7 @@ async fn client_network_override_compile_failure_releases_name_and_preserves_dup
             )
             .await;
         check!(
-            matches!(duplicate, Err(NetError::ClientAlreadyExists)),
+            matches!(duplicate, Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), crate::error::ErrorKind::ClientAlreadyExists)),
             "duplicate-name admission must precede override compilation"
         )?;
         engine.get_ws_client("reusable-override-name")?;
@@ -203,15 +202,14 @@ async fn client_network_override_submitted_creation_survives_waiter_drop() -> Te
         )?;
         check!(matches!(
             engine.get_ws_client("dropped-override-waiter"),
-            Err(NetError::ConnectionClosing)
-        ))?;
+            Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), crate::error::ErrorKind::ConnectionClosing)))?;
         let duplicate = tokio::time::timeout(
             FACTORY_TEST_TIMEOUT,
             engine.create_ws_client("dropped-override-waiter"),
         )
         .await?;
         check!(
-            matches!(duplicate, Err(NetError::ClientAlreadyExists)),
+            matches!(duplicate, Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), crate::error::ErrorKind::ClientAlreadyExists)),
             "dropping the waiter must retain the submitted Creating reservation"
         )?;
 
@@ -221,8 +219,7 @@ async fn client_network_override_submitted_creation_survives_waiter_drop() -> Te
         engine.destroy_ws_client("dropped-override-waiter").await?;
         check!(matches!(
             engine.get_ws_client("dropped-override-waiter"),
-            Err(NetError::ClientNotFound)
-        ))
+            Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), crate::error::ErrorKind::ClientNotFound)))
     }
     .await;
     // Release the gate before cleanup even when an earlier check returned an error.
@@ -275,25 +272,27 @@ async fn network_status_policy_engine_default_and_client_override_are_independen
         )?;
         for client in [&inherited, &inherited_configured] {
             check_eq!(
-                client.inner.network_status_policy_for_test(),
+                client.network_config().network_status_policy(),
                 NetworkStatusPolicy::PauseOnUnavailable
             )?;
-            check_eq!(client.connection_status(), crate::ConnectionStatus::Idle)?;
+            check!(!client.is_shutdown())?;
         }
         for client in [&explicit_default, &explicit_ignore] {
             check_eq!(
-                client.inner.network_status_policy_for_test(),
+                client.network_config().network_status_policy(),
                 NetworkStatusPolicy::Ignore
             )?;
-            check_eq!(client.connection_status(), crate::ConnectionStatus::Idle)?;
+            check!(!client.is_shutdown())?;
         }
         engine.destroy_ws_client("status-inherited").await?;
         check_eq!(
-            inherited_configured.inner.network_status_policy_for_test(),
+            inherited_configured
+                .network_config()
+                .network_status_policy(),
             NetworkStatusPolicy::PauseOnUnavailable
         )?;
         check_eq!(
-            explicit_default.inner.network_status_policy_for_test(),
+            explicit_default.network_config().network_status_policy(),
             NetworkStatusPolicy::Ignore
         )?;
         Ok(())
@@ -324,11 +323,11 @@ async fn network_status_policy_client_opt_in_does_not_change_default_siblings() 
         )
         .await??;
         check_eq!(
-            opted_in.inner.network_status_policy_for_test(),
+            opted_in.network_config().network_status_policy(),
             NetworkStatusPolicy::PauseOnUnavailable
         )?;
         check_eq!(
-            legacy.inner.network_status_policy_for_test(),
+            legacy.network_config().network_status_policy(),
             NetworkStatusPolicy::Ignore
         )?;
         check_eq!(
@@ -336,7 +335,7 @@ async fn network_status_policy_client_opt_in_does_not_change_default_siblings() 
             NetworkStatusPolicy::Ignore
         )?;
         engine.destroy_ws_client("status-opted-in").await?;
-        check_eq!(legacy.connection_status(), crate::ConnectionStatus::Idle)?;
+        check!(!legacy.is_shutdown())?;
         Ok(())
     }
     .await;

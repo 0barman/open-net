@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 /// worker 在握手成功后为该代连接创建一对读写任务。停止连接时会先按需通过控制通道
 /// 请求写任务发送关闭帧，再取消并中止两个任务；代次不匹配的旧资源只会被直接终止。
 pub(super) struct ActiveIo {
+    pub(super) peer_close: std::sync::Arc<super::io_diagnostics::PeerCloseObservation>,
     /// 创建这些资源时的连接代次，用于避免旧连接影响当前连接。
     pub(super) generation: u64,
     /// 由读写任务共享的取消令牌，用于协同停止本代 I/O。

@@ -10,7 +10,7 @@ async fn exercise(
     response: Vec<u8>,
     ipv6: bool,
     fragment: bool,
-) -> TestResult<(Result<(), WebSocketConnectionFailure>, String, Option<u8>)> {
+) -> TestResult<(Result<(), ConnectionFailure>, String, Option<u8>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let peer = tokio::spawn(async move {
@@ -87,7 +87,7 @@ async fn proxy_statuses_keep_their_stage_and_retry_policy() -> TestResult {
             Ok(()) => return Err("proxy rejection was accepted".into()),
             Err(failure) => failure,
         };
-        if failure.stage() != WebSocketConnectStage::ProxyConnect
+        if failure.stage() != ConnectStage::ProxyConnect
             || failure.http_status() != Some(code)
             || failure.retryable() != retryable
         {
@@ -177,6 +177,23 @@ async fn informational_proxy_headers_share_one_bounded_parse_budget() -> TestRes
         {
             return Err("unsupported or unbounded informational response was accepted".into());
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_eof_preserves_io_source_and_proxy_stage() -> TestResult {
+    let (outcome, _, _) = exercise(Vec::new(), false, false).await?;
+    let failure = outcome.err().ok_or("empty CONNECT response succeeded")?;
+    let error = failure.error();
+    if error.io_kind() != Some(std::io::ErrorKind::UnexpectedEof)
+        || error
+            .source()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_none()
+        || error.context().stage != Some(crate::error::ErrorStage::Proxy)
+    {
+        return Err("proxy EOF lost its source or original stage".into());
     }
     Ok(())
 }

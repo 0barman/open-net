@@ -1,14 +1,18 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/session.rs"]
+mod session;
+use session::{session_options, SessionGuard};
+
 use futures::{SinkExt, StreamExt};
-use open_net::{
-    NetError, OpenNet, PreparedRequest, ReconnectPolicy, RequestTerminationOutcome,
-    ResponseDeadlineOrigin, WSCResponse, WSRequestConfig, WSRequestTrait, WebSocketClient,
-    WebSocketClientConfig, WebSocketConnectOptions, WebSocketRequestOptions, WebSocketTaskEvent,
-    WebSocketTaskEventOptions, WsBody,
+use open_net::ws::{
+    PreparedRequest, Request, RequestClient, RequestId, RequestOptions, ResolveOutcome,
+    ResponseTimeoutOrigin, TaskEventOptions, TerminationOutcome,
 };
+use open_net::ws::{ReconnectPolicy, WebSocketClientConfig};
+use open_net::{NetError, OpenNet};
+
 use std::future::Future;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -18,10 +22,14 @@ use tokio_tungstenite::tungstenite::Message;
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 
+#[track_caller]
 fn error(message: impl Into<String>) -> TestError {
-    std::io::Error::other(message.into()).into()
+    let location = std::panic::Location::caller();
+    let message = message.into();
+    std::io::Error::other(format!("{location}: {message}")).into()
 }
 
+#[track_caller]
 fn check(condition: bool, message: &str) -> TestResult {
     if condition {
         Ok(())
@@ -113,87 +121,49 @@ impl Peer {
     }
 }
 
-struct Request(&'static str);
-
-impl WSRequestTrait for Request {
-    fn uuid(&self) -> String {
-        self.0.to_string()
-    }
-
-    fn body(&self) -> Result<WsBody, NetError> {
-        Ok(WsBody::Text(self.0.to_string()))
-    }
+fn request(id: &str) -> TestResult<Request> {
+    Ok(Request::new(RequestId::new(id)?, id.into()))
 }
-
-fn options(timeout: Duration) -> WebSocketRequestOptions {
-    WebSocketRequestOptions::new(WSRequestConfig {
+fn options(timeout: Duration, origin: ResponseTimeoutOrigin) -> RequestOptions {
+    RequestOptions {
         response_timeout: timeout,
-        ..WSRequestConfig::default()
-    })
+        response_timeout_origin: origin,
+        ..Default::default()
+    }
 }
-
-async fn connected(net: &OpenNet, name: &str, peer: &Peer) -> TestResult<WebSocketClient> {
-    let client = bounded(
-        "create deadline client",
-        net.create_ws_client_with_config(
-            name,
-            WebSocketClientConfig {
-                response_dispatch_grace: Duration::ZERO,
-                close_timeout: Duration::from_millis(40),
-                ..WebSocketClientConfig::default()
-            },
-        ),
+async fn connected(net: &OpenNet, name: &str, peer: &Peer) -> TestResult<SessionGuard> {
+    let client = net
+        .create_ws_client_with_config(name, {
+            let mut config = WebSocketClientConfig::default();
+            config.requests.manual_response_grace = Duration::ZERO;
+            config.close_timeout = Duration::from_millis(40);
+            config
+        })
+        .await?;
+    Ok(SessionGuard::establish(
+        &client,
+        session_options(&peer.url, ReconnectPolicy::Disabled),
     )
-    .await??;
-    bounded(
-        "connect deadline client",
-        client.connect_with_options(
-            &peer.url,
-            WebSocketConnectOptions {
-                reconnect: ReconnectPolicy {
-                    enabled: false,
-                    ..ReconnectPolicy::default()
-                },
-                ..WebSocketConnectOptions::default()
-            },
-        ),
-    )
-    .await??;
-    Ok(client)
+    .await?)
 }
-
-fn task_events(
-    client: &WebSocketClient,
-) -> TestResult<mpsc::UnboundedReceiver<WebSocketTaskEvent>> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    client.register_web_socket_client_task_complete_listener(
-        Box::new(move |event| {
-            if tx.send(event).is_err() {
-                eprintln!("deadline task event receiver closed");
-            }
-        }),
-        WebSocketTaskEventOptions::new(4, 4096),
-    )?;
-    Ok(rx)
-}
-
 async fn prepare_without_runtime(
-    client: WebSocketClient,
+    client: RequestClient,
     id: &'static str,
-    options: WebSocketRequestOptions,
+    options: RequestOptions,
 ) -> TestResult<PreparedRequest> {
     let (tx, rx) = oneshot::channel();
     let thread = std::thread::Builder::new().spawn(move || {
-        let result = (|| {
+        let result: TestResult<_> = (|| {
             check(
                 tokio::runtime::Handle::try_current().is_err(),
-                "try_prepare test thread unexpectedly has a runtime",
+                "unexpected caller runtime",
             )?;
-            Ok(client.try_prepare_registered(Arc::new(Request(id)), options)?)
+            Ok(client
+                .request(request(id)?)
+                .options(options)
+                .try_prepare()?)
         })();
-        if tx.send(result).is_err() {
-            eprintln!("deadline preparation result receiver closed");
-        }
+        let _ = tx.send(result);
     })?;
     let result = bounded("prepare without caller runtime", rx).await??;
     thread
@@ -201,214 +171,280 @@ async fn prepare_without_runtime(
         .map_err(|_| error("synchronous preparation thread failed"))?;
     result
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uncommitted_registration_expires_on_client_runtime_and_never_reaches_peer() -> TestResult {
     let net = OpenNet::new()?;
     let mut peer = Peer::start().await?;
-    let client = connected(&net, "deadline-uncommitted", &peer).await?;
-    let mut events = task_events(&client)?;
+    let session = connected(&net, "deadline-uncommitted", &peer).await?;
+    let requests = session.session.requests()?;
+    let mut events = session
+        .session
+        .subscribe_tasks(TaskEventOptions::default())?;
     let response_timeout = Duration::from_millis(120);
     let prepared = prepare_without_runtime(
-        client.clone(),
+        requests.clone(),
         "deadline-uncommitted-body",
-        options(response_timeout)
-            .with_response_deadline_origin(ResponseDeadlineOrigin::AtRegistration),
+        options(response_timeout, ResponseTimeoutOrigin::Registered),
     )
     .await?;
-    let registration = prepared.registration().clone();
+    let handle = prepared.handle().clone();
+    let registration = handle.registration().clone();
     let deadline = registration
         .response_deadline()?
-        .ok_or_else(|| error("AtRegistration omitted its absolute deadline"))?;
+        .ok_or("Registered omitted deadline")?;
     check(
         deadline == after(registration.registered_at(), response_timeout)?,
-        "registration receipt has a different deadline from its recorded start",
+        "deadline changed",
     )?;
-    // The owner deliberately never commits. An engine-owned timer must deliver the
-    // terminal event without any caller invoking cancel/expire or driving a send Future.
     let event = until(
-        "automatic expiry while owner has not committed",
+        "engine automatic expiry",
         after(deadline, Duration::from_millis(500))?,
         events.recv(),
     )
-    .await?
-    .ok_or_else(|| error("automatic expiry event channel closed"))?;
+    .await??
+    .ok_or("task stream ended")?;
     check(
-        event.request_id() == Some("deadline-uncommitted-body")
-            && event.result() == Err(NetError::TimeoutError),
-        "automatic expiry reported another registration or error",
+        event.operation_id == handle.id()
+            && event.result.as_ref().map_err(NetError::kind)
+                == Err(open_net::error::ErrorKind::TimedOut),
+        "expiry identity/category changed",
+    )?;
+    let committed = prepared.commit();
+    check(
+        matches!(&committed, Err(e) if e.kind() == open_net::error::ErrorKind::TimedOut),
+        &format!("expired preparation commit result: {committed:?}"),
     )?;
     check(
-        matches!(prepared.commit(), Err(NetError::TimeoutError)),
-        "expired owner commit did not retain TimeoutError",
+        registration.response_deadline()? == Some(deadline)
+            && requests.pending_snapshot()?.is_empty(),
+        "expiry lost deadline or leaked pending",
     )?;
-    check(
-        registration.response_deadline()? == Some(deadline),
-        "terminal registration lost its original deadline",
-    )?;
-    check(
-        client.pending_requests().is_empty(),
-        "expired preparation retained pending",
-    )?;
-    client.unregister_web_socket_client_task_complete_listener()?;
-    // A later real write crosses the writer and peer. If the uncommitted payload escaped,
-    // the peer observes it before this ordered probe; absence is not inferred from sleep.
-    bounded(
-        "post-expiry probe",
-        client.send_message(WsBody::Text("after-expiry-probe".into())),
-    )
-    .await??;
+    session.session.sender().send("after-expiry-probe").await?;
     check(
         peer.frame().await? == "after-expiry-probe",
         "uncommitted request reached peer",
     )?;
-    bounded(
-        "destroy uncommitted client",
-        net.destroy_ws_client("deadline-uncommitted"),
-    )
-    .await??;
+    net.destroy_ws_client("deadline-uncommitted").await?;
     Ok(())
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn written_registration_keeps_original_deadline_instead_of_restarting_budget() -> TestResult {
     let net = OpenNet::new()?;
     let mut peer = Peer::start().await?;
-    let client = connected(&net, "deadline-written", &peer).await?;
-    let prepared = bounded(
-        "prepare delayed commit",
-        client.prepare_registered(
-            Arc::new(Request("deadline-written-body")),
-            options(Duration::from_secs(1))
-                .with_response_deadline_origin(ResponseDeadlineOrigin::AtRegistration),
-        ),
-    )
-    .await??;
-    let registration = prepared.registration().clone();
+    let session = connected(&net, "deadline-written", &peer).await?;
+    let requests = session.session.requests()?;
+    let prepared = requests
+        .request(request("deadline-written-body")?)
+        .options(options(
+            Duration::from_secs(1),
+            ResponseTimeoutOrigin::Registered,
+        ))
+        .prepare()
+        .await?;
+    let handle = prepared.handle().clone();
+    let registration = handle.registration().clone();
     let deadline = registration
         .response_deadline()?
-        .ok_or_else(|| error("registered request has no deadline"))?;
-    // Hold the owner until a known point within its published budget. An erroneous
-    // write-origin restart then expires well after the bounded original deadline below.
+        .ok_or("registered request has no deadline")?;
     tokio::time::sleep_until(tokio::time::Instant::from_std(after(
         registration.registered_at(),
         Duration::from_millis(700),
     )?))
     .await;
-    let completion = bounded(
-        "delayed request written",
-        prepared.commit()?.wait_until_written(),
-    )
-    .await??;
+    let receipt = prepared.commit()?;
+    bounded("delayed request written", handle.written()).await??;
     check(
         peer.frame().await? == "deadline-written-body",
-        "delayed request was not written",
+        "wrong payload",
     )?;
     check(
         registration.response_deadline()? == Some(deadline),
-        "writing reset the AtRegistration deadline",
+        "write reset registered deadline",
     )?;
-    check(
-        until(
-            "response expires at original registration deadline",
-            after(deadline, Duration::from_millis(250))?,
-            completion.wait(),
-        )
-        .await?
-            == Err(NetError::TimeoutError),
-        "registered response wait did not terminate with TimeoutError",
-    )?;
-    check(
-        registration.expire()? == RequestTerminationOutcome::AlreadyClaimedOrFinished,
-        "old expiry acquired a second terminal result",
-    )?;
-    check(
-        registration.response_deadline()? == Some(deadline),
-        "expired written registration lost its original deadline",
-    )?;
-    check(
-        client.pending_requests().is_empty(),
-        "written timeout retained pending",
-    )?;
-    bounded(
-        "destroy written client",
-        net.destroy_ws_client("deadline-written"),
+    let terminal = until(
+        "original deadline",
+        after(deadline, Duration::from_millis(250))?,
+        receipt.response(),
     )
-    .await??;
+    .await?;
+    check(
+        matches!(terminal, Err(e) if e.kind() == open_net::error::ErrorKind::TimedOut),
+        "wrong terminal",
+    )?;
+    check(
+        handle.expire()? == TerminationOutcome::AlreadyFinished
+            && registration.response_deadline()? == Some(deadline)
+            && requests.pending_snapshot()?.is_empty(),
+        "duplicate terminal or leaked pending",
+    )?;
+    net.destroy_ws_client("deadline-written").await?;
     Ok(())
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_written_deadline_is_published_after_write_and_retained_after_claim() -> TestResult
 {
     let net = OpenNet::new()?;
     let mut peer = Peer::start().await?;
-    let client = connected(&net, "deadline-default", &peer).await?;
-    let (tx, mut responses) = mpsc::unbounded_channel::<WSCResponse>();
-    client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
-        if tx.send(response).is_err() {
-            eprintln!("deadline response receiver closed");
-        }
-    }));
-    let response_timeout = Duration::from_secs(2);
-    let prepared = bounded(
-        "prepare default deadline",
-        client.prepare_registered(
-            Arc::new(Request("deadline-default-body")),
-            options(response_timeout),
-        ),
-    )
-    .await??;
-    let registration = prepared.registration().clone();
+    let mut session = connected(&net, "deadline-default", &peer).await?;
+    let mut incoming = session
+        .session
+        .take_messages()
+        .ok_or("initial inbox missing")?;
+    let requests = session.session.requests()?;
+    let timeout = Duration::from_secs(2);
+    let prepared = requests
+        .request(request("deadline-default-body")?)
+        .options(RequestOptions {
+            response_timeout: timeout,
+            ..Default::default()
+        })
+        .prepare()
+        .await?;
+    let handle = prepared.handle().clone();
+    let registration = handle.registration().clone();
     check(
-        registration.response_deadline_origin() == ResponseDeadlineOrigin::AfterWritten
-            && registration.response_deadline()?.is_none(),
-        "default request published a response deadline before writing",
+        registration.response_deadline()?.is_none(),
+        "deadline started before write",
     )?;
-    let before_write = Instant::now();
-    let completion = bounded(
-        "default request written",
-        prepared.commit()?.wait_until_written(),
-    )
-    .await??;
+    let before = Instant::now();
+    let receipt = prepared.commit()?;
+    bounded("default request written", handle.written()).await??;
     let after_write = Instant::now();
     check(
         peer.frame().await? == "deadline-default-body",
-        "default request did not reach peer",
+        "wrong payload",
     )?;
     let deadline = registration
         .response_deadline()?
-        .ok_or_else(|| error("written default request omitted response deadline"))?;
+        .ok_or("written request omitted deadline")?;
     check(
-        deadline >= after(before_write, response_timeout)?
-            && deadline <= after(after_write, response_timeout)?,
-        "default response deadline is not based on confirmed write time",
+        deadline >= after(before, timeout)? && deadline <= after(after_write, timeout)?,
+        "deadline is not based on write",
     )?;
     peer.reply("deadline-default-response")?;
-    let response = bounded("default response", responses.recv())
-        .await?
-        .ok_or_else(|| error("default response channel closed"))?;
+    let response = bounded("response", incoming.recv())
+        .await??
+        .ok_or("inbox closed")?;
     check(
-        response
-            .take_request_if_registered(&registration)?
-            .is_some(),
-        "matching default response could not claim registration",
+        session
+            .session
+            .response_resolver()?
+            .resolve(&registration, &response)?
+            == ResolveOutcome::Resolved,
+        "matching registration failed",
     )?;
-    bounded("default completion", completion.wait()).await??;
+    let reply = bounded("completed response", receipt.response()).await??;
+    check(
+        reply.message().as_text() == Some("deadline-default-response"),
+        "reply body changed",
+    )?;
     check(
         registration.response_deadline()? == Some(deadline)
-            && registration.expire()? == RequestTerminationOutcome::AlreadyClaimedOrFinished,
-        "claimed registration deadline or terminal state changed",
+            && handle.expire()? == TerminationOutcome::AlreadyFinished
+            && requests.pending_snapshot()?.is_empty(),
+        "completed registration changed or leaked pending",
     )?;
+    net.destroy_ws_client("deadline-default").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_commit_preserves_explicit_cancel_winner() -> TestResult {
+    let net = OpenNet::new()?;
+    let mut peer = Peer::start().await?;
+    let session = connected(&net, "prepared-cancel", &peer).await?;
+    let mut tasks = session
+        .session
+        .subscribe_tasks(TaskEventOptions::default())?;
+    let prepared = session
+        .session
+        .requests()?
+        .request(request("never-written")?)
+        .prepare()
+        .await?;
+    let handle = prepared.handle().clone();
     check(
-        client.pending_requests().is_empty(),
-        "claimed response retained pending",
+        handle.cancel()? == TerminationOutcome::TerminatedBeforeWrite,
+        "prepared cancel delivery",
     )?;
-    drop(response);
-    bounded(
-        "destroy default client",
-        net.destroy_ws_client("deadline-default"),
-    )
-    .await??;
+    let committed = prepared.commit();
+    check(
+        matches!(committed, Err(e) if e.kind() == open_net::error::ErrorKind::Cancelled),
+        "commit changed cancellation winner",
+    )?;
+    let event = bounded("cancel terminal", tasks.recv())
+        .await??
+        .ok_or("task ended")?;
+    check(
+        event.operation_id == handle.id()
+            && event.result.as_ref().err().map(NetError::kind)
+                == Some(open_net::error::ErrorKind::Cancelled),
+        "cancel observer changed winner",
+    )?;
+    session.session.sender().send("barrier").await?;
+    check(
+        peer.frame().await? == "barrier",
+        "cancelled preparation reached peer",
+    )?;
+    net.destroy_ws_client("prepared-cancel").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_commit_preserves_session_close_winner() -> TestResult {
+    for shutdown in [false, true] {
+        let net = OpenNet::new()?;
+        let peer = Peer::start().await?;
+        let session = connected(&net, "prepared-close", &peer).await?;
+        let mut tasks = session
+            .session
+            .subscribe_tasks(TaskEventOptions::default())?;
+        let prepared = session
+            .session
+            .requests()?
+            .request(request("never-written")?)
+            .prepare()
+            .await?;
+        let handle = prepared.handle().clone();
+        if shutdown {
+            net.destroy_ws_client("prepared-close").await?;
+        } else {
+            session.session.close().await?;
+        }
+        let event = bounded("close terminal", tasks.recv())
+            .await??
+            .ok_or("task ended")?;
+        let winner = event
+            .result
+            .as_ref()
+            .err()
+            .ok_or("closed preparation succeeded")?
+            .kind();
+        check(
+            event.operation_id == handle.id()
+                && matches!(
+                    winner,
+                    open_net::error::ErrorKind::Closed | open_net::error::ErrorKind::Cancelled
+                ),
+            "close terminal missing",
+        )?;
+        let committed = prepared.commit();
+        check(
+            matches!(committed, Err(e) if e.kind() == winner),
+            "commit replaced selected close cause with generic cancellation",
+        )?;
+        check(
+            handle
+                .state()?
+                .result
+                .and_then(Result::err)
+                .map(|e| e.kind())
+                == Some(winner),
+            "close snapshot disagrees",
+        )?;
+        if !shutdown {
+            net.destroy_ws_client("prepared-close").await?;
+        }
+    }
     Ok(())
 }

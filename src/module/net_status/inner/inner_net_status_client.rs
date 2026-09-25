@@ -1,79 +1,215 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::common::log::listener::LogListener;
 use crate::common::log::log_def::LogType;
-use crate::common::log::logger::{LogSubscription, Logger};
 use crate::common::CommonEngine;
 use n0_watcher::Watcher as _;
-use tokio::runtime::Handle;
 use tokio::sync::{oneshot, watch};
 use tokio::time::{self, MissedTickBehavior};
 
-use super::monitor_runtime::{MonitorCompletion, MonitorRuntime};
-use super::monitor_state::{Dispatcher, MonitorState, SharedListener};
+use super::monitor_runtime::{MonitorCompletion, MonitorInitialization, MonitorRuntime};
+use super::monitor_state::MonitorState;
 use super::network_status_snapshot::{
-    NetworkStatusMonitorGuard, NetworkStatusSnapshot, NetworkStatusSource,
+    NetworkPublication, NetworkStatusPublisher, NetworkStatusSnapshot, NetworkStatusSource,
 };
 use super::platform::PlatformNetworkMonitor;
 use super::refresh_trigger::{request_refresh_or_stop, RefreshWorkOutcome};
-use crate::api::net_error::NetError;
-use crate::module::net_status::{
-    IpStack, NetworkStatus, NetworkStatusListener, NetworkStatusListenerHandle,
-};
+use crate::error::NetError;
+use crate::module::net_status::{IpStack, NetworkStatus};
+use crate::net_status::{MonitorState as PublicMonitorState, NetworkSnapshot};
+use crate::subscription::common_executor::CommonCallbackExecutor;
+use crate::subscription::StateReceiver;
 
 #[cfg(test)]
 #[path = "network_observation_tests.rs"]
 mod network_observation_tests;
 
+#[cfg(test)]
+#[path = "initialization_tests.rs"]
+mod initialization_tests;
+
 #[derive(Default)]
+// 客户端生命周期状态；短时同步锁串行化启动、停止和永久销毁。
 struct Lifecycle {
+    // 当前可接受更新的监控代；停止时先移出，再异步等待其完成。
     monitor: Option<MonitorRuntime>,
     /// Keep completion receivers after signaling stop, including when a caller
     /// cancels shutdown. A later destroy must still await these native resources.
+    // 已请求停止或自行退休但尚未完成内部资源清理的监控代，供后续 shutdown/destroy 等待。
     stopping: Vec<watch::Receiver<bool>>,
+    // 永久销毁标志；一旦置位，后续 start 不再允许创建监控任务。
     destroyed: bool,
-    log_subscription: Option<LogSubscription>,
 }
 
+// 在首次轮询之前即持有的一代退出守卫；清理不依赖 start 的等待者仍然存在。
+struct MonitorTaskCompletion {
+    // 弱引用避免后台任务与客户端形成所有权环，仅退休身份匹配的当前监控代。
+    lifecycle: Weak<Mutex<Lifecycle>>,
+    // 该代唯一有效性标志，其 Arc 身份同时用于防止旧代清理误删新代。
+    active: Arc<AtomicBool>,
+    // 监控代的退休屏障；退出时完成内部状态清理后再通知等待者。
+    state: Arc<Mutex<MonitorState>>,
+    // 失败或取消时在资源清理完成后唤醒所有同代初始化等待者。
+    initial_state: watch::Sender<MonitorInitialization>,
+    // 正常构造或首轮发布返回的初始化错误，取消未轮询任务时使用 RuntimeError。
+    initialization_error: Option<NetError>,
+    // 退出时重置本代内部观测；旧发布器不会覆盖新代观测。
+    observation: NetworkStatusPublisher,
+    // 内部资源清理后发布完成；任意用户捕获析构不包含在等待范围内，避免重入销毁自等。
+    completion: Option<MonitorCompletion>,
+}
+
+impl Drop for MonitorTaskCompletion {
+    // 原子地退休句柄并保留完成接收端；内部资源就绪后发布结果，再锁外释放用户捕获。
+    fn drop(&mut self) {
+        let stopped = !self.active.swap(false, Ordering::AcqRel);
+        let retired = self.lifecycle.upgrade().and_then(|lifecycle| {
+            let mut lifecycle = match lifecycle.lock() {
+                Ok(lifecycle) => lifecycle,
+                Err(poisoned) => {
+                    crate::log_e!(LogType::Engine; "network_status_monitor_exit", "error", "lifecycle_lock_poisoned_recovered");
+                    poisoned.into_inner()
+                }
+            };
+            if lifecycle
+                .monitor
+                .as_ref()
+                .is_some_and(|monitor| Arc::ptr_eq(&monitor.active, &self.active))
+            {
+                let monitor = lifecycle.monitor.take();
+                if let Some(monitor) = &monitor {
+                    lifecycle.stopping.push(monitor.finished.clone());
+                }
+                monitor
+            } else {
+                None
+            }
+        });
+        // Preserve the original retirement barrier before signalling native completion.
+        {
+            let _state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    crate::log_e!(LogType::Engine; "network_status_monitor_exit", "error", "state_lock_poisoned_recovered");
+                    poisoned.into_inner()
+                }
+            };
+        }
+        let failure = self.initialization_error.clone().or_else(|| {
+            (!stopped).then(|| NetError::from(crate::error::ErrorKind::RuntimeUnavailable))
+        });
+        let terminal = failure
+            .clone()
+            .map_or(PublicMonitorState::Stopped, PublicMonitorState::Failed);
+        let publication = self.observation.prepare_finish(terminal);
+        drop(retired);
+        drop(self.completion.take());
+        self.initial_state.send_if_modified(|initial| {
+            if !matches!(initial, MonitorInitialization::Pending) {
+                return false;
+            }
+            *initial = match failure {
+                Some(error) => MonitorInitialization::Failed(error),
+                None if stopped => MonitorInitialization::Stopped,
+                None => MonitorInitialization::Failed(NetError::from(
+                    crate::error::ErrorKind::RuntimeUnavailable,
+                )),
+            };
+            true
+        });
+        // User wakes and captures may synchronously wait for destroy. Signal completion first.
+        if let Err(error) = publication.and_then(NetworkPublication::dispatch) {
+            crate::log_e!(LogType::Engine; "network_status_monitor_exit", "error", crate::common::log::summary::error(&error));
+        }
+    }
+}
+
+// 网络状态客户端内部实现，连接引擎运行时、单代监控生命周期与跨代观测源。
 pub(crate) struct InnerNetStatusClient {
+    // 提供 Tokio 运行时与公开监听器回调线程池的共享引擎。
     engine: Arc<CommonEngine>,
-    lifecycle: Mutex<Lifecycle>,
+    // 保护监控任务及销毁状态；异步等待完成信号时不持有该锁。
+    lifecycle: Arc<Mutex<Lifecycle>>,
+    // 统一快照源；公开订阅复用引擎回调池，私有 watch 维持 WS 的网络门控时序。
     observations: NetworkStatusSource,
+    // 测试专用的安全初始化工厂，用于精确控制失败与并发时机，不改变生产构建。
+    #[cfg(test)]
+    monitor_factory: Mutex<Option<initialization_tests::MonitorFactory>>,
 }
 
 impl InnerNetStatusClient {
-    pub(crate) fn new(engine: Arc<CommonEngine>) -> Self {
-        Self {
+    // 创建未启动的客户端，持有共享引擎并将内部观测初始化为未知。
+    pub(crate) fn new(engine: Arc<CommonEngine>) -> Result<Self, NetError> {
+        let executor = Arc::new(CommonCallbackExecutor::new(&engine));
+        let observations = NetworkStatusSource::new(executor, 1024)?;
+        Ok(Self {
             engine,
-            lifecycle: Mutex::new(Lifecycle::default()),
-            observations: NetworkStatusSource::new(),
-        }
+            lifecycle: Arc::new(Mutex::new(Lifecycle::default())),
+            observations,
+            #[cfg(test)]
+            monitor_factory: Mutex::new(None),
+        })
     }
 
     /// Observe ordered network facts without involving the public callback pool.
     /// Before initialization and after monitoring stops, the status is Unknown.
     #[cfg_attr(not(any(feature = "ws-client", test)), allow(dead_code))]
+    // 订阅内部快照而不启动监控；尚无观测或停止后的状态为 None，表示未知。
     pub(crate) fn subscribe(&self) -> watch::Receiver<NetworkStatusSnapshot> {
         self.observations.subscribe()
     }
 
-    pub(crate) async fn start(&self) -> Result<(), NetError> {
-        let (mut initial_state, active) = {
+    // 幂等启动并等待同代初始化结果；失败代先完成退休，再将错误交付所有等待者。
+    // stop 取消初始化时返回当前快照；永久销毁优先返回 Closed。
+    pub(crate) async fn start(&self) -> Result<NetworkSnapshot, NetError> {
+        let (mut initial_state, task, publication) = {
             let mut lifecycle = self.lifecycle.lock().map_err(NetError::from_poison)?;
             if lifecycle.destroyed {
-                return Err(NetError::EngineDropped);
+                return Err(NetError::from(crate::error::ErrorKind::Closed));
             }
-            lifecycle.stopping.retain(|finished| !*finished.borrow());
-            if lifecycle.monitor.is_none() {
-                lifecycle.monitor = Some(self.spawn_monitor_task()?);
-            }
-            let monitor = lifecycle.monitor.as_ref().ok_or(NetError::InternalError)?;
-            (monitor.initial_state.clone(), Arc::clone(&monitor.active))
+            lifecycle
+                .stopping
+                .retain(|finished| !*::tokio::sync::watch::Receiver::borrow(finished));
+            let (task, publication) = if lifecycle.monitor.is_none() {
+                let (monitor, task, publication) = self.prepare_monitor_task()?;
+                lifecycle.monitor = Some(monitor);
+                (Some(task), Some(publication))
+            } else {
+                (None, None)
+            };
+            let monitor = lifecycle
+                .monitor
+                .as_ref()
+                .ok_or(NetError::from(crate::error::ErrorKind::Internal))?;
+            (monitor.initial_state.clone(), task, publication)
         };
-        while !*initial_state.borrow_and_update() {
+        // A failed preparation owns deferred cleanup. Retire its unpolled task first;
+        // normal notifications must follow submission because a user waker may await shutdown.
+        if let Err(error) = publication
+            .as_ref()
+            .map(NetworkPublication::result)
+            .transpose()
+        {
+            drop(task);
+            if let Some(publication) = publication {
+                if let Err(dispatch_error) = publication.dispatch() {
+                    crate::log_e!(LogType::Engine; "network_status_start", "error", crate::common::log::summary::error(&dispatch_error));
+                }
+            }
+            return Err(error);
+        }
+        // 退出守卫也会获取生命周期锁；在锁外提交，覆盖运行时拒绝未轮询任务的路径。
+        if let Some(task) = task {
+            self.engine.runtime_handle().spawn(task);
+        }
+        if let Some(publication) = publication {
+            publication.dispatch()?;
+        }
+        while matches!(
+            *initial_state.borrow_and_update(),
+            MonitorInitialization::Pending
+        ) {
             if initial_state.changed().await.is_err() {
                 break;
             }
@@ -84,120 +220,120 @@ impl InnerNetStatusClient {
             .map_err(NetError::from_poison)?
             .destroyed
         {
-            return Err(NetError::EngineDropped);
+            return Err(NetError::from(crate::error::ErrorKind::Closed));
         }
-        // A concurrent ordinary shutdown may have already retired this start.
-        // Preserve the idempotent lifecycle contract in that race.
-        if !active.load(Ordering::Acquire) {
-            return Ok(());
+        let result = ::tokio::sync::watch::Receiver::borrow(&initial_state).clone();
+        match result {
+            MonitorInitialization::Ready | MonitorInitialization::Stopped => self.snapshot(),
+            MonitorInitialization::Failed(error) => Err(error),
+            MonitorInitialization::Pending => {
+                Err(NetError::from(crate::error::ErrorKind::RuntimeUnavailable))
+            }
         }
-        if !*initial_state.borrow() {
-            return Err(NetError::RuntimeError);
-        }
-        Ok(())
     }
 
-    fn spawn_monitor_task(&self) -> Result<MonitorRuntime, NetError> {
+    // 创建独立监控代、信号与尚未提交的 Future，由 start 安装句柄后在生命周期锁外启动。
+    // 退出守卫在首次轮询前就由 Future 持有，覆盖取消等待、未轮询释放及异常退出。
+    fn prepare_monitor_task(
+        &self,
+    ) -> Result<
+        (
+            MonitorRuntime,
+            impl std::future::Future<Output = ()> + Send + 'static,
+            NetworkPublication,
+        ),
+        NetError,
+    > {
+        #[cfg(test)]
+        let factory = self
+            .monitor_factory
+            .lock()
+            .map_err(NetError::from_poison)?
+            .clone();
         let (stop_sender, stop_receiver) = oneshot::channel();
-        let (initial_sender, initial_state) = watch::channel(false);
+        let (initial_sender, initial_state) = watch::channel(MonitorInitialization::Pending);
         let (finished_sender, finished) = watch::channel(false);
-        let publisher = self.observations.begin_generation()?;
-        let observation_completion = NetworkStatusMonitorGuard(publisher.clone());
+        let (publisher, publication) = self.observations.begin_generation()?;
         let state = MonitorState {
-            observation: Some(publisher),
+            observation: Some(publisher.clone()),
             ..MonitorState::default()
         };
         let active = Arc::clone(&state.active);
         let state = Arc::new(Mutex::new(state));
         let shared_state = Arc::clone(&state);
-        let dispatcher = self.dispatcher(Arc::clone(&active));
-        let completion = MonitorCompletion(finished_sender);
-        // CommonEngine's post queue awaits one task at a time. A long-lived
-        // monitor must be spawned directly or it would starve unrelated work.
-        self.engine.runtime_handle().spawn(async move {
-            let _completion = completion;
-            let _observation_completion = observation_completion;
-            Self::monitor_until_stopped(shared_state, dispatcher, stop_receiver, initial_sender)
-                .await;
-        });
-        Ok(MonitorRuntime {
+        let completion = MonitorTaskCompletion {
+            lifecycle: Arc::downgrade(&self.lifecycle),
+            active: Arc::clone(&active),
+            state: Arc::clone(&state),
+            initial_state: initial_sender.clone(),
+            initialization_error: publication.result().err(),
+            observation: publisher,
+            completion: Some(MonitorCompletion(finished_sender)),
+        };
+        // 长期任务直接交给共享运行时，不进入逐项等待的引擎工作队列。
+        let task = async move {
+            let mut completion = completion;
+            if let Err(error) = Self::monitor_until_stopped(
+                shared_state,
+                stop_receiver,
+                initial_sender,
+                #[cfg(test)]
+                factory,
+            )
+            .await
+            {
+                completion.initialization_error = Some(error);
+            }
+        };
+        let monitor = MonitorRuntime {
             stop_sender: Some(stop_sender),
             initial_state,
             finished,
             state,
             active,
-        })
+        };
+        Ok((monitor, task, publication))
     }
 
-    fn dispatcher(&self, active: Arc<AtomicBool>) -> Dispatcher {
-        let runtime_handle = self.engine.runtime_handle();
-        Arc::from(
-            self.engine
-                .cb_pool_fn2_boxed(move |listener: SharedListener, status| {
-                    if active.load(Ordering::Acquire) {
-                        Self::invoke_listener(Some(&runtime_handle), &listener, status);
-                    }
-                }),
-        )
-    }
-
-    fn invoke_listener(
-        runtime_handle: Option<&Handle>,
-        listener: &SharedListener,
-        status: NetworkStatus,
-    ) {
-        let _runtime_guard = runtime_handle.map(Handle::enter);
-        if catch_unwind(AssertUnwindSafe(|| listener(status))).is_err() {
-            crate::log_s!(LogType::Engine; "network_status_listener", "listener_panic", status.name());
-        }
-    }
-
-    /// Linearize stopping under a short synchronous lock. Every start receives
-    /// an independent state; it can safely overlap a retiring task's cleanup.
+    // Commit the stop while holding the lifecycle lock; notify public observers afterwards.
     fn request_stop(&self, permanent: bool) -> (Vec<watch::Receiver<bool>>, Option<NetError>) {
         let mut error = None;
-        let (finished, listeners, subscription) = {
-            let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|poisoned| {
-                error = Some(NetError::InternalError);
-                poisoned.into_inner()
-            });
+        let (finished, retired, publication) = {
+            let mut lifecycle = match self.lifecycle.lock() {
+                Ok(lifecycle) => lifecycle,
+                Err(poisoned) => {
+                    error = Some(NetError::from(crate::error::ErrorKind::Internal));
+                    poisoned.into_inner()
+                }
+            };
             lifecycle.destroyed |= permanent;
-            let mut listeners = None;
-            if let Some(mut monitor) = lifecycle.monitor.take() {
+            let mut retired = lifecycle.monitor.take();
+            if let Some(monitor) = &mut retired {
                 monitor.active.store(false, Ordering::Release);
                 if let Some(stop) = monitor.stop_sender.take() {
                     let _ = stop.send(());
                 }
-                let mut state = monitor.state.lock().unwrap_or_else(|poisoned| {
-                    error = Some(NetError::InternalError);
-                    poisoned.into_inner()
-                });
-                state.reachability = NetworkStatus::Unavailable;
-                state.ip_stack = IpStack::None;
-                if let Some(observation) = &state.observation {
-                    if let Err(publication_error) = observation.publish(None) {
-                        crate::log_e!(LogType::Engine; "network_status_observation_stop", "error", crate::common::log::summary::error(&publication_error));
-                        error = Some(publication_error);
-                    }
-                }
-                listeners = Some(std::mem::take(&mut state.listeners));
-                lifecycle.stopping.push(monitor.finished);
+                lifecycle.stopping.push(monitor.finished.clone());
             }
-            lifecycle.stopping.retain(|finished| !*finished.borrow());
-            let subscription = if permanent {
-                lifecycle.log_subscription.take()
+            let publication = if permanent {
+                self.observations.prepare_closed()
             } else {
-                None
+                self.observations.prepare_stopped()
             };
-            (lifecycle.stopping.clone(), listeners, subscription)
+            lifecycle
+                .stopping
+                .retain(|finished| !*::tokio::sync::watch::Receiver::borrow(finished));
+            (lifecycle.stopping.clone(), retired, publication)
         };
-        // User callback captures can have reentrant destructors. Never release
-        // them while holding either lifecycle or monitor locks.
-        drop(listeners);
-        drop(subscription);
+        drop(retired);
+        if let Err(publication_error) = publication.and_then(NetworkPublication::dispatch) {
+            crate::log_e!(LogType::Engine; "network_status_stop", "error", crate::common::log::summary::error(&publication_error));
+            error = Some(publication_error);
+        }
         (finished, error)
     }
 
+    // 逐一等待已退役监控完成；发送端关闭也结束对应等待，全程不占用客户端生命周期锁。
     async fn wait_until_finished(finished: Vec<watch::Receiver<bool>>) {
         for mut receiver in finished {
             while !*receiver.borrow_and_update() {
@@ -208,22 +344,38 @@ impl InnerNetStatusClient {
         }
     }
 
-    pub(crate) async fn shutdown(&self) -> Result<(), NetError> {
+    // 停止当前监控并等待所有退役监控释放资源，之后允许重新启动；透传同步清理阶段的错误。
+    pub(crate) async fn stop(&self) -> Result<(), NetError> {
         let (finished, error) = self.request_stop(false);
         Self::wait_until_finished(finished).await;
         error.map_or(Ok(()), Err)
     }
 
+    // 发出永久销毁请求并禁止后续启动；此同步入口不等待异步监控资源清理完成。
     pub(crate) fn request_destroy(&self) {
         self.request_stop(true);
     }
 
+    // 永久销毁客户端并等待已有监控清理完成，返回停止过程中记录的错误。
     pub(crate) async fn destroy(&self) -> Result<(), NetError> {
         let (finished, error) = self.request_stop(true);
         Self::wait_until_finished(finished).await;
         error.map_or(Ok(()), Err)
     }
 
+    pub(crate) async fn shutdown(&self) -> Result<(), NetError> {
+        self.destroy().await
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<NetworkSnapshot, NetError> {
+        self.observations.snapshot()
+    }
+
+    pub(crate) fn subscribe_state(&self) -> Result<StateReceiver<NetworkSnapshot>, NetError> {
+        self.observations.observe()
+    }
+
+    #[cfg(test)]
     fn current_state(&self) -> Result<Option<Arc<Mutex<MonitorState>>>, NetError> {
         Ok(self
             .lifecycle
@@ -234,131 +386,12 @@ impl InnerNetStatusClient {
             .map(|monitor| Arc::clone(&monitor.state)))
     }
 
-    pub(crate) fn is_started(&self) -> bool {
-        self.lifecycle
-            .lock()
-            .map(|lifecycle| lifecycle.monitor.is_some())
-            .unwrap_or(false)
+    #[cfg(test)]
+    fn is_started(&self) -> bool {
+        matches!(self.snapshot(), Ok(snapshot) if matches!(snapshot.state, PublicMonitorState::Running))
     }
 
-    pub(crate) fn local_network_reachability(&self) -> Result<NetworkStatus, NetError> {
-        let Some(state) = self.current_state()? else {
-            return Ok(NetworkStatus::Unavailable);
-        };
-        #[cfg(target_os = "windows")]
-        if let Some(reachability) = Self::windows_network_reachability() {
-            let active = Arc::clone(&state.lock().map_err(NetError::from_poison)?.active);
-            Self::update_reachability_inner(&state, &self.dispatcher(active), reachability)?;
-        }
-        let value = state.lock().map_err(NetError::from_poison)?.reachability;
-        Ok(value)
-    }
-
-    pub(crate) fn ip_stack(&self) -> Result<IpStack, NetError> {
-        let Some(state) = self.current_state()? else {
-            return Ok(IpStack::None);
-        };
-        let value = state.lock().map_err(NetError::from_poison)?.ip_stack;
-        Ok(value)
-    }
-
-    pub(crate) fn register(
-        &self,
-        listener: NetworkStatusListener,
-    ) -> Result<Option<NetworkStatusListenerHandle>, NetError> {
-        // Keep the caller's reference alive until after all lock guards drop.
-        let listener: SharedListener = Arc::from(listener);
-        let Some(state) = self.current_state()? else {
-            return Ok(None);
-        };
-        let mut state = state.lock().map_err(NetError::from_poison)?;
-        if !state.active.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let handle = state.next_listener_handle();
-        state.listeners.insert(handle, Arc::clone(&listener));
-        Ok(Some(handle))
-    }
-
-    pub(crate) fn unregister(&self, handle: NetworkStatusListenerHandle) -> Result<bool, NetError> {
-        let Some(state) = self.current_state()? else {
-            return Ok(false);
-        };
-        let listener = state
-            .lock()
-            .map_err(NetError::from_poison)?
-            .listeners
-            .remove(&handle);
-        Ok(listener.is_some())
-    }
-
-    pub(crate) fn clear_all_listener(&self) -> Result<(), NetError> {
-        let state = self.current_state()?.ok_or(NetError::NotStarted)?;
-        let listeners = {
-            let mut state = state.lock().map_err(NetError::from_poison)?;
-            if !state.active.load(Ordering::Acquire) {
-                return Err(NetError::NotStarted);
-            }
-            std::mem::take(&mut state.listeners)
-        };
-        drop(listeners);
-        Ok(())
-    }
-
-    pub(crate) fn get_current_network_name(&self) -> Result<Option<String>, NetError> {
-        if self.current_state()?.is_none() {
-            return Ok(None);
-        }
-        #[cfg(target_os = "windows")]
-        {
-            Ok(Self::query_current_network())
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Ok(None)
-        }
-    }
-
-    pub(crate) fn set_log_listener(&self, listener: Option<LogListener>) {
-        if let Err(error) = self.try_set_log_listener(listener) {
-            crate::log_e!(LogType::Engine; "net_status_set_log_listener", "error", crate::common::log::summary::error(&error));
-        }
-    }
-
-    pub(crate) fn try_set_log_listener(
-        &self,
-        listener: Option<LogListener>,
-    ) -> std::io::Result<()> {
-        let listener = listener.map(Arc::new);
-        let previous = {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|_| std::io::Error::other("net status lifecycle lock poisoned"))?;
-            let replacement = if lifecycle.destroyed {
-                None
-            } else {
-                listener
-                    .as_ref()
-                    .map(|listener| {
-                        let listener = Arc::clone(listener);
-                        let handle = self.engine.runtime_handle();
-                        Logger::register_log_listener(
-                            Box::new(move |info| {
-                                let _guard = handle.enter();
-                                let _ = catch_unwind(AssertUnwindSafe(|| listener(info)));
-                            }),
-                            &[LogType::Engine, LogType::Common],
-                        )
-                    })
-                    .transpose()?
-            };
-            std::mem::replace(&mut lifecycle.log_subscription, replacement)
-        };
-        drop(previous);
-        Ok(())
-    }
-
+    // 按默认路由与 IP 能力推导可达性：同时具备默认路由及至少一种 IP 能力时为 Available。
     fn reachability_from_flags(
         has_default_route: bool,
         have_v4: bool,
@@ -371,6 +404,7 @@ impl InnerNetStatusClient {
         }
     }
 
+    // 从 netwatch 接口快照提取默认路由与 IPv4/IPv6 标志，转换为本库的可达性枚举。
     fn reachability_from_state(state: &netwatch::netmon::State) -> NetworkStatus {
         Self::reachability_from_flags(
             state.default_route_interface.is_some(),
@@ -382,10 +416,12 @@ impl InnerNetStatusClient {
     /// Derive the IP-stack capability from the `netwatch` interface state. This
     /// uses the same `have_v4` / `have_v6` flags on every platform, so the
     /// reported value has consistent cross-platform semantics.
+    // 将 netwatch 的 IPv4/IPv6 能力标志映射为 IP 栈枚举，各平台使用同一套映射规则。
     fn ip_stack_from_state(state: &netwatch::netmon::State) -> IpStack {
         IpStack::from_flags(state.have_v4, state.have_v6)
     }
 
+    // 获取当前可达性；Windows 优先使用系统连接状态，查询无结果或其他平台则使用 netwatch 快照。
     fn current_reachability(state: &netwatch::netmon::State) -> NetworkStatus {
         #[cfg(target_os = "windows")]
         if let Some(reachability) = Self::windows_network_reachability() {
@@ -395,84 +431,33 @@ impl InnerNetStatusClient {
         Self::reachability_from_state(state)
     }
 
-    /// Static version used by the monitor task (which only holds an
-    /// `Arc<Mutex<MonitorState>>` and the dispatcher).
-    ///
-    /// Returns [`NetError::InternalError`] on poison, leaving handling to the caller;
-    /// never panics.
-    #[cfg(any(target_os = "windows", test))]
-    fn update_reachability_inner(
-        state: &Arc<Mutex<MonitorState>>,
-        dispatcher: &Dispatcher,
-        reachability: NetworkStatus,
-    ) -> Result<(), NetError> {
-        let listeners = {
-            let mut guard = state.lock().map_err(NetError::from_poison)?;
-            if !guard.active.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if let Some(observation) = &guard.observation {
-                observation.publish(Some(reachability))?;
-            }
-            if guard.reachability == reachability {
-                return Ok(());
-            }
-            guard.reachability = reachability;
-            guard.listeners.values().cloned().collect::<Vec<_>>()
-        };
-
-        crate::log_s!(LogType::Engine;
-            "network_status_listener",
-            "network_status",
-            reachability.name()
-        );
-
-        for listener in listeners {
-            dispatcher(listener, reachability);
-        }
-        Ok(())
-    }
-
-    /// Update both reachability and IP-stack capability under a single lock.
-    ///
-    /// The IP-stack value is always refreshed (it has no listeners and fires no
-    /// callbacks). Reachability is only updated, and its listeners only
-    /// dispatched, when it actually changes — preserving the existing
-    /// change-detection contract. Used by the monitor task, which holds the full
-    /// `netwatch` state needed to compute both values at once.
-    ///
-    /// Returns [`NetError::InternalError`] on poison, leaving handling to the caller;
-    /// never panics.
+    // One authoritative snapshot contains reachability and IP capability. Public wakeups,
+    // user captures and callback scheduling are all released outside the monitor lock.
     fn update_state_inner(
         state: &Arc<Mutex<MonitorState>>,
-        dispatcher: &Dispatcher,
         reachability: NetworkStatus,
         ip_stack: IpStack,
     ) -> Result<(), NetError> {
-        let listeners = {
-            let mut guard = state.lock().map_err(NetError::from_poison)?;
+        #[cfg(target_os = "windows")]
+        let network_name = Self::query_current_network();
+        #[cfg(not(target_os = "windows"))]
+        let network_name = None;
+        let publication = {
+            let guard = state.lock().map_err(NetError::from_poison)?;
             if !guard.active.load(Ordering::Acquire) {
                 return Ok(());
             }
-            if let Some(observation) = &guard.observation {
-                observation.publish(Some(reachability))?;
+            match &guard.observation {
+                Some(observation) => Some(observation.prepare_observation(
+                    reachability,
+                    Some(ip_stack),
+                    network_name,
+                )?),
+                None => None,
             }
-            guard.ip_stack = ip_stack;
-            if guard.reachability == reachability {
-                return Ok(());
-            }
-            guard.reachability = reachability;
-            guard.listeners.values().cloned().collect::<Vec<_>>()
         };
-
-        crate::log_s!(LogType::Engine;
-            "network_status_listener",
-            "network_status",
-            reachability.name()
-        );
-
-        for listener in listeners {
-            dispatcher(listener, reachability);
+        if let Some(publication) = publication {
+            publication.dispatch()?;
         }
         Ok(())
     }
@@ -481,30 +466,32 @@ impl InnerNetStatusClient {
     /// `monitor_until_stopped`, but the state comes from the instance rather
     /// than a global.
     ///
-    /// This task runs directly on the shared engine runtime and cannot return errors to
-    /// the developer; if an internal lock becomes poisoned
-    /// (`update_reachability_inner` returns `Err`), the task gracefully exits
-    /// the loop and resets the state, and never panics.
+    /// Initialization errors reach every caller waiting on this generation's
+    /// start result. Later observation failures end the task; its completion
+    /// guard retires the generation and resets its state.
+    // 初始化 netwatch 并发布首轮观测，然后处理接口更新、原生刷新提示、定时复查与优先停止信号。
+    // 原生事件仅请求 netwatch 刷新，不能直接作为可达性事实；初始化失败保留内部未知状态。
+    // 退出时释放平台监控并重置公开状态，内部未知状态及完成通知由任务所持守卫负责发布。
     async fn monitor_until_stopped(
         state: Arc<Mutex<MonitorState>>,
-        dispatcher: Dispatcher,
         mut stop_receiver: oneshot::Receiver<()>,
-        initial_state: watch::Sender<bool>,
-    ) {
+        initial_state: watch::Sender<MonitorInitialization>,
+        #[cfg(test)] factory: Option<initialization_tests::MonitorFactory>,
+    ) -> Result<(), NetError> {
         let monitor = tokio::select! {
             biased;
-            _ = &mut stop_receiver => return,
-            result = netwatch::netmon::Monitor::new() => result,
+            _ = &mut stop_receiver => return Ok(()),
+            result = Self::create_monitor(
+                #[cfg(test)]
+                factory,
+            ) => result,
         };
         let monitor = match monitor {
             Ok(monitor) => monitor,
             Err(error) => {
-                // A detector failure does not establish that the network is
-                // unavailable. The completion guard preserves Unknown internally;
-                // the public facade retains its previous default Unavailable value.
-                crate::log_e!(LogType::Engine; "network_status_monitor_start", "error", crate::common::log::summary::error(&error));
-                let _ = initial_state.send(true);
-                return;
+                // Detector failure is not evidence of an unavailable network.
+                // Completion publishes Failed with no current observation.
+                return Err(error);
             }
         };
         let mut interface_state = monitor.interface_state();
@@ -513,11 +500,11 @@ impl InnerNetStatusClient {
         let current = Self::current_reachability(&initial);
         let ip_stack = Self::ip_stack_from_state(&initial);
         // If the initial state update fails (lock poisoned), end the task.
-        if Self::update_state_inner(&state, &dispatcher, current, ip_stack).is_err() {
-            let _ = initial_state.send(true);
-            return;
+        if let Err(error) = Self::update_state_inner(&state, current, ip_stack) {
+            crate::log_e!(LogType::Engine; "network_status_initial_observation", "error", crate::common::log::summary::error(&error));
+            return Err(error);
         }
-        let _ = initial_state.send(true);
+        initial_state.send_replace(MonitorInitialization::Ready);
 
         // The native macOS source is an optional post-initialization hint. A
         // yield after publishing the authoritative netwatch state ensures its
@@ -539,9 +526,7 @@ impl InnerNetStatusClient {
                             let reachability = Self::current_reachability(&new_state);
                             let ip_stack = Self::ip_stack_from_state(&new_state);
                             // Exit the monitor loop if the lock is poisoned.
-                            if Self::update_state_inner(&state, &dispatcher, reachability, ip_stack).is_err() {
-                                break;
-                            }
+                            Self::update_state_inner(&state, reachability, ip_stack)?;
                         }
                         Err(_) => break,
                     }
@@ -561,9 +546,7 @@ impl InnerNetStatusClient {
                     let snapshot = interface_state.get();
                     let reachability = Self::current_reachability(&snapshot);
                     let ip_stack = Self::ip_stack_from_state(&snapshot);
-                    if Self::update_state_inner(&state, &dispatcher, reachability, ip_stack).is_err() {
-                        break;
-                    }
+                    Self::update_state_inner(&state, reachability, ip_stack)?;
                 }
             }
         }
@@ -575,12 +558,22 @@ impl InnerNetStatusClient {
         #[cfg(target_os = "macos")]
         drop(platform_monitor);
 
-        // The task is exiting; silently reset the state. If the lock is
-        // poisoned it cannot be reset, so just give up (without panicking).
-        if let Ok(mut guard) = state.lock() {
-            guard.reachability = NetworkStatus::Unavailable;
-            guard.ip_stack = IpStack::None;
+        Ok(())
+    }
+
+    // 创建真实检测器并保留底层诊断；测试可替换构造 Future，以安全方式注入错误与时序。
+    async fn create_monitor(
+        #[cfg(test)] factory: Option<initialization_tests::MonitorFactory>,
+    ) -> Result<netwatch::netmon::Monitor, NetError> {
+        #[cfg(test)]
+        if let Some(factory) = factory {
+            return factory().await;
         }
+        netwatch::netmon::Monitor::new().await.map_err(|error| {
+            crate::log_e!(LogType::Engine; "network_status_monitor_start", "error", format!("{error:?}"));
+            NetError::with_source(crate::error::ErrorKind::RuntimeUnavailable, error)
+                .with_stage(crate::error::ErrorStage::NetworkMonitor)
+        })
     }
 
     // ------------------------------------------------------------------
@@ -588,6 +581,7 @@ impl InnerNetStatusClient {
     // ------------------------------------------------------------------
 
     #[cfg(target_os = "windows")]
+    // 将 Windows 连接标志转为可达性，只认可 IPv4 或 IPv6 的 INTERNET 位。
     fn reachability_from_windows_connectivity(
         connectivity: windows::Win32::Networking::NetworkListManager::NLM_CONNECTIVITY,
     ) -> NetworkStatus {
@@ -605,6 +599,8 @@ impl InnerNetStatusClient {
     }
 
     #[cfg(target_os = "windows")]
+    // 同步查询 Windows NetworkListManager 的连接状态，系统调用失败返回 None 以便上层回退。
+    // 仅当本次成功初始化 COM 时进行配对反初始化，不释放其他调用方已有的 COM 初始化计数。
     fn windows_network_reachability() -> Option<NetworkStatus> {
         use windows::Win32::{
             Networking::NetworkListManager::{INetworkListManager, NetworkListManager},
@@ -640,12 +636,14 @@ impl InnerNetStatusClient {
     /// `NetworkListManager` connected-network name. Returns `None` when no
     /// connected network can be resolved.
     #[cfg(target_os = "windows")]
+    // 优先解析活动 Wi-Fi 的 SSID，无结果再查询首个已连接 Windows 网络的名称。
     fn query_current_network() -> Option<String> {
         Self::query_wifi_network().or_else(Self::query_windows_connected_network)
     }
 
     /// Query the active Wi-Fi SSID via `netsh wlan show interfaces`.
     #[cfg(target_os = "windows")]
+    // 无可见控制台地执行 netsh 并解析 Wi-Fi 名称；命令启动失败、退出失败或无 SSID 时返回 None。
     fn query_wifi_network() -> Option<String> {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
@@ -670,6 +668,7 @@ impl InnerNetStatusClient {
     /// Extract the `SSID` value from `netsh wlan show interfaces` output,
     /// ignoring the `BSSID` line and any empty value.
     #[cfg(target_os = "windows")]
+    // 从 netsh 文本中提取首个非空 SSID 值，忽略 BSSID 等其他键，找不到时返回 None。
     fn parse_netsh_wifi_ssid(output: &str) -> Option<String> {
         output.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -688,6 +687,7 @@ impl InnerNetStatusClient {
     /// COM API. COM is uninitialized on every exit path via an RAII guard, even
     /// on early returns.
     #[cfg(target_os = "windows")]
+    // 通过 COM 获取首个已连接网络的非空名称；查询失败返回 None，并由守卫配对释放本次 COM 初始化。
     fn query_windows_connected_network() -> Option<String> {
         use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
         use windows::Win32::Networking::NetworkListManager::{
@@ -697,8 +697,10 @@ impl InnerNetStatusClient {
             CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
         };
 
-        struct CoUninit(bool);
+        // 当前线程 COM 初始化的局部释放守卫，覆盖查询中所有提前返回路径。
+        struct CoUninit(bool); // 唯一字段：本次调用是否成功初始化 COM，决定析构时是否需要反初始化。
         impl Drop for CoUninit {
+            // 仅释放本次成功取得的 COM 初始化引用，保留其他线程模型或调用者已有的初始化状态。
             fn drop(&mut self) {
                 if self.0 {
                     unsafe { CoUninitialize() };
@@ -738,354 +740,12 @@ impl InnerNetStatusClient {
 }
 
 impl Drop for InnerNetStatusClient {
+    // 客户端析构时发出永久停止请求；Drop 不执行异步等待，资源回收由监控任务自行完成。
     fn drop(&mut self) {
         self.request_destroy();
     }
 }
 
 #[cfg(test)]
-mod tests {
-    //! Regression coverage for the reported production crash:
-    //!
-    //! ```text
-    //! there is no reactor running, must be called from the context of a Tokio 1.x runtime
-    //! ```
-    //!
-    //! It happened because a registered listener called `tokio::spawn`, and
-    //! `net_status` dispatched that listener on CommonEngine's callback thread pool —
-    //! bare OS workers with no ambient Tokio runtime. These tests exercise
-    //! [`InnerNetStatusClient::invoke_listener`], the single choke point every listener call
-    //! now flows through, on a non-runtime thread (exactly like a callback
-    //! worker).
-    use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Instant;
-
-    /// Build a single-threaded multi-thread runtime to hand to `invoke_listener`.
-    fn test_runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("build test runtime")
-    }
-
-    /// Spin-wait (off any runtime) until `flag` is set or the deadline passes.
-    fn wait_for(flag: &AtomicBool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        flag.load(Ordering::SeqCst)
-    }
-
-    #[test]
-    fn listener_calling_tokio_spawn_runs_instead_of_panicking_with_handle() {
-        // The exact pattern that crashed: the listener calls `tokio::spawn`.
-        // With a runtime handle entered, it must spawn successfully — no panic.
-        let runtime = test_runtime();
-        let handle = runtime.handle().clone();
-
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_in_task = Arc::clone(&ran);
-        let listener: SharedListener = Arc::new(move |_status| {
-            let ran = Arc::clone(&ran_in_task);
-            tokio::spawn(async move {
-                ran.store(true, Ordering::SeqCst);
-            });
-        });
-
-        // Runs on the current (non-runtime) thread, just like a callback worker.
-        InnerNetStatusClient::invoke_listener(Some(&handle), &listener, NetworkStatus::Available);
-
-        assert!(
-            wait_for(&ran),
-            "listener's tokio::spawn should have executed on the entered runtime"
-        );
-    }
-
-    #[test]
-    fn listener_calling_tokio_spawn_without_handle_is_contained() {
-        // No runtime handle available: the listener's `tokio::spawn` panics with
-        // the reported "there is no reactor running" message. `invoke_listener`
-        // must swallow it so the callback worker (and the process) survives.
-        let body_ran = Arc::new(AtomicBool::new(false));
-        let body_ran_in_listener = Arc::clone(&body_ran);
-        let listener: SharedListener = Arc::new(move |_status| {
-            body_ran_in_listener.store(true, Ordering::SeqCst);
-            // Panics: no ambient runtime on this thread.
-            tokio::spawn(async {});
-        });
-
-        // Must return normally despite the listener panicking internally.
-        InnerNetStatusClient::invoke_listener(None, &listener, NetworkStatus::Available);
-
-        assert!(
-            body_ran.load(Ordering::SeqCst),
-            "listener body must have been entered before the contained panic"
-        );
-    }
-
-    #[test]
-    fn arbitrary_listener_panic_is_contained() {
-        // Any panic from third-party listener code — not just a missing runtime
-        // — must be contained rather than unwinding through the callback worker.
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_in_listener = Arc::clone(&calls);
-        let listener: SharedListener = Arc::new(move |_status| {
-            calls_in_listener.fetch_add(1, Ordering::SeqCst);
-            panic!("listener blew up");
-        });
-
-        InnerNetStatusClient::invoke_listener(None, &listener, NetworkStatus::Available);
-        InnerNetStatusClient::invoke_listener(None, &listener, NetworkStatus::Unavailable);
-
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "both panicking invocations must have run and been contained"
-        );
-    }
-
-    #[test]
-    fn non_windows_reachability_truth_table_remains_netwatch_only() {
-        let cases = [
-            (false, false, false, NetworkStatus::Unavailable),
-            (false, true, false, NetworkStatus::Unavailable),
-            (false, false, true, NetworkStatus::Unavailable),
-            (false, true, true, NetworkStatus::Unavailable),
-            (true, false, false, NetworkStatus::Unavailable),
-            (true, true, false, NetworkStatus::Available),
-            (true, false, true, NetworkStatus::Available),
-            (true, true, true, NetworkStatus::Available),
-        ];
-
-        for (has_default_route, have_v4, have_v6, expected) in cases {
-            assert_eq!(
-                InnerNetStatusClient::reachability_from_flags(has_default_route, have_v4, have_v6),
-                expected,
-                "unexpected result for default_route={has_default_route}, v4={have_v4}, v6={have_v6}"
-            );
-        }
-    }
-
-    #[test]
-    fn unchanged_reachability_refreshes_ip_stack_without_dispatching() {
-        let state = Arc::new(Mutex::new(MonitorState::default()));
-        let dispatches = Arc::new(AtomicUsize::new(0));
-        let dispatches_in_callback = Arc::clone(&dispatches);
-        let dispatcher: Dispatcher = Arc::new(move |_listener, _status| {
-            dispatches_in_callback.fetch_add(1, Ordering::SeqCst);
-        });
-
-        InnerNetStatusClient::update_state_inner(
-            &state,
-            &dispatcher,
-            NetworkStatus::Unavailable,
-            IpStack::V6Only,
-        )
-        .expect("state update should succeed");
-
-        let guard = state.lock().expect("test state lock should remain healthy");
-        assert_eq!(guard.reachability, NetworkStatus::Unavailable);
-        assert_eq!(guard.ip_stack, IpStack::V6Only);
-        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn repeated_reachability_is_deduplicated_while_ip_stack_keeps_refreshing() {
-        let state = Arc::new(Mutex::new(MonitorState::default()));
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let observed_in_listener = Arc::clone(&observed);
-        let listener: SharedListener = Arc::new(move |status| {
-            observed_in_listener
-                .lock()
-                .expect("observed status lock should remain healthy")
-                .push(status);
-        });
-        {
-            let mut guard = state.lock().expect("test state lock should remain healthy");
-            let handle = guard.next_listener_handle();
-            guard.listeners.insert(handle, listener);
-        }
-        let dispatcher: Dispatcher = Arc::new(move |listener, status| listener(status));
-
-        InnerNetStatusClient::update_state_inner(
-            &state,
-            &dispatcher,
-            NetworkStatus::Available,
-            IpStack::V4Only,
-        )
-        .expect("first state update should succeed");
-        InnerNetStatusClient::update_state_inner(
-            &state,
-            &dispatcher,
-            NetworkStatus::Available,
-            IpStack::DualStack,
-        )
-        .expect("repeated state update should succeed");
-
-        assert_eq!(
-            *observed
-                .lock()
-                .expect("observed status lock should remain healthy"),
-            vec![NetworkStatus::Available]
-        );
-        let guard = state.lock().expect("test state lock should remain healthy");
-        assert_eq!(guard.ip_stack, IpStack::DualStack);
-    }
-
-    /// Install controllable completion channels instead of a native monitor so
-    /// lifecycle races can be tested without depending on a real NIC change.
-    fn install_pending_monitor(
-        client: &InnerNetStatusClient,
-    ) -> (
-        Arc<Mutex<MonitorState>>,
-        oneshot::Receiver<()>,
-        watch::Sender<bool>,
-    ) {
-        let state = Arc::new(Mutex::new(MonitorState::default()));
-        let active = Arc::clone(&state.lock().unwrap().active);
-        let (stop_sender, stop_receiver) = oneshot::channel();
-        let (_initial_sender, initial_state) = watch::channel(true);
-        let (finished_sender, finished) = watch::channel(false);
-        client.lifecycle.lock().unwrap().monitor = Some(MonitorRuntime {
-            stop_sender: Some(stop_sender),
-            initial_state,
-            finished,
-            state: Arc::clone(&state),
-            active,
-        });
-        (state, stop_receiver, finished_sender)
-    }
-
-    #[tokio::test]
-    async fn cancelled_shutdown_keeps_retiring_monitor_for_destroy_to_await() {
-        let engine = Arc::new(CommonEngine::new(16, 16).unwrap());
-        let client = InnerNetStatusClient::new(engine);
-        let (_state, mut stopped, finished) = install_pending_monitor(&client);
-
-        let mut shutdown = Box::pin(client.shutdown());
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => panic!("shutdown must await the monitor completion"),
-            _ = std::future::ready(()) => {}
-        }
-        assert_eq!(stopped.try_recv(), Ok(()));
-        drop(shutdown);
-        assert_eq!(client.lifecycle.lock().unwrap().stopping.len(), 1);
-
-        let mut destroy = Box::pin(client.destroy());
-        tokio::select! {
-            biased;
-            _ = &mut destroy => panic!("destroy must also await the cancelled shutdown's monitor"),
-            _ = std::future::ready(()) => {}
-        }
-        assert_eq!(client.start().await, Err(NetError::EngineDropped));
-        finished.send_replace(true);
-        tokio::time::timeout(Duration::from_secs(2), destroy)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[test]
-    fn stopped_monitor_cannot_overwrite_state_or_dispatch_after_restart() {
-        let engine = Arc::new(CommonEngine::new(16, 16).unwrap());
-        let client = InnerNetStatusClient::new(engine);
-        let (old_state, _old_stopped, old_finished) = install_pending_monitor(&client);
-        let listener: SharedListener = Arc::new(|_| {});
-        {
-            let mut old = old_state.lock().unwrap();
-            let handle = old.next_listener_handle();
-            old.listeners.insert(handle, listener);
-            old.reachability = NetworkStatus::Available;
-            old.ip_stack = IpStack::DualStack;
-        }
-        client.request_stop(false);
-        let (new_state, _new_stopped, new_finished) = install_pending_monitor(&client);
-        let dispatches = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&dispatches);
-        let dispatcher: Dispatcher = Arc::new(move |_, _| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        InnerNetStatusClient::update_state_inner(
-            &new_state,
-            &dispatcher,
-            NetworkStatus::Available,
-            IpStack::V6Only,
-        )
-        .unwrap();
-        InnerNetStatusClient::update_state_inner(
-            &old_state,
-            &dispatcher,
-            NetworkStatus::Available,
-            IpStack::V4Only,
-        )
-        .unwrap();
-        InnerNetStatusClient::update_reachability_inner(
-            &old_state,
-            &dispatcher,
-            NetworkStatus::Available,
-        )
-        .unwrap();
-        let old = old_state.lock().unwrap();
-        assert_eq!(old.reachability, NetworkStatus::Unavailable);
-        assert_eq!(old.ip_stack, IpStack::None);
-        assert!(old.listeners.is_empty());
-        drop(old);
-        assert_eq!(
-            new_state.lock().unwrap().reachability,
-            NetworkStatus::Available
-        );
-        assert_eq!(client.ip_stack(), Ok(IpStack::V6Only));
-        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
-        old_finished.send_replace(true);
-        new_finished.send_replace(true);
-    }
-
-    #[test]
-    fn stop_drops_listener_captures_outside_lifecycle_and_state_locks() {
-        struct ReenterOnDrop {
-            client: std::sync::Weak<InnerNetStatusClient>,
-            dropped: Arc<AtomicBool>,
-        }
-        impl Drop for ReenterOnDrop {
-            fn drop(&mut self) {
-                if let Some(client) = self.client.upgrade() {
-                    assert!(!client.is_started());
-                    assert_eq!(client.ip_stack(), Ok(IpStack::None));
-                }
-                self.dropped.store(true, Ordering::SeqCst);
-            }
-        }
-        let engine = Arc::new(CommonEngine::new(16, 16).unwrap());
-        let client = Arc::new(InnerNetStatusClient::new(engine));
-        let (_state, _stopped, finished) = install_pending_monitor(&client);
-        let dropped = Arc::new(AtomicBool::new(false));
-        let capture = ReenterOnDrop {
-            client: Arc::downgrade(&client),
-            dropped: Arc::clone(&dropped),
-        };
-        client
-            .register(Box::new(move |_| {
-                let _ = &capture;
-            }))
-            .unwrap();
-        client.request_destroy();
-        assert!(dropped.load(Ordering::SeqCst));
-        finished.send_replace(true);
-    }
-
-    #[test]
-    fn completion_guard_notifies_even_when_unpolled_task_is_dropped() {
-        let (sender, receiver) = watch::channel(false);
-        let completion = MonitorCompletion(sender);
-        let future = async move {
-            let _completion = completion;
-            std::future::pending::<()>().await;
-        };
-        drop(future);
-        assert!(*receiver.borrow());
-    }
-}
+#[path = "lifecycle_tests.rs"]
+mod tests;

@@ -8,10 +8,14 @@ use tokio::runtime::{Handle, Id};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const WAIT: Duration = Duration::from_secs(5);
 
+#[track_caller]
 fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
-    std::io::Error::other(message.into()).into()
+    let location = std::panic::Location::caller();
+    let message = message.into();
+    std::io::Error::other(format!("{location}: {message}")).into()
 }
 
+#[track_caller]
 fn common_error(error: CommonError) -> Box<dyn std::error::Error + Send + Sync> {
     test_error(format!("common execution failed: {error:?}"))
 }
@@ -34,6 +38,7 @@ async fn observe_runtime(value: usize) -> TestResult<(Id, usize)> {
     Ok((Handle::try_current()?.id(), value))
 }
 
+#[track_caller]
 fn check_observation(actual: (Id, usize), expected: (Id, usize)) -> TestResult {
     if actual != expected {
         return Err(test_error(

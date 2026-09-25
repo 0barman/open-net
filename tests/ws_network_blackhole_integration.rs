@@ -1,13 +1,19 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/session.rs"]
+mod session;
+use session::session_options;
+
 use futures::{SinkExt, StreamExt};
-use open_net::{
-    ConnectionStatus, NetError, OpenNet, ReconnectPolicy, WebSocketClient, WebSocketClientConfig,
-    WebSocketConnectOptions, WebSocketMessage, WsBody,
+use open_net::ws::{
+    ConnectOptions, ConnectionState, MessageReceiver, ReconnectPolicy, Session,
+    WebSocketClientConfig,
 };
+use open_net::OpenNet;
+
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -187,27 +193,26 @@ impl BlackholeRelay {
     }
 }
 
-fn one_attempt() -> WebSocketConnectOptions {
-    WebSocketConnectOptions {
-        reconnect: ReconnectPolicy {
-            enabled: false,
-            handshake_timeout: Duration::from_secs(2),
-            ..ReconnectPolicy::default()
-        },
-        ..WebSocketConnectOptions::default()
-    }
+fn one_attempt(url: &str) -> ConnectOptions {
+    let mut connect_options = session_options(url, ReconnectPolicy::Disabled);
+    connect_options.handshake_timeout = Duration::from_secs(2);
+    connect_options
 }
 
 async fn echo_roundtrip(
-    client: &WebSocketClient,
-    responses: &mut mpsc::Receiver<String>,
+    session: &Session,
+    responses: &mut MessageReceiver,
     payload: &str,
 ) -> TestResult {
-    bounded(client.send_message(WsBody::Text(payload.to_owned()))).await??;
+    bounded(session.sender().send(payload)).await??;
     let echoed = bounded(responses.recv())
-        .await?
-        .ok_or("echo callback channel closed")?;
-    if echoed != payload {
+        .await??
+        .ok_or("echo message stream closed")?;
+    if echoed.message().and_then(|message| match message {
+        open_net::ws::Message::Text(text) => Some(text.as_str()),
+        _ => None,
+    }) != Some(payload)
+    {
         return Err(format!("expected echoed {payload:?}, received {echoed:?}").into());
     }
     Ok(())
@@ -222,34 +227,25 @@ async fn real_tcp_blackhole_times_out_without_network_events_and_explicit_connec
     // events. All reachability detection in this test comes from actual WS I/O.
     let engine = OpenNet::new()?;
     let name = "real-tcp-blackhole";
-    let client = bounded(engine.create_ws_client_with_config(
-        name,
-        WebSocketClientConfig {
-            heartbeat_interval: HEARTBEAT_INTERVAL,
+    let client = bounded(engine.create_ws_client_with_config(name, {
+        let mut config = WebSocketClientConfig::default();
+        config.frames.control_write_timeout = WRITE_TIMEOUT;
+        config.frames.data_frame_write_timeout = WRITE_TIMEOUT;
+        config.close_timeout = Duration::from_millis(300);
+        config.requests.manual_response_grace = Duration::ZERO;
+        config.heartbeat = Some(open_net::ws::HeartbeatConfig {
+            interval: HEARTBEAT_INTERVAL,
             pong_timeout: PONG_TIMEOUT,
-            control_write_timeout: WRITE_TIMEOUT,
-            data_frame_write_timeout: WRITE_TIMEOUT,
-            close_timeout: Duration::from_millis(300),
-            response_dispatch_grace: Duration::ZERO,
-            ..WebSocketClientConfig::default()
-        },
-    ))
+        });
+        config
+    }))
     .await??;
-    let (response_tx, mut responses) = mpsc::channel(4);
-    let callback_failed = Arc::new(AtomicBool::new(false));
-    let callback_failure = Arc::clone(&callback_failed);
-    client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
-        if let WebSocketMessage::Text(text) = response.message() {
-            if response_tx.try_send(text.to_string()).is_err() {
-                callback_failure.store(true, Ordering::SeqCst);
-            }
-        }
-    }));
     let url = format!("ws://{}/blackhole", relay.address);
     let scenario: TestResult = async {
-        bounded(client.connect_with_options(&url, one_attempt())).await??;
-        echo_roundtrip(&client, &mut responses, "before-blackhole").await?;
-        if client.connection_status() != ConnectionStatus::Connected {
+        let mut session = bounded(client.connect(one_attempt(&url))).await??;
+        let mut responses = session.take_messages().ok_or("missing initial inbox")?;
+        echo_roundtrip(&session, &mut responses, "before-blackhole").await?;
+        if !matches!(session.state()?.state, ConnectionState::Connected(_)) {
             return Err("the initial echo did not leave a live connection".into());
         }
 
@@ -258,18 +254,26 @@ async fn real_tcp_blackhole_times_out_without_network_events_and_explicit_connec
             .await?
             .ok_or("relay ended before retaining its blackholed sockets")?;
         tokio::time::timeout(BLACKHOLE_BUDGET, async {
-            while client.connection_status() == ConnectionStatus::Connected {
+            while session
+                .state()
+                .is_ok_and(|s| matches!(s.state, ConnectionState::Connected(_)))
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await?;
-        if client.connection_status() != ConnectionStatus::Disconnected
-            || client.last_connection_error() != Some(NetError::SocketRecvTimeout)
+        if !matches!(session.state()?.state, ConnectionState::Closed(_))
+            || session
+                .state()?
+                .last_error
+                .as_ref()
+                .map(|error| error.kind())
+                != Some(open_net::error::ErrorKind::TimedOut)
         {
             return Err(format!(
                 "blackhole must fail through missing Pong: status={:?}, error={:?}",
-                client.connection_status(),
-                client.last_connection_error(),
+                session.state()?.state,
+                session.state()?.last_error,
             )
             .into());
         }
@@ -278,14 +282,16 @@ async fn real_tcp_blackhole_times_out_without_network_events_and_explicit_connec
         }
 
         relay.blackhole.send_replace(false);
-        bounded(client.connect_with_options(&url, one_attempt())).await??;
-        echo_roundtrip(&client, &mut responses, "after-explicit-reconnect").await?;
+        let mut session = bounded(client.connect(one_attempt(&url))).await??;
+        let mut responses = session.take_messages().ok_or("missing initial inbox")?;
+        echo_roundtrip(&session, &mut responses, "after-explicit-reconnect").await?;
         if relay.accepted.load(Ordering::SeqCst) != 2
-            || client.connection_status() != ConnectionStatus::Connected
-            || client.last_connection_error().is_some()
+            || !matches!(session.state()?.state, ConnectionState::Connected(_))
+            || session.state()?.last_error.is_some()
         {
             return Err("explicit recovery must use a new tunnel and clear the timeout".into());
         }
+        bounded(session.close()).await??;
         Ok(())
     }
     .await;
@@ -317,9 +323,6 @@ async fn real_tcp_blackhole_times_out_without_network_events_and_explicit_connec
         if let Err(error) = result {
             failures.push(format!("{stage}: {error}"));
         }
-    }
-    if callback_failed.load(Ordering::SeqCst) {
-        failures.push("data callback could not deliver its observation".to_owned());
     }
     if !failures.is_empty() {
         return Err(failures.join("; ").into());

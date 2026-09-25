@@ -1,12 +1,21 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/session.rs"]
+mod session;
+use open_net::ws::ConnectionEventKind;
+use session::{session_options, SessionGuard};
+
+#[path = "support/tls.rs"]
+mod tls_support;
+
 use futures::StreamExt;
-use open_net::{
-    ClientIdentity, ConnectionStatus, NetError, NetworkConfig, OpenNet, ProxyConfig,
-    ReconnectPolicy, RootCertificateMode, TlsConfig, WebSocketClient, WebSocketClientConfig,
-    WebSocketConnectOptions, WebSocketConnectionEventKind, WebSocketConnectionEvents,
-    WebSocketContextConnectOptions,
+use open_net::network::{
+    ClientIdentity, NetworkConfig, ProxyConfig, RootCertificateMode, TlsConfig,
 };
+use open_net::ws::{ConnectOptions, ReconnectPolicy, WebSocketClientConfig};
+use open_net::OpenNet;
+use session::ObservedSession;
+
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::future::Future;
@@ -32,28 +41,31 @@ async fn bounded<T>(future: impl Future<Output = T>) -> TestResult<T> {
 }
 
 fn client_config() -> WebSocketClientConfig {
-    WebSocketClientConfig {
-        close_timeout: Duration::from_millis(30),
-        ..WebSocketClientConfig::default()
+    {
+        let mut config = WebSocketClientConfig::default();
+        config.close_timeout = Duration::from_millis(30);
+        config
     }
 }
 
 fn reconnect(retries: usize) -> ReconnectPolicy {
-    ReconnectPolicy {
-        enabled: retries > 0,
-        max_retries: retries,
-        initial_delay: Duration::from_millis(1),
-        max_delay: Duration::from_millis(1),
-        max_elapsed: Some(Duration::from_secs(2)),
-        handshake_timeout: Duration::from_secs(1),
+    if retries > 0 {
+        ReconnectPolicy::Backoff(open_net::ws::BackoffConfig {
+            max_retries: retries,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            max_elapsed: Some(Duration::from_secs(2)),
+        })
+    } else {
+        ReconnectPolicy::Disabled
     }
 }
 
-fn options(retries: usize) -> WebSocketConnectOptions {
-    WebSocketConnectOptions {
-        reconnect: reconnect(retries),
-        ..WebSocketConnectOptions::default()
-    }
+fn options(url: &str, retries: usize) -> ConnectOptions {
+    let mut connect_options = session_options(url, reconnect(retries));
+    connect_options.handshake_timeout = Duration::from_secs(1);
+    connect_options.connect_timeout = Some(Duration::from_secs(2));
+    connect_options
 }
 
 fn proxy_config(address: SocketAddr) -> TestResult<NetworkConfig> {
@@ -241,15 +253,15 @@ async fn same_engine_routes_inherited_overridden_and_explicit_default_clients_in
     let url = origin.url();
     let (a, b, direct_result) = bounded(async {
         tokio::join!(
-            inherited.connect_with_options(&url, options(0)),
-            overridden.connect_with_options(&url, options(0)),
-            direct.connect_with_options(&url, options(0)),
+            SessionGuard::establish(&inherited, options(&url, 0)),
+            SessionGuard::establish(&overridden, options(&url, 0)),
+            SessionGuard::establish(&direct, options(&url, 0)),
         )
     })
     .await?;
-    a?;
-    b?;
-    direct_result?;
+    let _session_a = a?;
+    let _session_b = b?;
+    let _session_direct_result = direct_result?;
     for _ in 0..3 {
         origin.observe().await?;
     }
@@ -275,7 +287,7 @@ async fn mtls_origin() -> TestResult<(String, TaskGuard)> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from_pem_slice(CA)?)?;
     let server = Arc::new(
-        rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_client_cert_verifier(
                 rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -302,9 +314,16 @@ async fn mtls_origin() -> TestResult<(String, TaskGuard)> {
                     let (socket, _) = accepted?;
                     let server = Arc::clone(&server);
                     connections.spawn(async move {
-                        let stream = match tokio_rustls::TlsAcceptor::from(server).accept(socket).await {
+                        let stream = match tokio_rustls::TlsAcceptor::from(server)
+                            .accept(socket)
+                            .into_fallible()
+                            .await
+                        {
                             Ok(stream) => stream,
-                            Err(_) => return Ok(()),
+                            Err((_, mut socket)) => {
+                                tls_support::close_rejected_connection(&mut socket).await?;
+                                return Ok(());
+                            }
                         };
                         let mut ws = match tokio_tungstenite::accept_async(stream).await {
                             Ok(ws) => ws,
@@ -325,7 +344,7 @@ async fn mtls_origin() -> TestResult<(String, TaskGuard)> {
 }
 
 fn trust_with_identity(ca: &[u8], identity: bool) -> TestResult<NetworkConfig> {
-    let mut tls = TlsConfig::default().with_root_certificates(ca, RootCertificateMode::Only)?;
+    let mut tls = TlsConfig::default().with_root_certificates(ca, RootCertificateMode::Replace)?;
     if identity {
         tls = tls.with_client_identity(ClientIdentity::from_pem(CLIENT, CLIENT_KEY)?);
     }
@@ -364,10 +383,10 @@ async fn explicit_client_defaults_replace_engine_ca_and_identity_without_cross_c
         .await?;
     let (default_result, identity_result, other_ca_result, inherited_result) = bounded(async {
         tokio::join!(
-            explicit_default.connect_with_options(&url, options(0)),
-            no_identity.connect_with_options(&url, options(0)),
-            other_ca.connect_with_options(&url, options(0)),
-            inherited.connect_with_options(&url, options(0)),
+            SessionGuard::establish(&explicit_default, options(&url, 0)),
+            SessionGuard::establish(&no_identity, options(&url, 0)),
+            SessionGuard::establish(&other_ca, options(&url, 0)),
+            SessionGuard::establish(&inherited, options(&url, 0)),
         )
     })
     .await?;
@@ -383,10 +402,13 @@ async fn explicit_client_defaults_replace_engine_ca_and_identity_without_cross_c
     ] {
         engine.destroy_ws_client(name).await?;
     }
-    inherited_result?;
-    if default_result != Err(NetError::TlsConnectError)
-        || identity_result != Err(NetError::TlsConnectError)
-        || other_ca_result != Err(NetError::TlsConnectError)
+    inherited_result?.finish().await?;
+    if default_result.err().as_ref().map(|error| error.kind())
+        != Some(open_net::error::ErrorKind::Tls)
+        || identity_result.err().as_ref().map(|error| error.kind())
+            != Some(open_net::error::ErrorKind::Tls)
+        || other_ca_result.err().as_ref().map(|error| error.kind())
+            != Some(open_net::error::ErrorKind::Tls)
     {
         return Err(
             "engine trust roots or client identity leaked into replacement client configuration"
@@ -410,8 +432,8 @@ async fn client_ca_and_mtls_override_enables_tls_without_changing_engine_default
     let inherited = engine.create_ws_client("unchanged-default-trust").await?;
     let (accepted, rejected) = bounded(async {
         tokio::join!(
-            overridden.connect_with_options(&url, options(0)),
-            inherited.connect_with_options(&url, options(0)),
+            SessionGuard::establish(&overridden, options(&url, 0)),
+            SessionGuard::establish(&inherited, options(&url, 0)),
         )
     })
     .await?;
@@ -419,43 +441,39 @@ async fn client_ca_and_mtls_override_enables_tls_without_changing_engine_default
     bounded(inherited.shutdown()).await??;
     engine.destroy_ws_client("enabled-client-identity").await?;
     engine.destroy_ws_client("unchanged-default-trust").await?;
-    accepted?;
-    if rejected != Err(NetError::TlsConnectError) {
+    accepted?.finish().await?;
+    if rejected.err().as_ref().map(|error| error.kind()) != Some(open_net::error::ErrorKind::Tls) {
         return Err("client-specific TLS roots mutated the engine defaults".into());
     }
     Ok(())
 }
 
-async fn wait_connected(client: &WebSocketClient) -> TestResult {
+async fn expect_context_established(
+    events: &mut ObservedSession,
+    sequence: u64,
+) -> TestResult<open_net::ws::ConnectionInfo> {
     bounded(async {
-        loop {
-            if client.connection_status() == ConnectionStatus::Connected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let started = events.recv().await?.ok_or("context omitted Started")?;
+        let ConnectionEventKind::AttemptStarted { attempt } = &started.kind else {
+            return Err("context omitted Started".into());
+        };
+        let event = events
+            .recv()
+            .await?
+            .ok_or("context ended before connection")?;
+        let ConnectionEventKind::Established { connection } = &event.kind else {
+            return Err("context did not establish".into());
+        };
+        if started.sequence != sequence
+            || event.sequence != sequence + 1
+            || event.session_id != attempt.session_id
+            || event.client_id != attempt.client_id
+            || connection.attempt_id != attempt.attempt_id
+            || connection.cycle_id != attempt.cycle_id
+        {
+            return Err("context event sequence or actual attempt identity changed".into());
         }
-    })
-    .await
-}
-
-async fn expect_context_established(events: &mut WebSocketConnectionEvents) -> TestResult {
-    bounded(async {
-        for _ in 0..8 {
-            let event = events
-                .recv()
-                .await?
-                .ok_or("context session ended before connection")?;
-            if event.session_context_id() != 73 {
-                return Err("test received another context session's event".into());
-            }
-            if event.kind() == WebSocketConnectionEventKind::Established {
-                return Ok(());
-            }
-            if event.kind() == WebSocketConnectionEventKind::SessionTerminated {
-                return Err("context session failed before connection".into());
-            }
-        }
-        Err("context session did not establish within its event bound".into())
+        Ok(connection.clone())
     })
     .await?
 }
@@ -475,7 +493,7 @@ async fn client_proxy_override_survives_retry_reconnect_reuse_and_context_sessio
         .await?;
     let url = origin.url();
 
-    bounded(client.connect_with_options(&url, options(1))).await??;
+    let _session = bounded(SessionGuard::establish(&client, options(&url, 1))).await??;
     origin.observe().await?;
     origin.observe().await?;
     if proxy_b.count() != 2 || proxy_a.count() != 0 {
@@ -484,27 +502,53 @@ async fn client_proxy_override_survives_retry_reconnect_reuse_and_context_sessio
 
     origin.close.send(())?;
     origin.observe().await?;
-    wait_connected(&client).await?;
+    bounded(_session.session.wait_connected()).await??;
     if proxy_b.count() != 3 || proxy_a.count() != 0 {
         return Err("physical reconnect did not preserve the client proxy override".into());
     }
-    bounded(client.disconnect()).await??;
+    bounded(_session.session.close()).await??;
 
-    bounded(client.connect_with_options(&url, options(0))).await??;
+    let _session = bounded(SessionGuard::establish(&client, options(&url, 0))).await??;
     origin.observe().await?;
     if proxy_b.count() != 4 || proxy_a.count() != 0 {
         return Err("explicit reconnect did not preserve the client proxy override".into());
     }
-    bounded(client.disconnect()).await??;
+    bounded(_session.session.close()).await??;
 
-    let context = WebSocketContextConnectOptions::new(&url, 73)
-        .with_headers(Vec::new(), 74)
-        .with_reconnect(reconnect(1));
-    let mut events = bounded(client.start_connect_with_context(context)).await??;
-    expect_context_established(&mut events).await?;
+    let context = {
+        let mut connect_options = {
+            let mut options = {
+                let mut options = ConnectOptions::new(&url);
+                options.headers = open_net::HeaderMap::new();
+                options
+            };
+            options.reconnect = reconnect(1);
+            options
+        };
+        connect_options.handshake_timeout = Duration::from_secs(1);
+        connect_options.connect_timeout = Some(Duration::from_secs(2));
+        connect_options
+    };
+    let mut events = bounded(session::observe(&client, context)).await??;
+    let first = expect_context_established(&mut events, 1).await?;
     origin.observe().await?;
     origin.close.send(())?;
-    expect_context_established(&mut events).await?;
+    let ended = bounded(events.recv())
+        .await??
+        .ok_or("reconnect omitted Disconnected")?;
+    let ConnectionEventKind::Disconnected { connection, .. } = &ended.kind else {
+        return Err("reconnect omitted Disconnected".into());
+    };
+    if ended.sequence != 3 || connection.connection_id != first.connection_id {
+        return Err("reconnect changed original connection identity".into());
+    }
+    let second = expect_context_established(&mut events, 4).await?;
+    if second.session_id != first.session_id
+        || second.connection_id == first.connection_id
+        || second.cycle_id == first.cycle_id
+    {
+        return Err("reconnect did not preserve session and renew connection".into());
+    }
     origin.observe().await?;
     let final_routing = (proxy_a.count(), proxy_b.count());
     bounded(client.shutdown()).await??;
