@@ -13,18 +13,18 @@ impl OpenNetInner {
         thread_name: &str,
     ) -> Result<NetStatusClient, NetError> {
         if thread_name.contains('\0') {
-            return Err(NetError::ConfigError);
+            return Err(NetError::from(crate::error::ErrorKind::InvalidConfig));
         }
         let mut clients = self
             .net_status_clients
             .lock()
             .map_err(NetError::from_poison)?;
         if clients.contains_key(thread_name) {
-            return Err(NetError::ClientAlreadyExists);
+            return Err(NetError::from(crate::error::ErrorKind::ClientAlreadyExists));
         }
         // Construction only allocates the facade; monitoring starts explicitly.
         // Admission and publication are atomic and have no cancellation point.
-        let client = NetStatusClient::new(Arc::clone(&self.common_engine));
+        let client = NetStatusClient::new(Arc::clone(&self.common_engine))?;
         clients.insert(
             thread_name.to_owned(),
             NetStatusClientSlot::Ready(client.clone()),
@@ -42,8 +42,10 @@ impl OpenNetInner {
             .map_err(NetError::from_poison)?;
         match clients.get(thread_name) {
             Some(NetStatusClientSlot::Ready(client)) => Ok(client.clone()),
-            Some(NetStatusClientSlot::Closing(_)) => Err(NetError::ConnectionClosing),
-            None => Err(NetError::ClientNotFound),
+            Some(NetStatusClientSlot::Closing(_)) => {
+                Err(NetError::from(crate::error::ErrorKind::ConnectionClosing))
+            }
+            None => Err(NetError::from(crate::error::ErrorKind::ClientNotFound)),
         }
     }
 
@@ -58,8 +60,10 @@ impl OpenNetInner {
                 .map_err(NetError::from_poison)?;
             let client = match clients.get(thread_name) {
                 Some(NetStatusClientSlot::Ready(client)) => client.clone(),
-                Some(NetStatusClientSlot::Closing(_)) => return Err(NetError::ConnectionClosing),
-                None => return Err(NetError::ClientNotFound),
+                Some(NetStatusClientSlot::Closing(_)) => {
+                    return Err(NetError::from(crate::error::ErrorKind::ConnectionClosing))
+                }
+                None => return Err(NetError::from(crate::error::ErrorKind::ClientNotFound)),
             };
             clients.insert(
                 thread_name.to_owned(),
@@ -82,7 +86,7 @@ impl OpenNetInner {
         });
         completion
             .await
-            .map_err(|_| NetError::TaskInterruptionError)?
+            .map_err(|_| NetError::from(crate::error::ErrorKind::Internal))?
     }
 
     pub(super) fn stop_net_status_clients(&self) {

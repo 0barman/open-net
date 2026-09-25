@@ -1,14 +1,22 @@
 #![cfg(feature = "ws-client")]
 
-//! Exercise callback admission through a real socket and the public connection events.
-//! Tiny payloads and callback gates make both overload limits deterministic.
+#[path = "support/session.rs"]
+mod session;
+
+// Exercise callback admission through a real socket and the public connection events.
+// Tiny payloads and callback gates make both overload limits deterministic.
 
 use futures::{SinkExt, StreamExt};
-use open_net::{
-    ConnectionStatus, NetError, OpenNet, ReconnectPolicy, WebSocketClient, WebSocketClientConfig,
-    WebSocketConnectStage, WebSocketConnectionEvent, WebSocketConnectionEventKind as Kind,
-    WebSocketConnectionEvents, WebSocketContextConnectOptions, WebSocketTerminationReason,
-};
+use open_net::error::ErrorStage;
+use open_net::subscription::Subscription;
+use open_net::ws::ConnectionEvent;
+use open_net::ws::ConnectionEventKind as Kind;
+use open_net::ws::TerminationReason;
+use open_net::ws::{ConnectOptions, ReconnectPolicy, WebSocketClientConfig};
+use open_net::ws::{ConnectionId, ConnectionState, Message as DataMessage, Session};
+use open_net::{OpenNet, WebSocketClient};
+use session::ObservedSession;
+
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -20,10 +28,14 @@ type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 type Peer = WebSocketStream<TcpStream>;
 
+#[track_caller]
 fn error(message: impl Into<String>) -> TestError {
-    std::io::Error::other(message.into()).into()
+    let location = std::panic::Location::caller();
+    let message = message.into();
+    std::io::Error::other(format!("{location}: {message}")).into()
 }
 
+#[track_caller]
 fn check(condition: bool, message: &str) -> TestResult {
     if condition {
         Ok(())
@@ -82,30 +94,32 @@ impl Drop for ReleaseOnDrop {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Observation {
-    generation: u64,
+    generation: ConnectionId,
     payload: Vec<u8>,
 }
 
 struct Probe {
     gate: Gate,
     _release: ReleaseOnDrop,
+    _subscription: Subscription,
     entered: mpsc::Receiver<Observation>,
     finished: mpsc::Receiver<TestResult<Observation>>,
 }
 
 impl Probe {
-    fn install(client: &WebSocketClient) -> Self {
+    fn install(session: &mut Session) -> TestResult<Self> {
         let gate = Gate::new();
         let callback_gate = gate.clone();
         let (entered_tx, entered) = mpsc::channel(8);
         let (finished_tx, finished) = mpsc::channel(8);
-        client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
+        let subscription = session.on_message(move |_context, response| {
             let result = (|| -> TestResult<Observation> {
-                let Message::Binary(payload) = response.message() else {
+                let response = response?;
+                let Some(DataMessage::Binary(payload)) = response.message() else {
                     return Err(error("unexpected non-binary callback payload"));
                 };
                 let observation = Observation {
-                    generation: response.connection_generation(),
+                    generation: response.connection_id(),
                     payload: payload.to_vec(),
                 };
                 entered_tx.try_send(observation.clone())?;
@@ -117,16 +131,17 @@ impl Probe {
             if let Err(cause) = finished_tx.try_send(result) {
                 eprintln!("callback result observation failed: {cause}");
             }
-        }));
-        Self {
+        })?;
+        Ok(Self {
             _release: ReleaseOnDrop(gate.clone()),
+            _subscription: subscription,
             gate,
             entered,
             finished,
-        }
+        })
     }
 
-    async fn entered_payload(&mut self, payload: &[u8]) -> TestResult<u64> {
+    async fn entered_payload(&mut self, payload: &[u8]) -> TestResult<ConnectionId> {
         let observation = bounded("callback entered", self.entered.recv())
             .await?
             .ok_or_else(|| error("callback entry channel closed"))?;
@@ -137,14 +152,14 @@ impl Probe {
         Ok(observation.generation)
     }
 
-    async fn entered(&mut self, generation: u64, payload: &[u8]) -> TestResult {
+    async fn entered(&mut self, generation: ConnectionId, payload: &[u8]) -> TestResult {
         check(
             self.entered_payload(payload).await? == generation,
             "callbacks from the same socket used different response generations",
         )
     }
 
-    async fn finished(&mut self, generation: u64, payload: &[u8]) -> TestResult {
+    async fn finished(&mut self, generation: ConnectionId, payload: &[u8]) -> TestResult {
         let observation = bounded("callback completed", self.finished.recv())
             .await?
             .ok_or_else(|| error("callback completion channel closed"))??;
@@ -156,15 +171,18 @@ impl Probe {
 }
 
 fn config(capacity: usize, bytes: usize) -> WebSocketClientConfig {
-    WebSocketClientConfig {
-        callback_queue_capacity: capacity,
-        callback_queue_max_bytes: bytes,
-        data_callback_concurrency: 1,
-        response_dispatch_grace: Duration::from_millis(40),
-        close_timeout: Duration::from_millis(40),
-        heartbeat_interval: Duration::from_secs(60),
-        pong_timeout: Duration::from_secs(120),
-        ..WebSocketClientConfig::default()
+    {
+        let mut config = WebSocketClientConfig::default();
+        config.dispatch.incoming.max_items = capacity;
+        config.dispatch.incoming.max_bytes = bytes;
+        config.dispatch.message_callback_workers = 1;
+        config.requests.manual_response_grace = Duration::from_millis(40);
+        config.close_timeout = Duration::from_millis(40);
+        config.heartbeat = Some(open_net::ws::HeartbeatConfig {
+            interval: Duration::from_secs(60),
+            pong_timeout: Duration::from_secs(120),
+        });
+        config
     }
 }
 
@@ -172,21 +190,33 @@ async fn connect(
     client: &WebSocketClient,
     listener: &TcpListener,
     reconnect: bool,
-) -> TestResult<WebSocketConnectionEvents> {
-    let options =
-        WebSocketContextConnectOptions::new(format!("ws://{}", listener.local_addr()?), 111)
-            .with_headers(Vec::new(), 222)
-            .with_reconnect(ReconnectPolicy {
-                enabled: reconnect,
-                max_retries: 1,
-                initial_delay: Duration::from_millis(1),
-                max_delay: Duration::from_millis(1),
-                max_elapsed: Some(Duration::from_secs(3)),
-                handshake_timeout: Duration::from_secs(3),
-            });
+) -> TestResult<ObservedSession> {
+    let options = {
+        let mut connect_options = {
+            let mut options = {
+                let mut options = ConnectOptions::new(format!("ws://{}", listener.local_addr()?));
+                options.headers = open_net::HeaderMap::new();
+                options
+            };
+            options.reconnect = if reconnect {
+                ReconnectPolicy::Backoff(open_net::ws::BackoffConfig {
+                    max_retries: 1,
+                    initial_delay: Duration::from_millis(1),
+                    max_delay: Duration::from_millis(1),
+                    max_elapsed: Some(Duration::from_secs(3)),
+                })
+            } else {
+                ReconnectPolicy::Disabled
+            };
+            options
+        };
+        connect_options.handshake_timeout = Duration::from_secs(3);
+        connect_options.connect_timeout = Some(Duration::from_secs(3));
+        connect_options
+    };
     Ok(bounded(
         "start context connection",
-        client.start_connect_with_context(options),
+        session::observe(&client, options),
     )
     .await??)
 }
@@ -200,78 +230,83 @@ async fn accept(listener: &TcpListener) -> TestResult<Peer> {
     .await??)
 }
 
-async fn next(events: &mut WebSocketConnectionEvents) -> TestResult<WebSocketConnectionEvent> {
+async fn next(events: &mut ObservedSession) -> TestResult<ConnectionEvent> {
     bounded("connection event", events.recv())
         .await??
         .ok_or_else(|| error("connection events ended early"))
 }
 
-async fn established(
-    events: &mut WebSocketConnectionEvents,
-) -> TestResult<WebSocketConnectionEvent> {
+async fn established(events: &mut ObservedSession) -> TestResult<ConnectionEvent> {
+    let started = next(events).await?;
+    let Kind::AttemptStarted { attempt } = &started.kind else {
+        return Err(error("expected Started"));
+    };
     let event = next(events).await?;
-    check(event.kind() == Kind::Established, "expected Established")?;
+    let Kind::Established { connection } = &event.kind else {
+        return Err(error("expected Established"));
+    };
     check(
-        event.session_context_id() == 111 && event.attempt_context_id() == Some(222),
-        "handshake context was changed",
+        event.sequence == started.sequence + 1
+            && connection.attempt_id == attempt.attempt_id
+            && connection.cycle_id == attempt.cycle_id
+            && event.session_id == attempt.session_id
+            && connection.credential_version.is_none(),
+        "handshake attempt identity or order changed",
     )?;
-    check(event.failure().is_none(), "Established contained failure")?;
     Ok(event)
 }
 
 async fn overflow(
-    events: &mut WebSocketConnectionEvents,
-    established: WebSocketConnectionEvent,
-) -> TestResult<WebSocketConnectionEvent> {
+    events: &mut ObservedSession,
+    established: &ConnectionEvent,
+) -> TestResult<ConnectionEvent> {
+    let Kind::Established {
+        connection: original,
+    } = &established.kind
+    else {
+        return Err(error("expected original Established"));
+    };
     let event = next(events).await?;
+    let Kind::Disconnected { connection, end } = &event.kind else {
+        return Err(error("overflow omitted Disconnected"));
+    };
     check(
-        event.kind() == Kind::ConnectionTerminated
-            && event.cycle_id() == established.cycle_id()
-            && event.session_id() == established.session_id()
-            && event.client_instance_id() == established.client_instance_id()
-            && event.session_context_id() == established.session_context_id()
-            && event.sequence()
-                == established
-                    .sequence()
-                    .checked_add(1)
-                    .ok_or_else(|| error("sequence overflow"))?,
-        "overflow lost its original connection identity or event sequence",
+        connection.connection_id == original.connection_id
+            && connection.cycle_id == original.cycle_id
+            && event.session_id == established.session_id
+            && event.client_id == established.client_id
+            && event.sequence == established.sequence + 1,
+        "overflow lost original connection identity or event sequence",
     )?;
     check(
-        event.termination_reason() == Some(WebSocketTerminationReason::IoFailure)
-            && event.failure().is_some_and(|failure| {
-                failure.error() == NetError::CallbackQueueOverflow
-                    && failure.stage() == WebSocketConnectStage::WebSocketIo
+        end.reason == TerminationReason::IoFailure
+            && end.error.as_ref().is_some_and(|failure| {
+                failure.kind() == open_net::error::ErrorKind::CallbackOverflow
+                    && failure.context().stage == Some(ErrorStage::Receive)
             }),
         "raw callback overflow did not produce the explicit I/O failure",
     )?;
     Ok(event)
 }
 
-async fn session_ended(
-    events: &mut WebSocketConnectionEvents,
-    previous: WebSocketConnectionEvent,
-) -> TestResult {
+async fn session_ended(events: &mut ObservedSession, previous: ConnectionEvent) -> TestResult {
+    let Kind::Disconnected { connection, .. } = &previous.kind else {
+        return Err(error("expected previous Disconnected"));
+    };
     let event = next(events).await?;
     check(
-        event.kind() == Kind::SessionTerminated
-            && event.session_id() == previous.session_id()
-            && event.cycle_id() == previous.cycle_id()
-            && event.sequence()
-                == previous
-                    .sequence()
-                    .checked_add(1)
-                    .ok_or_else(|| error("sequence overflow"))?
-            && event
-                .failure()
-                .is_some_and(|failure| failure.error() == NetError::CallbackQueueOverflow),
+        event.session_id == previous.session_id
+            && event.sequence == previous.sequence + 1
+            && matches!(&event.kind, Kind::Closed { result: Err(failure) }
+            if failure.kind() == open_net::error::ErrorKind::CallbackOverflow
+                && failure.context().connection_id == Some(connection.connection_id)),
         "disabled reconnect omitted or changed the overload terminal event",
     )?;
     check(
         bounded("session event EOF", events.recv())
             .await??
             .is_none(),
-        "events appeared after SessionTerminated",
+        "events appeared after Closed",
     )
 }
 
@@ -285,7 +320,7 @@ async fn send(peer: &mut Peer, payload: &[u8]) -> TestResult {
 }
 
 /// A returned Pong proves the reader processed every preceding data message.
-/// The blocked callback is still holding its bytes while this protocol reply runs.
+/// Data callbacks stay blocked while the reader sends this protocol reply.
 async fn ping_fence(peer: &mut Peer) -> TestResult {
     let payload = b"callback-budget-fence";
     bounded(
@@ -326,9 +361,9 @@ async fn raw_count_overflow_is_observable_and_shutdown_does_not_wait_for_blocked
         net.create_ws_client_with_config(NAME, config(1, 16)),
     )
     .await??;
-    let mut probe = Probe::install(&client);
+    let mut events = connect(&client, &listener, false).await?;
+    let mut probe = Probe::install(&mut events.session)?;
     let outcome = async {
-        let mut events = connect(&client, &listener, false).await?;
         let mut peer = accept(&listener).await?;
         let opened = established(&mut events).await?;
         send(&mut peer, b"A").await?;
@@ -336,11 +371,17 @@ async fn raw_count_overflow_is_observable_and_shutdown_does_not_wait_for_blocked
         send(&mut peer, b"B").await?;
         ping_fence(&mut peer).await?;
         send(&mut peer, b"C").await?;
-        let ended = overflow(&mut events, opened).await?;
+        let ended = overflow(&mut events, &opened).await?;
         session_ended(&mut events, ended).await?;
         check(
-            client.connection_status() == ConnectionStatus::Disconnected
-                && client.last_connection_error() == Some(NetError::CallbackQueueOverflow),
+            matches!(events.session.state()?.state, ConnectionState::Closed(_))
+                && events
+                    .session
+                    .state()?
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.kind())
+                    == Some(open_net::error::ErrorKind::CallbackOverflow),
             "public connection snapshot lost the callback overflow",
         )?;
         bounded(
@@ -348,10 +389,7 @@ async fn raw_count_overflow_is_observable_and_shutdown_does_not_wait_for_blocked
             client.shutdown(),
         )
         .await??;
-        check(
-            client.connection_status() == ConnectionStatus::Closed,
-            "shutdown did not reach Closed",
-        )?;
+        check(client.is_shutdown(), "shutdown did not reach Closed")?;
         probe.gate.release();
         probe.finished(generation, b"A").await?;
         Ok(())
@@ -370,28 +408,38 @@ async fn raw_cumulative_byte_overflow_preserves_admitted_data_and_protocol_pong(
         net.create_ws_client_with_config(NAME, config(4, 5)),
     )
     .await??;
-    let mut probe = Probe::install(&client);
+    let mut events = connect(&client, &listener, false).await?;
+    let mut probe = Probe::install(&mut events.session)?;
     let outcome = async {
-        let mut events = connect(&client, &listener, false).await?;
         let mut peer = accept(&listener).await?;
         let opened = established(&mut events).await?;
         send(&mut peer, b"AAA").await?;
         let generation = probe.entered_payload(b"AAA").await?;
         send(&mut peer, b"BB").await?;
+        send(&mut peer, b"CCC").await?;
         ping_fence(&mut peer).await?;
         // Queue capacity is four, and every individual payload is <= five bytes.
-        // Only the combined running + queued byte budget rejects this final byte.
-        send(&mut peer, b"C").await?;
-        let ended = overflow(&mut events, opened).await?;
+        // V2 counts queued bytes; the running callback has already released its quota.
+        // The two queued messages exhaust all five bytes and reject one more.
+        send(&mut peer, b"D").await?;
+        let ended = overflow(&mut events, &opened).await?;
         session_ended(&mut events, ended).await?;
         check(
-            client.last_connection_error() == Some(NetError::CallbackQueueOverflow),
+            events
+                .session
+                .state()?
+                .last_error
+                .as_ref()
+                .map(|error| error.kind())
+                == Some(open_net::error::ErrorKind::CallbackOverflow),
             "byte overflow error was not retained",
         )?;
         probe.gate.release();
         probe.finished(generation, b"AAA").await?;
         probe.entered(generation, b"BB").await?;
         probe.finished(generation, b"BB").await?;
+        probe.entered(generation, b"CCC").await?;
+        probe.finished(generation, b"CCC").await?;
         bounded("shutdown drained byte overflow", client.shutdown()).await??;
         check(
             matches!(
@@ -417,49 +465,52 @@ async fn raw_byte_budget_is_shared_across_reconnects_and_recovers_after_callback
         net.create_ws_client_with_config(NAME, config(4, 6)),
     )
     .await??;
-    let mut probe = Probe::install(&client);
+    let mut events = connect(&client, &listener, true).await?;
+    let mut probe = Probe::install(&mut events.session)?;
     let outcome = async {
-        let mut events = connect(&client, &listener, true).await?;
         let mut old_peer = accept(&listener).await?;
         let first = established(&mut events).await?;
         send(&mut old_peer, b"AAAA").await?;
         let old_generation = probe.entered_payload(b"AAAA").await?;
+        send(&mut old_peer, b"BBBB").await?;
         ping_fence(&mut old_peer).await?;
         drop(old_peer);
         let lost = next(&mut events).await?;
         check(
-            lost.kind() == Kind::ConnectionTerminated && lost.cycle_id() == first.cycle_id(),
+            matches!((&lost.kind, &first.kind), (Kind::Disconnected { connection, .. }, Kind::Established { connection: original }) if connection.connection_id == original.connection_id)
+                && lost.sequence == first.sequence + 1,
             "old socket termination lost its generation",
         )?;
 
         let mut overloaded_peer = accept(&listener).await?;
         let second = established(&mut events).await?;
         check(
-            second.session_id() == first.session_id() && second.cycle_id() != first.cycle_id(),
+            second.session_id == first.session_id && second.sequence == lost.sequence + 2
+                && matches!((&second.kind, &first.kind), (Kind::Established { connection }, Kind::Established { connection: original }) if connection.cycle_id != original.cycle_id),
             "automatic reconnect replaced the session or reused its generation",
         )?;
-        // The old callback retains four of six bytes. A fresh per-connection
-        // budget would incorrectly admit this valid three-byte message.
-        send(&mut overloaded_peer, b"BBB").await?;
-        let ended = overflow(&mut events, second).await?;
+        // An older queued message retains four of six bytes across reconnect.
+        // A fresh per-connection budget would wrongly admit this three-byte message.
+        send(&mut overloaded_peer, b"EEE").await?;
+        let ended = overflow(&mut events, &second).await?;
         check(
-            ended
-                .failure()
-                .is_some_and(|failure| failure.error() == NetError::CallbackQueueOverflow),
+            matches!(&ended.kind, Kind::Disconnected { end, .. } if end.error.as_ref().is_some_and(|failure| failure.kind() == open_net::error::ErrorKind::CallbackOverflow)),
             "reconnect did not share the original byte budget",
         )?;
         drop(overloaded_peer);
         probe.gate.release();
         probe.finished(old_generation, b"AAAA").await?;
+        probe.entered(old_generation, b"BBBB").await?;
+        probe.finished(old_generation, b"BBBB").await?;
 
         let mut recovered_peer = accept(&listener).await?;
         let third = established(&mut events).await?;
         check(
-            third.session_id() == first.session_id() && third.cycle_id() != second.cycle_id(),
+            third.session_id == first.session_id && third.sequence == ended.sequence + 2
+                && matches!((&third.kind, &second.kind), (Kind::Established { connection }, Kind::Established { connection: original }) if connection.cycle_id != original.cycle_id),
             "budget recovery changed session identity",
         )?;
-        // This probe fits even before the completed old callback's waiter is
-        // polled. Its entry proves the serial dispatcher reclaimed the old lease.
+        // Draining the older queued message frees the shared quota for this connection.
         send(&mut recovered_peer, b"CC").await?;
         let recovered_generation = probe.entered_payload(b"CC").await?;
         check(
@@ -472,10 +523,11 @@ async fn raw_byte_budget_is_shared_across_reconnects_and_recovers_after_callback
         probe.finished(recovered_generation, b"DDDD").await?;
         ping_fence(&mut recovered_peer).await?;
         check(
-            client.connection_status() == ConnectionStatus::Connected,
+            matches!(events.session.state()?.state, ConnectionState::Connected(_)),
             "released callback budget did not recover the live connection",
         )?;
-        bounded("cancel recovered session", events.cancel()).await??;
+        events.session.cancel();
+        let _ = bounded("cancel recovered session", events.session.closed()).await?;
         bounded("shutdown recovered budget client", client.shutdown()).await??;
         Ok(())
     }

@@ -294,4 +294,70 @@ mod tests {
         )?;
         Ok(())
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_generation_and_sequence_probes_cannot_change_current_probe() -> TestResult {
+        let timeout = Duration::from_secs(5);
+        for stale_source in ["previous-generation", "previous-sequence"] {
+            let heartbeat = HeartbeatState::new(42);
+            let previous_generation = HeartbeatState::new(41);
+            let now = Instant::now();
+            let stale_state = if stale_source == "previous-generation" {
+                &previous_generation
+            } else {
+                &heartbeat
+            };
+            let HeartbeatTick::SendProbe(stale) = stale_state.on_tick(now, timeout) else {
+                return Err(test_error("stale fixture did not create a real probe"));
+            };
+            if stale_source == "previous-sequence" {
+                check!(heartbeat.acknowledge_pong(&stale))?;
+            }
+            let HeartbeatTick::SendProbe(current) = heartbeat.on_tick(now, timeout) else {
+                return Err(test_error("current fixture did not create a real probe"));
+            };
+            check!(
+                !heartbeat.mark_sent(&stale, now),
+                "{stale_source}: stale probe marked the current Sending probe sent"
+            )?;
+            check_eq!(heartbeat.pong_deadline(), None)?;
+            check!(
+                !heartbeat.acknowledge_pong(&stale),
+                "{stale_source}: stale Pong cleared the current Sending probe"
+            )?;
+            check_eq!(heartbeat.on_tick(now, timeout), HeartbeatTick::Waiting)?;
+            check!(heartbeat.mark_sent(&current, now))?;
+            let deadline = now
+                .checked_add(timeout)
+                .ok_or_else(|| test_error("bounded probe deadline was not representable"))?;
+            check_eq!(heartbeat.pong_deadline(), Some(deadline))?;
+            check!(
+                !heartbeat.acknowledge_pong(&stale),
+                "{stale_source}: stale Pong cleared the current AwaitingPong probe"
+            )?;
+            check_eq!(heartbeat.pong_deadline(), Some(deadline))?;
+            heartbeat.abandon_probe(&stale);
+            check_eq!(
+                heartbeat.pong_deadline(),
+                Some(deadline),
+                "{stale_source}: stale failure abandoned the current probe"
+            )?;
+            tokio::time::advance(Duration::from_secs(4)).await;
+            check!(!heartbeat.is_timed_out(Instant::now()))?;
+            check!(!heartbeat.mark_sent(&stale, Instant::now()))?;
+            check!(!heartbeat.acknowledge_pong(&stale))?;
+            check_eq!(heartbeat.pong_deadline(), Some(deadline))?;
+            tokio::time::advance(Duration::from_secs(1)).await;
+            check!(heartbeat.is_timed_out(Instant::now()))?;
+            check!(!heartbeat.acknowledge_pong(&current))?;
+            check_eq!(
+                heartbeat.on_tick(Instant::now(), timeout),
+                HeartbeatTick::TimedOut
+            )?;
+            println!(
+                "T19_STALE_PROBE source={stale_source} sending_unchanged=true deadline_unchanged=true expired_at_original_deadline=true"
+            );
+        }
+        Ok(())
+    }
 }

@@ -7,8 +7,11 @@ use tokio::sync::oneshot;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const WAIT: Duration = Duration::from_secs(5);
 
+#[track_caller]
 fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
-    std::io::Error::other(message.into()).into()
+    let location = std::panic::Location::caller();
+    let message = message.into();
+    std::io::Error::other(format!("{location}: {message}")).into()
 }
 
 async fn wait_for_last_owner<T: Send + Sync + 'static>(owner: Arc<T>) -> TestResult<Arc<T>> {

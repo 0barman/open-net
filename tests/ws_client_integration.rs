@@ -1,109 +1,35 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/session.rs"]
+mod session;
+use session::{session_options, SessionGuard};
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn check(condition: bool, message: &str) -> TestResult {
+    if condition {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(message).into())
+    }
+}
+
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use open_net::{
-    ConnectionStatus, NetError, OpenNet, ReconnectPolicy, WSRequestConfig, WSRequestTrait,
-    WebSocketClientConfig, WebSocketConnectOptions, WebSocketMessage, WsBody,
-};
+use open_net::ws::{ConnectionState, Message as NetMessage, RequestOptions, ResolveOutcome};
+use open_net::OpenNet;
+#[path = "support/v2_peer.rs"]
+mod v2;
+use open_net::ws::{ReconnectPolicy, WebSocketClientConfig};
+
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::{handshake::derive_accept_key, Message};
-
-struct TestRequest {
-    id: String,
-    payload: String,
-}
-
-impl TestRequest {
-    fn new(id: &str, payload: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            payload: payload.to_string(),
-        }
-    }
-}
-
-impl WSRequestTrait for TestRequest {
-    fn request_extension(&self) -> HashMap<String, String> {
-        HashMap::from([("payload".to_string(), self.payload.clone())])
-    }
-
-    fn uuid(&self) -> String {
-        self.id.clone()
-    }
-
-    fn body(&self) -> Result<WsBody, NetError> {
-        Ok(WsBody::Text(
-            json!({"request_id": self.id, "payload": self.payload}).to_string(),
-        ))
-    }
-}
-
-struct BinaryRequest {
-    id: String,
-    payload: Bytes,
-}
-
-impl WSRequestTrait for BinaryRequest {
-    fn uuid(&self) -> String {
-        self.id.clone()
-    }
-
-    fn body(&self) -> Result<WsBody, NetError> {
-        Ok(WsBody::Binary(self.payload.clone()))
-    }
-}
-
-async fn start_echo_server() -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind echo server");
-    let address = listener.local_addr().expect("echo server address");
-    let handle = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept echo connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("upgrade echo connection");
-        while let Some(message) = socket.next().await {
-            match message.expect("read echo message") {
-                Message::Text(text) => {
-                    let value: Value = serde_json::from_str(text.as_str()).expect("request JSON");
-                    socket
-                        .send(Message::Text(
-                            json!({
-                                "request_id": value["request_id"],
-                                "payload": value["payload"],
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await
-                        .expect("send echo response");
-                }
-                Message::Ping(payload) => {
-                    socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .expect("send pong");
-                }
-                Message::Close(frame) => {
-                    let _ = socket.send(Message::Close(frame)).await;
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-    (format!("ws://{address}"), handle)
-}
 
 #[derive(Debug)]
 struct RawWebSocketFrame {
@@ -194,40 +120,24 @@ async fn send_raw_control_frame(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_registry_rejects_duplicates_and_destroy_closes_handles() {
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client(" \tregistry-test\n ")
-        .await
-        .expect("create client");
-    let statuses = Arc::new(Mutex::new(Vec::new()));
-    let status_sink = Arc::clone(&statuses);
-    client.register_web_socket_client_connect_status_listener(Box::new(move |status| {
-        status_sink.lock().expect("status lock").push(status);
-    }));
-    let duplicate = open_net.create_ws_client("registry-test").await;
-    assert!(matches!(duplicate, Err(NetError::ClientAlreadyExists)));
-    assert_eq!(
-        open_net
-            .get_ws_client("registry-test")
-            .expect("get client")
-            .connection_status(),
-        ConnectionStatus::Idle
-    );
-
-    open_net
-        .destroy_ws_client("registry-test")
-        .await
-        .expect("destroy client");
-    assert_eq!(client.connection_status(), ConnectionStatus::Closed);
-    assert_eq!(
-        statuses.lock().expect("status lock").last().copied(),
-        Some(ConnectionStatus::Closed)
-    );
-    assert!(matches!(
-        open_net.get_ws_client("registry-test"),
-        Err(NetError::ClientNotFound)
-    ));
+async fn client_registry_rejects_duplicates_and_destroy_closes_handles() -> TestResult {
+    let open_net = OpenNet::new()?;
+    let client = open_net.create_ws_client(" \tregistry-test\n ").await?;
+    check(
+        matches!(open_net.create_ws_client("registry-test").await,Err(e) if e.kind()==open_net::error::ErrorKind::ClientAlreadyExists),
+        "duplicate accepted",
+    )?;
+    check(
+        open_net.get_ws_client("registry-test")?.id() == client.id(),
+        "registry changed client identity",
+    )?;
+    open_net.destroy_ws_client("registry-test").await?;
+    check(client.is_shutdown(), "destroy did not close handles")?;
+    check(
+        matches!(open_net.get_ws_client("registry-test"),Err(e) if e.kind()==open_net::error::ErrorKind::ClientNotFound),
+        "name remained reserved",
+    )?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -236,56 +146,49 @@ async fn client_creation_rejects_empty_and_whitespace_names() {
     for name in ["", " \t\n "] {
         assert!(matches!(
             open_net.create_ws_client(name).await,
-            Err(NetError::ParameterEmpty)
-        ));
+            Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), open_net::error::ErrorKind::InvalidInput)));
         assert!(matches!(
             open_net
                 .create_ws_client_with_config(name, WebSocketClientConfig::default())
                 .await,
-            Err(NetError::ParameterEmpty)
-        ));
+            Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), open_net::error::ErrorKind::InvalidInput)));
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn invalid_client_config_releases_name_for_retry() {
-    let open_net = OpenNet::new().expect("create open net");
+async fn invalid_client_config_releases_name_for_retry() -> TestResult {
+    let open_net = OpenNet::new()?;
     let invalid = open_net
-        .create_ws_client_with_config(
-            " \tconfig-retry-test\n ",
-            WebSocketClientConfig {
-                callback_queue_capacity: 0,
-                ..WebSocketClientConfig::default()
-            },
-        )
+        .create_ws_client_with_config(" \tconfig-retry-test\n ", {
+            let mut config = WebSocketClientConfig::default();
+            config.dispatch.incoming.max_items = 0;
+            config
+        })
         .await;
-    assert!(matches!(invalid, Err(NetError::ConfigError)));
-    assert!(matches!(
-        open_net.get_ws_client("config-retry-test"),
-        Err(NetError::ClientNotFound)
-    ));
+    check(
+        matches!(invalid, Err(error) if error.kind() == open_net::error::ErrorKind::InvalidConfig),
+        "invalid configuration was accepted",
+    )?;
+    check(
+        matches!(open_net.get_ws_client("config-retry-test"), Err(error) if error.kind() == open_net::error::ErrorKind::ClientNotFound),
+        "invalid configuration reserved the client name",
+    )?;
 
     let client = open_net
         .create_ws_client_with_config(" \tconfig-retry-test\n ", WebSocketClientConfig::default())
-        .await
-        .expect("retry with valid config");
-    assert_eq!(
-        open_net
-            .get_ws_client("config-retry-test")
-            .expect("client registered before creation returns")
-            .connection_status(),
-        ConnectionStatus::Idle
-    );
-    open_net
-        .destroy_ws_client("config-retry-test")
-        .await
-        .expect("destroy client");
-    assert_eq!(client.connection_status(), ConnectionStatus::Closed);
+        .await?;
+    check(
+        open_net.get_ws_client("config-retry-test")?.id() == client.id(),
+        "client was not registered before creation returned",
+    )?;
+    open_net.destroy_ws_client("config-retry-test").await?;
+    check(client.is_shutdown(), "destroy did not close client")?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_client_creation_with_same_name_has_one_success() {
-    let open_net = OpenNet::new().expect("create open net");
+async fn concurrent_client_creation_with_same_name_has_one_success() -> TestResult {
+    let open_net = OpenNet::new()?;
     let (first, second) = tokio::join!(
         open_net.create_ws_client("concurrent-create-test"),
         open_net.create_ws_client_with_config(
@@ -293,527 +196,437 @@ async fn concurrent_client_creation_with_same_name_has_one_success() {
             WebSocketClientConfig::default(),
         ),
     );
-    assert!(matches!(
+    check(
+        matches!(
         (&first, &second),
-        (Ok(_), Err(NetError::ClientAlreadyExists)) | (Err(NetError::ClientAlreadyExists), Ok(_))
-    ));
-    open_net
-        .destroy_ws_client("concurrent-create-test")
-        .await
-        .expect("destroy the single registered client");
+        (Ok(_), Err(error)) | (Err(error), Ok(_)) if error.kind() == open_net::error::ErrorKind::ClientAlreadyExists),
+        "condition failed",
+    )?;
+    open_net.destroy_ws_client("concurrent-create-test").await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_shutdown_calls_share_one_successful_completion() {
-    let open_net = OpenNet::new().expect("create open net");
+async fn concurrent_shutdown_calls_share_one_successful_completion() -> TestResult {
+    let open_net = OpenNet::new()?;
     let client = open_net
         .create_ws_client("concurrent-shutdown-test")
-        .await
-        .expect("create client");
+        .await?;
     let first = client.clone();
     let second = client.clone();
 
     let (first_result, second_result) = tokio::join!(first.shutdown(), second.shutdown());
 
-    assert_eq!(first_result, Ok(()));
-    assert_eq!(second_result, Ok(()));
-    assert_eq!(client.connection_status(), ConnectionStatus::Closed);
+    first_result?;
+    second_result?;
+    check(
+        client.is_shutdown(),
+        "concurrent shutdown did not close client",
+    )?;
     open_net
         .destroy_ws_client("concurrent-shutdown-test")
-        .await
-        .expect("destroy joined client");
+        .await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_response_can_atomically_take_its_request() {
-    let (url, server) = start_echo_server().await;
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client("response-test")
-        .await
-        .expect("create client");
-    let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
-    client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
-        let WebSocketMessage::Text(text) = response.message() else {
-            return;
-        };
-        let value: Value = serde_json::from_str(text.as_str()).expect("response JSON");
-        let request_id = value["request_id"].as_str().expect("request id");
-        let request = response.take_request(request_id);
-        let _ = response_tx.send(request.map(|request| request.uuid()));
-    }));
-    client
-        .connect_with_options(
-            url.as_str(),
-            WebSocketConnectOptions {
-                reconnect: ReconnectPolicy {
-                    enabled: false,
-                    ..ReconnectPolicy::default()
-                },
-                ..WebSocketConnectOptions::default()
-            },
-        )
-        .await
-        .expect("connect client");
-    let completion = client
-        .send_boxed_with_completion(
-            Box::new(TestRequest::new("request-1", "hello")),
-            WSRequestConfig::default(),
-        )
-        .await
-        .expect("send request");
-
-    let matched = tokio::time::timeout(Duration::from_secs(2), response_rx.recv())
-        .await
-        .expect("response timeout")
-        .expect("response channel");
-    assert_eq!(matched.as_deref(), Some("request-1"));
-    assert_eq!(completion.wait().await, Ok(()));
-
-    let shared_request: Arc<dyn WSRequestTrait> = Arc::new(TestRequest::new("request-2", "shared"));
-    let shared_completion = client
-        .send_shared_with_completion(shared_request, WSRequestConfig::default())
-        .await
-        .expect("send shared request");
-    let shared_matched = tokio::time::timeout(Duration::from_secs(2), response_rx.recv())
-        .await
-        .expect("shared response timeout")
-        .expect("shared response channel");
-    assert_eq!(shared_matched.as_deref(), Some("request-2"));
-    assert_eq!(shared_completion.wait().await, Ok(()));
-    assert!(client.pending_requests().is_empty());
-
-    open_net
-        .destroy_ws_client("response-test")
-        .await
-        .expect("destroy client");
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server stop timeout")
-        .expect("server task");
+async fn raw_response_can_atomically_take_its_request() -> TestResult {
+    let (_net, client, mut session, mut peer) =
+        v2::connected("response-test", WebSocketClientConfig::default()).await?;
+    let mut inbox = session.take_messages().ok_or("inbox")?;
+    let requests = session.requests()?;
+    let resolver = session.response_resolver()?;
+    for id in ["request-1", "request-2"] {
+        let prepared = requests.request(v2::request(id)?).prepare().await?;
+        let registration = prepared.handle().registration().clone();
+        let receipt = prepared.commit()?;
+        check(
+            matches!(peer.next().await?,Message::Text(t) if t==id),
+            "request did not reach peer",
+        )?;
+        peer.text(id)?;
+        let incoming = v2::bounded(inbox.recv()).await??.ok_or("reply")?;
+        check(
+            resolver.resolve(&registration, &incoming)? == ResolveOutcome::Resolved,
+            "request correlation failed",
+        )?;
+        check(
+            resolver.resolve(&registration, &incoming)? == ResolveOutcome::StaleOrFinished,
+            "request claimed twice",
+        )?;
+        check(
+            receipt.response().await?.request_id().as_str() == id,
+            "response ID changed",
+        )?;
+    }
+    check(
+        requests.pending_snapshot()?.is_empty(),
+        "finished requests remain pending",
+    )?;
+    client.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boxed_try_send_from_a_thread_without_runtime_reaches_the_peer() {
-    let (url, server) = start_echo_server().await;
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client("runtime-free-try-send-test")
-        .await
-        .expect("create client");
-    let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
-    client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
-        let WebSocketMessage::Text(text) = response.message() else {
-            return;
-        };
-        let value: Value = serde_json::from_str(text.as_str()).expect("response JSON");
-        let request_id = value["request_id"].as_str().expect("request id");
-        if response.take_request(request_id).is_some() {
-            let _ = response_tx.send(request_id.to_string());
-        }
-    }));
-    client.connect(url.as_str()).await.expect("connect client");
-
-    let sending_client = client.clone();
-    let receipt = std::thread::spawn(move || {
-        sending_client.try_send_boxed_with_completion(
-            Box::new(TestRequest::new("runtime-free", "callback-thread")),
-            WSRequestConfig::default(),
-        )
+async fn try_prepare_and_commit_from_a_thread_without_runtime_reach_the_peer() -> TestResult {
+    let (_net, client, mut session, mut peer) =
+        v2::connected("runtime-free", WebSocketClientConfig::default()).await?;
+    let mut inbox = session.take_messages().ok_or("inbox")?;
+    let requests = session.requests()?;
+    let prepared = std::thread::spawn(move || -> TestResult<_> {
+        Ok(requests
+            .request(v2::request("runtime-free")?)
+            .try_prepare()?)
     })
     .join()
-    .expect("non-runtime sender thread")
-    .expect("nonblocking enqueue");
-    assert_eq!(receipt.request_id(), "runtime-free");
-    let completion = receipt
-        .wait_until_written()
-        .await
-        .expect("queued request write");
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), response_rx.recv())
-            .await
-            .expect("response timeout")
-            .expect("response channel"),
-        "runtime-free"
-    );
-    assert_eq!(completion.wait().await, Ok(()));
-    assert!(client.pending_requests().is_empty());
-
-    open_net
-        .destroy_ws_client("runtime-free-try-send-test")
-        .await
-        .expect("destroy client");
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server stop timeout")
-        .expect("server task");
+    .map_err(|_| "sender thread failed")??;
+    let registration = prepared.handle().registration().clone();
+    let receipt = std::thread::spawn(move || prepared.commit())
+        .join()
+        .map_err(|_| "commit thread failed")??;
+    receipt.handle().written().await?;
+    peer.next().await?;
+    peer.text("reply")?;
+    let incoming = v2::bounded(inbox.recv()).await??.ok_or("reply")?;
+    session
+        .response_resolver()?
+        .resolve(&registration, &incoming)?;
+    check(
+        receipt.response().await?.request_id().as_str() == "runtime-free",
+        "response ID changed",
+    )?;
+    client.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pending_request_expires_after_response_timeout() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("upgrade connection");
-        let _ = socket.next().await;
-        while let Some(Ok(message)) = socket.next().await {
-            if matches!(message, Message::Close(_)) {
-                break;
+async fn pending_request_expires_after_response_timeout() -> TestResult {
+    let (_net, client, session, mut peer) =
+        v2::connected("expires", WebSocketClientConfig::default()).await?;
+    let requests = session.requests()?;
+    let receipt = requests
+        .request(v2::request("expires")?)
+        .options(RequestOptions {
+            response_timeout: Duration::from_millis(80),
+            ..RequestOptions::default()
+        })
+        .enqueue()
+        .await?;
+    peer.next().await?;
+    check(
+        requests.pending_snapshot()?.len() == 1,
+        "request not registered",
+    )?;
+    check(
+        matches!(requests.request(v2::request("expires")?).try_enqueue(),Err(e) if e.error().kind()==open_net::error::ErrorKind::DuplicateRequestId),
+        "duplicate not rejected",
+    )?;
+    check(
+        v2::bounded(receipt.response())
+            .await?
+            .map(|_| ())
+            .map_err(|e| e.kind())
+            == Err(open_net::error::ErrorKind::TimedOut),
+        "wrong response timeout",
+    )?;
+    check(
+        requests.pending_snapshot()?.is_empty(),
+        "timeout leaked pending",
+    )?;
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_peer_close_completes_pending_without_fabricating_connection_error() -> TestResult {
+    let (_net, client, session, mut peer) =
+        v2::connected("normal-close", WebSocketClientConfig::default()).await?;
+    let receipt = session
+        .requests()?
+        .request(v2::request("pending")?)
+        .enqueue()
+        .await?;
+    peer.next().await?;
+    peer.outbound.send(Message::Close(None))?;
+    check(
+        v2::bounded(receipt.response())
+            .await?
+            .map(|_| ())
+            .map_err(|e| e.kind())
+            == Err(open_net::error::ErrorKind::Closed),
+        "normal Close pending cause",
+    )?;
+    check(
+        v2::bounded(session.closed()).await?.is_ok(),
+        "normal Close fabricated connection error",
+    )?;
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_accepted_before_peer_close_keeps_correlation_during_callback_dispatch(
+) -> TestResult {
+    let mut config = WebSocketClientConfig::default();
+    config.requests.manual_response_grace = Duration::from_secs(2);
+    let (_net, client, mut session, mut peer) =
+        v2::connected("response-close-race", config).await?;
+    let gate = v2::Gate::default();
+    let _release = v2::ReleaseOnDrop(gate.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (start_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let prepared = session
+        .requests()?
+        .request(v2::request("pending")?)
+        .prepare()
+        .await?;
+    let registration = prepared.handle().registration().clone();
+    let resolver = session.response_resolver()?;
+    let _callback = session.on_message(move |_, incoming| {
+        let _ = start_tx.send(());
+        gate.wait();
+        if let Ok(incoming) = incoming {
+            let _ = tx.send(resolver.resolve(&registration, &incoming));
+        }
+    })?;
+    let receipt = prepared.commit()?;
+    peer.next().await?;
+    peer.text("reply")?;
+    v2::bounded(started.recv()).await?;
+    peer.outbound.send(Message::Close(None))?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(session.state()?.state, ConnectionState::Closed(_)) {
+                break Ok::<_, open_net::NetError>(());
             }
-        }
-    });
-
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client("timeout-test")
-        .await
-        .expect("create client");
-    client
-        .connect(format!("ws://{address}").as_str())
-        .await
-        .expect("connect client");
-    let completion = client
-        .send_with_completion(
-            TestRequest::new("expires", "no response"),
-            WSRequestConfig {
-                response_timeout: Duration::from_millis(50),
-                ..WSRequestConfig::default()
-            },
-        )
-        .await
-        .expect("send request");
-    assert_eq!(client.pending_requests().len(), 1);
-    let duplicate = client.send(TestRequest::new("expires", "duplicate")).await;
-    assert!(matches!(duplicate, Err(NetError::DuplicateRequestId)));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(completion.wait().await, Err(NetError::TimeoutError));
-    assert!(client.pending_requests().is_empty());
-
-    open_net
-        .destroy_ws_client("timeout-test")
-        .await
-        .expect("destroy client");
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server stop timeout")
-        .expect("server task");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disconnect_completes_pending_and_exposes_the_connection_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("upgrade connection");
-        let _request = socket
-            .next()
-            .await
-            .expect("request frame")
-            .expect("request");
-        socket.close(None).await.expect("close connection");
-    });
-
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client("completion-disconnect-test")
-        .await
-        .expect("create client");
-    client
-        .connect_with_options(
-            format!("ws://{address}").as_str(),
-            WebSocketConnectOptions {
-                reconnect: ReconnectPolicy {
-                    enabled: false,
-                    ..ReconnectPolicy::default()
-                },
-                ..WebSocketConnectOptions::default()
-            },
-        )
-        .await
-        .expect("connect");
-    let completion = client
-        .send_with_completion(
-            TestRequest::new("closed-before-response", "payload"),
-            WSRequestConfig::default(),
-        )
-        .await
-        .expect("write request");
-
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), completion.wait())
-            .await
-            .expect("completion timeout"),
-        Err(NetError::ConnectionClosed)
-    );
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while client.connection_status() != ConnectionStatus::Disconnected {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("disconnect status timeout");
-    assert_eq!(
-        client.last_connection_error(),
-        Some(NetError::ConnectionClosed)
-    );
-
-    open_net
-        .destroy_ws_client("completion-disconnect-test")
-        .await
-        .expect("destroy client");
-    server.await.expect("server task");
+    .await??;
+    _release.0.release();
+    check(
+        v2::bounded(rx.recv()).await?.ok_or("resolve callback")?? == ResolveOutcome::Resolved,
+        "accepted response lost after Close",
+    )?;
+    receipt.response().await?;
+    client.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn response_accepted_before_peer_close_keeps_correlation_during_callback_dispatch() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("upgrade connection");
-        let request = socket
-            .next()
-            .await
-            .expect("request frame")
-            .expect("request");
-        let Message::Text(request) = request else {
-            panic!("expected text request");
-        };
-        let request: Value = serde_json::from_str(request.as_str()).expect("request JSON");
-        socket
-            .send(Message::Text(
-                json!({"request_id": request["request_id"], "payload": "ok"})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .expect("send response");
-        socket.close(None).await.expect("send peer Close");
-        matches!(socket.next().await, Some(Ok(Message::Close(_))))
-    });
-
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client("response-close-race-test")
-        .await
-        .expect("create client");
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let callback_gate = Arc::clone(&gate);
-    let callback_started = Arc::new(AtomicBool::new(false));
-    let listener_started = Arc::clone(&callback_started);
-    let (matched_tx, mut matched_rx) = tokio::sync::mpsc::unbounded_channel();
-    client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
-        listener_started.store(true, Ordering::Release);
-        let (released, wake) = &*callback_gate;
-        let mut released = released.lock().expect("callback gate lock");
-        while !*released {
-            released = wake.wait(released).expect("callback gate wait");
-        }
-        drop(released);
-        let request_id = match response.message() {
-            WebSocketMessage::Text(text) => serde_json::from_str::<Value>(text.as_str())
-                .ok()
-                .and_then(|value| value["request_id"].as_str().map(str::to_string)),
-            _ => None,
-        };
-        let matched = request_id
-            .as_deref()
-            .and_then(|request_id| response.take_request(request_id))
-            .map(|request| request.uuid());
-        let _ = matched_tx.send(matched);
-    }));
-    client
-        .connect_with_options(
-            format!("ws://{address}").as_str(),
-            WebSocketConnectOptions {
-                reconnect: ReconnectPolicy {
-                    enabled: false,
-                    ..ReconnectPolicy::default()
-                },
-                ..WebSocketConnectOptions::default()
-            },
-        )
-        .await
-        .expect("connect");
-    let completion = client
-        .send_with_completion(
-            TestRequest::new("response-before-close", "payload"),
-            WSRequestConfig::default(),
-        )
-        .await
-        .expect("write request");
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !callback_started.load(Ordering::Acquire)
-            || client.connection_status() != ConnectionStatus::Disconnected
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("response callback and disconnect status");
-    let (released, wake) = &*gate;
-    *released.lock().expect("callback gate lock") = true;
-    wake.notify_all();
-
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), matched_rx.recv())
-            .await
-            .expect("matched callback timeout")
-            .expect("matched callback channel")
-            .as_deref(),
-        Some("response-before-close")
-    );
-    assert_eq!(completion.wait().await, Ok(()));
-    assert!(
-        server.await.expect("server task"),
-        "client must reply Close"
-    );
-    open_net
-        .destroy_ws_client("response-close-race-test")
-        .await
-        .expect("destroy client");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocking_header_provider_does_not_block_client_destruction() {
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client_with_config(
-            "blocking-header-provider-test",
-            WebSocketClientConfig {
-                close_timeout: Duration::from_millis(50),
-                ..WebSocketClientConfig::default()
-            },
-        )
-        .await
-        .expect("create client");
+async fn blocking_header_provider_does_not_block_client_destruction() -> TestResult {
+    let net = OpenNet::new()?;
+    let client = net
+        .create_ws_client_with_config("blocking-header-provider-test", {
+            let mut config = WebSocketClientConfig::default();
+            config.close_timeout = Duration::from_millis(50);
+            config
+        })
+        .await?;
     let provider_started = Arc::new(AtomicBool::new(false));
     let provider_signal = Arc::clone(&provider_started);
-    let connect_client = client.clone();
-    let connect = tokio::spawn(async move {
-        connect_client
-            .connect_with_options(
-                "ws://127.0.0.1:9",
-                WebSocketConnectOptions {
-                    header_provider: Some(Arc::new(move || {
-                        provider_signal.store(true, Ordering::Release);
-                        std::thread::sleep(Duration::from_millis(500));
-                        Ok(Vec::new())
-                    })),
-                    reconnect: ReconnectPolicy {
-                        enabled: false,
-                        handshake_timeout: Duration::from_secs(5),
-                        ..ReconnectPolicy::default()
-                    },
-                    ..WebSocketConnectOptions::default()
-                },
-            )
-            .await
-    });
+    let mut events = session::observe(&client, {
+        let mut options = {
+            let mut connect_options =
+                session_options("ws://127.0.0.1:9", ReconnectPolicy::Disabled);
+            connect_options.handshake_timeout = Duration::from_secs(5);
+            connect_options
+        };
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+            provider_signal.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((1).to_string()),
+            })
+        }));
+        options
+    })
+    .await?;
     tokio::time::timeout(Duration::from_secs(1), async {
         while !provider_started.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("provider starts");
-
+    .await?;
     tokio::time::timeout(
         Duration::from_millis(300),
-        open_net.destroy_ws_client("blocking-header-provider-test"),
+        net.destroy_ws_client("blocking-header-provider-test"),
     )
-    .await
-    .expect("detached provider must not hold worker runtime")
-    .expect("destroy client");
-    assert!(matches!(
-        connect.await.expect("connect task"),
-        Err(NetError::Cancelled | NetError::EngineDropped)
-    ));
+    .await??;
+    let mut records = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+        records.push(event);
+    }
+    let [started, failed, closed] = records.as_slice() else {
+        return Err("provider shutdown omitted an attempt or terminal event".into());
+    };
+    let open_net::ws::ConnectionEventKind::AttemptStarted { attempt } = &started.kind else {
+        return Err("provider shutdown omitted Started".into());
+    };
+    if started.sequence != 1
+        || failed.sequence != 2
+        || closed.sequence != 3
+        || !matches!(&failed.kind, open_net::ws::ConnectionEventKind::AttemptFailed { attempt: completed, error, retry: open_net::ws::RetryDecision::Stop, .. }
+            if completed.attempt_id == attempt.attempt_id && completed.session_id == attempt.session_id && error.kind() == open_net::error::ErrorKind::Cancelled)
+        || !matches!(&closed.kind, open_net::ws::ConnectionEventKind::Closed { result: Ok(end) }
+            if end.reason == open_net::ws::TerminationReason::ClientShutdown && end.last_connection.is_none())
+    {
+        return Err("provider shutdown changed attempt cancellation or normal session end".into());
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unexpected_close_transitions_through_reconnecting_and_connects_again() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let server = tokio::spawn(async move {
-        let (first, _) = listener.accept().await.expect("accept first connection");
-        let mut first = tokio_tungstenite::accept_async(first)
-            .await
-            .expect("upgrade first connection");
-        first.close(None).await.expect("close first connection");
+async fn unexpected_close_transitions_through_reconnecting_and_connects_again() -> TestResult {
+    use open_net::ws::ConnectionEventKind;
 
-        let (second, _) = listener.accept().await.expect("accept second connection");
-        let mut second = tokio_tungstenite::accept_async(second)
-            .await
-            .expect("upgrade second connection");
+    const WATCHDOG: Duration = Duration::from_secs(3);
+
+    struct ServerGuard(JoinHandle<TestResult>);
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    async fn next_event(
+        events: &mut session::ObservedSession,
+    ) -> TestResult<open_net::ws::ConnectionEvent> {
+        tokio::time::timeout(WATCHDOG, events.recv())
+            .await??
+            .ok_or_else(|| io::Error::other("reconnect session ended before its next event").into())
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (close_first_tx, close_first_rx) = tokio::sync::oneshot::channel();
+    let mut server = ServerGuard(tokio::spawn(async move {
+        let (first, _) = tokio::time::timeout(WATCHDOG, listener.accept()).await??;
+        let mut first =
+            tokio::time::timeout(WATCHDOG, tokio_tungstenite::accept_async(first)).await??;
+        tokio::time::timeout(WATCHDOG, close_first_rx).await??;
+        tokio::time::timeout(WATCHDOG, first.close(None)).await??;
+        drop(first);
+
+        let (second, _) = tokio::time::timeout(WATCHDOG, listener.accept()).await??;
+        let mut second =
+            tokio::time::timeout(WATCHDOG, tokio_tungstenite::accept_async(second)).await??;
         second
             .send(Message::Text(
                 json!({"kind": "reconnected"}).to_string().into(),
             ))
-            .await
-            .expect("send reconnect notification");
-        while let Some(Ok(message)) = second.next().await {
-            if matches!(message, Message::Close(_)) {
+            .await?;
+        while let Some(message) = tokio::time::timeout(WATCHDOG, second.next()).await? {
+            if matches!(message?, Message::Close(_)) {
                 break;
             }
         }
-    });
-
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client("reconnect-test")
-        .await
-        .expect("create client");
-    let statuses = Arc::new(Mutex::new(Vec::new()));
-    let status_sink = Arc::clone(&statuses);
-    client.register_web_socket_client_connect_status_listener(Box::new(move |status| {
-        status_sink.lock().expect("status lock").push(status);
+        Ok(())
     }));
-    let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
-    client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
-        let _ = data_tx.send(response.into_message());
-    }));
-    client
-        .connect(format!("ws://{address}").as_str())
-        .await
-        .expect("initial connect");
 
-    tokio::time::timeout(Duration::from_secs(3), data_rx.recv())
-        .await
-        .expect("reconnect data timeout")
-        .expect("reconnect data");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let observed = statuses.lock().expect("status lock").clone();
-    assert!(observed.contains(&ConnectionStatus::Reconnecting));
-    assert!(
-        observed
-            .iter()
-            .filter(|status| **status == ConnectionStatus::Connected)
-            .count()
-            >= 2
-    );
+    let open_net = OpenNet::new()?;
+    let client =
+        tokio::time::timeout(WATCHDOG, open_net.create_ws_client("reconnect-test")).await??;
+    // Status callbacks may coalesce intermediate transitions. The ordered session
+    // event stream preserves each actual connection and its physical cycle identity.
+    let mut events = tokio::time::timeout(
+        WATCHDOG,
+        session::observe(
+            &client,
+            session_options(format!("ws://{address}"), ReconnectPolicy::default()),
+        ),
+    )
+    .await??;
+    let mut data_rx = events.session.take_messages().ok_or("inbox")?;
+    let started = next_event(&mut events).await?;
+    let ConnectionEventKind::AttemptStarted { attempt } = &started.kind else {
+        return Err("initial attempt omitted Started".into());
+    };
+    let first = next_event(&mut events).await?;
+    let ConnectionEventKind::Established {
+        connection: initial,
+    } = &first.kind
+    else {
+        return Err("initial connection omitted Established".into());
+    };
+    if started.sequence != 1
+        || first.sequence != 2
+        || initial.attempt_id != attempt.attempt_id
+        || initial.cycle_id != attempt.cycle_id
+        || initial.session_id != attempt.session_id
+    {
+        return Err("initial attempt order or identity changed".into());
+    }
+    close_first_tx
+        .send(())
+        .map_err(|_| io::Error::other("peer ended before first connection could close"))?;
+    let closed = next_event(&mut events).await?;
+    if closed.sequence != 3
+        || !matches!(&closed.kind, ConnectionEventKind::Disconnected { connection, .. }
+        if connection.connection_id == initial.connection_id && connection.session_id == initial.session_id)
+    {
+        return Err("peer close omitted original connection termination".into());
+    }
+    let restarted = next_event(&mut events).await?;
+    let ConnectionEventKind::AttemptStarted { attempt } = &restarted.kind else {
+        return Err("reconnect omitted Started".into());
+    };
+    let second = next_event(&mut events).await?;
+    let ConnectionEventKind::Established { connection } = &second.kind else {
+        return Err("reconnect omitted Established".into());
+    };
+    if restarted.sequence != 4
+        || second.sequence != 5
+        || connection.cycle_id == initial.cycle_id
+        || connection.connection_id == initial.connection_id
+        || connection.session_id != initial.session_id
+        || connection.attempt_id != attempt.attempt_id
+        || connection.cycle_id != attempt.cycle_id
+    {
+        return Err("automatic reconnect changed ordered attempt or session identity".into());
+    }
+    let notification = tokio::time::timeout(WATCHDOG, data_rx.recv())
+        .await??
+        .ok_or_else(|| io::Error::other("reconnected peer omitted its data notification"))?;
+    let notification: Value = serde_json::from_str(
+        notification
+            .message()
+            .and_then(NetMessage::as_text)
+            .ok_or("notification text")?,
+    )?;
+    if notification["kind"] != "reconnected" {
+        return Err("second connection delivered an unexpected notification".into());
+    }
 
-    open_net
-        .destroy_ws_client("reconnect-test")
-        .await
-        .expect("destroy client");
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server stop timeout")
-        .expect("server task");
+    tokio::time::timeout(WATCHDOG, open_net.destroy_ws_client("reconnect-test")).await??;
+    let mut terminated = false;
+    let mut sequence = second.sequence;
+    while let Some(event) = tokio::time::timeout(WATCHDOG, events.recv()).await?? {
+        if terminated {
+            return Err("connection event followed SessionTerminated".into());
+        }
+        if event.sequence != sequence + 1 {
+            return Err("cleanup event sequence skipped".into());
+        }
+        sequence = event.sequence;
+        if let ConnectionEventKind::Closed { result } = &event.kind {
+            let end = result.as_ref().map_err(Clone::clone)?;
+            if end.reason != open_net::ws::TerminationReason::ClientShutdown {
+                return Err("destroy changed shutdown reason".into());
+            }
+            terminated = true;
+        }
+    }
+    if !terminated {
+        return Err("destroy omitted SessionTerminated".into());
+    }
+    tokio::time::timeout(WATCHDOG, &mut server.0).await???;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fragmented_binary_is_reassembled_as_one_message_end_to_end() {
+async fn fragmented_binary_is_reassembled_as_one_message_end_to_end() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let address = listener.local_addr().expect("server address");
     let server = tokio::spawn(async move {
@@ -840,43 +653,46 @@ async fn fragmented_binary_is_reassembled_as_one_message_end_to_end() {
 
     let open_net = OpenNet::new().expect("create open net");
     let client = open_net
-        .create_ws_client_with_config(
-            "fragmentation-test",
-            WebSocketClientConfig {
-                data_frame_payload_size: Some(WebSocketClientConfig::MIN_DATA_FRAME_PAYLOAD_SIZE),
-                ..WebSocketClientConfig::default()
-            },
-        )
+        .create_ws_client_with_config("fragmentation-test", {
+            let mut config = WebSocketClientConfig::default();
+            config.frames.data_frame_payload_size =
+                Some(open_net::ws::FrameConfig::MIN_DATA_FRAME_PAYLOAD_SIZE);
+            config
+        })
         .await
         .expect("create client");
-    let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
-    client.register_web_socket_client_data_receive_listener(Box::new(move |response| {
-        if let WebSocketMessage::Binary(payload) = response.into_message() {
-            let _ = data_tx.send(payload);
-        }
-    }));
-    client
-        .connect(format!("ws://{address}").as_str())
-        .await
-        .expect("connect");
+    let mut _session = SessionGuard::establish(
+        &client,
+        session_options(
+            format!("ws://{address}").as_str(),
+            ReconnectPolicy::default(),
+        ),
+    )
+    .await?;
 
+    let mut data_rx = _session.session.take_messages().ok_or("inbox")?;
     let payload = Bytes::from(
         (0..100_000)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>(),
     );
-    client
-        .send(BinaryRequest {
-            id: "fragmented-binary".to_string(),
-            payload: payload.clone(),
-        })
-        .await
-        .expect("send fragmented binary");
+    _session
+        .session
+        .sender()
+        .message(NetMessage::binary(payload.clone()))
+        .enqueue()
+        .await?
+        .written()
+        .await?;
     let echoed = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
         .await
         .expect("echo timeout")
         .expect("echo response");
-    assert_eq!(echoed, payload);
+    let echoed = echoed.ok_or("echo inbox ended")?;
+    check(
+        echoed.message().map(NetMessage::as_bytes) == Some(payload.as_ref()),
+        "fragmented payload changed",
+    )?;
 
     open_net
         .destroy_ws_client("fragmentation-test")
@@ -886,11 +702,12 @@ async fn fragmented_binary_is_reassembled_as_one_message_end_to_end() {
         .await
         .expect("server stop timeout")
         .expect("server task");
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() {
-    const FRAME_PAYLOAD_SIZE: usize = WebSocketClientConfig::MIN_DATA_FRAME_PAYLOAD_SIZE;
+async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> TestResult {
+    const FRAME_PAYLOAD_SIZE: usize = open_net::ws::FrameConfig::MIN_DATA_FRAME_PAYLOAD_SIZE;
     const PAYLOAD_SIZE: usize = 512 * 1_024;
     const PEER_READ_DELAY: Duration = Duration::from_millis(3);
     const PONG_DELAY_LIMIT: Duration = Duration::from_millis(750);
@@ -978,41 +795,42 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() {
 
     let open_net = OpenNet::new().expect("create open net");
     let client = open_net
-        .create_ws_client_with_config(
-            "on-wire-pong-test",
-            WebSocketClientConfig {
-                data_frame_payload_size: Some(FRAME_PAYLOAD_SIZE),
-                write_buffer_size: 0,
-                tcp_send_buffer_size: Some(4 * 1_024),
-                heartbeat_interval: Duration::from_secs(60),
+        .create_ws_client_with_config("on-wire-pong-test", {
+            let mut config = WebSocketClientConfig::default();
+            config.frames.data_frame_payload_size = Some(FRAME_PAYLOAD_SIZE);
+            config.frames.write_buffer_size = 0;
+            config.tcp.send_buffer_size = Some(4 * 1_024);
+            config.heartbeat = Some(open_net::ws::HeartbeatConfig {
+                interval: Duration::from_secs(60),
                 pong_timeout: Duration::from_secs(120),
-                ..WebSocketClientConfig::default()
-            },
-        )
+            });
+            config
+        })
         .await
         .expect("create client");
-    client
-        .connect_with_options(
+    let mut _session = SessionGuard::establish(
+        &client,
+        session_options(
             format!("ws://{address}").as_str(),
-            WebSocketConnectOptions {
-                reconnect: ReconnectPolicy {
-                    enabled: false,
-                    ..ReconnectPolicy::default()
-                },
-                ..WebSocketConnectOptions::default()
-            },
-        )
-        .await
-        .expect("connect client");
+            ReconnectPolicy::Disabled,
+        ),
+    )
+    .await?;
     let payload = Bytes::from(
         (0..PAYLOAD_SIZE)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>(),
     );
-    let send_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.send_message(WsBody::Binary(payload.clone())),
-    )
+    let send_result = tokio::time::timeout(Duration::from_secs(10), async {
+        _session
+            .session
+            .sender()
+            .message(NetMessage::binary(payload.clone()))
+            .enqueue()
+            .await?
+            .written()
+            .await
+    })
     .await;
     let probe_result = tokio::time::timeout(Duration::from_secs(10), &mut server).await;
     if probe_result.is_err() {
@@ -1036,125 +854,67 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() {
         pong_elapsed <= PONG_DELAY_LIMIT,
         "Pong arrived after {pong_elapsed:?} ({data_frames_before_pong} data frames were observed before it; limit {PONG_DELAY_LIMIT:?})"
     );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fire_and_forget_message_does_not_consume_pending_capacity() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("upgrade connection");
-        while let Some(Ok(message)) = socket.next().await {
-            if matches!(message, Message::Close(_)) {
-                break;
-            }
-        }
-    });
-
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client_with_config(
-            "untracked-test",
-            WebSocketClientConfig {
-                pending_request_capacity: 1,
-                ..WebSocketClientConfig::default()
-            },
-        )
-        .await
-        .expect("create client");
-    client
-        .connect(format!("ws://{address}").as_str())
-        .await
-        .expect("connect");
-    client
-        .send(TestRequest::new("fills-pending", "no response"))
-        .await
-        .expect("fill pending table");
-    assert_eq!(client.pending_requests().len(), 1);
-    client
-        .send_urgent_message(WsBody::Binary(Bytes::from_static(b"application ack")))
-        .await
-        .expect("send untracked message");
-    assert_eq!(client.pending_requests().len(), 1);
-
-    open_net
-        .destroy_ws_client("untracked-test")
-        .await
-        .expect("destroy client");
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server stop timeout")
-        .expect("server task");
+async fn fire_and_forget_message_does_not_consume_pending_capacity() -> TestResult {
+    let mut config = WebSocketClientConfig::default();
+    config.requests.max_pending = 1;
+    let (_net, client, session, mut peer) = v2::connected("untracked", config).await?;
+    let requests = session.requests()?;
+    let receipt = requests.request(v2::request("pending")?).enqueue().await?;
+    peer.next().await?;
+    check(
+        requests.pending_snapshot()?.len() == 1,
+        "pending capacity not filled",
+    )?;
+    session
+        .sender()
+        .message(NetMessage::binary(Bytes::from_static(b"application ack")))
+        .options(open_net::ws::SendOptions {
+            lane: open_net::ws::MessageLane::Urgent,
+            ..Default::default()
+        })
+        .enqueue()
+        .await?
+        .written()
+        .await?;
+    check(
+        matches!(peer.next().await?,Message::Binary(v) if v.as_ref()==b"application ack"),
+        "urgent message missing",
+    )?;
+    check(
+        requests.pending_snapshot()?.len() == 1,
+        "message consumed pending capacity",
+    )?;
+    receipt.handle().cancel()?;
+    client.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocked_data_callback_does_not_prevent_client_shutdown() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept connection");
-        let mut socket = tokio_tungstenite::accept_async(stream)
-            .await
-            .expect("upgrade connection");
-        socket
-            .send(Message::Text("block callback".into()))
-            .await
-            .expect("send callback message");
-        while let Some(Ok(message)) = socket.next().await {
-            if matches!(message, Message::Close(_)) {
-                break;
-            }
+async fn blocked_data_callback_does_not_prevent_client_shutdown() -> TestResult {
+    let mut config = WebSocketClientConfig::default();
+    config.requests.manual_response_grace = Duration::from_millis(40);
+    config.close_timeout = Duration::from_millis(40);
+    let (net, _client, mut session, peer) = v2::connected("blocked-callback", config).await?;
+    let gate = v2::Gate::default();
+    let _release = v2::ReleaseOnDrop(gate.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _callback = session.on_message(move |_, value| {
+        if value.is_ok() {
+            let _ = tx.send(());
+            gate.wait();
         }
-    });
-
-    let open_net = OpenNet::new().expect("create open net");
-    let client = open_net
-        .create_ws_client_with_config(
-            "blocked-callback-test",
-            WebSocketClientConfig {
-                response_dispatch_grace: Duration::from_millis(40),
-                ..WebSocketClientConfig::default()
-            },
-        )
-        .await
-        .expect("create client");
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let callback_gate = Arc::clone(&gate);
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    client.register_web_socket_client_data_receive_listener(Box::new(move |_response| {
-        let _ = started_tx.send(());
-        let (released, wake) = &*callback_gate;
-        let mut released = released.lock().expect("callback gate lock");
-        while !*released {
-            released = wake.wait(released).expect("callback gate wait");
-        }
-    }));
-    client
-        .connect(format!("ws://{address}").as_str())
-        .await
-        .expect("connect");
-    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(1)))
-        .await
-        .expect("callback start waiter")
-        .expect("callback starts");
-
-    let destroy_result = tokio::time::timeout(
+    })?;
+    peer.text("block callback")?;
+    v2::bounded(rx.recv()).await?;
+    tokio::time::timeout(
         Duration::from_secs(1),
-        open_net.destroy_ws_client("blocked-callback-test"),
+        net.destroy_ws_client("blocked-callback"),
     )
-    .await;
-    let (released, wake) = &*gate;
-    *released.lock().expect("callback gate lock") = true;
-    wake.notify_all();
-    destroy_result
-        .expect("blocked callback must not hold worker runtime open")
-        .expect("destroy client");
-
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server stop timeout")
-        .expect("server task");
+    .await??;
+    _release.0.release();
+    Ok(())
 }

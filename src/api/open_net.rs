@@ -1,47 +1,75 @@
-use crate::api::net_error::NetError;
-use crate::api::net_status_client::NetStatusClient;
-#[cfg(feature = "ws-client")]
-use crate::api::web_socket_client::WebSocketClient;
-#[cfg(feature = "ws-client")]
-use crate::api::wsc::web_socket_client_config::WebSocketClientConfig;
+#[cfg(feature = "http-client")]
+use crate::api::http::http_client::HttpClient;
+#[cfg(feature = "http-client")]
+use crate::api::http::http_config::HttpClientConfig;
+use crate::api::open_net_config::OpenNetConfig;
 use crate::common::log::log_def::LogType;
+use crate::error::NetError;
 use crate::inner::net_impl::OpenNetInner;
+use crate::net_status::NetStatusClient;
+#[cfg(feature = "ws-client")]
+use crate::ws::WebSocketClient;
+#[cfg(feature = "ws-client")]
+use crate::ws::WebSocketClientConfig;
 
+/// Top-level networking engine that owns runtime workers and named client instances.
+///
+/// Cloneable client handles remain valid until their named client is destroyed or the engine is dropped.
 pub struct OpenNet {
     #[allow(dead_code)]
     pub(crate) inner: OpenNetInner,
 }
 
 impl OpenNet {
-    /// 创建引擎，并为其 WebSocket 客户端设置不可变的默认网络配置。
+    /// Creates an engine with an immutable default network policy for WebSocket clients.
     ///
-    /// 创建任何工作任务前会先校验代理和 TLS 配置。该配置目前仅适用于 WebSocket
-    /// 客户端，此接口不提供 HTTP 请求执行器。
-    /// 可通过 [`Self::create_ws_client_with_network_config`] 为单个客户端覆盖默认配置。
+    /// Proxy and TLS settings are validated before any work starts. This
+    /// constructor currently applies only to WebSocket clients; use the
+    /// per-client network-config constructor to override defaults.
     #[cfg(feature = "ws-client")]
     pub fn new_with_network_config(
-        config: crate::api::network_config::NetworkConfig,
+        config: crate::network::NetworkConfig,
     ) -> Result<Self, NetError> {
-        Ok(Self {
-            inner: OpenNetInner::new_with_network_config(config)?,
-        })
+        Self::new_with_config(OpenNetConfig::default().with_network_config(config))
     }
 
+    /// Creates an engine with default settings and queue capacities of 128.
     pub fn new() -> Result<Self, NetError> {
         crate::log_t!(LogType::Engine; "new");
+        Self::new_with_config(OpenNetConfig::default())
+    }
+
+    /// Creates an engine with the supplied runtime, queue capacities, and network policy.
+    ///
+    /// Validates configuration before creating channels or workers. Invalid
+    /// capacities or worker counts return `InvalidConfig`; values remain fixed thereafter.
+    ///
+    /// ```no_run
+    /// use open_net::{config::OpenNetConfig, NetError, OpenNet};
+    /// # fn example() -> Result<(), NetError> {
+    /// let net = OpenNet::new_with_config(
+    ///     OpenNetConfig::default()
+    ///         .with_async_queue_capacity(256)
+    ///         .with_sync_queue_capacity(128),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_with_config(config: OpenNetConfig) -> Result<Self, NetError> {
+        crate::log_t!(LogType::Engine; "new_with_config");
         let result: Result<Self, NetError> = (|| {
             Ok(Self {
-                inner: OpenNetInner::new()?,
+                inner: OpenNetInner::new_with_config(config)?,
             })
         })();
         result.inspect_err(|error| {
-            crate::log_e!(LogType::Engine; "new", "error|error_code", format!("{error:?}"), *error as i32);
+            crate::log_e!(LogType::Engine; "new_with_config", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
         })
     }
 
-    /// 使用默认 WebSocket 参数和引擎默认网络配置创建客户端，等待工作任务就绪后返回。
+    /// Creates a WebSocket client with default parameters and waits for its worker to become ready.
     ///
-    /// 返回的客户端尚未连接服务器，需要继续调用 `connect` 或 `connect_with_options`。
+    /// The returned client is disconnected; call `connect` or `start_session` to establish a session.
     #[cfg(feature = "ws-client")]
     pub async fn create_ws_client(&self, thread_name: &str) -> Result<WebSocketClient, NetError> {
         crate::log_t!(LogType::WSC; "create_ws_client", "thread_name", thread_name);
@@ -51,14 +79,14 @@ impl OpenNet {
         }
         .await;
         result.inspect_err(|error| {
-            crate::log_e!(LogType::WSC; "create_ws_client", "error|error_code", format!("{error:?}"), *error as i32);
+            crate::log_e!(LogType::WSC; "create_ws_client", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
         })
     }
 
-    /// 使用指定 WebSocket 参数和引擎默认网络配置创建客户端，等待工作任务就绪后返回。
+    /// Creates a WebSocket client with the supplied parameters and engine network policy.
     ///
-    /// 取消等待不会取消已经提交的创建任务；创建成功后仍可通过 `get_ws_client` 获取，
-    /// 并通过 `destroy_ws_client` 销毁客户端。
+    /// Cancelling the wait does not cancel submitted creation; retrieve the
+    /// client later with `get_ws_client` and release it with `destroy_ws_client`.
     #[cfg(feature = "ws-client")]
     pub async fn create_ws_client_with_config(
         &self,
@@ -69,7 +97,7 @@ impl OpenNet {
         let result: Result<WebSocketClient, NetError> = async {
             let thread_name = thread_name.trim();
             if thread_name.is_empty() {
-                return Err(NetError::ParameterEmpty);
+                return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
             }
             self.inner
                 .create_ws_client(thread_name.to_string(), config, None)
@@ -77,24 +105,20 @@ impl OpenNet {
         }
         .await;
         result.inspect_err(|error| {
-            crate::log_e!(LogType::WSC; "create_ws_client_with_config", "error|error_code", format!("{error:?}"), *error as i32);
+            crate::log_e!(LogType::WSC; "create_ws_client_with_config", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
         })
     }
 
-    /// 创建 WebSocket 客户端，并为其单独设置不可变的代理和 TLS 策略。
+    /// Creates a WebSocket client with an immutable per-client proxy and TLS policy.
     ///
-    /// 传入的网络策略会完整替换引擎默认配置。传入 `NetworkConfig::default()`
-    /// 表示明确使用直连和 WebPKI 根证书。
-    /// 两种连接接口、重试和重连均使用该客户端选定的策略。
-    /// 如需仅修改代理并保留默认 TLS 设置，应克隆原始网络配置，修改代理后再传入。
+    /// The supplied policy completely replaces engine defaults. `default()` selects
+    /// direct mode and WebPKI roots; connect, retry, and reconnect use this snapshot.
     ///
-    /// 此方法等待工作任务就绪，返回时尚未建立网络连接。创建任务提交后，丢弃返回的
-    /// 异步任务不会取消创建：仍可通过 [`Self::get_ws_client`] 获取客户端，
-    /// 并且需要通过 [`Self::destroy_ws_client`] 释放客户端。
-    /// 配置校验失败时会释放预留名称，允许后续重试。
+    /// Waits for the worker to become ready but does not connect. Dropping the
+    /// future does not cancel creation; retrieve and later destroy the client by name.
     ///
     /// ```no_run
-    /// use open_net::{NetworkConfig, NetError, OpenNet, ProxyConfig, WebSocketClientConfig};
+    /// use open_net::{network::{NetworkConfig, ProxyConfig}, ws::WebSocketClientConfig, NetError, OpenNet};
     /// # async fn example() -> Result<(), NetError> {
     /// let defaults = NetworkConfig::default()
     ///     .with_proxy(ProxyConfig::http_connect("http://127.0.0.1:8080", None)?);
@@ -118,13 +142,13 @@ impl OpenNet {
         &self,
         thread_name: &str,
         config: WebSocketClientConfig,
-        network_config: crate::api::network_config::NetworkConfig,
+        network_config: crate::network::NetworkConfig,
     ) -> Result<WebSocketClient, NetError> {
         crate::log_t!(LogType::WSC; "create_ws_client_with_network_config", "thread_name|config", thread_name, format!("{config:?}"));
         let result: Result<WebSocketClient, NetError> = async {
             let thread_name = thread_name.trim();
             if thread_name.is_empty() {
-                return Err(NetError::ParameterEmpty);
+                return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
             }
             self.inner
                 .create_ws_client(thread_name.to_string(), config, Some(network_config))
@@ -132,45 +156,46 @@ impl OpenNet {
         }
         .await;
         result.inspect_err(|error| {
-            crate::log_e!(LogType::WSC; "create_ws_client_with_network_config", "error|error_code", format!("{error:?}"), *error as i32);
+            crate::log_e!(LogType::WSC; "create_ws_client_with_network_config", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
         })
     }
 
     #[cfg(feature = "ws-client")]
+    /// Returns a shared handle to an existing WebSocket client.
     pub fn get_ws_client(&self, thread_name: &str) -> Result<WebSocketClient, NetError> {
         crate::log_t!(LogType::WSC; "get_ws_client", "thread_name", thread_name);
         let result: Result<WebSocketClient, NetError> = (|| {
             if thread_name.trim().is_empty() {
-                return Err(NetError::ParameterEmpty);
+                return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
             }
             self.inner.get_ws_client(thread_name.trim())
         })();
         result.inspect_err(|error| {
-            crate::log_e!(LogType::WSC; "get_ws_client", "error|error_code", format!("{error:?}"), *error as i32);
+            crate::log_e!(LogType::WSC; "get_ws_client", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
         })
     }
 
     #[cfg(feature = "ws-client")]
+    /// Permanently destroys a named WebSocket client after its worker exits.
     pub async fn destroy_ws_client(&self, thread_name: &str) -> Result<(), NetError> {
         crate::log_t!(LogType::WSC; "destroy_ws_client", "thread_name", thread_name);
         let result: Result<(), NetError> = async {
             if thread_name.trim().is_empty() {
-                return Err(NetError::ParameterEmpty);
+                return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
             }
             self.inner.destroy_ws_client(thread_name.trim()).await
         }
         .await;
         result.inspect_err(|error| {
-            crate::log_e!(LogType::WSC; "destroy_ws_client", "error|error_code", format!("{error:?}"), *error as i32);
+            crate::log_e!(LogType::WSC; "destroy_ws_client", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
         })
     }
 }
 
 impl OpenNet {
-    /// 创建网络状态客户端；返回时尚未监控，需要继续调用 `start().await`。
+    /// Creates a network-status client; call `start().await` to begin monitoring.
     ///
-    /// 名称会去除首尾空白，同一引擎内网络状态客户端不能重名。
-    /// 本功能始终可用，不需要启用任何可选功能。
+    /// Names are trimmed and must be unique within an engine. This feature is always available.
     ///
     /// ```no_run
     /// use open_net::{NetError, OpenNet};
@@ -178,8 +203,9 @@ impl OpenNet {
     /// let net = OpenNet::new()?;
     /// let client = net.create_net_status_client("network-status").await?;
     /// client.start().await?;
-    /// let status = client.local_network_reachability()?;
-    /// let ip_stack = client.ip_stack()?;
+    /// let snapshot = client.snapshot()?;
+    /// let status = snapshot.reachability;
+    /// let ip_stack = snapshot.ip_stack;
     /// net.destroy_net_status_client("network-status").await?;
     /// # Ok(())
     /// # }
@@ -190,29 +216,76 @@ impl OpenNet {
     ) -> Result<NetStatusClient, NetError> {
         let thread_name = thread_name.trim();
         if thread_name.is_empty() {
-            return Err(NetError::ParameterEmpty);
+            return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
         self.inner.create_net_status_client(thread_name)
     }
 
-    /// 获取同名客户端的共享句柄。
+    /// Returns a shared handle to a named network-status client.
     pub fn get_net_status_client(&self, thread_name: &str) -> Result<NetStatusClient, NetError> {
         let thread_name = thread_name.trim();
         if thread_name.is_empty() {
-            return Err(NetError::ParameterEmpty);
+            return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
         self.inner.get_net_status_client(thread_name)
     }
 
-    /// 永久停止客户端，等待监控退出后释放名称。已有克隆不能再次启动。
+    /// Permanently stops a client, waits for monitoring to exit, and releases its name.
     ///
-    /// 取消等待不会取消已经提交的销毁；清理完成前名称仍保留。
-    /// 仅需暂停并保留客户端时，使用 `NetStatusClient::shutdown`。
+    /// Cancelling the wait does not cancel submitted destruction; the name remains
+    /// reserved until cleanup completes. Use `NetStatusClient::shutdown` to pause instead.
     pub async fn destroy_net_status_client(&self, thread_name: &str) -> Result<(), NetError> {
         let thread_name = thread_name.trim();
         if thread_name.is_empty() {
-            return Err(NetError::ParameterEmpty);
+            return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
         self.inner.destroy_net_status_client(thread_name).await
+    }
+}
+
+impl OpenNet {
+    #[cfg(feature = "http-client")]
+    /// Creates an HTTP client with the supplied configuration.
+    pub async fn create_http_client_with_config(
+        &self,
+        thread_name: &str,
+        config: HttpClientConfig,
+    ) -> Result<HttpClient, NetError> {
+        crate::log_t!(LogType::HTTP; "create_http_client_with_config", "thread_name|config", thread_name, format!("{:?}", config));
+        let result: Result<HttpClient, NetError> = async {
+            let thread_name = thread_name.trim();
+            if thread_name.is_empty() || thread_name.contains('\0') {
+                return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
+            }
+            self.inner
+                .create_http_client(thread_name.to_string(), config)
+                .await
+        }
+        .await;
+        result.inspect_err(|error| {
+            crate::log_e!(LogType::HTTP; "create_http_client_with_config", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
+        })
+    }
+
+    #[cfg(feature = "http-client")]
+    /// Returns a shared handle to an existing HTTP client.
+    pub fn get_http_client(&self, thread_name: &str) -> Result<HttpClient, NetError> {
+        crate::log_t!(LogType::HTTP; "get_http_client", "thread_name", thread_name);
+        let name = thread_name.trim();
+        if name.is_empty() {
+            return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
+        }
+        self.inner.get_http_client(name)
+    }
+
+    #[cfg(feature = "http-client")]
+    /// Permanently destroys a named HTTP client after its worker exits.
+    pub async fn destroy_http_client(&self, thread_name: &str) -> Result<(), NetError> {
+        crate::log_t!(LogType::HTTP; "destroy_http_client", "thread_name", thread_name);
+        let name = thread_name.trim();
+        if name.is_empty() {
+            return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
+        }
+        self.inner.destroy_http_client(name).await
     }
 }

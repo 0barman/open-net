@@ -20,8 +20,87 @@ struct ProbeSink {
 }
 
 #[tokio::test]
-async fn request_scope_cancel_wakes_flush_and_blocks_the_retired_sink() -> TestResult {
-    let scope = crate::api::wsc::RequestScope::new();
+async fn cancelled_domain_blocks_all_sink_calls_before_cleanup_hook_runs() -> TestResult {
+    let domain = crate::ws::CancellationGroup::new();
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions {
+            cancellation: Some(domain.clone()),
+            ..Default::default()
+        },
+        false,
+        1,
+    )?;
+    phase.enqueue()?;
+    check!(phase.mark_writing(crate::ws::ConnectionId::from_allocated(1)))?;
+    check!(phase.start_data_write(false)?)?;
+    let retirement = CancellationToken::new();
+    phase.bind_write_retirement(retirement.clone());
+    let gate = Arc::new(DomainIoGate::default());
+    let _active = gate.activate(phase)?;
+    let counts = Arc::new(Counts::default());
+    let mut sink = NetworkAwareSink::new(
+        ProbeSink {
+            counts: counts.clone(),
+            block_flush: false,
+        },
+        None,
+        0,
+    )
+    .with_cancel_domain_gate(gate);
+    domain.cancel();
+    check!(
+        std::future::poll_fn(|cx| Pin::new(&mut sink).poll_ready(cx))
+            .await
+            .is_err()
+    )?;
+    check!(Pin::new(&mut sink)
+        .start_send(Message::Text("cancelled".into()))
+        .is_err())?;
+    check!(sink.flush().await.is_err())?;
+    check!(sink.close().await.is_err())?;
+    check_eq!(counts.readiness.load(Ordering::Relaxed), 0)?;
+    check_eq!(counts.sends.load(Ordering::Relaxed), 0)?;
+    check_eq!(counts.flushes.load(Ordering::Relaxed), 0)?;
+    check_eq!(counts.closes.load(Ordering::Relaxed), 0)?;
+    check!(retirement.is_cancelled())?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_domain_before_data_does_not_freeze_shared_control_io() -> TestResult {
+    let domain = crate::ws::CancellationGroup::new();
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions {
+            cancellation: Some(domain.clone()),
+            ..Default::default()
+        },
+        false,
+        1,
+    )?;
+    phase.enqueue()?;
+    check!(phase.mark_writing(crate::ws::ConnectionId::from_allocated(1)))?;
+    let gate = Arc::new(DomainIoGate::default());
+    let _active = gate.activate(phase.clone())?;
+    let counts = Arc::new(Counts::default());
+    let mut sink = NetworkAwareSink::new(
+        ProbeSink {
+            counts: counts.clone(),
+            block_flush: false,
+        },
+        None,
+        0,
+    )
+    .with_cancel_domain_gate(gate);
+    domain.cancel();
+    check!(!phase.start_data_write(false)?)?;
+    sink.send(Message::Ping(Vec::new().into())).await?;
+    check_eq!(counts.sends.load(Ordering::Relaxed), 1)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn connection_retirement_wakes_flush_and_blocks_the_retired_sink() -> TestResult {
+    let scope = CancellationToken::new();
     let counts = Arc::new(Counts::default());
     let mut sink = NetworkAwareSink::new(
         ProbeSink {
@@ -31,7 +110,7 @@ async fn request_scope_cancel_wakes_flush_and_blocks_the_retired_sink() -> TestR
         None,
         0,
     )
-    .with_request_scope(Some(&scope));
+    .with_write_retirement(&scope);
     sink.feed(Message::Text("already accepted".into())).await?;
     let mut flush = Box::pin(sink.flush());
     check!(flush.as_mut().now_or_never().is_none())?;
@@ -49,8 +128,8 @@ async fn request_scope_cancel_wakes_flush_and_blocks_the_retired_sink() -> TestR
 }
 
 #[tokio::test]
-async fn request_scope_cancel_between_readiness_and_send_blocks_first_byte() -> TestResult {
-    let scope = crate::api::wsc::RequestScope::new();
+async fn connection_retirement_between_readiness_and_send_blocks_first_byte() -> TestResult {
+    let scope = CancellationToken::new();
     let counts = Arc::new(Counts::default());
     let mut sink = NetworkAwareSink::new(
         ProbeSink {
@@ -60,7 +139,7 @@ async fn request_scope_cancel_between_readiness_and_send_blocks_first_byte() -> 
         None,
         0,
     )
-    .with_request_scope(Some(&scope));
+    .with_write_retirement(&scope);
     std::future::poll_fn(|cx| Pin::new(&mut sink).poll_ready(cx)).await?;
     scope.cancel();
     check!(Pin::new(&mut sink)
@@ -197,20 +276,94 @@ async fn unknown_monitor_and_unmonitored_clients_keep_writing() -> TestResult {
 
 struct ProbeStream(Arc<AtomicUsize>);
 
+#[test]
+fn cancelled_domain_freezes_reader_without_waiting_for_writer_cleanup() -> TestResult {
+    let domain = crate::ws::CancellationGroup::new();
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions {
+            cancellation: Some(domain.clone()),
+            ..Default::default()
+        },
+        false,
+        1,
+    )?;
+    phase.enqueue()?;
+    check!(phase.mark_writing(crate::ws::ConnectionId::from_allocated(1)))?;
+    check!(phase.start_data_write(false)?)?;
+    let retirement = CancellationToken::new();
+    phase.bind_write_retirement(retirement.clone());
+    let gate = Arc::new(DomainIoGate::default());
+    let _active = gate.activate(phase)?;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mut stream = NetworkAwareStream::new(ProbeStream(polls.clone()), None, 0)
+        .with_write_retirement(&retirement)
+        .with_cancel_domain_gate(gate);
+    let waker = std::task::Waker::from(Arc::new(WakeCount::default()));
+    let mut cx = Context::from_waker(&waker);
+    check!(Pin::new(&mut stream).poll_next(&mut cx).is_pending())?;
+    domain.cancel();
+    check!(Pin::new(&mut stream).poll_next(&mut cx).is_pending())?;
+    check_eq!(polls.load(Ordering::Relaxed), 1)?;
+    check!(retirement.is_cancelled())?;
+    Ok(())
+}
+
 #[tokio::test]
-async fn request_scope_cancel_wakes_reader_without_an_automatic_flush() -> TestResult {
-    let scope = crate::api::wsc::RequestScope::new();
+async fn cancelling_written_domain_does_not_retire_the_connection() -> TestResult {
+    let domain = crate::ws::CancellationGroup::new();
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions {
+            cancellation: Some(domain.clone()),
+            ..Default::default()
+        },
+        false,
+        1,
+    )?;
+    phase.enqueue()?;
+    check!(phase.mark_writing(crate::ws::ConnectionId::from_allocated(1)))?;
+    check!(phase.start_data_write(false)?)?;
+    let (written, publication) = phase.select_written();
+    check!(written)?;
+    publication.dispatch();
+    let retirement = CancellationToken::new();
+    phase.bind_write_retirement(retirement.clone());
+    let gate = Arc::new(DomainIoGate::default());
+    let _active = gate.activate(phase)?;
+    let counts = Arc::new(Counts::default());
+    let mut sink = NetworkAwareSink::new(
+        ProbeSink {
+            counts: counts.clone(),
+            block_flush: false,
+        },
+        None,
+        0,
+    )
+    .with_cancel_domain_gate(gate);
+    domain.cancel();
+    sink.send(Message::Ping(Vec::new().into())).await?;
+    check!(!retirement.is_cancelled())?;
+    check_eq!(counts.sends.load(Ordering::Relaxed), 1)?;
+    Ok(())
+}
+
+#[test]
+fn connection_retirement_wakes_then_freezes_reader_without_an_automatic_flush() -> TestResult {
+    let retirement = CancellationToken::new();
     let polls = Arc::new(AtomicUsize::new(0));
     let mut stream = NetworkAwareStream::new(ProbeStream(Arc::clone(&polls)), None, 0)
-        .with_request_scope(Some(&scope));
-    let mut next = Box::pin(stream.next());
-    check!(next.as_mut().now_or_never().is_none())?;
-    scope.cancel();
-    check!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), next).await?,
-        Some(Err(_))
-    ))?;
+        .with_write_retirement(&retirement);
+    let wakes = Arc::new(WakeCount::default());
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    check!(Pin::new(&mut stream).poll_next(&mut cx).is_pending())?;
+    retirement.cancel();
+    check!(wakes.0.load(Ordering::SeqCst) > 0)?;
+    let before = wakes.0.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        check!(Pin::new(&mut stream).poll_next(&mut cx).is_pending())?;
+    }
     check_eq!(polls.load(Ordering::Relaxed), 1)?;
+    check_eq!(wakes.0.load(Ordering::SeqCst), before)?;
     Ok(())
 }
 

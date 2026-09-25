@@ -1,16 +1,21 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/session.rs"]
+mod session;
+
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
-use open_net::{
-    DisconnectedTaskPolicy, NetError, OpenNet, ReconnectPolicy, RequestScope,
-    RequestTerminationOutcome, WSRequestConfig, WSRequestTrait, WebSocketClientConfig,
-    WebSocketConnectionEventKind, WebSocketConnectionEvents, WebSocketContextConnectOptions,
-    WebSocketRequestOptions, WsBody,
+use open_net::ws::ConnectionEventKind;
+use open_net::ws::{
+    ConnectionState, DisconnectedPolicy, Message as DataMessage, OperationPhase, Request,
+    RequestId, RequestOptions, SendOptions, TerminationOutcome,
 };
+use open_net::ws::{ReconnectPolicy, WebSocketClientConfig};
+use open_net::{EnqueueError, OpenNet};
+use session::ObservedSession;
+
 use socket2::SockRef;
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -22,12 +27,19 @@ type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 
 const BODY_BYTES: usize = 32 * 1024 * 1024;
+const FRAME_BYTES: usize = 32 * 1024;
+const FRAME_HEADER_BYTES: usize = 8;
+const REQUEST_WIRE_BYTES: usize = BODY_BYTES + FRAME_HEADER_BYTES * (BODY_BYTES / FRAME_BYTES);
 const FRESH_MESSAGE: &str = "new scope remains writable";
 
+#[track_caller]
 fn error(message: impl Into<String>) -> TestError {
-    std::io::Error::other(message.into()).into()
+    let location = std::panic::Location::caller();
+    let message = message.into();
+    std::io::Error::other(format!("{location}: {message}")).into()
 }
 
+#[track_caller]
 fn check(condition: bool, message: &str) -> TestResult {
     if condition {
         Ok(())
@@ -42,17 +54,6 @@ async fn bounded<T>(label: &str, future: impl Future<Output = T>) -> TestResult<
         .map_err(|cause| error(format!("{label}: {cause}")))
 }
 
-struct BinaryRequest(&'static str, Bytes);
-
-impl WSRequestTrait for BinaryRequest {
-    fn uuid(&self) -> String {
-        self.0.to_owned()
-    }
-    fn body(&self) -> Result<WsBody, NetError> {
-        Ok(WsBody::Binary(self.1.clone()))
-    }
-}
-
 struct PeerTask(JoinHandle<TestResult<usize>>);
 
 impl Drop for PeerTask {
@@ -61,27 +62,41 @@ impl Drop for PeerTask {
     }
 }
 
-async fn established(events: &mut WebSocketConnectionEvents) -> TestResult {
+async fn established(events: &mut ObservedSession) -> TestResult<open_net::ws::ConnectionInfo> {
+    let started = bounded("receive Started", events.recv())
+        .await??
+        .ok_or_else(|| error("session ended before Started"))?;
+    let ConnectionEventKind::AttemptStarted { attempt } = &started.kind else {
+        return Err(error("expected Started"));
+    };
     let event = bounded("receive Established", events.recv())
         .await??
         .ok_or_else(|| error("session ended before Established"))?;
+    let ConnectionEventKind::Established { connection } = &event.kind else {
+        return Err(error("expected Established"));
+    };
     check(
-        event.kind() == WebSocketConnectionEventKind::Established,
-        "expected Established",
-    )
+        event.sequence == started.sequence + 1
+            && connection.attempt_id == attempt.attempt_id
+            && connection.cycle_id == attempt.cycle_id
+            && event.session_id == attempt.session_id
+            && event.client_id == attempt.client_id,
+        "attempt identity or order changed",
+    )?;
+    Ok(connection.clone())
 }
 
-async fn terminated(events: &mut WebSocketConnectionEvents) -> TestResult {
+async fn terminated(events: &mut ObservedSession) -> TestResult {
     bounded("wait for complete scope cleanup", async {
         let mut seen_terminal = false;
         while let Some(event) = events.recv().await? {
             if seen_terminal {
                 return Err(error("event followed SessionTerminated"));
             }
-            if event.kind() == WebSocketConnectionEventKind::Established {
+            if matches!(event.kind, ConnectionEventKind::Established { .. }) {
                 return Err(error("cancelled scope established another connection"));
             }
-            seen_terminal = event.kind() == WebSocketConnectionEventKind::SessionTerminated;
+            seen_terminal = matches!(event.kind, ConnectionEventKind::Closed { .. });
         }
         check(seen_terminal, "missing SessionTerminated")
     })
@@ -90,11 +105,21 @@ async fn terminated(events: &mut WebSocketConnectionEvents) -> TestResult {
 
 #[tokio::test]
 async fn scope_cancel_during_real_socket_backpressure_retires_both_socket_halves() -> TestResult {
+    run_scope_backpressure(true).await
+}
+
+#[tokio::test]
+async fn real_socket_backpressure_without_revocation_delivers_the_complete_request() -> TestResult {
+    run_scope_backpressure(false).await
+}
+
+async fn run_scope_backpressure(revoke_while_blocked: bool) -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("ws://{}", listener.local_addr()?);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (first_bytes_tx, first_bytes_rx) = oneshot::channel();
     let (resume_read_tx, resume_read_rx) = oneshot::channel();
+    let (old_stopped_tx, old_stopped_rx) = oneshot::channel();
     let (old_drained_tx, old_drained_rx) = oneshot::channel();
     let (fresh_received_tx, fresh_received_rx) = oneshot::channel();
     let (finish_peer_tx, finish_peer_rx) = oneshot::channel();
@@ -120,27 +145,36 @@ async fn scope_cancel_during_real_socket_backpressure_retires_both_socket_halves
         )
         .await??;
         check(
-            prefix.first().copied() == Some(0x82),
-            "old request was not one final binary frame",
+            prefix.first().copied() == Some(0x02),
+            &format!(
+                "old request did not begin with a non-final binary frame: {:02x?}",
+                &prefix[..FRAME_HEADER_BYTES]
+            ),
         )?;
         check(
-            prefix.get(1).copied() == Some(0xff),
-            "expected masked frame with a 64-bit length",
+            prefix.get(1).copied() == Some(0xfe),
+            &format!(
+                "expected masked frame with a 16-bit length: {:02x?}",
+                &prefix[..FRAME_HEADER_BYTES]
+            ),
         )?;
-        let length_bytes: [u8; 8] = prefix
-            .get(2..10)
+        let length_bytes: [u8; 2] = prefix
+            .get(2..4)
             .ok_or_else(|| error("missing frame length"))?
             .try_into()?;
         check(
-            u64::from_be_bytes(length_bytes) == BODY_BYTES as u64,
-            "unexpected old payload size",
+            usize::from(u16::from_be_bytes(length_bytes)) == FRAME_BYTES,
+            &format!(
+                "unexpected first-frame payload size: {}",
+                u16::from_be_bytes(length_bytes)
+            ),
         )?;
         first_bytes_tx
             .send(receive_buffer)
             .map_err(|_| error("first-byte receiver closed"))?;
 
-        // Stop reading until cancellation and the session cleanup boundary have
-        // both been observed. Kernel-accepted bytes may still arrive afterwards.
+        // Resume immediately after cancellation is published, before local tasks
+        // have necessarily stopped. The control run resumes without cancellation.
         bounded("release old peer backpressure", resume_read_rx).await??;
         let received = bounded("drain retired socket to EOF or reset", async {
             let mut received = prefix.len();
@@ -152,8 +186,12 @@ async fn scope_cancel_during_real_socket_backpressure_retires_both_socket_halves
                         received = received
                             .checked_add(count)
                             .ok_or_else(|| error("received byte count overflow"))?;
-                        if received >= BODY_BYTES + 14 {
-                            return Err(error("the complete old request escaped cancellation"));
+                        if received >= REQUEST_WIRE_BYTES {
+                            return if revoke_while_blocked {
+                                Err(error(format!("the complete old request escaped cancellation: received {received} of {REQUEST_WIRE_BYTES} wire bytes")))
+                            } else {
+                                Ok(received)
+                            };
                         }
                     }
                     Err(cause)
@@ -170,6 +208,9 @@ async fn scope_cancel_during_real_socket_backpressure_retires_both_socket_halves
             }
         })
         .await??;
+        // In the control run keep the peer alive until the confirmed write and
+        // explicit scope cleanup; peer EOF must not race the successful commit.
+        bounded("old client completed scope cleanup", old_stopped_rx).await??;
         drop(socket);
         old_drained_tx
             .send(received)
@@ -198,30 +239,31 @@ async fn scope_cancel_during_real_socket_backpressure_retires_both_socket_halves
     let net = OpenNet::new()?;
     let client = bounded(
         "create scoped client",
-        net.create_ws_client_with_config(
-            "scope-real-backpressure",
-            WebSocketClientConfig {
-                business_queue_max_bytes: BODY_BYTES,
-                data_frame_payload_size: None,
-                write_buffer_size: 0,
-                max_write_buffer_size: BODY_BYTES + 1024,
-                tcp_send_buffer_size: Some(4096),
-                data_frame_write_timeout: Duration::from_secs(60),
-                heartbeat_interval: Duration::from_secs(3600),
+        net.create_ws_client_with_config("scope-real-backpressure", {
+            let mut config = WebSocketClientConfig::default();
+            config.queues.normal.max_bytes = BODY_BYTES;
+            // A single large socket write may be accepted despite a small send
+            // buffer. Bounded frames require repeated writes while the peer is
+            // stopped, keeping the complete request behind real backpressure.
+            config.frames.data_frame_payload_size = Some(FRAME_BYTES);
+            config.frames.write_buffer_size = 0;
+            config.frames.max_write_buffer_size = BODY_BYTES + 1024;
+            config.tcp.send_buffer_size = Some(4096);
+            config.frames.data_frame_write_timeout = Duration::from_secs(60);
+            config.close_timeout = Duration::from_millis(100);
+            config.heartbeat = Some(open_net::ws::HeartbeatConfig {
+                interval: Duration::from_secs(3600),
                 pong_timeout: Duration::from_secs(7200),
-                close_timeout: Duration::from_millis(100),
-                ..WebSocketClientConfig::default()
-            },
-        ),
+            });
+            config
+        }),
     )
     .await??;
-    let old_scope = RequestScope::new();
     let mut old_events = bounded(
         "start old scoped connection",
-        client.start_connect_with_context(
-            WebSocketContextConnectOptions::new(&url, 301)
-                .with_headers(Vec::new(), 401)
-                .with_request_scope(old_scope.clone()),
+        session::observe(
+            &client,
+            session::session_options(&url, ReconnectPolicy::Disabled),
         ),
     )
     .await??;
@@ -230,71 +272,95 @@ async fn scope_cancel_during_real_socket_backpressure_retires_both_socket_halves
 
     let prepared = bounded(
         "prepare large old request",
-        client.prepare_registered(
-            Arc::new(BinaryRequest(
-                "scope-backpressured-old-owner",
-                Bytes::from(vec![0x5a; BODY_BYTES]),
-            )),
-            WebSocketRequestOptions::new(WSRequestConfig {
-                write_timeout: Duration::from_secs(60),
-                send_retry_count: 0,
-                idempotent: false,
-                ..WSRequestConfig::default()
+        old_events
+            .session
+            .requests()?
+            .request(Request::new(
+                RequestId::new("scope-backpressured-old-owner")?,
+                DataMessage::binary(Bytes::from(vec![0x5a; BODY_BYTES])),
+            ))
+            .options(RequestOptions {
+                send: SendOptions {
+                    write_timeout: Duration::from_secs(60),
+                    ..SendOptions::default()
+                },
+                ..RequestOptions::default()
             })
-            .with_scope(old_scope.clone()),
-        ),
+            .prepare(),
     )
-    .await??;
+    .await?
+    .map_err(EnqueueError::into_error)?;
     let receipt = prepared.commit()?;
-    let mut writing = Box::pin(receipt.wait_until_written());
+    let mut writing = Box::pin(receipt.handle().written());
     let receive_buffer = bounded(
         "peer observes first frame before cancellation",
         first_bytes_rx,
     )
     .await??;
-    check(
-        writing.as_mut().now_or_never().is_none(),
-        "large send completed before the backpressure barrier",
-    )?;
-    old_scope.cancel();
-    check(
-        matches!(
-            bounded("cancel backpressured write", writing).await?,
-            Err(NetError::DeliveryUnknown)
-        ),
-        "partial real-socket send did not report DeliveryUnknown",
-    )?;
-    terminated(&mut old_events).await?;
+    if let Some(result) = writing.as_mut().now_or_never() {
+        return Err(error(format!(
+            "large send completed before the backpressure barrier: {:?}; peer receive buffer={receive_buffer}",
+            result.map(|_| ())
+        )));
+    }
+    if revoke_while_blocked {
+        old_events.session.cancel();
+    }
     resume_read_tx
         .send(())
         .map_err(|_| error("old peer disappeared before socket cleanup"))?;
+    let write_result = bounded("resolve backpressured write", writing).await?;
+    if revoke_while_blocked {
+        check(
+            matches!(write_result, Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), open_net::error::ErrorKind::DeliveryUnknown)),
+            &format!(
+                "partial real-socket send did not report DeliveryUnknown: {:?}",
+                write_result.as_ref().map(|_| ())
+            ),
+        )?;
+    } else {
+        check(
+            write_result.is_ok(),
+            &format!(
+                "unrevoked request did not finish writing: {:?}",
+                write_result.as_ref().map(|_| ())
+            ),
+        )?;
+        old_events.session.cancel();
+    }
+    terminated(&mut old_events).await?;
+    old_stopped_tx
+        .send(())
+        .map_err(|_| error("old peer ended before scope cleanup"))?;
     let received = bounded("peer observes old socket EOF or reset", old_drained_rx).await??;
     check(
-        (64..BODY_BYTES).contains(&received),
-        "old socket did not stop after a partial request",
+        if revoke_while_blocked {
+            (64..REQUEST_WIRE_BYTES).contains(&received)
+        } else {
+            received == REQUEST_WIRE_BYTES
+        },
+        &format!("old socket delivery did not match scope revocation: revoked={revoke_while_blocked}, received={received}, complete request={REQUEST_WIRE_BYTES} wire bytes"),
     )?;
 
-    let fresh_scope = RequestScope::new();
     let mut fresh_events = bounded(
         "start new scoped connection",
-        client.start_connect_with_context(
-            WebSocketContextConnectOptions::new(&url, 302)
-                .with_headers(Vec::new(), 402)
-                .with_request_scope(fresh_scope.clone()),
+        session::observe(
+            &client,
+            session::session_options(&url, ReconnectPolicy::Disabled),
         ),
     )
     .await??;
     established(&mut fresh_events).await?;
     bounded(
         "send new scope message",
-        client.send_message_with_options(
-            WsBody::Text(FRESH_MESSAGE.to_owned()),
-            WebSocketRequestOptions::default().with_scope(fresh_scope.clone()),
-        ),
+        fresh_events
+            .session
+            .sender()
+            .send(DataMessage::text(FRESH_MESSAGE)),
     )
     .await??;
     bounded("peer confirms new owner data", fresh_received_rx).await??;
-    fresh_scope.cancel();
+    fresh_events.session.cancel();
     terminated(&mut fresh_events).await?;
     finish_peer_tx
         .send(())
@@ -309,7 +375,7 @@ async fn scope_cancel_during_real_socket_backpressure_retires_both_socket_halves
         net.destroy_ws_client("scope-real-backpressure"),
     )
     .await??;
-    eprintln!("scope backpressure verified: old wire bytes={received}, body bytes={BODY_BYTES}, peer receive buffer={receive_buffer}; new scope delivered");
+    eprintln!("scope backpressure verified: revoked while blocked={revoke_while_blocked}, old wire bytes={received}/{REQUEST_WIRE_BYTES}, body bytes={BODY_BYTES}, frame bytes={FRAME_BYTES}, peer receive buffer={receive_buffer}; new scope delivered");
     Ok(())
 }
 
@@ -377,62 +443,55 @@ async fn same_scope_prepared_request_survives_automatic_reconnect_without_new_id
     let net = OpenNet::new()?;
     let client = bounded(
         "create reconnect client",
-        net.create_ws_client_with_config(
-            "scope-prepared-auto-reconnect",
-            WebSocketClientConfig {
-                close_timeout: Duration::from_millis(100),
-                ..WebSocketClientConfig::default()
-            },
-        ),
+        net.create_ws_client_with_config("scope-prepared-auto-reconnect", {
+            let mut config = WebSocketClientConfig::default();
+            config.close_timeout = Duration::from_millis(100);
+            config
+        }),
     )
     .await??;
-    let original_scope = RequestScope::new();
     let mut events = bounded(
         "start original scope session",
-        client.start_connect_with_context(
-            WebSocketContextConnectOptions::new(&url, 501)
-                .with_headers(Vec::new(), 601)
-                .with_request_scope(original_scope.clone())
-                .with_reconnect(ReconnectPolicy {
-                    enabled: true,
+        session::observe(&client, {
+            let mut options = session::session_options(
+                &url,
+                ReconnectPolicy::Backoff(open_net::ws::BackoffConfig {
                     max_retries: 1,
                     initial_delay: Duration::from_millis(1),
                     max_delay: Duration::from_millis(1),
                     max_elapsed: Some(Duration::from_secs(20)),
-                    handshake_timeout: Duration::from_secs(10),
                 }),
-        ),
+            );
+            options.handshake_timeout = Duration::from_secs(10);
+            options
+        }),
     )
     .await??;
-    let first_event = bounded("first Established", events.recv())
-        .await??
-        .ok_or_else(|| error("original scope ended before first connection"))?;
-    check(
-        first_event.kind() == WebSocketConnectionEventKind::Established,
-        "first event was not Established",
-    )?;
-    let first_cycle = first_event
-        .cycle_id()
-        .ok_or_else(|| error("missing first physical cycle"))?;
+    let first_connection = established(&mut events).await?;
+    let first_cycle = first_connection.cycle_id;
     let prepared = bounded(
         "prepare before connection loss",
-        client.prepare_registered(
-            Arc::new(BinaryRequest(
-                "same-scope-prepared-reconnect",
-                Bytes::from_static(ORIGINAL_BODY),
-            )),
-            WebSocketRequestOptions::new(WSRequestConfig {
-                disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-                send_retry_count: 0,
+        events
+            .session
+            .requests()?
+            .request(Request::new(
+                RequestId::new("same-scope-prepared-reconnect")?,
+                DataMessage::binary(Bytes::from_static(ORIGINAL_BODY)),
+            ))
+            .options(RequestOptions {
+                send: SendOptions {
+                    disconnected: DisconnectedPolicy::WaitForReconnect,
+                    ..SendOptions::default()
+                },
                 response_timeout: Duration::from_secs(60),
-                ..WSRequestConfig::default()
+                ..RequestOptions::default()
             })
-            .with_scope(original_scope.clone()),
-        ),
+            .prepare(),
     )
-    .await??;
-    let registration = prepared.registration().clone();
-    let original_registration_token = registration.token();
+    .await?
+    .map_err(EnqueueError::into_error)?;
+    let handle = prepared.handle().clone();
+    let original_operation = handle.id();
     drop_first_tx
         .send(())
         .map_err(|_| error("first peer disappeared before preparation"))?;
@@ -440,17 +499,19 @@ async fn same_scope_prepared_request_survives_automatic_reconnect_without_new_id
         .await??
         .ok_or_else(|| error("session terminated instead of reconnecting"))?;
     check(
-        ended.kind() == WebSocketConnectionEventKind::ConnectionTerminated
-            && ended.cycle_id() == Some(first_cycle),
-        "wrong connection termination identity",
+        matches!(&ended.kind, ConnectionEventKind::Disconnected { connection, .. }
+        if connection.connection_id == first_connection.connection_id && connection.cycle_id == first_cycle)
+            && ended.sequence == 3,
+        "wrong connection termination identity or order",
     )?;
     bounded("second socket accepted before Upgrade", second_accepted_rx).await??;
     check(
-        !original_scope.is_cancelled(),
+        !matches!(events.session.state()?.state, ConnectionState::Closed(_))
+            && handle.state()?.phase == OperationPhase::Prepared,
         "physical disconnect revoked the business scope",
     )?;
     let receipt = prepared.commit()?;
-    let mut written = Box::pin(receipt.wait_until_written());
+    let mut written = Box::pin(receipt.handle().written());
     check(
         written.as_mut().now_or_never().is_none(),
         "request completed while second Upgrade was gated",
@@ -458,57 +519,43 @@ async fn same_scope_prepared_request_survives_automatic_reconnect_without_new_id
     allow_upgrade_tx
         .send(())
         .map_err(|_| error("second peer disappeared before commit"))?;
-    let second_event = bounded("second Established", events.recv())
-        .await??
-        .ok_or_else(|| error("session ended before reconnection"))?;
+    let second_connection = established(&mut events).await?;
     check(
-        second_event.kind() == WebSocketConnectionEventKind::Established,
-        "reconnect omitted Established",
+        second_connection.cycle_id != first_cycle
+            && second_connection.connection_id != first_connection.connection_id,
+        "physical connection identity did not change",
     )?;
     check(
-        second_event
-            .cycle_id()
-            .is_some_and(|cycle| cycle != first_cycle),
-        "physical connection cycle did not change",
-    )?;
-    check(
-        second_event.session_id() == first_event.session_id()
-            && second_event.client_instance_id() == first_event.client_instance_id()
-            && second_event.session_context_id() == first_event.session_context_id(),
+        second_connection.session_id == first_connection.session_id
+            && second_connection.client_id == first_connection.client_id,
         "reconnect changed original session ownership",
     )?;
-    let completion = bounded("preserved request write succeeds", written).await??;
+    bounded("preserved request write succeeds", written).await??;
     bounded("peer confirms original operation", original_received_rx).await??;
     check(
-        registration.token() == original_registration_token,
+        handle.id() == original_operation,
         "reconnect replaced registration token",
     )?;
     check(
-        matches!(
-            registration.cancel()?,
-            RequestTerminationOutcome::Terminated {
-                error: NetError::Cancelled
-            }
-        ),
+        handle.cancel()? == TerminationOutcome::TerminatedAfterWrite,
         "original registration no longer owned the reconnected pending request",
     )?;
     check(
         matches!(
-            bounded("finish original pending registration", completion.wait()).await?,
-            Err(NetError::Cancelled)
-        ),
+            bounded("finish original pending registration", receipt.response()).await?,
+            Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), open_net::error::ErrorKind::Cancelled)),
         "original registration did not retain terminal ownership",
     )?;
     bounded(
         "send using the original business scope",
-        client.send_message_with_options(
-            WsBody::Text(FRESH_MESSAGE.to_owned()),
-            WebSocketRequestOptions::default().with_scope(original_scope.clone()),
-        ),
+        events
+            .session
+            .sender()
+            .send(DataMessage::text(FRESH_MESSAGE)),
     )
     .await??;
     bounded("peer confirms same-scope followup", followup_received_rx).await??;
-    original_scope.cancel();
+    events.session.cancel();
     terminated(&mut events).await?;
     finish_peer_tx
         .send(())

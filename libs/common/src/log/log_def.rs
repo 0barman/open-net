@@ -7,18 +7,7 @@ use serde_json::Value;
 pub static LOG_PREFIX: &str = "ON";
 pub static DESC: &str = "desc";
 
-/// Origin of a log record. Existing numeric values are stable.
-#[repr(i32)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum LogType {
-    None = 0,
-    Database = 1,
-    Engine = 2,
-    WSS = 3,
-    WSC = 4,
-    Common = 5,
-    HTTP = 6,
-}
+pub(crate) use crate::api::log::LogType;
 
 /// Builds JSON content from pipe-separated field names and serializable values.
 /// Logging internals deliberately do not emit logs through their own pipeline.
@@ -68,7 +57,7 @@ pub fn on_log(
     if !Logger::is_enabled(log_type) {
         return;
     }
-    Logger::dispatch(LogInfo {
+    crate::common::log::logger::dispatch(LogInfo {
         log_type,
         location,
         level,

@@ -2,9 +2,10 @@
 //! A second handshake is opened explicitly; these tests do not exercise worker reconnect policy.
 
 use super::*;
-use crate::api::traits::ws::ws_request_config::WSRequestConfig;
 use crate::module::ws_client::test_support::{check, check_eq, test_error, TestResult};
-use crate::module::ws_client::write::queued_request::DispatchPhase;
+use crate::module::ws_client::v2_test_support as fixture;
+use crate::ws::{DisconnectedPolicy, SendOptions};
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,67 +184,52 @@ fn context(
     control_rx: mpsc::Receiver<ControlMessage>,
     io_event_tx: mpsc::Sender<IoEvent>,
     generation: u64,
-) -> WriteLoopContext {
-    WriteLoopContext {
+) -> TestResult<WriteLoopContext> {
+    Ok(WriteLoopContext {
+        cancel_domain_gate: None,
         queue,
         urgent_queue,
         control_rx,
-        pending_requests: PendingRequestView::default(),
+        pending_requests: fixture::pending(2)?,
         io_event_tx,
         generation,
         cancel: CancellationToken::new(),
         data_frame_payload_size: Some(3),
         control_write_timeout: REQUEST_TIMEOUT,
         data_frame_write_timeout: REQUEST_TIMEOUT,
-        heartbeat_interval: Duration::from_secs(3_600),
-        pong_timeout: Duration::from_secs(7_200),
-        response_dispatch_grace: Duration::from_secs(1),
+        heartbeat_config: Some(crate::ws::HeartbeatConfig {
+            interval: Duration::from_secs(3_600),
+            pong_timeout: Duration::from_secs(7_200),
+        }),
         heartbeat: Arc::new(HeartbeatState::new(generation)),
-    }
+    })
 }
 
 async fn check_interrupted_prefix_on_wire(deadline: bool) -> TestResult {
     let (client, mut peer) = socket_pair().await?;
-    let queue = PriorityWriteQueue::new(2, 64)
-        .map_err(|error| test_error(format!("wire queue: {error:?}")))?;
-    let urgent_queue = PriorityWriteQueue::new(1, 64)
-        .map_err(|error| test_error(format!("wire urgent queue: {error:?}")))?;
-    let shutdown = CancellationToken::new();
-    let dispatch_cancel = CancellationToken::new();
-    let config = WSRequestConfig {
+    let mut config = crate::ws::WebSocketClientConfig::default();
+    config.queues.normal.max_items = 2;
+    config.queues.normal.max_bytes = 64;
+    let runtime = fixture::runtime(config, crate::ws::ResponseRouting::Disabled, true).await?;
+    let queue = runtime.queue.clone();
+    let urgent_queue = runtime.urgent_queue.clone();
+    let sender = fixture::sender(&runtime);
+    let options = SendOptions {
         write_timeout: REQUEST_TIMEOUT,
-        idempotent: true,
-        send_retry_count: 1,
-        ..WSRequestConfig::default()
+        retry: crate::ws::SendRetryPolicy::Idempotent { max_retries: 1 },
+        disconnected: DisconnectedPolicy::WaitForReconnect,
+        ..Default::default()
     };
-    let written_a = queue
-        .enqueue(
-            "wire-A".to_string(),
-            None,
-            Message::Binary(Bytes::from_static(b"abcdef")),
-            6,
-            config.clone(),
-            &shutdown,
-            dispatch_cancel.clone(),
-            DispatchPhase::new(),
-            CancellationToken::new(),
-        )
-        .await
-        .map_err(|error| test_error(format!("enqueue wire A: {error:?}")))?;
-    let mut written_b = queue
-        .enqueue(
-            "wire-B".to_string(),
-            None,
-            Message::Binary(Bytes::from_static(b"B")),
-            1,
-            config,
-            &shutdown,
-            CancellationToken::new(),
-            DispatchPhase::new(),
-            CancellationToken::new(),
-        )
-        .await
-        .map_err(|error| test_error(format!("enqueue wire B: {error:?}")))?;
+    let written_a = sender
+        .message(crate::ws::Message::binary(Bytes::from_static(b"abcdef")))
+        .options(options.clone())
+        .try_enqueue()
+        .map_err(|e| e.into_error())?;
+    let written_b = sender
+        .message(crate::ws::Message::binary(Bytes::from_static(b"B")))
+        .options(options)
+        .try_enqueue()
+        .map_err(|e| e.into_error())?;
     let (control_tx, control_rx) = mpsc::channel(MAX_READY_CONTROLS_PER_BOUNDARY);
     let (entered, entered_rx) = oneshot::channel();
     let (release_tx, release) = oneshot::channel();
@@ -268,7 +254,7 @@ async fn check_interrupted_prefix_on_wire(deadline: bool) -> TestResult {
             control_rx,
             io_event_tx,
             41,
-        ),
+        )?,
         CancellationToken::new(),
     ));
     tokio::time::timeout(LIMIT, async {
@@ -300,13 +286,13 @@ async fn check_interrupted_prefix_on_wire(deadline: bool) -> TestResult {
         tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
         tokio::time::resume();
     } else {
-        dispatch_cancel.cancel();
+        written_a.cancel()?;
     }
     tokio::time::timeout(LIMIT, writer.as_mut()).await?;
     drop(writer);
     check_eq!(
-        tokio::time::timeout(LIMIT, written_a).await??,
-        Err(NetError::DeliveryUnknown)
+        tokio::time::timeout(LIMIT, written_a.written()).await?,
+        Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
     )?;
     let event = tokio::time::timeout(LIMIT, io_event_rx.recv())
         .await?
@@ -315,13 +301,10 @@ async fn check_interrupted_prefix_on_wire(deadline: bool) -> TestResult {
         event,
         IoEvent::WriteEnded {
             generation: 41,
-            error: NetError::DeliveryUnknown,
-        }
-    ))?;
-    check!(matches!(
-        written_b.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ))?;
+            error,
+            ..
+        } if matches!(error.kind(), crate::error::ErrorKind::DeliveryUnknown)))?;
+    check!(written_b.state()?.result.is_none())?;
     check_no_more_wire_bytes(peer.get_mut()).await?;
     drop(peer);
 
@@ -333,11 +316,14 @@ async fn check_interrupted_prefix_on_wire(deadline: bool) -> TestResult {
     queue.close();
     let next_writer = run_write_loop(
         next_client,
-        context(queue, urgent_queue, next_control_rx, next_events_tx, 42),
+        context(queue, urgent_queue, next_control_rx, next_events_tx, 42)?,
         CancellationToken::new(),
     );
     tokio::time::timeout(LIMIT, next_writer).await?;
-    check_eq!(tokio::time::timeout(LIMIT, written_b).await??, Ok(()))?;
+    check_eq!(
+        tokio::time::timeout(LIMIT, written_b.written()).await?,
+        Ok(())
+    )?;
     let (flags, payload) = read_masked_frame(next_peer.get_mut()).await?;
     check_eq!(
         flags,

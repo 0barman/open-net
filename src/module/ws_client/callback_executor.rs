@@ -1,71 +1,18 @@
 //! User callbacks run outside the network runtime, including initial notifications.
 
+mod data_callback_pool;
+mod data_callback_worker;
+mod data_callback_worker_lease;
+pub(super) use data_callback_pool::DataCallbackPool;
+
 use crate::common::log::log_def::LogType;
 use std::future::Future;
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use tokio_util::sync::CancellationToken;
 
-/// Starts immediately; dropping the returned waiter does not cancel user code.
-/// Detached OS threads let network shutdown finish even when a callback is blocked.
-pub(super) fn start_user_callback<F>(
-    thread_name: &'static str,
-    callback: F,
-) -> impl Future<Output = ()> + Send
-where
-    F: FnOnce() + Send + 'static,
-{
-    start_user_callback_with(thread_name, callback, move |task| {
-        std::thread::Builder::new()
-            .name(thread_name.to_string())
-            .spawn(task)
-            .map(drop)
-    })
-}
-
-pub(super) async fn run_user_callback<F>(thread_name: &'static str, callback: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    crate::log_t!(LogType::WSC; "run_user_callback", "thread_name|callback", thread_name, std::any::type_name::<F>());
-    start_user_callback(thread_name, callback).await;
-}
-
-/// Reports failure to start user code, while preserving immediate, detached execution.
-pub(super) fn try_start_user_callback<F>(
-    thread_name: &'static str,
-    callback: F,
-) -> io::Result<impl Future<Output = ()> + Send>
-where
-    F: FnOnce() + Send + 'static,
-{
-    try_start_user_callback_with(thread_name, callback, move |task| {
-        std::thread::Builder::new()
-            .name(thread_name.to_string())
-            .spawn(task)
-            .map(drop)
-    })
-}
-
-/// The injectable spawn boundary lets tests exercise resource exhaustion without
-/// exhausting OS threads or relying on process-wide mutable test hooks.
-fn start_user_callback_with<F, S>(
-    thread_name: &'static str,
-    callback: F,
-    spawn: S,
-) -> impl Future<Output = ()> + Send
-where
-    F: FnOnce() + Send + 'static,
-    S: FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
-{
-    let started = try_start_user_callback_with(thread_name, callback, spawn);
-    async move {
-        if let Ok(completed) = started {
-            completed.await;
-        }
-    }
-}
-
+/// The injectable dispatch boundary reports queue/thread rejection to the caller.
+/// Callback captures and completion guards are released if dispatch is rejected.
 pub(super) fn try_start_user_callback_with<F, S>(
     thread_name: &'static str,
     callback: F,
@@ -131,43 +78,24 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn rejected_spawn_releases_initial_barrier_without_executing_user_code() -> TestResult {
-        let called = Arc::new(AtomicBool::new(false));
-        let callback_called = Arc::clone(&called);
-        let initial_done = CancellationToken::new();
-        let initial_guard = initial_done.clone().drop_guard();
-        let completed = start_user_callback_with(
-            "rejected-callback-test",
-            move || {
-                let _initial_guard = initial_guard;
-                callback_called.store(true, Ordering::SeqCst);
-            },
-            |task| {
-                drop(task);
-                Err(io::Error::other("injected thread resource exhaustion"))
-            },
-        );
-        tokio::time::timeout(Duration::from_secs(2), completed).await?;
-        check!(!called.load(Ordering::SeqCst))?;
-        check!(initial_done.is_cancelled())?;
-        Ok(())
-    }
-
     #[test]
     fn dropping_waiter_still_runs_callback_on_a_runtime_free_thread() -> TestResult {
         let caller = std::thread::current().id();
         let (observed_tx, observed_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        drop(start_user_callback("detached-callback-test", move || {
-            // The sender is dropped only after the waiter, so completion proves the
-            // submitted callback survives even when nobody polls its future.
-            let _ = release_rx.recv();
-            let _ = observed_tx.send((
-                std::thread::current().id(),
-                tokio::runtime::Handle::try_current().is_ok(),
-            ));
-        }));
+        drop(try_start_user_callback_with(
+            "detached-callback-test",
+            move || {
+                // The sender is dropped only after the waiter, so completion proves the
+                // submitted callback survives even when nobody polls its future.
+                let _ = release_rx.recv();
+                let _ = observed_tx.send((
+                    std::thread::current().id(),
+                    tokio::runtime::Handle::try_current().is_ok(),
+                ));
+            },
+            |task| std::thread::Builder::new().spawn(task).map(drop),
+        )?);
         drop(release_tx);
         let (callback_thread, has_runtime) = observed_rx.recv_timeout(Duration::from_secs(5))?;
         check!(callback_thread != caller)?;
@@ -181,11 +109,15 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let called = Arc::new(AtomicBool::new(false));
         let callback_called = Arc::clone(&called);
-        let completed = start_user_callback("completion-callback-test", move || {
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv();
-            callback_called.store(true, Ordering::SeqCst);
-        });
+        let completed = try_start_user_callback_with(
+            "completion-callback-test",
+            move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                callback_called.store(true, Ordering::SeqCst);
+            },
+            |task| std::thread::Builder::new().spawn(task).map(drop),
+        )?;
         tokio::pin!(completed);
         tokio::time::timeout(Duration::from_secs(2), entered_rx).await??;
         check!(futures::poll!(&mut completed).is_pending())?;

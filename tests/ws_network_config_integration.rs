@@ -1,11 +1,21 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/session.rs"]
+mod session;
+use session::{session_options, SessionGuard};
+
+#[path = "support/tls.rs"]
+mod tls_support;
+
 use futures::StreamExt;
-use open_net::{
-    ClientIdentity, NetError, NetworkConfig, ProxyBasicAuth, ProxyConfig, RootCertificateMode,
-    TlsConfig,
+use open_net::network::{
+    ClientIdentity, NetworkConfig, ProxyBasicAuth, ProxyConfig, RootCertificateMode, TlsConfig,
 };
-use open_net::{OpenNet, ReconnectPolicy, WebSocketConnectOptions};
+use open_net::NetError;
+
+use open_net::ws::ReconnectPolicy;
+use open_net::OpenNet;
+
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::error::Error;
@@ -43,6 +53,7 @@ impl<T> Drop for TaskGuard<T> {
 #[derive(Debug)]
 struct TlsObservation {
     accepted: bool,
+    rejection: Option<String>,
     version: Option<rustls::ProtocolVersion>,
     alpn: Option<Vec<u8>>,
     full_handshake: bool,
@@ -58,7 +69,7 @@ fn tls_server_config(
     version: &'static rustls::SupportedProtocolVersion,
 ) -> TestResult<rustls::ServerConfig> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[version])?;
     let builder = if mtls {
         let mut roots = rustls::RootCertStore::empty();
@@ -89,11 +100,17 @@ async fn tls_peer(
     let address = listener.local_addr()?;
     let task = tokio::spawn(async move {
         let (socket, _) = listener.accept().await?;
-        let stream = match TlsAcceptor::from(Arc::new(config)).accept(socket).await {
+        let stream = match TlsAcceptor::from(Arc::new(config))
+            .accept(socket)
+            .into_fallible()
+            .await
+        {
             Ok(stream) => stream,
-            Err(_) => {
+            Err((error, mut socket)) => {
+                tls_support::close_rejected_connection(&mut socket).await?;
                 return Ok(TlsObservation {
                     accepted: false,
+                    rejection: Some(error.to_string()),
                     version: None,
                     alpn: None,
                     full_handshake: false,
@@ -106,6 +123,7 @@ async fn tls_peer(
         let session = &stream.get_ref().1;
         let mut observation = TlsObservation {
             accepted: true,
+            rejection: None,
             version: session.protocol_version(),
             alpn: session.alpn_protocol().map(Vec::from),
             full_handshake: session.handshake_kind() == Some(rustls::HandshakeKind::Full),
@@ -135,19 +153,12 @@ async fn tls_peer(
     Ok((address, TaskGuard { task }))
 }
 
-fn one_attempt() -> WebSocketConnectOptions {
-    WebSocketConnectOptions {
-        reconnect: ReconnectPolicy {
-            enabled: false,
-            handshake_timeout: Duration::from_secs(2),
-            ..ReconnectPolicy::default()
-        },
-        ..WebSocketConnectOptions::default()
-    }
+fn one_attempt() -> ReconnectPolicy {
+    ReconnectPolicy::Disabled
 }
 
 fn trusted_config(mtls: bool) -> TestResult<NetworkConfig> {
-    let mut tls = TlsConfig::default().with_root_certificates(CA, RootCertificateMode::Only)?;
+    let mut tls = TlsConfig::default().with_root_certificates(CA, RootCertificateMode::Replace)?;
     if mtls {
         tls = tls.with_client_identity(ClientIdentity::from_pem(CLIENT, CLIENT_KEY)?);
     }
@@ -164,13 +175,17 @@ async fn custom_ca_and_mtls_connect_with_both_tls_versions_and_no_alpn() -> Test
             let (address, peer) = tls_peer(SERVER, SERVER_KEY, mtls, version).await?;
             let engine = OpenNet::new_with_network_config(trusted_config(mtls)?)?;
             let client = engine.create_ws_client("trusted-local-peer").await?;
-            let connected = client
-                .connect_with_options(&format!("wss://{address}/auth?scope=test"), one_attempt())
-                .await;
+            let connected = SessionGuard::establish(&client, {
+                let mut connect_options =
+                    session_options(&format!("wss://{address}/auth?scope=test"), one_attempt());
+                connect_options.handshake_timeout = Duration::from_secs(2);
+                connect_options
+            })
+            .await;
             client.shutdown().await?;
             engine.destroy_ws_client("trusted-local-peer").await?;
             let observation = peer.finish().await??;
-            connected?;
+            connected?.finish().await?;
             if !observation.accepted
                 || observation.version != Some(expected)
                 || observation.alpn.is_some()
@@ -203,21 +218,30 @@ async fn certificate_rejections_are_tls_errors_without_http_status() -> TestResu
             SERVER_KEY,
             NetworkConfig::default().with_tls(TlsConfig::default().with_root_certificates(
                 include_bytes!("fixtures/network/other-ca.pem"),
-                RootCertificateMode::Only,
+                RootCertificateMode::Replace,
             )?),
         ),
     ] {
         let (address, peer) = tls_peer(cert, key, false, &rustls::version::TLS13).await?;
         let engine = OpenNet::new_with_network_config(config)?;
         let client = engine.create_ws_client("certificate-rejection").await?;
-        let result = client
-            .connect_with_options(&format!("wss://{address}/"), one_attempt())
-            .await;
-        let status = client.last_handshake_http_status();
+        let result = SessionGuard::establish(&client, {
+            let mut connect_options = session_options(&format!("wss://{address}/"), one_attempt());
+            connect_options.handshake_timeout = Duration::from_secs(2);
+            connect_options
+        })
+        .await;
+        let status = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.context().http_status);
         client.shutdown().await?;
         engine.destroy_ws_client("certificate-rejection").await?;
         let observation = peer.finish().await??;
-        if result != Err(NetError::TlsConnectError) || status.is_some() || observation.accepted {
+        if result.as_ref().err().map(|error| error.kind()) != Some(open_net::error::ErrorKind::Tls)
+            || status.is_some()
+            || observation.accepted
+        {
             return Err(format!(
                 "certificate rejection was not a terminal TLS failure: {result:?}, {status:?}"
             )
@@ -267,22 +291,35 @@ async fn connect_proxy_carries_mtls_and_separates_proxy_credentials() -> TestRes
     )?);
     let engine = OpenNet::new_with_network_config(config)?;
     let client = engine.create_ws_client("proxy-mtls").await?;
-    let mut options = one_attempt();
-    options.headers = vec![
-        ("Authorization".into(), "Bearer source-test-token".into()),
-        ("Proxy-Authorization".into(), "must-not-reach-origin".into()),
-    ];
-    let result = client
-        .connect_with_options(
-            &format!("wss://{target}/secret-test-path?secret-test-query"),
-            options,
-        )
-        .await;
+    let options = one_attempt();
+    let headers = open_net::HeaderMap::from_iter([
+        (
+            open_net::HeaderName::from_bytes(("Authorization").as_bytes())?,
+            open_net::HeaderValue::from_str("Bearer source-test-token")?,
+        ),
+        (
+            open_net::HeaderName::from_bytes(("Proxy-Authorization").as_bytes())?,
+            open_net::HeaderValue::from_str("must-not-reach-origin")?,
+        ),
+    ]);
+    let result = SessionGuard::establish(&client, {
+        let mut connect_options = {
+            let mut options = session_options(
+                &format!("wss://{target}/secret-test-path?secret-test-query"),
+                options,
+            );
+            options.headers = headers;
+            options
+        };
+        connect_options.handshake_timeout = Duration::from_secs(2);
+        connect_options
+    })
+    .await;
     client.shutdown().await?;
     engine.destroy_ws_client("proxy-mtls").await?;
     let observed = peer.finish().await??;
     let request = tunnel.finish().await??;
-    result?;
+    result?.finish().await?;
     if !observed.accepted
         || observed.client_certificates == 0
         || !observed.origin_auth_received
@@ -306,14 +343,28 @@ async fn proxy_rejection_never_becomes_origin_handshake_status() -> TestResult {
             .with_proxy(ProxyConfig::http_connect(&format!("http://{proxy}"), None)?),
     )?;
     let client = engine.create_ws_client("proxy-rejection").await?;
-    let result = client
-        .connect_with_options("ws://127.0.0.1:9/", one_attempt())
-        .await;
-    let status = client.last_handshake_http_status();
+    let result = SessionGuard::establish(&client, {
+        let mut connect_options = session_options("ws://127.0.0.1:9/", one_attempt());
+        connect_options.handshake_timeout = Duration::from_secs(2);
+        connect_options
+    })
+    .await;
+    let status = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.context().http_status);
     client.shutdown().await?;
     engine.destroy_ws_client("proxy-rejection").await?;
     let _ = tunnel.finish().await??;
-    if result != Err(NetError::ConnectError) || status.is_some() {
+    if result.as_ref().err().map(|error| error.kind())
+        != Some(open_net::error::ErrorKind::HandshakeRejected)
+        || status.map(|v| v.as_u16()) != Some(407)
+        || result
+            .as_ref()
+            .err()
+            .and_then(|error| error.context().stage)
+            != Some(open_net::error::ErrorStage::Proxy)
+    {
         return Err(
             format!("proxy failure leaked into origin status: {result:?}, {status:?}").into(),
         );
@@ -323,7 +374,10 @@ async fn proxy_rejection_never_becomes_origin_handshake_status() -> TestResult {
 
 #[test]
 fn network_configuration_rejects_invalid_material_before_connecting() -> TestResult {
-    use open_net::{ClientIdentity, ProxyBasicAuth, ProxyConfig, RootCertificateMode, TlsConfig};
+    use open_net::network::{
+        ClientIdentity, ProxyBasicAuth, ProxyConfig, RootCertificateMode, TlsConfig,
+    };
+
     for (username, password) in [
         ("bad:name", "secret"),
         ("name", "bad\nsecret"),
@@ -344,7 +398,7 @@ fn network_configuration_rejects_invalid_material_before_connecting() -> TestRes
         }
     }
     if TlsConfig::default()
-        .with_root_certificates([], RootCertificateMode::Only)
+        .with_root_certificates([], RootCertificateMode::Replace)
         .is_ok()
     {
         return Err("empty exclusive trust roots were accepted".into());
@@ -410,7 +464,7 @@ fn proxy_urls_and_pem_bundles_are_validated_strictly() -> TestResult {
 fn root_certificates_reject_nested_pem_begin_markers() -> TestResult {
     let nested = [b"-----BEGIN CERTIFICATE-----\n".as_slice(), CA].concat();
     if TlsConfig::default()
-        .with_root_certificates(nested, RootCertificateMode::Only)
+        .with_root_certificates(nested, RootCertificateMode::Replace)
         .is_ok()
     {
         return Err("nested CA PEM begin marker was accepted".into());
@@ -422,7 +476,7 @@ fn root_certificates_reject_nested_pem_begin_markers() -> TestResult {
     ]
     .concat();
     if TlsConfig::default()
-        .with_root_certificates(foreign, RootCertificateMode::Only)
+        .with_root_certificates(foreign, RootCertificateMode::Replace)
         .is_ok()
     {
         return Err("foreign nested CA PEM block was accepted".into());
@@ -455,7 +509,7 @@ fn config_debug_does_not_reveal_proxy_or_private_key_material() -> TestResult {
     let identity = ClientIdentity::from_pem(CLIENT, CLIENT_KEY)?;
     let config = NetworkConfig::default().with_proxy(proxy).with_tls(
         TlsConfig::default()
-            .with_root_certificates(CA, RootCertificateMode::Only)?
+            .with_root_certificates(CA, RootCertificateMode::Replace)?
             .with_client_identity(identity.clone()),
     );
     let debug = format!("{config:?} {auth:?} {identity:?}");
@@ -495,19 +549,13 @@ async fn standalone_ws_writes_tls_client_hello_without_global_provider() -> Test
     });
     let connecting = client.clone();
     let attempt = tokio::spawn(async move {
-        connecting
-            .connect_with_options(
-                &format!("wss://{address}/"),
-                WebSocketConnectOptions {
-                    reconnect: ReconnectPolicy {
-                        enabled: false,
-                        handshake_timeout: Duration::from_secs(2),
-                        ..ReconnectPolicy::default()
-                    },
-                    ..WebSocketConnectOptions::default()
-                },
-            )
-            .await
+        SessionGuard::establish(&connecting, {
+            let mut connect_options =
+                session_options(&format!("wss://{address}/"), ReconnectPolicy::Disabled);
+            connect_options.handshake_timeout = Duration::from_secs(2);
+            connect_options
+        })
+        .await
     });
     let observed = tokio::time::timeout(Duration::from_secs(3), peer).await;
     attempt.abort();
@@ -522,33 +570,81 @@ async fn standalone_ws_writes_tls_client_hello_without_global_provider() -> Test
 }
 
 #[tokio::test]
+async fn rejected_tls_socket_is_retained_until_client_closes() -> TestResult {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+    let (mut socket, _) = listener.accept().await?;
+    let peer = TaskGuard {
+        task: tokio::spawn(async move {
+            // Exercise the TCP teardown independently of TLS handshake timing.
+            socket.write_all(b"rejection").await?;
+            tls_support::close_rejected_connection(&mut socket).await
+        }),
+    };
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut reply)).await??;
+    if reply != b"rejection" || peer.task.is_finished() {
+        return Err("rejected peer released its socket before the client closed".into());
+    }
+    // The server has half-closed, but must still accept bytes already in flight
+    // from the client's Upgrade instead of dropping its receive side.
+    client.write_all(b"in-flight upgrade bytes").await?;
+    client.shutdown().await?;
+    peer.finish().await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn mtls_rejects_missing_and_untrusted_client_certificates() -> TestResult {
     let other = ClientIdentity::from_pem(
         include_bytes!("fixtures/network/other-client.pem"),
         include_bytes!("fixtures/network/other-client-key.pem"),
     )?;
-    for config in [
-        trusted_config(false)?,
-        NetworkConfig::default().with_tls(
-            TlsConfig::default()
-                .with_root_certificates(CA, RootCertificateMode::Only)?
-                .with_client_identity(other),
-        ),
-    ] {
-        let (address, peer) = tls_peer(SERVER, SERVER_KEY, true, &rustls::version::TLS13).await?;
-        let engine = OpenNet::new_with_network_config(config)?;
-        let client = engine.create_ws_client("mtls-rejection").await?;
-        let connected = client
-            .connect_with_options(&format!("wss://{address}/"), one_attempt())
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        for (identity, config) in [
+            ("missing", trusted_config(false)?),
+            (
+                "untrusted",
+                NetworkConfig::default().with_tls(
+                    TlsConfig::default()
+                        .with_root_certificates(CA, RootCertificateMode::Replace)?
+                        .with_client_identity(other.clone()),
+                ),
+            ),
+        ] {
+            let (address, peer) = tls_peer(SERVER, SERVER_KEY, true, version).await?;
+            let engine = OpenNet::new_with_network_config(config)?;
+            let client = engine.create_ws_client("mtls-rejection").await?;
+            let connected = SessionGuard::establish(&client, {
+                let mut connect_options =
+                    session_options(&format!("wss://{address}/"), one_attempt());
+                connect_options.handshake_timeout = Duration::from_secs(2);
+                connect_options
+            })
             .await;
-        client.shutdown().await?;
-        engine.destroy_ws_client("mtls-rejection").await?;
-        let observed = peer.finish().await??;
-        if observed.accepted || connected != Err(NetError::TlsConnectError) {
-            return Err(format!(
-                "invalid mTLS identity was not a terminal TLS error: {connected:?}"
-            )
-            .into());
+            let status = connected
+                .as_ref()
+                .err()
+                .and_then(|error| error.context().http_status);
+            client.shutdown().await?;
+            engine.destroy_ws_client("mtls-rejection").await?;
+            let observed = peer.finish().await??;
+            if observed.accepted
+                || observed.rejection.is_none()
+                || connected.as_ref().err().map(|error| error.kind())
+                    != Some(open_net::error::ErrorKind::Tls)
+                || status.is_some()
+            {
+                return Err(format!(
+                    "invalid mTLS identity was not a terminal TLS error: \
+                     version={:?}, identity={identity}, result={connected:?}, \
+                     http_status={status:?}, peer={observed:?}",
+                    version.version,
+                )
+                .into());
+            }
         }
     }
     Ok(())
@@ -589,19 +685,32 @@ async fn plain_websocket_uses_connect_tunnel_with_source_headers_intact() -> Tes
             .with_proxy(ProxyConfig::http_connect(&format!("http://{proxy}"), None)?),
     )?;
     let client = engine.create_ws_client("plain-tunnel").await?;
-    let mut options = one_attempt();
-    options.headers = vec![
-        ("Authorization".into(), "Bearer test-plain-token".into()),
-        ("Proxy-Authorization".into(), "test-must-not-forward".into()),
-    ];
-    let connected = client
-        .connect_with_options(&format!("ws://{target}/"), options)
-        .await;
+    let options = one_attempt();
+    let headers = open_net::HeaderMap::from_iter([
+        (
+            open_net::HeaderName::from_bytes(("Authorization").as_bytes())?,
+            open_net::HeaderValue::from_str("Bearer test-plain-token")?,
+        ),
+        (
+            open_net::HeaderName::from_bytes(("Proxy-Authorization").as_bytes())?,
+            open_net::HeaderValue::from_str("test-must-not-forward")?,
+        ),
+    ]);
+    let connected = SessionGuard::establish(&client, {
+        let mut connect_options = {
+            let mut options = session_options(&format!("ws://{target}/"), options);
+            options.headers = headers;
+            options
+        };
+        connect_options.handshake_timeout = Duration::from_secs(2);
+        connect_options
+    })
+    .await;
     client.shutdown().await?;
     engine.destroy_ws_client("plain-tunnel").await?;
     let request = tunnel.finish().await??;
     peer.finish().await??;
-    connected?;
+    connected?.finish().await?;
     if request.contains("test-plain-token") || request.contains("test-must-not-forward") {
         return Err("source headers leaked into CONNECT".into());
     }
@@ -642,10 +751,14 @@ async fn repeated_mtls_connections_do_not_start_resuming_sessions() -> TestResul
     let engine = OpenNet::new_with_network_config(trusted_config(true)?)?;
     let client = engine.create_ws_client("full-handshakes").await?;
     for _ in 0..2 {
-        client
-            .connect_with_options(&format!("wss://{address}/"), one_attempt())
-            .await?;
-        client.disconnect().await?;
+        let session = SessionGuard::establish(&client, {
+            let mut connect_options = session_options(&format!("wss://{address}/"), one_attempt());
+            connect_options.handshake_timeout = Duration::from_secs(2);
+            connect_options
+        })
+        .await?;
+        session.session.close().await?;
+        session.finish().await?;
     }
     client.shutdown().await?;
     engine.destroy_ws_client("full-handshakes").await?;
@@ -684,15 +797,18 @@ async fn explicit_tls_provider_coexists_with_a_host_provider() -> TestResult {
     let (address, peer) = tls_peer(SERVER, SERVER_KEY, false, &rustls::version::TLS12).await?;
     let engine = OpenNet::new_with_network_config(trusted_config(false)?)?;
     let client = engine.create_ws_client("host-provider-coexistence").await?;
-    let connected = client
-        .connect_with_options(&format!("wss://{address}/"), one_attempt())
-        .await;
+    let connected = SessionGuard::establish(&client, {
+        let mut connect_options = session_options(&format!("wss://{address}/"), one_attempt());
+        connect_options.handshake_timeout = Duration::from_secs(2);
+        connect_options
+    })
+    .await;
     client.shutdown().await?;
     engine
         .destroy_ws_client("host-provider-coexistence")
         .await?;
     let observed = peer.finish().await??;
-    connected?;
+    connected?.finish().await?;
     if observed.version != Some(rustls::ProtocolVersion::TLSv1_2) {
         return Err("host provider replaced open-net's explicit protocol support".into());
     }
@@ -715,8 +831,16 @@ async fn simultaneous_engines_keep_default_and_appended_roots_isolated() -> Test
     let trusted_url = format!("wss://{trusted_address}/");
     let default_url = format!("wss://{default_address}/");
     let (accepted, rejected) = tokio::join!(
-        trusted.connect_with_options(&trusted_url, one_attempt()),
-        untrusted.connect_with_options(&default_url, one_attempt())
+        SessionGuard::establish(&trusted, {
+            let mut connect_options = session_options(&trusted_url, one_attempt());
+            connect_options.handshake_timeout = Duration::from_secs(2);
+            connect_options
+        }),
+        SessionGuard::establish(&untrusted, {
+            let mut connect_options = session_options(&default_url, one_attempt());
+            connect_options.handshake_timeout = Duration::from_secs(2);
+            connect_options
+        })
     );
     trusted.shutdown().await?;
     untrusted.shutdown().await?;
@@ -724,8 +848,8 @@ async fn simultaneous_engines_keep_default_and_appended_roots_isolated() -> Test
     default.destroy_ws_client("isolated-default").await?;
     let trusted_observation = trusted_peer.finish().await??;
     let default_observation = default_peer.finish().await??;
-    accepted?;
-    if rejected != Err(NetError::TlsConnectError)
+    accepted?.finish().await?;
+    if rejected.as_ref().err().map(|error| error.kind()) != Some(open_net::error::ErrorKind::Tls)
         || !trusted_observation.accepted
         || default_observation.accepted
     {
@@ -861,27 +985,43 @@ async fn connect_proxy_mtls_retry_fetches_updated_token_for_second_upgrade() -> 
     let client = engine.create_ws_client("proxy-mtls-refresh").await?;
     let invocations = Arc::new(AtomicUsize::new(0));
     let provider_invocations = Arc::clone(&invocations);
-    let mut options = one_attempt();
-    options.reconnect.enabled = true;
-    options.reconnect.max_retries = 1;
-    options.reconnect.initial_delay = Duration::from_millis(1);
-    options.reconnect.max_delay = Duration::from_millis(1);
-    options.header_provider = Some(Arc::new(move || {
-        let value = match provider_invocations.fetch_add(1, Ordering::SeqCst) {
-            0 => "Bearer fixture-T1",
-            1 => "Bearer fixture-T2",
-            _ => return Err(NetError::ConfigError),
-        };
-        Ok(vec![("Authorization".to_owned(), value.to_owned())])
-    }));
+    let policy = ReconnectPolicy::Backoff(open_net::ws::BackoffConfig {
+        max_retries: 1,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        ..open_net::ws::BackoffConfig::default()
+    });
+    let provider: open_net::ws::HandshakeProvider =
+        open_net::ws::HandshakeProvider::blocking(move |_| {
+            let value = match provider_invocations.fetch_add(1, Ordering::SeqCst) {
+                0 => "Bearer fixture-T1",
+                1 => "Bearer fixture-T2",
+                _ => return Err(NetError::from(open_net::error::ErrorKind::InvalidConfig).into()),
+            };
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::from_iter([(
+                    open_net::HeaderName::from_bytes(("Authorization".to_owned()).as_bytes())?,
+                    open_net::HeaderValue::from_str(value)?,
+                )]),
+                credential_version: Some((1).to_string()),
+            })
+        });
     let connected = tokio::time::timeout(
         Duration::from_secs(4),
-        client.connect_with_options(&format!("wss://{target_authority}/"), options),
+        SessionGuard::establish(&client, {
+            let mut connect_options = {
+                let mut options = session_options(&format!("wss://{target_authority}/"), policy);
+                options.handshake_provider = Some(provider);
+                options
+            };
+            connect_options.handshake_timeout = Duration::from_secs(2);
+            connect_options
+        }),
     )
     .await;
     client.shutdown().await?;
     engine.destroy_ws_client("proxy-mtls-refresh").await?;
-    connected??;
+    connected??.finish().await?;
     peer.finish().await??;
     tunnel.finish().await??;
     if invocations.load(Ordering::SeqCst) != 2 {

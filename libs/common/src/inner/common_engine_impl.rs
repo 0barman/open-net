@@ -12,6 +12,10 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+#[path = "common_callback_laziness_tests.rs"]
+mod callback_laziness_tests;
+
 // Used while constructing log fields; do not log this formatting dependency.
 fn panic_payload_message(payload: &Box<dyn Any + Send + 'static>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -71,8 +75,13 @@ impl CommonEngine {
                 })
             }),
             Ok(_) => {
-                let handle =
-                    std::thread::spawn(move || std::panic::catch_unwind(AssertUnwindSafe(f)));
+                let handle = std::thread::Builder::new()
+                    .name("open-net-runtime-bridge".to_string())
+                    .spawn(move || std::panic::catch_unwind(AssertUnwindSafe(f)))
+                    .map_err(|error| {
+                        log_e!(LogType::Common; "run_blocking_on_engine_rt", "error", crate::common::log::summary::error(&error));
+                        CommonError::RuntimeError
+                    })?;
                 match handle.join() {
                     Ok(Ok(v)) => Ok(v),
                     Ok(Err(payload)) => {
@@ -171,7 +180,7 @@ impl CommonEngine {
     {
         crate::log_t!(LogType::Common; "cb_pool_once", "callback_type", std::any::type_name_of_val(&cb));
         let cb_pool = self.cb_pool.clone();
-        move |r1| cb_pool.execute(move || cb(r1))
+        move |r1| cb_pool.execute_or_log(move || cb(r1))
     }
 
     /// cb_pool 重载接口，接受两个回调参数
@@ -183,7 +192,7 @@ impl CommonEngine {
     {
         crate::log_t!(LogType::Common; "cb_pool_once2", "callback_type", std::any::type_name_of_val(&cb));
         let cb_pool = self.cb_pool.clone();
-        move |r1, r2| cb_pool.execute(move || cb(r1, r2))
+        move |r1, r2| cb_pool.execute_or_log(move || cb(r1, r2))
     }
 
     /// cb_pool 重载接口，接受三个回调参数
@@ -196,7 +205,7 @@ impl CommonEngine {
     {
         crate::log_t!(LogType::Common; "cb_pool_once3", "callback_type", std::any::type_name_of_val(&cb));
         let cb_pool = self.cb_pool.clone();
-        move |r1, r2, r3| cb_pool.execute(move || cb(r1, r2, r3))
+        move |r1, r2, r3| cb_pool.execute_or_log(move || cb(r1, r2, r3))
     }
 
     /// cb_pool 重载接口，接受三个回调参数
@@ -212,7 +221,7 @@ impl CommonEngine {
     {
         crate::log_t!(LogType::Common; "cb_pool_once3_boxed", "callback_type", std::any::type_name_of_val(&cb));
         let cb_pool = self.cb_pool.clone();
-        Box::new(move |r1, r2, r3| cb_pool.execute(move || cb(r1, r2, r3)))
+        Box::new(move |r1, r2, r3| cb_pool.execute_or_log(move || cb(r1, r2, r3)))
     }
 
     /// cb_pool 重载接口，接受零个回调参数，返回 Fn()
@@ -226,7 +235,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         Box::new(move || {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone())
+            cb_pool.execute_or_log(move || cb_clone())
         })
     }
 
@@ -242,7 +251,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         Box::new(move |r| {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(r))
+            cb_pool.execute_or_log(move || cb_clone(r))
         })
     }
 
@@ -259,7 +268,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         Box::new(move |r1, r2| {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(r1, r2))
+            cb_pool.execute_or_log(move || cb_clone(r1, r2))
         })
     }
 
@@ -277,7 +286,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         move |r1, r2| {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(r1, r2))
+            cb_pool.execute_or_log(move || cb_clone(r1, r2))
         }
     }
 
@@ -292,7 +301,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         move |r1, r2| {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(r1, r2))
+            cb_pool.execute_or_log(move || cb_clone(r1, r2))
         }
     }
 
@@ -313,7 +322,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         Box::new(move |r1, r2, r3| {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(r1, r2, r3))
+            cb_pool.execute_or_log(move || cb_clone(r1, r2, r3))
         })
     }
 
@@ -335,7 +344,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         Box::new(move |r1, r2, r3, r4| {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(r1, r2, r3, r4))
+            cb_pool.execute_or_log(move || cb_clone(r1, r2, r3, r4))
         })
     }
 
@@ -358,7 +367,7 @@ impl CommonEngine {
         let cb = Arc::new(cb);
         Box::new(move |r1, r2, r3, r4, r5| {
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(r1, r2, r3, r4, r5))
+            cb_pool.execute_or_log(move || cb_clone(r1, r2, r3, r4, r5))
         })
     }
 
@@ -379,7 +388,7 @@ impl CommonEngine {
         Box::new(move |r1, r2| {
             let r1 = r1.clone();
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(&r1, r2))
+            cb_pool.execute_or_log(move || cb_clone(&r1, r2))
         })
     }
 
@@ -395,7 +404,7 @@ impl CommonEngine {
         Box::new(move |s: &str| {
             let s_clone = s.to_string();
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(&s_clone))
+            cb_pool.execute_or_log(move || cb_clone(&s_clone))
         })
     }
 
@@ -415,7 +424,7 @@ impl CommonEngine {
         Box::new(move |s: &str, r2: R2| {
             let s_clone = s.to_string();
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(&s_clone, r2))
+            cb_pool.execute_or_log(move || cb_clone(&s_clone, r2))
         })
     }
 
@@ -436,7 +445,7 @@ impl CommonEngine {
         Box::new(move |s: &str, r2: R2, r3: R3| {
             let s_clone = s.to_string();
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(&s_clone, r2, r3))
+            cb_pool.execute_or_log(move || cb_clone(&s_clone, r2, r3))
         })
     }
 
@@ -458,7 +467,7 @@ impl CommonEngine {
         Box::new(move |s: &str, r2: R2, r3: R3, r4: R4| {
             let s_clone = s.to_string();
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(&s_clone, r2, r3, r4))
+            cb_pool.execute_or_log(move || cb_clone(&s_clone, r2, r3, r4))
         })
     }
 
@@ -480,7 +489,7 @@ impl CommonEngine {
             let s1_clone = s1.to_string();
             let s2_clone = s2.to_string();
             let cb_clone = cb.clone();
-            cb_pool.execute(move || cb_clone(&s1_clone, r2, r3, &s2_clone))
+            cb_pool.execute_or_log(move || cb_clone(&s1_clone, r2, r3, &s2_clone))
         })
     }
 }

@@ -1,10 +1,15 @@
 #![cfg(feature = "ws-client")]
 
-use open_net::{
-    ConnectionStatus, NetError, NetworkConfig, OpenNet, ProxyConfig, ReconnectPolicy,
-    WebSocketClient, WebSocketClientConfig, WebSocketConnectOptions, WebSocketConnectionEventKind,
-    WebSocketContextConnectOptions, WebSocketTerminationReason,
-};
+#[path = "support/session.rs"]
+mod session;
+use open_net::ws::ConnectionEventKind;
+use open_net::ws::{ConnectionEvent, RetryDecision, TerminationReason};
+use session::{session_options, SessionGuard};
+
+use open_net::network::{NetworkConfig, ProxyConfig};
+use open_net::ws::{ConnectOptions, ConnectionState, ReconnectPolicy, WebSocketClientConfig};
+use open_net::{NetError, OpenNet, WebSocketClient};
+
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -18,10 +23,14 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 
+#[track_caller]
 fn error(message: impl Into<String>) -> TestError {
-    std::io::Error::other(message.into()).into()
+    let location = std::panic::Location::caller();
+    let message = message.into();
+    std::io::Error::other(format!("{location}: {message}")).into()
 }
 
+#[track_caller]
 fn check(condition: bool, message: &str) -> TestResult {
     if condition {
         Ok(())
@@ -36,22 +45,122 @@ async fn bounded<T>(label: &str, future: impl Future<Output = T>) -> TestResult<
         .map_err(|e| error(format!("{label}: {e}")))
 }
 
+async fn established(events: &mut session::ObservedSession) -> TestResult<ConnectionEvent> {
+    let started = bounded("Started", events.recv())
+        .await??
+        .ok_or("missing Started")?;
+    let ConnectionEventKind::AttemptStarted { attempt } = started.kind else {
+        return Err(error("first event was not Started"));
+    };
+    check(
+        started.sequence == 1
+            && started.client_id == attempt.client_id
+            && started.session_id == attempt.session_id,
+        "Started identity or sequence changed",
+    )?;
+    let established = bounded("Established", events.recv())
+        .await??
+        .ok_or("missing Established")?;
+    let ConnectionEventKind::Established { connection } = &established.kind else {
+        return Err(error("attempt did not establish"));
+    };
+    check(
+        established.sequence == 2
+            && established.client_id == started.client_id
+            && established.session_id == started.session_id,
+        "Established envelope changed",
+    )?;
+    check(
+        connection.client_id == attempt.client_id
+            && connection.session_id == attempt.session_id
+            && connection.cycle_id == attempt.cycle_id
+            && connection.attempt_id == attempt.attempt_id,
+        "Established did not retain its attempt identity",
+    )?;
+    Ok(established)
+}
+
+async fn cancelled(
+    events: &mut session::ObservedSession,
+    established: &ConnectionEvent,
+) -> TestResult {
+    let ConnectionEventKind::Established { connection } = &established.kind else {
+        return Err(error("cancellation fixture had no connection"));
+    };
+    let disconnected = bounded("Disconnected", events.recv())
+        .await??
+        .ok_or("missing Disconnected")?;
+    check(
+        disconnected.sequence == 3
+            && disconnected.client_id == established.client_id
+            && disconnected.session_id == established.session_id,
+        "Disconnected envelope changed",
+    )?;
+    let ConnectionEventKind::Disconnected {
+        connection: ended,
+        end,
+    } = disconnected.kind
+    else {
+        return Err(error("cancellation omitted physical terminal"));
+    };
+    check(
+        ended.connection_id == connection.connection_id
+            && end.reason == TerminationReason::Cancelled,
+        "cancellation closed another physical connection",
+    )?;
+    let closed = bounded("Closed", events.recv())
+        .await??
+        .ok_or("missing Closed")?;
+    check(
+        closed.sequence == 4
+            && closed.client_id == established.client_id
+            && closed.session_id == established.session_id,
+        "Closed envelope changed",
+    )?;
+    let ConnectionEventKind::Closed {
+        result: Err(failure),
+    } = closed.kind
+    else {
+        return Err(error("cancelled session did not report failure"));
+    };
+    check(
+        failure.kind() == open_net::error::ErrorKind::Cancelled,
+        "wrong cancellation classification",
+    )?;
+    check(
+        bounded("stable EOF", events.recv()).await??.is_none(),
+        "event followed Closed",
+    )?;
+    Ok(())
+}
+
+fn check_exhaustion_source(failure: &NetError) -> TestResult {
+    let cause = std::error::Error::source(failure)
+        .and_then(|source| source.downcast_ref::<NetError>())
+        .ok_or("exhaustion lost its original NetError source")?;
+    check(
+        cause.kind() == open_net::error::ErrorKind::HandshakeRejected
+            && cause.context().http_status == Some(open_net::StatusCode::SERVICE_UNAVAILABLE)
+            && cause.context().stage == Some(open_net::error::ErrorStage::Upgrade)
+            && failure.context().http_status == cause.context().http_status,
+        "exhaustion did not retain the last HTTP rejection",
+    )?;
+    Ok(())
+}
+
 fn policy(retries: usize) -> ReconnectPolicy {
-    ReconnectPolicy {
-        enabled: true,
+    ReconnectPolicy::Backoff(open_net::ws::BackoffConfig {
         max_retries: retries,
         initial_delay: Duration::from_millis(1),
         max_delay: Duration::from_millis(1),
         max_elapsed: Some(Duration::from_secs(3)),
-        handshake_timeout: Duration::from_secs(2),
-    }
+    })
 }
 
-fn options(retries: usize) -> WebSocketConnectOptions {
-    WebSocketConnectOptions {
-        reconnect: policy(retries),
-        ..WebSocketConnectOptions::default()
-    }
+fn options(url: &str, retries: usize) -> ConnectOptions {
+    let mut connect_options = session_options(url, policy(retries));
+    connect_options.handshake_timeout = Duration::from_secs(2);
+    connect_options
 }
 
 fn increment(counter: &AtomicUsize) -> Result<usize, NetError> {
@@ -59,13 +168,14 @@ fn increment(counter: &AtomicUsize) -> Result<usize, NetError> {
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
             value.checked_add(1)
         })
-        .map_err(|_| NetError::InternalError)
+        .map_err(|_| NetError::from(open_net::error::ErrorKind::Internal))
 }
 
 fn client_config() -> WebSocketClientConfig {
-    WebSocketClientConfig {
-        close_timeout: Duration::from_millis(20),
-        ..WebSocketClientConfig::default()
+    {
+        let mut config = WebSocketClientConfig::default();
+        config.close_timeout = Duration::from_millis(20);
+        config
     }
 }
 
@@ -154,9 +264,14 @@ impl Peer {
                                 .then_some(value.trim())
                         })
                         .ok_or_else(|| error("missing WebSocket key"))?;
-                    format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\n\r\n", derive_accept_key(key.as_bytes()))
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                        derive_accept_key(key.as_bytes())
+                    )
                 } else {
-                    format!("HTTP/1.1 {status} Test Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    format!(
+                        "HTTP/1.1 {status} Test Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
                 };
                 stream.write_all(response.as_bytes()).await?;
                 if status == 101 {
@@ -210,50 +325,63 @@ impl Drop for Peer {
 }
 
 #[tokio::test]
-async fn legacy_terminal_http_rejection_blocks_hints_but_allows_explicit_recovery() -> TestResult {
+async fn terminal_http_rejection_blocks_hints_but_allows_explicit_recovery() -> TestResult {
     for status in [401, 403] {
         let mut peer = Peer::start(vec![status]).await?;
         let net = OpenNet::new()?;
         let client = net
-            .create_ws_client_with_config("legacy-terminal-http-recovery", client_config())
+            .create_ws_client_with_config("terminal-http-recovery", client_config())
             .await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_calls = Arc::clone(&calls);
-        let initial = WebSocketConnectOptions {
-            header_provider: Some(Arc::new(move || {
-                increment(&provider_calls)?;
-                Ok(Vec::new())
-            })),
-            ..options(6)
+        let initial = {
+            let mut options = options(&peer.url, 6);
+            options.handshake_provider =
+                Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+                    increment(&provider_calls)?;
+                    Ok(open_net::ws::HandshakeHeaders {
+                        headers: open_net::HeaderMap::new(),
+                        credential_version: Some((1).to_string()),
+                    })
+                }));
+            options
         };
         let outcome: TestResult = async {
-            let failed = bounded(
-                "initial rejection",
-                client.connect_with_options(&peer.url, initial),
-            )
-            .await?;
+            let failed_session = client.start_session(initial, None).await?;
+            let failed = bounded("initial rejection", failed_session.wait_connected()).await?;
             check(
-                failed == Err(NetError::ConnectError),
-                "legacy HTTP error changed",
+                failed.err().as_ref().map(|error| error.kind())
+                    == Some(open_net::error::ErrorKind::HandshakeRejected),
+                "HTTP error changed",
             )?;
             check(
-                client.last_handshake_http_status() == Some(status),
+                failed_session
+                    .state()?
+                    .last_error
+                    .as_ref()
+                    .and_then(|error| error.context().http_status)
+                    .map(|status| status.as_u16())
+                    == Some(status),
                 "HTTP snapshot changed",
             )?;
             check(
-                client.last_connection_error() == Some(NetError::ConnectError),
+                failed_session
+                    .state()?
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.kind())
+                    == Some(open_net::error::ErrorKind::HandshakeRejected),
                 "HTTP terminal failure lost its stable error snapshot",
             )?;
             check(peer.count() == 1, "non-retryable HTTP failure was retried")?;
             for _ in 0..8 {
-                client.notify_network_available();
+                failed_session.notify_network_available();
             }
-            // The explicit command follows every hint in the worker FIFO. Its
-            // successful handshake is a completion barrier: a stale hint would
-            // have occupied the one connection slot and caused ConnectionExists.
-            bounded(
+            // A terminated session has no recoverable target. The new owner must
+            // establish without a hint reviving the old rejected provider.
+            let _session = bounded(
                 "explicit recovery after hints",
-                client.connect_with_options(&peer.url, options(0)),
+                SessionGuard::establish(&client, options(&peer.url, 0)),
             )
             .await??;
             check(
@@ -265,11 +393,14 @@ async fn legacy_terminal_http_rejection_blocks_hints_but_allows_explicit_recover
                 "explicit recovery did not use exactly one new socket",
             )?;
             check(
-                client.connection_status() == ConnectionStatus::Connected,
+                matches!(
+                    _session.session.state()?.state,
+                    ConnectionState::Connected(_)
+                ),
                 "explicit recovery did not establish",
             )?;
             check(
-                client.last_connection_error().is_none(),
+                _session.session.state()?.last_error.is_none(),
                 "explicit recovery retained the old failure snapshot",
             )?;
             Ok(())
@@ -287,10 +418,11 @@ async fn legacy_terminal_http_rejection_blocks_hints_but_allows_explicit_recover
 #[tokio::test]
 async fn local_provider_and_header_failures_do_not_restart_on_hints() -> TestResult {
     for failure in [
-        NetError::NotLoggedInError,
-        NetError::RetryExhausted,
-        NetError::ConfigError,
+        NetError::from(open_net::error::ErrorKind::ProviderFailed),
+        NetError::from(open_net::error::ErrorKind::RetryExhausted),
+        NetError::from(open_net::error::ErrorKind::InvalidConfig),
     ] {
+        let failure_kind = failure.kind();
         let mut peer = Peer::start(Vec::new()).await?;
         let net = OpenNet::new()?;
         let client = net
@@ -298,40 +430,70 @@ async fn local_provider_and_header_failures_do_not_restart_on_hints() -> TestRes
             .await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_calls = Arc::clone(&calls);
-        let initial = WebSocketConnectOptions {
-            header_provider: Some(Arc::new(move || {
-                if increment(&provider_calls)? == 0 {
-                    if failure == NetError::ConfigError {
-                        return Ok(vec![("authorization".into(), "invalid\r\nvalue".into())]);
+        let initial = {
+            let mut options = options(&peer.url, 6);
+            options.handshake_provider =
+                Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+                    if increment(&provider_calls)? == 0 {
+                        if failure.kind() == open_net::error::ErrorKind::InvalidConfig {
+                            return Ok(open_net::ws::HandshakeHeaders {
+                                headers: open_net::HeaderMap::from_iter([(
+                                    open_net::HeaderName::from_bytes(("authorization").as_bytes())?,
+                                    open_net::HeaderValue::from_str("invalid\r\nvalue")?,
+                                )]),
+                                credential_version: Some((1).to_string()),
+                            });
+                        }
+                        return Err(failure.clone().into());
                     }
-                    return Err(failure);
-                }
-                Ok(Vec::new())
-            })),
-            ..options(6)
+                    Ok(open_net::ws::HandshakeHeaders {
+                        headers: open_net::HeaderMap::new(),
+                        credential_version: Some((1).to_string()),
+                    })
+                }));
+            options
         };
         let outcome: TestResult = async {
-            let failed = bounded(
-                "local terminal failure",
-                client.connect_with_options(&peer.url, initial),
-            )
-            .await?;
-            check(failed == Err(failure), "provider/header error changed")?;
+            let failed_session = client.start_session(initial, None).await?;
+            let failed = bounded("local terminal failure", failed_session.wait_connected()).await?;
+            let failure = failed.err().ok_or("provider/header failure was accepted")?;
+            let source = std::error::Error::source(&failure)
+                .ok_or("provider/header failure dropped its original source")?;
+            let source_matches = if failure_kind == open_net::error::ErrorKind::InvalidConfig {
+                source.is::<http::header::InvalidHeaderValue>()
+            } else {
+                source
+                    .downcast_ref::<NetError>()
+                    .is_some_and(|source| source.kind() == failure_kind)
+            };
+            check(
+                failure.kind() == open_net::error::ErrorKind::ProviderFailed && source_matches,
+                "provider/header failure lost its boundary or original source",
+            )?;
             check(peer.count() == 0, "local failure opened a network socket")?;
             check(
-                client.last_handshake_http_status().is_none(),
+                failed_session
+                    .state()?
+                    .last_error
+                    .as_ref()
+                    .is_some_and(|error| error.context().http_status.is_none()),
                 "local failure inherited an HTTP status",
             )?;
             check(
-                client.last_connection_error() == Some(failure),
+                failed_session
+                    .state()?
+                    .last_error
+                    .as_ref()
+                    .map(NetError::kind)
+                    == Some(open_net::error::ErrorKind::ProviderFailed),
                 "local failure lost its stable error snapshot",
             )?;
             for _ in 0..8 {
-                client.notify_network_available();
+                failed_session.notify_network_available();
             }
-            bounded(
+            let _session = bounded(
                 "explicit recovery after local failure",
-                client.connect_with_options(&peer.url, options(0)),
+                SessionGuard::establish(&client, options(&peer.url, 0)),
             )
             .await??;
             check(
@@ -365,22 +527,24 @@ async fn proxy_authentication_rejection_does_not_restart_on_hints() -> TestResul
         .await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
-    let initial = WebSocketConnectOptions {
-        header_provider: Some(Arc::new(move || {
+    let initial = {
+        let mut options = options("ws://origin.invalid/recovery", 6);
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
             increment(&provider_calls)?;
-            Ok(Vec::new())
-        })),
-        ..options(6)
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((1).to_string()),
+            })
+        }));
+        options
     };
     let target = "ws://origin.invalid/recovery";
     let outcome: TestResult = async {
-        let failed = bounded(
-            "proxy auth rejection",
-            client.connect_with_options(target, initial),
-        )
-        .await?;
+        let failed_session = client.start_session(initial, None).await?;
+        let failed = bounded("proxy auth rejection", failed_session.wait_connected()).await?;
         check(
-            failed == Err(NetError::ConnectError),
+            failed.err().as_ref().map(|error| error.kind())
+                == Some(open_net::error::ErrorKind::HandshakeRejected),
             "proxy auth error changed",
         )?;
         check(
@@ -388,15 +552,23 @@ async fn proxy_authentication_rejection_does_not_restart_on_hints() -> TestResul
             "proxy authentication was retried in the same cycle",
         )?;
         check(
-            client.last_handshake_http_status().is_none(),
-            "proxy status contaminated Upgrade snapshot",
+            failed_session
+                .state()?
+                .last_error
+                .as_ref()
+                .is_some_and(|error| {
+                    error.context().http_status
+                        == Some(open_net::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                        && error.context().stage == Some(open_net::error::ErrorStage::Proxy)
+                }),
+            "proxy rejection lost its typed Proxy-stage HTTP context",
         )?;
         for _ in 0..8 {
-            client.notify_network_available();
+            failed_session.notify_network_available();
         }
-        bounded(
+        let _session = bounded(
             "explicit proxy recovery",
-            client.connect_with_options(target, options(0)),
+            SessionGuard::establish(&client, options(target, 0)),
         )
         .await??;
         check(
@@ -415,7 +587,8 @@ async fn proxy_authentication_rejection_does_not_restart_on_hints() -> TestResul
 }
 
 #[tokio::test]
-async fn transient_retry_counts_and_hint_recovery_preserve_the_healthy_socket() -> TestResult {
+async fn transient_exhaustion_requires_a_new_session_and_hints_preserve_healthy_socket(
+) -> TestResult {
     for retries in [0usize, 1, 6] {
         let attempts = retries
             .checked_add(1)
@@ -427,80 +600,110 @@ async fn transient_retry_counts_and_hint_recovery_preserve_the_healthy_socket() 
             .await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_calls = Arc::clone(&calls);
-        let initial = WebSocketConnectOptions {
-            header_provider: Some(Arc::new(move || {
-                increment(&provider_calls)?;
-                Ok(Vec::new())
-            })),
-            ..options(retries)
+        let initial = {
+            let mut options = options(&peer.url, retries);
+            options.handshake_provider =
+                Some(open_net::ws::HandshakeProvider::blocking(move |_| {
+                    increment(&provider_calls)?;
+                    Ok(open_net::ws::HandshakeHeaders {
+                        headers: open_net::HeaderMap::new(),
+                        credential_version: Some((1).to_string()),
+                    })
+                }));
+            options
         };
-        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
-        client.register_web_socket_client_connect_status_listener(Box::new(move |status| {
-            // The receiver may close during client destruction. This observation
-            // channel does not affect network work or require its own completion.
-            let _ = status_tx.send(status);
-        }));
         let outcome: TestResult = async {
-            let failed = bounded(
-                "exhaust transient attempts",
-                client.connect_with_options(&peer.url, initial),
-            )
-            .await?;
+            let mut old = session::observe(&client, initial).await?;
+            let mut failures = 0usize;
+            let mut started = None;
+            let mut terminal = None;
+            let mut sequence = 0u64;
+            while let Some(event) = bounded("exhaust attempts", old.recv()).await?? {
+                sequence = sequence.checked_add(1).ok_or("event sequence overflow")?;
+                check(event.sequence == sequence, "exhaustion event sequence skipped")?;
+                check(terminal.is_none(), "event followed Closed")?;
+                match &event.kind {
+                    ConnectionEventKind::AttemptStarted { attempt } => {
+                        check(started.is_none(), "attempt started before previous outcome")?;
+                        check(attempt.client_id == event.client_id && attempt.session_id == event.session_id,
+                            "Started has a different envelope scope")?;
+                        started = Some(attempt.clone());
+                    }
+                    ConnectionEventKind::AttemptFailed { attempt, error: failure, retry, .. } => {
+                        let previous = started.take().ok_or("failure omitted Started")?;
+                        check(previous.cycle_id == attempt.cycle_id && previous.attempt_id == attempt.attempt_id,
+                            "failure changed attempt identity")?;
+                        check(failure.context().http_status == Some(open_net::StatusCode::SERVICE_UNAVAILABLE), "failed attempt lost HTTP status")?;
+                        failures = failures.checked_add(1).ok_or("failure count overflow")?;
+                        check(matches!(retry, RetryDecision::Stop) == (failures == attempts),
+                            "retry decision disagrees with configured budget")?;
+                    }
+                    ConnectionEventKind::Closed { result: Err(failure) } => {
+                        check(started.is_none(), "Closed omitted an attempt outcome")?;
+                        check(failure.kind() == open_net::error::ErrorKind::RetryExhausted,
+                            "exhaustion lost its terminal classification")?;
+                        check_exhaustion_source(failure)?;
+                        check(failure.context().session_id == Some(event.session_id),
+                            "Closed error lost its session identity")?;
+                        terminal = Some(event);
+                    }
+                    _ => return Err(error("exhausted session unexpectedly established")),
+                }
+            }
+            terminal.ok_or_else(|| error("missing terminal event"))?;
             check(
-                failed == Err(NetError::ConnectError),
-                "legacy exhaustion error changed",
-            )?;
-            check(
-                peer.count() == attempts,
+                failures == attempts && peer.count() == attempts,
                 "max_retries did not yield exactly 1 + max_retries handshakes",
             )?;
             check(
                 calls.load(Ordering::SeqCst) == attempts,
-                "provider count disagreed with actual handshakes",
+                "provider count disagreed with handshakes",
             )?;
-            client.notify_network_available();
-            bounded("hint-established status", async {
-                while let Some(status) = status_rx.recv().await {
-                    if status == ConnectionStatus::Connected {
-                        return Ok::<(), TestError>(());
-                    }
-                }
-                Err(error("status channel closed before hint recovery"))
-            })
-            .await??;
-            let expected = attempts
-                .checked_add(1)
-                .ok_or_else(|| error("recovered count overflow"))?;
             for _ in 0..8 {
-                client.notify_network_available();
+                old.session.notify_network_available();
             }
-            // The next command is a FIFO barrier after all repeated hints. It
-            // must observe the existing healthy connection and must not replace it.
-            let duplicate = bounded(
-                "healthy-connection command barrier",
-                client.connect_with_options(&peer.url, options(0)),
+            // A new owner must be admitted after exhaustion; hints only wake
+            // active backoff and cannot revive the terminated owner.
+            let session = bounded(
+                "explicit recovery after exhaustion",
+                SessionGuard::establish(&client, options(&peer.url, 0)),
             )
-            .await?;
+            .await??;
             check(
-                duplicate == Err(NetError::ConnectionExists),
-                "healthy socket was replaced or lost",
+                peer.count() == attempts + 1,
+                "explicit recovery used extra sockets",
             )?;
             check(
-                peer.count() == expected,
-                "repeated hint opened another healthy socket",
+                calls.load(Ordering::SeqCst) == attempts,
+                "hint revived the terminal provider",
             )?;
             check(
-                calls.load(Ordering::SeqCst) == expected,
-                "repeated hint restarted the healthy provider",
+                bounded("terminal stream stays closed", old.recv())
+                    .await??
+                    .is_none(),
+                "hint restarted the terminal event stream",
+            )?;
+            old.session.cancel();
+            for _ in 0..8 {
+                session.session.notify_network_available();
+            }
+            let duplicate = session::observe(&client
+                , options(&peer.url, 0))
+                .await;
+            check(
+                matches!(duplicate, Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), open_net::error::ErrorKind::SessionAlreadyExists)),
+                "healthy owner was replaced",
             )?;
             check(
-                client.last_handshake_http_status().is_none(),
-                "successful recovery retained stale HTTP failure",
+                peer.count() == attempts + 1,
+                "hint opened an extra healthy socket",
             )?;
             check(
-                client.last_connection_error() == Some(NetError::ConnectError),
-                "automatic recovery no longer preserves the last connection failure",
+                session.session.state()?.last_error.is_none(),
+                "explicit recovery retained stale failure snapshots",
             )?;
+            session.session.cancel();
+            session.finish().await?;
             Ok(())
         }
         .await;
@@ -520,36 +723,73 @@ async fn context_exhaustion_recovers_explicitly_without_a_network_hint() -> Test
     let outcome: TestResult = async {
         let mut old = bounded(
             "start exhausted context",
-            client.start_connect_with_context(
-                WebSocketContextConnectOptions::new(&peer.url, 400)
-                    .with_headers(Vec::new(), 4000)
-                    .with_reconnect(policy(1)),
-            ),
+            session::observe(&client, {
+                let mut connect_options = {
+                    let mut options = {
+                        let mut options = ConnectOptions::new(&peer.url);
+                        options.headers = open_net::HeaderMap::new();
+                        options
+                    };
+                    options.reconnect = policy(1);
+                    options
+                };
+                connect_options.handshake_timeout = Duration::from_secs(2);
+                connect_options
+            }),
         )
         .await??;
         let mut failed_attempts = 0usize;
         let mut terminal = None;
+        let mut started = None;
+        let mut sequence = 0u64;
         while let Some(event) = bounded("exhaust old context", old.recv()).await?? {
-            check(
-                terminal.is_none(),
-                "old context emitted after its terminal event",
-            )?;
-            match event.kind() {
-                WebSocketConnectionEventKind::AttemptFailed => {
+            sequence = sequence.checked_add(1).ok_or("event sequence overflow")?;
+            check(event.sequence == sequence, "old context sequence skipped")?;
+            check(terminal.is_none(), "old context emitted after Closed")?;
+            match &event.kind {
+                ConnectionEventKind::AttemptStarted { attempt } => {
+                    check(started.is_none(), "attempt started before previous outcome")?;
+                    check(
+                        attempt.client_id == event.client_id
+                            && attempt.session_id == event.session_id,
+                        "Started has a different envelope scope",
+                    )?;
+                    started = Some(attempt.clone());
+                }
+                ConnectionEventKind::AttemptFailed {
+                    attempt,
+                    error: failure,
+                    retry,
+                    ..
+                } => {
+                    let previous = started.take().ok_or("failure omitted Started")?;
+                    check(
+                        previous.cycle_id == attempt.cycle_id
+                            && previous.attempt_id == attempt.attempt_id,
+                        "failure changed attempt identity",
+                    )?;
                     failed_attempts = failed_attempts
                         .checked_add(1)
-                        .ok_or_else(|| error("event count overflow"))?;
+                        .ok_or("event count overflow")?;
                     check(
-                        event.failure().and_then(|failure| failure.http_status()) == Some(503),
+                        failure.context().http_status
+                            == Some(open_net::StatusCode::SERVICE_UNAVAILABLE),
                         "original transient failure lost",
                     )?;
-                }
-                WebSocketConnectionEventKind::SessionTerminated => {
                     check(
-                        event.termination_reason()
-                            == Some(WebSocketTerminationReason::RetryExhausted),
-                        "wrong exhaustion reason",
+                        matches!(retry, RetryDecision::Stop) == (failed_attempts == 2),
+                        "retry decision disagrees with configured budget",
                     )?;
+                }
+                ConnectionEventKind::Closed {
+                    result: Err(failure),
+                } => {
+                    check(started.is_none(), "Closed omitted an attempt outcome")?;
+                    check(
+                        failure.kind() == open_net::error::ErrorKind::RetryExhausted,
+                        "wrong exhaustion classification",
+                    )?;
+                    check_exhaustion_source(failure)?;
                     terminal = Some(event);
                 }
                 _ => return Err(error("unexpected successful event during exhaustion")),
@@ -564,33 +804,31 @@ async fn context_exhaustion_recovers_explicitly_without_a_network_hint() -> Test
         // event and this explicit new session.
         let mut current = bounded(
             "start explicit new context",
-            client.start_connect_with_context(
-                WebSocketContextConnectOptions::new(&peer.url, 401)
-                    .with_headers(Vec::new(), 4010)
-                    .with_reconnect(policy(0)),
-            ),
+            session::observe(&client, {
+                let mut connect_options = {
+                    let mut options = {
+                        let mut options = ConnectOptions::new(&peer.url);
+                        options.headers = open_net::HeaderMap::new();
+                        options
+                    };
+                    options.reconnect = policy(0);
+                    options
+                };
+                connect_options.handshake_timeout = Duration::from_secs(2);
+                connect_options
+            }),
         )
         .await??;
-        let established = bounded("new context Established", current.recv())
-            .await??
-            .ok_or_else(|| error("new context closed before Established"))?;
+        let established = established(&mut current).await?;
         check(
-            established.kind() == WebSocketConnectionEventKind::Established,
-            "explicit new session failed",
-        )?;
-        check(
-            established.session_id() != previous.session_id(),
+            established.session_id != previous.session_id,
             "new context reused terminal session identity",
         )?;
         check(
-            established.client_instance_id() == previous.client_instance_id(),
+            established.client_id == previous.client_id,
             "explicit recovery unexpectedly replaced the client",
         )?;
-        check(
-            established.session_context_id() == 401,
-            "new session lost application context",
-        )?;
-        bounded("cancel stale handle", old.cancel()).await??;
+        old.session.cancel();
         check(
             bounded("old stream remains ended", old.recv())
                 .await??
@@ -600,30 +838,20 @@ async fn context_exhaustion_recovers_explicitly_without_a_network_hint() -> Test
         drop(old);
         let duplicate = bounded(
             "new context survives old handle",
-            client.connect_with_options(&peer.url, options(0)),
+            SessionGuard::establish(&client, options(&peer.url, 0)),
         )
         .await?;
         check(
-            duplicate == Err(NetError::ConnectionExists),
+            duplicate.err().as_ref().map(|error| error.kind())
+                == Some(open_net::error::ErrorKind::SessionAlreadyExists),
             "stale handle cancellation affected new session",
         )?;
         check(
             peer.count() == 3,
             "explicit context recovery opened extra sockets",
         )?;
-        bounded("cancel recovered context", current.cancel()).await??;
-        let mut terminal_count = 0usize;
-        while let Some(event) = bounded("drain recovered context", current.recv()).await?? {
-            if event.kind() == WebSocketConnectionEventKind::SessionTerminated {
-                terminal_count = terminal_count
-                    .checked_add(1)
-                    .ok_or_else(|| error("terminal count overflow"))?;
-            }
-        }
-        check(
-            terminal_count == 1,
-            "recovered context omitted or duplicated terminal event",
-        )?;
+        current.session.cancel();
+        cancelled(&mut current, &established).await?;
         Ok(())
     }
     .await;
@@ -640,25 +868,29 @@ async fn disabled_reconnect_stops_after_one_attempt_and_ignores_hints() -> TestR
         .await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
-    let initial = WebSocketConnectOptions {
-        reconnect: ReconnectPolicy {
-            enabled: false,
-            ..policy(6)
-        },
-        header_provider: Some(Arc::new(move || {
+    let mut initial = {
+        let mut options = session_options(&peer.url, ReconnectPolicy::Disabled);
+        options.handshake_provider = Some(open_net::ws::HandshakeProvider::blocking(move |_| {
             increment(&provider_calls)?;
-            Ok(Vec::new())
-        })),
-        ..WebSocketConnectOptions::default()
+            Ok(open_net::ws::HandshakeHeaders {
+                headers: open_net::HeaderMap::new(),
+                credential_version: Some((1).to_string()),
+            })
+        }));
+        options
     };
+    initial.handshake_timeout = Duration::from_secs(2);
+    initial.connect_timeout = Some(Duration::from_secs(3));
     let outcome: TestResult = async {
+        let failed_session = client.start_session(initial, None).await?;
         let failed = bounded(
             "disabled reconnect first failure",
-            client.connect_with_options(&peer.url, initial),
+            failed_session.wait_connected(),
         )
         .await?;
         check(
-            failed == Err(NetError::ConnectError),
+            failed.err().as_ref().map(|error| error.kind())
+                == Some(open_net::error::ErrorKind::HandshakeRejected),
             "disabled reconnect error changed",
         )?;
         check(
@@ -666,11 +898,11 @@ async fn disabled_reconnect_stops_after_one_attempt_and_ignores_hints() -> TestR
             "disabled reconnect consumed additional attempts",
         )?;
         for _ in 0..8 {
-            client.notify_network_available();
+            failed_session.notify_network_available();
         }
-        bounded(
+        let _session = bounded(
             "explicit recovery with reconnect disabled",
-            client.connect_with_options(&peer.url, options(0)),
+            SessionGuard::establish(&client, options(&peer.url, 0)),
         )
         .await??;
         check(
@@ -697,17 +929,24 @@ async fn one_hundred_concurrent_context_requests_admit_one_connection_owner() ->
         .await?;
     let outcome: TestResult = async {
         let mut attempts = JoinSet::new();
-        for context in 0..100u64 {
+        for _ in 0..100u64 {
             let client = client.clone();
             let target = peer.url.clone();
             attempts.spawn(async move {
-                client
-                    .start_connect_with_context(
-                        WebSocketContextConnectOptions::new(target, context)
-                            .with_headers(Vec::new(), context)
-                            .with_reconnect(policy(0)),
-                    )
-                    .await
+                session::observe(&client, {
+                    let mut connect_options = {
+                        let mut options = {
+                            let mut options = ConnectOptions::new(target);
+                            options.headers = open_net::HeaderMap::new();
+                            options
+                        };
+                        options.reconnect = policy(0);
+                        options
+                    };
+                    connect_options.handshake_timeout = Duration::from_secs(2);
+                    connect_options
+                })
+                .await
             });
         }
         // The server has read a real Upgrade but deliberately withholds 101, so
@@ -727,7 +966,9 @@ async fn one_hundred_concurrent_context_requests_admit_one_connection_owner() ->
                     )?;
                     owner = Some(events);
                 }
-                Err(NetError::ConnectionExists) => {
+                Err(failure)
+                    if failure.kind() == open_net::error::ErrorKind::SessionAlreadyExists =>
+                {
                     rejected = rejected
                         .checked_add(1)
                         .ok_or_else(|| error("rejection count overflow"))?;
@@ -745,42 +986,29 @@ async fn one_hundred_concurrent_context_requests_admit_one_connection_owner() ->
         )?;
         let mut owner = owner.ok_or_else(|| error("no concurrent session was admitted"))?;
         peer.release_handshake()?;
-        let established = bounded("one owner establishes", owner.recv())
-            .await??
-            .ok_or_else(|| error("winning session ended before Established"))?;
-        check(
-            established.kind() == WebSocketConnectionEventKind::Established,
-            "winning session did not establish",
-        )?;
+        let established = established(&mut owner).await?;
         for _ in 0..8 {
-            client.notify_network_available();
+            owner.session.notify_network_available();
         }
         let duplicate = bounded(
             "healthy owner command barrier",
-            client.connect_with_options(&peer.url, options(0)),
+            SessionGuard::establish(&client, options(&peer.url, 0)),
         )
         .await?;
         check(
-            duplicate == Err(NetError::ConnectionExists),
+            duplicate.err().as_ref().map(|error| error.kind())
+                == Some(open_net::error::ErrorKind::SessionAlreadyExists),
             "healthy owner was replaced by hints",
         )?;
         check(
             peer.count() == 1,
             "healthy owner was assigned another socket",
         )?;
-        bounded("cancel winning session", owner.cancel()).await??;
-        let mut terminals = 0usize;
-        while let Some(event) = bounded("winning session terminal", owner.recv()).await?? {
-            if event.kind() == WebSocketConnectionEventKind::SessionTerminated {
-                terminals = terminals
-                    .checked_add(1)
-                    .ok_or_else(|| error("terminal count overflow"))?;
-            }
-        }
         check(
-            terminals == 1,
-            "winning session did not terminate exactly once",
+            owner.session.cancel(),
+            "winning session was already cancelled",
         )?;
+        cancelled(&mut owner, &established).await?;
         Ok(())
     }
     .await;

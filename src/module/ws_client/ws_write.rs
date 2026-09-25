@@ -1,20 +1,25 @@
-use crate::api::net_error::NetError;
-use crate::api::wsc::wsc_response::PendingRequestView;
 use crate::common::log::log_def::LogType;
-use crate::common::platform::spawn;
+use crate::error::NetError;
+use crate::module::ws_client::heartbeat_schedule::HeartbeatSchedule;
 use crate::module::ws_client::heartbeat_state::{HeartbeatState, HeartbeatTick};
+use crate::module::ws_client::io_diagnostics::{classify_io_error, ClassifiedSink};
 use crate::module::ws_client::io_event::IoEvent;
+use crate::module::ws_client::native_pending::NativePending;
+use crate::module::ws_client::operation_control::OperationControl;
 use crate::module::ws_client::write::control_message::ControlMessage;
 use crate::module::ws_client::write::priority_write_queue::PriorityWriteQueue;
-use crate::module::ws_client::write::queued_request::{DispatchPhase, QueuedRequest};
+use crate::module::ws_client::write::queued_request::QueuedRequest;
 use crate::module::ws_client::write::write_loop_context::WriteLoopContext;
+use crate::ws::IoEndKind;
 use bytes::Bytes;
 use futures::{FutureExt, Sink, SinkExt};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, Interval, MissedTickBehavior};
+use tokio::time::Instant;
+#[cfg(test)]
+use tokio::time::{Interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::protocol::frame::{
     coding::{Data as OpData, OpCode},
     Frame,
@@ -48,7 +53,7 @@ const MAX_READY_CONTROLS_PER_BOUNDARY: usize = 16;
 /// 业务请求按队列优先级写入。一次逻辑消息从开始处理起共享同一个
 /// `write_timeout` deadline；每个 data frame 还受独立的 `data_frame_write_timeout`
 /// 限制，实际采用两者中更早的 deadline。任一 data frame 超时都会返回
-/// `NetError::DeliveryUnknown` 并终止当前连接，因为无法判断该帧有多少数据已进入
+/// `ErrorKind::DeliveryUnknown` 并终止当前连接，因为无法判断该帧有多少数据已进入
 /// 底层。非取消错误在
 /// 请求声明幂等且仍有重试额度时，会保留原容量许可和 FIFO 序号重新入队；
 /// 随后写循环报告连接错误并退出，由工作线程决定是否重连并继续重试。
@@ -56,7 +61,7 @@ const MAX_READY_CONTROLS_PER_BOUNDARY: usize = 16;
 /// `response_timeout` 清理，也可更早被响应监听器认领或被断线/关闭清理。响应可能
 /// 在 sink 发送返回后立即被取走，先于写循环更新状态；此时不会启动超时
 /// 任务，但网络写入仍以成功完成。若写入前因记录缺失、token 不匹配或锁中毒而
-/// 无法标记为写入中，请求不会上网，而是以 `NetError::Cancelled` 完成。
+/// 无法标记为写入中，请求不会上网，而是以 `ErrorKind::Cancelled` 完成。
 ///
 /// 收到主动关闭指令、取消令牌触发、控制通道关闭，或业务队列关闭且已经排空时，
 /// 当前循环会不发送 `WriteEnded` 而结束；需要驱动连接状态变化的非取消 I/O
@@ -66,14 +71,16 @@ const MAX_READY_CONTROLS_PER_BOUNDARY: usize = 16;
 /// 取消令牌；控制写入超时以 `DeliveryUnknown` 报告并废弃当前连接。控制指令不会
 /// 取消一个已经开始的 data frame 写入，以免继续复用可能只写出半帧的 sink。
 pub(crate) async fn run_write_loop<W>(
-    mut write: W,
+    write: W,
     context: WriteLoopContext,
     write_retirement: CancellationToken,
 ) where
     W: Sink<Message, Error = WsError> + Unpin + Send + 'static,
 {
     crate::log_t!(LogType::WSC; "run_write_loop", "generation|data_frame_payload_size", context.generation, context.data_frame_payload_size);
+    let mut write = ClassifiedSink::new(write);
     let WriteLoopContext {
+        cancel_domain_gate,
         queue,
         urgent_queue,
         mut control_rx,
@@ -84,17 +91,16 @@ pub(crate) async fn run_write_loop<W>(
         data_frame_payload_size,
         control_write_timeout,
         data_frame_write_timeout,
-        heartbeat_interval,
-        pong_timeout,
-        response_dispatch_grace,
+        heartbeat_config,
         heartbeat: heartbeat_state,
     } = context;
-    let Some(start) = Instant::now().checked_add(heartbeat_interval) else {
-        send_write_end(&io_event_tx, generation, NetError::ConfigError, &cancel).await;
-        return;
+    let mut heartbeat = match HeartbeatSchedule::new(heartbeat_config) {
+        Ok(schedule) => schedule,
+        Err(error) => {
+            send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel).await;
+            return;
+        }
     };
-    let mut heartbeat = tokio::time::interval_at(start, heartbeat_interval);
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut consecutive_controls = 0usize;
     loop {
         // `select!` intentionally prioritizes control traffic, but a peer can keep that
@@ -120,12 +126,14 @@ pub(crate) async fn run_write_loop<W>(
                     consecutive_controls = consecutive_controls.saturating_add(1);
                 }
                 Some(ControlAction::Stop(_)) => return,
-                Some(ControlAction::Failed {
-                    error: NetError::Cancelled,
-                    ..
-                }) => return,
+                Some(ControlAction::Failed { error, .. })
+                    if error.kind() == crate::error::ErrorKind::Cancelled =>
+                {
+                    return
+                }
                 Some(ControlAction::Failed { error, .. }) => {
-                    send_write_end(&io_event_tx, generation, error, &cancel).await;
+                    send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                        .await;
                     return;
                 }
                 None => {}
@@ -135,7 +143,9 @@ pub(crate) async fn run_write_loop<W>(
                 send_write_end(
                     &io_event_tx,
                     generation,
-                    NetError::SocketRecvTimeout,
+                    NetError::from(crate::error::ErrorKind::TimedOut)
+                        .with_stage(crate::error::ErrorStage::Heartbeat),
+                    write.end_kind(),
                     &cancel,
                 )
                 .await;
@@ -146,7 +156,7 @@ pub(crate) async fn run_write_loop<W>(
         // This preserves the peer-Close handshake without allowing a control stream to reset the
         // bounded fairness counter: after the heartbeat, the next iteration still forces a ready
         // business request once the shared control budget has been reached.
-        if heartbeat.tick().now_or_never().is_some() {
+        if let Some(pong_timeout) = heartbeat.tick().now_or_never() {
             match try_handle_ready_control(
                 &mut write,
                 &mut control_rx,
@@ -159,12 +169,14 @@ pub(crate) async fn run_write_loop<W>(
                     consecutive_controls = consecutive_controls.saturating_add(1);
                 }
                 Some(ControlAction::Stop(_)) => return,
-                Some(ControlAction::Failed {
-                    error: NetError::Cancelled,
-                    ..
-                }) => return,
+                Some(ControlAction::Failed { error, .. })
+                    if error.kind() == crate::error::ErrorKind::Cancelled =>
+                {
+                    return
+                }
                 Some(ControlAction::Failed { error, .. }) => {
-                    send_write_end(&io_event_tx, generation, error, &cancel).await;
+                    send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                        .await;
                     return;
                 }
                 None => {}
@@ -178,8 +190,9 @@ pub(crate) async fn run_write_loop<W>(
             )
             .await
             {
-                if error != NetError::Cancelled {
-                    send_write_end(&io_event_tx, generation, error, &cancel).await;
+                if error.kind() != crate::error::ErrorKind::Cancelled {
+                    send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                        .await;
                 }
                 return;
             }
@@ -212,7 +225,7 @@ pub(crate) async fn run_write_loop<W>(
                 _ = cancel.cancelled() => WriteLoopEvent::Cancelled,
                 control = control_rx.recv() => WriteLoopEvent::Control(control),
                 _ = wait_for_pong_deadline(&heartbeat_state) => WriteLoopEvent::HeartbeatTimedOut,
-                _ = heartbeat.tick() => WriteLoopEvent::Heartbeat,
+                pong_timeout = heartbeat.tick() => WriteLoopEvent::Heartbeat(pong_timeout),
                 request = urgent_queue.next() => WriteLoopEvent::Request(
                     request,
                     Arc::clone(&urgent_queue),
@@ -239,12 +252,14 @@ pub(crate) async fn run_write_loop<W>(
                 {
                     ControlAction::Continue => {}
                     ControlAction::Stop(_) => return,
-                    ControlAction::Failed {
-                        error: NetError::Cancelled,
-                        ..
-                    } => return,
+                    ControlAction::Failed { error, .. }
+                        if error.kind() == crate::error::ErrorKind::Cancelled =>
+                    {
+                        return
+                    }
                     ControlAction::Failed { error, .. } => {
-                        send_write_end(&io_event_tx, generation, error, &cancel).await;
+                        send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                            .await;
                         return;
                     }
                 }
@@ -260,14 +275,16 @@ pub(crate) async fn run_write_loop<W>(
                     send_write_end(
                         &io_event_tx,
                         generation,
-                        NetError::SocketRecvTimeout,
+                        NetError::from(crate::error::ErrorKind::TimedOut)
+                            .with_stage(crate::error::ErrorStage::Heartbeat),
+                        write.end_kind(),
                         &cancel,
                     )
                     .await;
                     return;
                 }
             }
-            WriteLoopEvent::Heartbeat => {
+            WriteLoopEvent::Heartbeat(pong_timeout) => {
                 consecutive_controls = 0;
                 if let Err(error) = handle_heartbeat_tick(
                     &mut write,
@@ -278,8 +295,9 @@ pub(crate) async fn run_write_loop<W>(
                 )
                 .await
                 {
-                    if error != NetError::Cancelled {
-                        send_write_end(&io_event_tx, generation, error, &cancel).await;
+                    if error.kind() != crate::error::ErrorKind::Cancelled {
+                        send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                            .await;
                     }
                     return;
                 }
@@ -289,7 +307,27 @@ pub(crate) async fn run_write_loop<W>(
                 request
                     .dispatch_phase
                     .bind_write_retirement(write_retirement.clone());
-                match handle_queued_request(
+                let domain_io = match &cancel_domain_gate {
+                    Some(gate) if request.dispatch_phase.cancel_domain().is_some() => {
+                        match gate.activate(request.dispatch_phase.clone()) {
+                            Ok(active) => Some(active),
+                            Err(error) => {
+                                request.complete(Err(error.clone()));
+                                send_write_end(
+                                    &io_event_tx,
+                                    generation,
+                                    error,
+                                    write.end_kind(),
+                                    &cancel,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let action = handle_queued_request(
                     &mut write,
                     request,
                     &source_queue,
@@ -302,16 +340,16 @@ pub(crate) async fn run_write_loop<W>(
                     data_frame_write_timeout,
                     &mut heartbeat,
                     &heartbeat_state,
-                    pong_timeout,
-                    response_dispatch_grace,
                     &cancel,
                 )
-                .await
-                {
+                .await;
+                drop(domain_io);
+                match action {
                     RequestAction::Continue => {}
                     RequestAction::Stop => return,
                     RequestAction::StopWithError(error) => {
-                        send_write_end(&io_event_tx, generation, error, &cancel).await;
+                        send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                            .await;
                         return;
                     }
                 }
@@ -352,7 +390,7 @@ enum WriteLoopEvent {
     Cancelled,
     Control(Option<ControlMessage>),
     HeartbeatTimedOut,
-    Heartbeat,
+    Heartbeat(Duration),
     Request(
         Option<QueuedRequest>,
         Arc<PriorityWriteQueue>,
@@ -377,7 +415,7 @@ enum RequestRequeue {
 /// A control-frame timeout can make the shared sink unsafe while the current business request is
 /// still provably unsent. In that case `request_error` stays a safe `ConnectionClosed`, while
 /// `connection_action` carries `DeliveryUnknown` and retires the physical connection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct RequestWriteFailure {
     request_error: NetError,
     connection_action: RequestAction,
@@ -387,20 +425,28 @@ struct RequestWriteFailure {
 impl RequestWriteFailure {
     fn connection(error: NetError, data_started: bool) -> Self {
         crate::log_t!(LogType::WSC; "connection", "error|data_started", format!("{error:?}"), data_started);
-        if matches!(error, NetError::Cancelled | NetError::ConnectionClosed) {
+        if matches!(
+            error.kind(),
+            crate::error::ErrorKind::Cancelled | crate::error::ErrorKind::Closed
+        ) {
             crate::log_s!(LogType::WSC; "connection", "error|data_started", format!("{error:?}"), data_started);
         } else {
             crate::log_e!(LogType::WSC; "connection", "error|data_started", format!("{error:?}"), data_started);
         }
-        let request_error = if data_started {
-            NetError::DeliveryUnknown
-        } else if error == NetError::DeliveryUnknown {
-            NetError::ConnectionClosed
-        } else {
-            error
-        };
-        let connection_action = if matches!(error, NetError::Cancelled | NetError::ConnectionClosed)
-        {
+        let request_error =
+            if data_started && error.kind() != crate::error::ErrorKind::DeliveryUnknown {
+                NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error.clone())
+                    .with_context(error.context().clone())
+            } else if !data_started && error.kind() == crate::error::ErrorKind::DeliveryUnknown {
+                NetError::with_source(crate::error::ErrorKind::Closed, error.clone())
+                    .with_context(error.context().clone())
+            } else {
+                error.clone()
+            };
+        let connection_action = if matches!(
+            error.kind(),
+            crate::error::ErrorKind::Cancelled | crate::error::ErrorKind::Closed
+        ) {
             RequestAction::Stop
         } else {
             RequestAction::StopWithError(error)
@@ -421,13 +467,11 @@ impl RequestWriteFailure {
         crate::log_t!(LogType::WSC; "cancelled", "data_started", data_started);
         crate::log_s!(LogType::WSC; "cancelled", "state|data_started", "dispatch_cancelled", data_started);
         Self {
-            request_error: if data_started {
-                NetError::DeliveryUnknown
-            } else {
-                NetError::Cancelled
-            },
+            request_error: NetError::from(crate::error::ErrorKind::Cancelled),
             connection_action: if data_started {
-                RequestAction::StopWithError(NetError::DeliveryUnknown)
+                RequestAction::StopWithError(NetError::from(
+                    crate::error::ErrorKind::DeliveryUnknown,
+                ))
             } else {
                 RequestAction::Continue
             },
@@ -438,13 +482,12 @@ impl RequestWriteFailure {
     fn local_close(data_started: bool, error: Option<NetError>) -> Self {
         crate::log_t!(LogType::WSC; "local_close", "data_started|error", data_started, format!("{error:?}"));
         Self {
-            request_error: if data_started {
-                NetError::DeliveryUnknown
-            } else {
-                NetError::Cancelled
-            },
+            request_error: NetError::from(crate::error::ErrorKind::Cancelled),
             connection_action: match error {
-                Some(NetError::Cancelled) | None => RequestAction::Stop,
+                None => RequestAction::Stop,
+                Some(error) if error.kind() == crate::error::ErrorKind::Cancelled => {
+                    RequestAction::Stop
+                }
                 Some(error) => RequestAction::StopWithError(error),
             },
             requeue: RequestRequeue::Never,
@@ -455,13 +498,11 @@ impl RequestWriteFailure {
         crate::log_t!(LogType::WSC; "deadline", "data_started|connection_uncertain", data_started, connection_uncertain);
         crate::log_e!(LogType::WSC; "deadline", "error|data_started|connection_uncertain", "request_deadline_elapsed", data_started, connection_uncertain);
         Self {
-            request_error: if data_started {
-                NetError::DeliveryUnknown
-            } else {
-                NetError::TimeoutError
-            },
+            request_error: NetError::from(crate::error::ErrorKind::TimedOut),
             connection_action: if data_started || connection_uncertain {
-                RequestAction::StopWithError(NetError::DeliveryUnknown)
+                RequestAction::StopWithError(NetError::from(
+                    crate::error::ErrorKind::DeliveryUnknown,
+                ))
             } else {
                 RequestAction::Continue
             },
@@ -470,74 +511,72 @@ impl RequestWriteFailure {
     }
 }
 
-/// 处理一条普通或紧急队列请求，并给主循环返回连接级动作。
+/// Writes one accepted operation while retaining the existing frame/control scheduler.
 #[allow(clippy::too_many_arguments)]
 async fn handle_queued_request<W>(
     write: &mut W,
     mut request: QueuedRequest,
     source_queue: &Arc<PriorityWriteQueue>,
-    pending_requests: &PendingRequestView,
+    pending_requests: &Arc<NativePending>,
     generation: u64,
     data_frame_payload_size: Option<usize>,
     first_frame_control_budget: usize,
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     control_write_timeout: Duration,
     data_frame_write_timeout: Duration,
-    heartbeat: &mut Interval,
+    heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
-    pong_timeout: Duration,
-    response_dispatch_grace: Duration,
     connection_cancel: &CancellationToken,
 ) -> RequestAction
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "handle_queued_request", "uuid|generation|attempt|message_bytes|pending_token|data_frame_payload_size", &request.uuid, generation, request.attempt, request.message.len(), request.pending_token, data_frame_payload_size);
+    let connection = crate::ws::ConnectionId::from_allocated(generation);
     if request
         .admission_cancel
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
     {
-        crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation", "admission_cancelled_before_write", &request.uuid, generation);
-        remove_pending_for_request(pending_requests, &request, NetError::ConnectionClosed);
-        request.complete(Err(NetError::ConnectionClosed));
+        request.complete(Err(NetError::from(crate::error::ErrorKind::Closed)));
         return RequestAction::Continue;
     }
-    // The writer has committed this admission. A retry after an actual write error is
-    // governed by request idempotency/policy rather than the old connection lease.
     request.admission_cancel = None;
-    if !request.dispatch_phase.start_writing() || request.dispatch_cancel.is_cancelled() {
-        crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation", "dispatch_cancelled_before_write", &request.uuid, generation);
-        remove_pending_for_request(pending_requests, &request, NetError::Cancelled);
-        request.complete(Err(NetError::Cancelled));
+    if !request.dispatch_phase.mark_writing(connection) || request.dispatch_cancel.is_cancelled() {
+        let error = inactive_operation_error(&request.dispatch_phase);
+        request.complete(Err(error));
         return RequestAction::Continue;
     }
-    if let Some(token) = request.pending_token {
-        if !pending_requests.mark_writing(request.uuid.as_str(), token, request.attempt, generation)
-        {
-            crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation", "pending_unavailable_before_write", &request.uuid, generation);
-            request.complete(Err(NetError::Cancelled));
-            return RequestAction::Continue;
+    if let Some(registration) = &request.registration {
+        match pending_requests.bind_connection(registration, connection) {
+            Ok(true) => {}
+            Ok(false) => {
+                let error = inactive_operation_error(&request.dispatch_phase);
+                request.complete(Err(error));
+                return RequestAction::Continue;
+            }
+            Err(error) => {
+                request.complete(Err(error));
+                return RequestAction::Continue;
+            }
         }
     }
-    if let Some(observation) = request.dispatch_phase.observation() {
-        observation.mark_writing(generation);
-    }
-
     let Some(write_deadline) = Instant::now().checked_add(request.config.write_timeout) else {
-        crate::log_e!(LogType::WSC; "handle_queued_request", "error|uuid", "unrepresentable_write_deadline", &request.uuid);
-        remove_pending_for_request(pending_requests, &request, NetError::ConfigError);
-        request.complete(Err(NetError::ConfigError));
+        request.complete(Err(NetError::config(
+            "write_timeout",
+            "exceeds monotonic clock range",
+        )));
         return RequestAction::Continue;
     };
     let write_deadline = request
         .dispatch_phase
-        .response_deadline()
+        .absolute_deadline()
         .map_or(write_deadline, |deadline| {
             write_deadline.min(Instant::from_std(deadline))
         });
-    crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation|attempt", "write_started", &request.uuid, generation, request.attempt);
-    let send_result = send_request_message_with_phase(
+    // Registered response expiry is arbitrated by NativePending, including its
+    // bounded Manual grace. Freezing that deadline here would cancel a request
+    // even after the table extended an already accepted response's claim window.
+    let result = send_request_message_with_phase(
         write,
         request.message.clone(),
         data_frame_payload_size,
@@ -548,234 +587,146 @@ where
         data_frame_write_timeout,
         heartbeat,
         heartbeat_state,
-        pong_timeout,
         connection_cancel,
         &request.dispatch_cancel,
         &request.dispatch_phase,
     )
     .await;
-    // Publish the successful sink commit before notifying the awaiting Future. If
-    // cancellation won the atomic race while writing, the connection is no longer
-    // safe to reuse even when the sink future happened to return Ok immediately after.
-    // A scope can revoke the child token without changing the dispatch phase. Honor
-    // that signal when observed before commit; later revocation cannot undo this write.
-    let send_result = match send_result {
-        Ok(()) if !request.dispatch_cancel.is_cancelled() && request.dispatch_phase.commit() => {
-            Ok(())
-        }
-        Ok(()) => Err(RequestWriteFailure::cancelled(true)),
-        Err(failure) => Err(failure),
-    };
-
-    match send_result {
+    match result {
         Ok(()) => {
-            crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation|expect_response", "sink_write_committed", &request.uuid, generation, request.pending_token.is_some());
-            if request.pending_token.is_some() {
-                if let Some(observation) = request.dispatch_phase.observation() {
-                    observation.mark_written();
-                }
-            }
-            if let Some(token) = request.pending_token {
-                let uuid = request.uuid.clone();
-                let response_timeout = request.config.response_timeout;
-                if let Some(timeout_cancel) = pending_requests.mark_sent(uuid.as_str(), token) {
-                    let timeout_pending = pending_requests.clone();
-                    spawn(expire_pending_after_response_timeout(
-                        timeout_pending,
-                        uuid,
-                        token,
-                        timeout_cancel,
-                        response_timeout,
-                        response_dispatch_grace,
-                    ));
-                }
-            }
-            // 响应或发送 Future 的取消可能已经认领/移除了 pending；这不改变网络写入成功。
+            let control = request.dispatch_phase.clone();
+            // Completion releases queue permits before publishing write observation.
+            // NativePending starts Written-origin response timing exactly once.
             request.complete(Ok(()));
-            RequestAction::Continue
+            match control.snapshot() {
+                Ok(snapshot)
+                    if matches!(
+                        snapshot.delivery,
+                        crate::ws::DeliveryEvidence::Written
+                            | crate::ws::DeliveryEvidence::ResponseConfirmed
+                    ) =>
+                {
+                    RequestAction::Continue
+                }
+                Ok(snapshot) => match snapshot.result {
+                    Some(Err(error)) => {
+                        control.retire_write();
+                        RequestAction::StopWithError(error)
+                    }
+                    _ => RequestAction::Continue,
+                },
+                Err(error) => {
+                    control.retire_write();
+                    RequestAction::StopWithError(error)
+                }
+            }
         }
         Err(failure) => {
-            if failure.request_error == NetError::Cancelled {
-                crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation", "request_cancelled", &request.uuid, generation);
-            } else {
-                crate::log_e!(LogType::WSC; "handle_queued_request", "uuid|generation|attempt|request_error|connection_action", &request.uuid, generation, request.attempt, format!("{:?}", failure.request_error), format!("{:?}", failure.connection_action));
-            }
-            let request_error = failure.request_error;
-            request.remember_delivery_error(request_error);
-            let dispatch_cancelled =
-                request.dispatch_phase.is_cancelled() || request.dispatch_cancel.is_cancelled();
-            let connection_action = failure.connection_action;
-            if connection_action != RequestAction::Continue {
+            let action = failure.connection_action;
+            if !matches!(action, RequestAction::Continue) {
                 request.dispatch_phase.retire_write();
             }
-            if let Some(token) = request.pending_token {
-                if let Err(error) = pending_requests.enforce_registration_deadline(
-                    request.uuid.as_str(),
-                    token,
-                    response_dispatch_grace,
-                ) {
-                    crate::log_e!(LogType::WSC; "handle_queued_request", "stage|error", "registration_deadline", format!("{error:?}"));
-                    remove_pending_for_request(pending_requests, &request, error);
-                    request.complete(Err(error));
-                    return connection_action;
-                }
-                match pending_requests.defer_registration_write(&mut request) {
-                    Ok(true) => return connection_action,
-                    Ok(false) => {}
-                    Err(error) => {
-                        crate::log_e!(LogType::WSC; "handle_queued_request", "stage|error", "defer_registration_receipt", format!("{error:?}"));
-                        remove_pending_for_request(pending_requests, &request, error);
-                        request.complete(Err(error));
-                        return connection_action;
+            // An already correlated response remains authoritative even if flush fails.
+            if request.dispatch_phase.response_confirmed() {
+                request.release();
+                if !matches!(action, RequestAction::Continue) {
+                    if let Err(error) =
+                        pending_requests.fail_connection(connection, failure.request_error)
+                    {
+                        return RequestAction::StopWithError(error);
                     }
                 }
+                return action;
             }
-            // A listener may correlate a response after the peer received the request but
-            // before Tungstenite finishes flushing it. That successful business response is
-            // authoritative for this request, although the ambiguous I/O error still retires
-            // the physical connection.
-            if request.dispatch_phase.take_write_response_claim() {
-                crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation", "response_claim_won_over_write_error", &request.uuid, generation);
-                request.complete(Ok(()));
-                return connection_action;
-            }
-            let wait_for_reconnect = failure.requeue == RequestRequeue::WaitForReconnect
-                && !dispatch_cancelled
-                && request.config.disconnected_policy
-                    == crate::api::traits::ws::ws_request_config::DisconnectedTaskPolicy::WaitForReconnect;
-            let can_retry = failure.requeue == RequestRequeue::IdempotentRetry
-                && request.config.idempotent
-                && request.attempt < request.config.send_retry_count
-                && !dispatch_cancelled;
-            let should_requeue =
-                (can_retry || wait_for_reconnect) && request.dispatch_phase.requeue();
-            if should_requeue {
-                crate::log_s!(LogType::WSC; "handle_queued_request", "state|uuid|generation|attempt|idempotent_retry|wait_for_reconnect", "request_requeue", &request.uuid, generation, request.attempt, can_retry, wait_for_reconnect);
-                if can_retry {
-                    request.attempt += 1;
-                }
-                if !mark_request_queued(pending_requests, &request) {
-                    if request.dispatch_phase.take_write_response_claim() {
-                        request.complete(Ok(()));
-                    } else {
-                        let terminal_error = request.terminal_error(request_error);
-                        request.complete(Err(terminal_error));
-                    }
-                    return connection_action;
-                }
-                if let Err(request) = source_queue.push_existing(request) {
-                    let request = *request;
-                    let fallback_error = if request.dispatch_cancel.is_cancelled() {
-                        NetError::Cancelled
-                    } else {
-                        NetError::QueueClosed
-                    };
-                    let push_error = request.terminal_error(fallback_error);
-                    crate::log_e!(LogType::WSC; "handle_queued_request", "stage|uuid|error", "requeue_failed", &request.uuid, format!("{push_error:?}"));
-                    remove_pending_for_request(pending_requests, &request, push_error);
-                    request.complete(Err(push_error));
-                    return if push_error == NetError::Cancelled {
-                        connection_action
-                    } else {
-                        RequestAction::StopWithError(push_error)
-                    };
+            let cancelled =
+                request.dispatch_cancel.is_cancelled() || request.dispatch_phase.is_finished();
+            let retry = !cancelled
+                && failure.requeue == RequestRequeue::IdempotentRetry
+                && request.can_retry();
+            let wait = !cancelled
+                && failure.requeue == RequestRequeue::WaitForReconnect
+                && request.can_wait_for_reconnect();
+            let requeued = if retry || wait {
+                match &request.registration {
+                    Some(registration) => pending_requests.requeue(registration),
+                    None => Ok(request.dispatch_phase.requeue()),
                 }
             } else {
-                let terminal_error = request.terminal_error(request_error);
-                remove_pending_for_request(pending_requests, &request, terminal_error);
-                request.complete(Err(terminal_error));
-            }
-
-            connection_action
-        }
-    }
-}
-
-/// 在请求响应 deadline 后清理关联记录，并保护 deadline 前已进入回调 lane 的响应。
-///
-/// 通用层无法在业务 listener 解析之前得知响应 UUID，因此只要目标请求所属连接代仍有
-/// 任意已接收响应，便保守地给予一次有界宽限。宽限不会循环续期；用户回调永久阻塞时，
-/// 请求仍会在确定的最长期限内以 `TimeoutError` 完成。
-async fn expire_pending_after_response_timeout(
-    pending_requests: PendingRequestView,
-    uuid: String,
-    token: u64,
-    timeout_cancel: CancellationToken,
-    response_timeout: Duration,
-    response_dispatch_grace: Duration,
-) {
-    crate::log_t!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|token|response_timeout_seconds|response_grace_seconds", &uuid, token, response_timeout.as_secs_f64(), response_dispatch_grace.as_secs_f64());
-    let response_deadline = match pending_requests.response_deadline(uuid.as_str(), token) {
-        Ok(Some(deadline)) => Instant::from_std(deadline),
-        Ok(None) => return,
-        Err(error) => {
-            crate::log_e!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|error", &uuid, format!("{error:?}"));
-            pending_requests.remove_if_token(uuid.as_str(), token, error);
-            return;
-        }
-    };
-    tokio::select! {
-        _ = timeout_cancel.cancelled() => {
-            crate::log_s!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|token|state", &uuid, token, "response_timeout_cancelled");
-            return;
-        },
-        _ = tokio::time::sleep_until(response_deadline) => {}
-    }
-    if !pending_requests.record_deferred_error(uuid.as_str(), token, NetError::TimeoutError) {
-        crate::log_s!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|token|state", &uuid, token, "request_already_completed");
-        return;
-    }
-    crate::log_e!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|token|error", &uuid, token, "response_timeout");
-    if pending_requests.response_dispatch_in_flight(uuid.as_str(), token)
-        && !response_dispatch_grace.is_zero()
-    {
-        if let Some(grace_deadline) = response_deadline.checked_add(response_dispatch_grace) {
-            crate::log_s!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|token|state", &uuid, token, "accepted_response_claim_grace");
-            tokio::select! {
-                    _ = timeout_cancel.cancelled() => {
-                crate::log_s!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|token|state", &uuid, token, "response_timeout_cancelled");
-                return;
-            },
-                    _ = tokio::time::sleep_until(grace_deadline) => {}
+                Ok(false)
+            };
+            match requeued {
+                Err(error) => {
+                    request.complete(Err(error.clone()));
+                    RequestAction::StopWithError(error)
                 }
+                Ok(true) => {
+                    if retry {
+                        let Some(attempt) = request.attempt.checked_add(1) else {
+                            request.complete(Err(NetError::from(
+                                crate::error::ErrorKind::ResourceExhausted,
+                            )));
+                            return action;
+                        };
+                        request.attempt = attempt;
+                    }
+                    if let Err((request, error)) = source_queue.push_existing(request) {
+                        request.complete(Err(error));
+                    }
+                    // The requeued registration has relinquished this physical identity.
+                    // Retire other pending requests without destroying the queued retry.
+                    if let Err(error) =
+                        pending_requests.fail_connection(connection, failure.request_error)
+                    {
+                        return RequestAction::StopWithError(error);
+                    }
+                    action
+                }
+                Ok(false)
+                    if failure.requeue != RequestRequeue::Never
+                        && request.registration.is_some() =>
+                {
+                    // The table may retain an already accepted Manual response for one
+                    // bounded grace. Releasing queue ownership must not select a failure.
+                    request.release();
+                    if let Err(error) =
+                        pending_requests.fail_connection(connection, failure.request_error)
+                    {
+                        return RequestAction::StopWithError(error);
+                    }
+                    action
+                }
+                Ok(false) => {
+                    request.complete(Err(failure.request_error));
+                    action
+                }
+            }
         }
     }
-    pending_requests.remove_if_token(uuid.as_str(), token, NetError::TimeoutError);
-    crate::log_s!(LogType::WSC; "expire_pending_after_response_timeout", "uuid|token|state", &uuid, token, "response_timeout_cleanup_finished");
 }
 
-fn mark_request_queued(pending_requests: &PendingRequestView, request: &QueuedRequest) -> bool {
-    crate::log_t!(LogType::WSC; "mark_request_queued", "uuid|token", &request.uuid, request.pending_token);
-    if let Some(token) = request.pending_token {
-        pending_requests.mark_queued(request.uuid.as_str(), token)
-    } else {
-        true
-    }
+fn inactive_operation_error(control: &OperationControl) -> NetError {
+    control.selected_error().map_or_else(
+        || {
+            if control
+                .deadline()
+                .is_some_and(|deadline| Instant::now().into_std() >= deadline)
+            {
+                NetError::from(crate::error::ErrorKind::TimedOut)
+            } else {
+                NetError::from(crate::error::ErrorKind::Cancelled)
+            }
+        },
+        |error| error,
+    )
 }
 
-fn remove_pending_for_request(
-    pending_requests: &PendingRequestView,
-    request: &QueuedRequest,
-    error: NetError,
-) {
-    crate::log_t!(LogType::WSC; "remove_pending_for_request", "uuid|token|error", &request.uuid, request.pending_token, format!("{error:?}"));
-    if let Some(token) = request.pending_token {
-        pending_requests.remove_if_token(
-            request.uuid.as_str(),
-            token,
-            request.terminal_error(error),
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum RequestAction {
     Continue,
     Stop,
     StopWithError(NetError),
 }
 
-/// 处理一条控制指令。控制写超时后返回 `DeliveryUnknown`，调用方必须废弃连接。
 async fn handle_control_message<W>(
     write: &mut W,
     control: ControlMessage,
@@ -785,7 +736,7 @@ async fn handle_control_message<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "handle_control_message", "control|timeout_seconds", match &control { ControlMessage::FlushAutomatic => "flush_automatic", ControlMessage::PeerClose(_) => "peer_close", ControlMessage::Close(_) => "local_close" }, timeout.as_secs_f64());
+    crate::log_t!(LogType::WSC; "handle_control_message", "control|timeout_seconds", match &control { ControlMessage::FlushAutomatic => "flush_automatic", ControlMessage::PeerClose(_) => "peer_close", ControlMessage::CloseWith { .. } => "local_close" }, timeout.as_secs_f64());
     match control {
         ControlMessage::FlushAutomatic => match flush_sink(write, timeout, cancel).await {
             Ok(()) => ControlAction::Continue,
@@ -797,7 +748,7 @@ where
         ControlMessage::PeerClose(done_tx) => {
             crate::log_s!(LogType::WSC; "handle_control_message", "state", "peer_close_reply_flush_started");
             let result = flush_sink(write, timeout, cancel).await;
-            let _ = done_tx.send(());
+            let _ = done_tx.send(result.clone());
             match result {
                 Ok(()) => ControlAction::Stop(ControlStop::ConnectionClosed),
                 Err(error) => ControlAction::Failed {
@@ -806,14 +757,13 @@ where
                 },
             }
         }
-        ControlMessage::Close(done_tx) => {
-            crate::log_s!(LogType::WSC; "handle_control_message", "state", "local_close_started");
-            let result = async {
-                send_control_frame(write, Message::Close(None), timeout, cancel).await?;
-                close_sink(write, timeout, cancel).await
-            }
-            .await;
-            let _ = done_tx.send(());
+        ControlMessage::CloseWith {
+            frame,
+            deadline,
+            reply,
+        } => {
+            let result = send_close_frame(write, frame, deadline, timeout, cancel).await;
+            let _ = reply.send(result.clone());
             match result {
                 Ok(()) => ControlAction::Stop(ControlStop::LocalClose),
                 Err(error) => ControlAction::Failed {
@@ -821,6 +771,53 @@ where
                     origin: ControlOrigin::LocalClose,
                 },
             }
+        }
+    }
+}
+
+/// Sending and flushing share the remaining original close budget.
+async fn send_close_frame<W>(
+    write: &mut W,
+    frame: Option<crate::ws::CloseFrame>,
+    deadline: Instant,
+    control_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<(), NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    use crate::error::{ErrorKind, ErrorStage};
+    let started = Instant::now();
+    let control_deadline = started.checked_add(control_timeout).ok_or_else(|| {
+        NetError::config(
+            "frames.control_write_timeout",
+            "cannot represent a close deadline",
+        )
+        .with_stage(ErrorStage::Close)
+    })?;
+    let deadline = deadline.min(control_deadline);
+    if started >= deadline {
+        return Err(NetError::from(ErrorKind::TimedOut).with_stage(ErrorStage::Close));
+    }
+    let message = Message::Close(frame.map(crate::ws::CloseFrame::into_wire));
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            Err(NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Close))
+        }
+        result = tokio::time::timeout_at(deadline, async {
+            write.send(message).await?;
+            write.close().await
+        }) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                let kind = crate::module::ws_client::io_diagnostics::classify_io_error(&error);
+                let error = NetError::from(error).with_stage(ErrorStage::Close);
+                let mut context = error.context().clone();
+                context.io_end = Some(kind);
+                Err(error.with_context(context))
+            },
+            Err(_) => Err(NetError::from(ErrorKind::DeliveryUnknown).with_stage(ErrorStage::Close)),
         }
     }
 }
@@ -837,13 +834,13 @@ where
     crate::log_t!(LogType::WSC; "flush_sink", "timeout_seconds|cancelled", timeout.as_secs_f64(), cancel.is_cancelled());
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         crate::log_e!(LogType::WSC; "flush_sink", "error", "unrepresentable_deadline");
-        NetError::ConfigError
+        NetError::from(crate::error::ErrorKind::InvalidConfig)
     })?;
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             crate::log_s!(LogType::WSC; "flush_sink", "state", "cancelled");
-            Err(NetError::Cancelled)
+            Err(NetError::from(crate::error::ErrorKind::Cancelled))
         },
         result = tokio::time::timeout_at(deadline, write.flush()) => match result {
             Ok(Ok(())) => {
@@ -852,11 +849,15 @@ where
             },
             Ok(Err(error)) => {
                 crate::log_e!(LogType::WSC; "flush_sink", "error", crate::common::log::summary::error(&error));
-                Err(error.into())
+                let io_end = classify_io_error(&error);
+                let error = NetError::from(error);
+                let mut context = error.context().clone();
+                context.io_end = Some(io_end);
+                Err(error.with_context(context))
             },
             Err(_) => {
                 crate::log_e!(LogType::WSC; "flush_sink", "error|delivery", "sink_operation_timeout", "unknown");
-                Err(NetError::DeliveryUnknown)
+                Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
             },
         },
     }
@@ -869,9 +870,8 @@ async fn drain_ready_controls<W>(
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     timeout: Duration,
     cancel: &CancellationToken,
-    heartbeat: &mut Interval,
+    heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
-    pong_timeout: Duration,
     request_deadline: Instant,
     remaining_controls: &mut usize,
 ) -> Result<ControlAction, NetError>
@@ -885,7 +885,7 @@ where
         let now = Instant::now();
         if now >= request_deadline {
             crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "TimeoutError");
-            return Err(NetError::TimeoutError);
+            return Err(NetError::from(crate::error::ErrorKind::TimedOut));
         }
         let pong_timed_out = heartbeat_state.is_timed_out(now);
         if *remaining_controls == 0 && !pong_timed_out {
@@ -913,16 +913,17 @@ where
                 }
                 if pong_timed_out || heartbeat_state.is_timed_out(Instant::now()) {
                     crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "SocketRecvTimeout");
-                    return Err(NetError::SocketRecvTimeout);
+                    return Err(NetError::from(crate::error::ErrorKind::TimedOut)
+                        .with_stage(crate::error::ErrorStage::Heartbeat));
                 }
                 // A ready-control producer can refill the channel between every receive.
                 // Poll the interval after each control, not merely after the whole batch, so
                 // creation of a new Ping is delayed by at most one bounded control write.
-                if heartbeat.tick().now_or_never().is_some() {
+                if let Some(pong_timeout) = heartbeat.tick().now_or_never() {
                     let now = Instant::now();
                     if now >= request_deadline {
                         crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "TimeoutError");
-                        return Err(NetError::TimeoutError);
+                        return Err(NetError::from(crate::error::ErrorKind::TimedOut));
                     }
                     handle_heartbeat_tick(
                         write,
@@ -937,7 +938,8 @@ where
             Err(mpsc::error::TryRecvError::Empty) => {
                 if pong_timed_out {
                     crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "SocketRecvTimeout");
-                    return Err(NetError::SocketRecvTimeout);
+                    return Err(NetError::from(crate::error::ErrorKind::TimedOut)
+                        .with_stage(crate::error::ErrorStage::Heartbeat));
                 }
                 return Ok(ControlAction::Continue);
             }
@@ -971,7 +973,8 @@ where
         }
         HeartbeatTick::TimedOut => {
             crate::log_e!(LogType::WSC; "handle_heartbeat_tick", "error", "pong_timeout");
-            return Err(NetError::SocketRecvTimeout);
+            return Err(NetError::from(crate::error::ErrorKind::TimedOut)
+                .with_stage(crate::error::ErrorStage::Heartbeat));
         }
         HeartbeatTick::SendProbe(payload) => {
             crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|payload_bytes", "ping_write_started", payload.len());
@@ -1026,12 +1029,11 @@ async fn send_request_message_with_phase<W>(
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     control_write_timeout: Duration,
     data_frame_write_timeout: Duration,
-    heartbeat: &mut Interval,
+    heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
-    pong_timeout: Duration,
     connection_cancel: &CancellationToken,
     dispatch_cancel: &CancellationToken,
-    dispatch_phase: &DispatchPhase,
+    dispatch_phase: &OperationControl,
 ) -> Result<(), RequestWriteFailure>
 where
     W: Sink<Message, Error = WsError> + Unpin,
@@ -1052,7 +1054,7 @@ where
         }
         if connection_cancel.is_cancelled() {
             return Err(RequestWriteFailure::connection(
-                NetError::Cancelled,
+                NetError::from(crate::error::ErrorKind::Cancelled),
                 wrote_frame,
             ));
         }
@@ -1066,7 +1068,6 @@ where
             connection_cancel,
             heartbeat,
             heartbeat_state,
-            pong_timeout,
             write_deadline,
             &mut remaining_controls,
         )
@@ -1076,7 +1077,7 @@ where
             ControlAction::Continue => {}
             ControlAction::Stop(ControlStop::ConnectionClosed) => {
                 return Err(RequestWriteFailure::connection(
-                    NetError::ConnectionClosed,
+                    NetError::from(crate::error::ErrorKind::Closed),
                     wrote_frame,
                 ));
             }
@@ -1092,7 +1093,7 @@ where
                 ));
             }
         }
-        if heartbeat.tick().now_or_never().is_some() {
+        if let Some(pong_timeout) = heartbeat.tick().now_or_never() {
             let now = Instant::now();
             if now >= write_deadline {
                 return Err(RequestWriteFailure::deadline(wrote_frame, wrote_frame));
@@ -1116,7 +1117,6 @@ where
                 connection_cancel,
                 heartbeat,
                 heartbeat_state,
-                pong_timeout,
                 write_deadline,
                 &mut remaining_controls,
             )
@@ -1126,7 +1126,7 @@ where
                 ControlAction::Continue => {}
                 ControlAction::Stop(ControlStop::ConnectionClosed) => {
                     return Err(RequestWriteFailure::connection(
-                        NetError::ConnectionClosed,
+                        NetError::from(crate::error::ErrorKind::Closed),
                         wrote_frame,
                     ));
                 }
@@ -1170,9 +1170,13 @@ fn classify_boundary_failure(
     request_deadline: Instant,
 ) -> RequestWriteFailure {
     crate::log_t!(LogType::WSC; "classify_boundary_failure", "error|data_started|deadline_elapsed", format!("{error:?}"), data_started, Instant::now() >= request_deadline);
-    if error == NetError::TimeoutError {
+    if error.kind() == crate::error::ErrorKind::TimedOut
+        && error.context().stage != Some(crate::error::ErrorStage::Heartbeat)
+    {
         RequestWriteFailure::deadline(data_started, data_started)
-    } else if error == NetError::DeliveryUnknown && Instant::now() >= request_deadline {
+    } else if error.kind() == crate::error::ErrorKind::DeliveryUnknown
+        && Instant::now() >= request_deadline
+    {
         // The request deadline bounded an in-flight control write. The business request is still
         // known-unsent when `data_started` is false, but the shared sink must be discarded.
         RequestWriteFailure::deadline(data_started, true)
@@ -1207,7 +1211,7 @@ async fn send_data_frame_with_phase<W>(
     frame_write_timeout: Duration,
     connection_cancel: &CancellationToken,
     dispatch_cancel: &CancellationToken,
-    dispatch_phase: &DispatchPhase,
+    dispatch_phase: &OperationControl,
 ) -> Result<(), RequestWriteFailure>
 where
     W: Sink<Message, Error = WsError> + Unpin,
@@ -1222,7 +1226,7 @@ where
     }
     if connection_cancel.is_cancelled() {
         return Err(RequestWriteFailure::connection(
-            NetError::Cancelled,
+            NetError::from(crate::error::ErrorKind::Cancelled),
             data_started,
         ));
     }
@@ -1244,28 +1248,39 @@ where
                 std::task::Poll::Ready(Ok(())) => {}
             }
             if connection_cancel.is_cancelled() {
-                return std::task::Poll::Ready(Err(RequestWriteFailure::connection(NetError::Cancelled, data_started || dispatch_phase.data_write_started())));
+                return std::task::Poll::Ready(Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::Cancelled), data_started || dispatch_phase.data_write_started())));
             }
             if Instant::now() >= deadline {
                 return std::task::Poll::Ready(Err(RequestWriteFailure::deadline(data_started || dispatch_phase.data_write_started(), true)));
             }
-            if dispatch_cancel.is_cancelled() || !dispatch_phase.start_data_write() {
+            let may_write = match dispatch_phase.start_data_write(data_started) {
+                Ok(may_write) => may_write,
+                Err(error) => {
+                    return std::task::Poll::Ready(Err(RequestWriteFailure::connection(
+                        error,
+                        data_started || dispatch_phase.data_write_started(),
+                    )));
+                }
+            };
+            if dispatch_cancel.is_cancelled() || !may_write {
                 return std::task::Poll::Ready(Err(RequestWriteFailure::cancelled(data_started || dispatch_phase.data_write_started())));
             }
             let Some(frame) = frame.take() else {
                 crate::log_e!(LogType::WSC; "send_data_frame", "error", "data_frame_already_consumed");
-                return std::task::Poll::Ready(Err(RequestWriteFailure::connection(NetError::InternalError, true)));
+                return std::task::Poll::Ready(Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::Internal), true)));
             };
             // No await separates this CAS from start_send. Cancellation that wins
             // the same atomic state prevents this request from entering the sink.
             std::task::Poll::Ready(Pin::new(&mut *write).start_send(frame).map_err(|error| {
                 crate::log_e!(LogType::WSC; "send_data_frame", "error|delivery", crate::common::log::summary::error(&error), "unknown");
-                RequestWriteFailure::connection(NetError::DeliveryUnknown, true)
+                RequestWriteFailure::connection(NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error)
+                    .with_stage(crate::error::ErrorStage::Write), true)
             }))
         }).await?;
         write.flush().await.map_err(|error| {
             crate::log_e!(LogType::WSC; "send_data_frame", "error|delivery", crate::common::log::summary::error(&error), "unknown");
-            RequestWriteFailure::connection(NetError::DeliveryUnknown, true)
+            RequestWriteFailure::connection(NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error)
+                .with_stage(crate::error::ErrorStage::Write), true)
         })
     };
     tokio::select! {
@@ -1282,11 +1297,11 @@ where
             }
             Err(_) => {
                 crate::log_e!(LogType::WSC; "send_data_frame", "error|delivery", "frame_write_timeout", "unknown");
-                Err(RequestWriteFailure::connection(NetError::DeliveryUnknown, data_started || dispatch_phase.data_write_started()))
+                Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::DeliveryUnknown), data_started || dispatch_phase.data_write_started()))
             },
         },
         _ = connection_cancel.cancelled() => {
-            Err(RequestWriteFailure::connection(NetError::Cancelled, data_started || dispatch_phase.data_write_started()))
+            Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::Cancelled), data_started || dispatch_phase.data_write_started()))
         },
     }
 }
@@ -1302,19 +1317,26 @@ async fn send_request_message<W>(
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     control_write_timeout: Duration,
     data_frame_write_timeout: Duration,
-    heartbeat: &mut Interval,
+    heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
-    pong_timeout: Duration,
     connection_cancel: &CancellationToken,
     dispatch_cancel: &CancellationToken,
 ) -> Result<(), RequestWriteFailure>
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    let phase = DispatchPhase::new();
-    if !phase.start_writing() {
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions::default(),
+        false,
+        1,
+    )
+    .map_err(|error| RequestWriteFailure::connection(error, false))?;
+    phase
+        .enqueue()
+        .map_err(|error| RequestWriteFailure::connection(error, false))?;
+    if !phase.mark_writing(crate::ws::ConnectionId::from_allocated(1)) {
         return Err(RequestWriteFailure::connection(
-            NetError::InternalError,
+            NetError::from(crate::error::ErrorKind::Internal),
             false,
         ));
     }
@@ -1329,7 +1351,6 @@ where
         data_frame_write_timeout,
         heartbeat,
         heartbeat_state,
-        pong_timeout,
         connection_cancel,
         dispatch_cancel,
         &phase,
@@ -1350,10 +1371,18 @@ async fn send_data_frame<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    let phase = DispatchPhase::new();
-    if !phase.start_writing() {
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions::default(),
+        false,
+        1,
+    )
+    .map_err(|error| RequestWriteFailure::connection(error, false))?;
+    phase
+        .enqueue()
+        .map_err(|error| RequestWriteFailure::connection(error, false))?;
+    if !phase.mark_writing(crate::ws::ConnectionId::from_allocated(1)) {
         return Err(RequestWriteFailure::connection(
-            NetError::InternalError,
+            NetError::from(crate::error::ErrorKind::Internal),
             false,
         ));
     }
@@ -1383,13 +1412,13 @@ where
     crate::log_t!(LogType::WSC; "send_control_frame", "frame_type|frame_bytes|timeout_seconds", match &frame { Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", _ => "data" }, frame.len(), timeout.as_secs_f64());
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         crate::log_e!(LogType::WSC; "send_control_frame", "error", "unrepresentable_deadline");
-        NetError::ConfigError
+        NetError::from(crate::error::ErrorKind::InvalidConfig)
     })?;
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             crate::log_s!(LogType::WSC; "send_control_frame", "state", "cancelled");
-            Err(NetError::Cancelled)
+            Err(NetError::from(crate::error::ErrorKind::Cancelled))
         },
         result = tokio::time::timeout_at(deadline, write.send(frame)) => match result {
             Ok(Ok(())) => {
@@ -1402,51 +1431,14 @@ where
             },
             Err(_) => {
                 crate::log_e!(LogType::WSC; "send_control_frame", "error|delivery", "sink_operation_timeout", "unknown");
-                Err(NetError::DeliveryUnknown)
-            },
-        },
-    }
-}
-
-/// 在控制写 deadline 内关闭 sink。
-async fn close_sink<W>(
-    write: &mut W,
-    timeout: Duration,
-    cancel: &CancellationToken,
-) -> Result<(), NetError>
-where
-    W: Sink<Message, Error = WsError> + Unpin,
-{
-    crate::log_t!(LogType::WSC; "close_sink", "timeout_seconds|cancelled", timeout.as_secs_f64(), cancel.is_cancelled());
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        crate::log_e!(LogType::WSC; "close_sink", "error", "unrepresentable_deadline");
-        NetError::ConfigError
-    })?;
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            crate::log_s!(LogType::WSC; "close_sink", "state", "cancelled");
-            Err(NetError::Cancelled)
-        },
-        result = tokio::time::timeout_at(deadline, write.close()) => match result {
-            Ok(Ok(())) => {
-                crate::log_s!(LogType::WSC; "close_sink", "state", "sink_operation_completed");
-                Ok(())
-            },
-            Ok(Err(error)) => {
-                crate::log_e!(LogType::WSC; "close_sink", "error", crate::common::log::summary::error(&error));
-                Err(error.into())
-            },
-            Err(_) => {
-                crate::log_e!(LogType::WSC; "close_sink", "error|delivery", "sink_operation_timeout", "unknown");
-                Err(NetError::DeliveryUnknown)
+                Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
             },
         },
     }
 }
 
 /// 控制消息处理后写循环应继续还是停止。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum ControlAction {
     Continue,
     Stop(ControlStop),
@@ -1558,10 +1550,19 @@ async fn send_write_end(
     io_event_tx: &mpsc::Sender<IoEvent>,
     generation: u64,
     error: NetError,
+    kind: IoEndKind,
     cancel: &CancellationToken,
 ) {
+    let error = if error.context().stage.is_none() {
+        error.with_stage(crate::error::ErrorStage::Write)
+    } else {
+        error
+    };
     crate::log_t!(LogType::WSC; "send_write_end", "generation|error|cancelled", generation, format!("{error:?}"), cancel.is_cancelled());
-    if matches!(error, NetError::Cancelled | NetError::ConnectionClosed) {
+    if matches!(
+        error.kind(),
+        crate::error::ErrorKind::Cancelled | crate::error::ErrorKind::Closed
+    ) {
         crate::log_s!(LogType::WSC; "send_write_end", "state|generation|error", "write_ended", generation, format!("{error:?}"));
     } else {
         crate::log_e!(LogType::WSC; "send_write_end", "generation|error", generation, format!("{error:?}"));
@@ -1571,7 +1572,7 @@ async fn send_write_end(
         _ = cancel.cancelled() => {
             crate::log_s!(LogType::WSC; "send_write_end", "state|generation", "end_notification_cancelled", generation);
         }
-        result = io_event_tx.send(IoEvent::WriteEnded { generation, error }) => {
+        result = io_event_tx.send(IoEvent::WriteEnded { generation, error, kind }) => {
             if result.is_err() {
                 crate::log_s!(LogType::WSC; "send_write_end", "state|generation", "worker_event_receiver_closed", generation);
             }
@@ -1583,17 +1584,9 @@ async fn send_write_end(
 ///
 /// 对每条请求先按 UUID 与令牌删除匹配的待响应记录，再释放其任务/字节许可，
 /// 并通知原始发送调用方。令牌检查可避免迟到清理删除后来复用相同 UUID 的记录。
-pub(crate) fn fail_requests(
-    requests: Vec<QueuedRequest>,
-    pending_requests: &PendingRequestView,
-    error: NetError,
-) {
-    crate::log_t!(LogType::WSC; "fail_requests", "count|error", requests.len(), format!("{error:?}"));
-    crate::log_s!(LogType::WSC; "fail_requests", "state|count|error", "queued_requests_terminated", requests.len(), format!("{error:?}"));
+pub(crate) fn fail_requests(requests: Vec<QueuedRequest>, error: NetError) {
     for request in requests {
-        let terminal_error = request.terminal_error(error);
-        remove_pending_for_request(pending_requests, &request, terminal_error);
-        request.complete(Err(terminal_error));
+        request.complete(Err(error.clone()));
     }
 }
 
@@ -1618,116 +1611,16 @@ mod registration_cancellation_tests;
 mod response_deadline_tests;
 
 #[cfg(test)]
-/// WebSocket 业务写队列与重连保留规则的单元测试。
+/// Frame-level tests retain the original programmable sinks and wire assertions.
 mod tests {
     use super::*;
-    use crate::api::traits::ws::ws_body::WsBody;
-    use crate::api::traits::ws::ws_request_config::{
-        DisconnectedTaskPolicy, WSRequestConfig, WSRequestPriority,
-    };
-    use crate::api::traits::ws::ws_request_trait::WSRequestTrait;
     use crate::module::ws_client::test_support::{
         check, check_eq, check_ne, test_error, TestResult,
     };
-    use crate::module::ws_client::write::priority_write_queue::PriorityWriteQueue;
-    use std::collections::BinaryHeap;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::sync::oneshot;
-
-    struct TimeoutTestRequest(&'static str);
-
-    impl WSRequestTrait for TimeoutTestRequest {
-        fn uuid(&self) -> String {
-            self.0.to_string()
-        }
-
-        fn body(&self) -> Result<WsBody, NetError> {
-            Ok(WsBody::Text(self.0.to_string()))
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn response_received_before_deadline_gets_one_bounded_claim_grace() -> TestResult {
-        let pending = PendingRequestView::with_capacity(1);
-        let config = WSRequestConfig::default();
-        let (token, completion) = pending
-            .reserve(Arc::new(TimeoutTestRequest("grace-success")), &config)
-            .map_err(|error| test_error(format!("reserve request: {error:?}")))?;
-        check!(pending.mark_writing("grace-success", token, 0, 41))?;
-        let timeout_cancel = pending
-            .mark_sent("grace-success", token)
-            .ok_or_else(|| test_error("mark request sent"))?;
-        let response_guard = pending.begin_response_dispatch(41);
-        let timeout = tokio::spawn(expire_pending_after_response_timeout(
-            pending.clone(),
-            "grace-success".to_string(),
-            token,
-            timeout_cancel,
-            Duration::from_secs(10),
-            Duration::from_secs(3),
-        ));
-        tokio::task::yield_now().await;
-
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
-        let survived_deadline = pending.len();
-        let response_claimed = pending.take_request("grace-success", 41).is_some();
-        drop(response_guard);
-        let response_result = check_eq!(
-            survived_deadline,
-            1,
-            "accepted response must survive deadline"
-        )
-        .and_then(|()| check!(response_claimed, "response must claim the tracked request"));
-        if response_result.is_err() {
-            timeout.abort();
-            let _ = timeout.await;
-            return response_result;
-        }
-
-        timeout
-            .await
-            .map_err(|error| test_error(format!("timeout task: {error:?}")))?;
-        check_eq!(completion.wait().await, Ok(()))?;
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn blocked_response_cannot_extend_request_timeout_more_than_once() -> TestResult {
-        let pending = PendingRequestView::with_capacity(1);
-        let config = WSRequestConfig::default();
-        let (token, completion) = pending
-            .reserve(Arc::new(TimeoutTestRequest("grace-timeout")), &config)
-            .map_err(|error| test_error(format!("reserve request: {error:?}")))?;
-        check!(pending.mark_writing("grace-timeout", token, 0, 43))?;
-        let timeout_cancel = pending
-            .mark_sent("grace-timeout", token)
-            .ok_or_else(|| test_error("mark request sent"))?;
-        let _response_guard = pending.begin_response_dispatch(43);
-        let timeout = tokio::spawn(expire_pending_after_response_timeout(
-            pending.clone(),
-            "grace-timeout".to_string(),
-            token,
-            timeout_cancel,
-            Duration::from_secs(10),
-            Duration::from_secs(3),
-        ));
-        tokio::task::yield_now().await;
-
-        tokio::time::advance(Duration::from_secs(13)).await;
-        tokio::task::yield_now().await;
-        timeout
-            .await
-            .map_err(|error| test_error(format!("timeout task: {error:?}")))?;
-
-        check_eq!(completion.wait().await, Err(NetError::TimeoutError))?;
-        check!(pending.is_empty())?;
-        Ok(())
-    }
-
     #[derive(Clone, Copy)]
     enum InjectedControlKind {
         FlushAutomatic,
@@ -2038,57 +1931,6 @@ mod tests {
         }
     }
 
-    /// Claims the correlated response while `Sink::send` is flushing, then fails that flush.
-    struct ResponseClaimThenFlushErrorSink {
-        pending: PendingRequestView,
-        uuid: &'static str,
-        generation: u64,
-        claimed: bool,
-        claim_result: Option<TestResult>,
-    }
-
-    impl Sink<Message> for ResponseClaimThenFlushErrorSink {
-        type Error = WsError;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, _message: Message) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            let this = self.get_mut();
-            if !this.claimed {
-                this.claimed = true;
-                this.claim_result = Some(check!(
-                    this.pending
-                        .take_request(this.uuid, this.generation)
-                        .is_some(),
-                    "response must claim the writing request"
-                ));
-            }
-            Poll::Ready(Err(WsError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "flush failed after peer response",
-            ))))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
     /// 永远不接受写入的 sink，用于验证控制写 deadline。
     #[derive(Default)]
     struct PendingSink {
@@ -2223,250 +2065,6 @@ mod tests {
         Ok(reconstructed)
     }
 
-    /// 构造不占用信号量许可的测试请求。
-    ///
-    /// UUID 与待响应令牌均由 `sequence` 派生，其他请求配置使用默认值。
-    fn request(priority: WSRequestPriority, sequence: u64) -> QueuedRequest {
-        let (result_tx, _result_rx) = oneshot::channel();
-        QueuedRequest {
-            uuid: sequence.to_string(),
-            pending_token: Some(sequence),
-            message: Message::Text(sequence.to_string().into()),
-            config: WSRequestConfig {
-                priority,
-                ..WSRequestConfig::default()
-            },
-            attempt: 0,
-            prior_delivery_unknown: false,
-            result_tx: Some(result_tx),
-            dispatch_cancel: CancellationToken::new(),
-            dispatch_phase: crate::module::ws_client::write::queued_request::DispatchPhase::new(),
-            admission_cancel: None,
-            sequence,
-            slot_permit: None,
-            byte_permit: None,
-        }
-    }
-
-    /// Constructs an untracked handler-level request whose receipt can be asserted independently.
-    fn request_with_receipt(
-        uuid: &'static str,
-        message: Message,
-        config: WSRequestConfig,
-        sequence: u64,
-        dispatch_cancel: CancellationToken,
-    ) -> (QueuedRequest, oneshot::Receiver<Result<(), NetError>>) {
-        let (result_tx, result_rx) = oneshot::channel();
-        (
-            QueuedRequest {
-                uuid: uuid.to_string(),
-                pending_token: None,
-                message,
-                config,
-                attempt: 0,
-                prior_delivery_unknown: false,
-                result_tx: Some(result_tx),
-                dispatch_cancel,
-                dispatch_phase: crate::module::ws_client::write::queued_request::DispatchPhase::new(
-                ),
-                admission_cancel: None,
-                sequence,
-                slot_permit: None,
-                byte_permit: None,
-            },
-            result_rx,
-        )
-    }
-
-    #[test]
-    /// 验证严格优先级调度以及相同优先级内的 FIFO 顺序。
-    fn priority_is_strict_and_equal_priority_is_fifo() -> TestResult {
-        let mut heap = BinaryHeap::new();
-        heap.push(request(WSRequestPriority::Low, 1));
-        heap.push(request(WSRequestPriority::High, 2));
-        heap.push(request(WSRequestPriority::High, 3));
-        heap.push(request(WSRequestPriority::Normal, 4));
-
-        check_eq!(heap.pop().map(|item| item.sequence), Some(2))?;
-        check_eq!(heap.pop().map(|item| item.sequence), Some(3))?;
-        check_eq!(heap.pop().map(|item| item.sequence), Some(4))?;
-        check_eq!(heap.pop().map(|item| item.sequence), Some(1))?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn data_frame_failure_logs_original_cause_without_changing_delivery_unknown() -> TestResult
-    {
-        use crate::common::log::log_level::LogLevel;
-        use crate::common::log::logger::Logger;
-
-        let (log_tx, log_rx) = std::sync::mpsc::channel();
-        let _subscription = Logger::register_log_listener_with_capacity(
-            Box::new(move |record| {
-                if record.tag == "ON_WSC-send_data_frame-E"
-                    && record.content.contains("ws-write-log-original-cause")
-                {
-                    let _ = log_tx.send(record);
-                }
-            }),
-            &[LogType::WSC],
-            16_384,
-        )
-        .map_err(|error| test_error(format!("log subscription: {error:?}")))?;
-        let mut sink = Box::pin(futures::sink::unfold((), |(), _message: Message| async {
-            Err::<(), _>(WsError::Io(std::io::Error::other(
-                "ws-write-log-original-cause",
-            )))
-        }));
-        let connection_cancel = CancellationToken::new();
-        let dispatch_cancel = CancellationToken::new();
-        let failure = send_data_frame(
-            &mut sink,
-            Message::Binary(Bytes::from_static(b"payload must not appear in logs")),
-            false,
-            Instant::now() + Duration::from_secs(1),
-            Duration::from_secs(1),
-            &connection_cancel,
-            &dispatch_cancel,
-        )
-        .await
-        .err()
-        .ok_or_else(|| test_error("expected transport failure"))?;
-        check_eq!(failure.request_error, NetError::DeliveryUnknown)?;
-        let record = log_rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|error| test_error(format!("original error log: {error:?}")))?;
-        check_eq!(record.log_type, LogType::WSC)?;
-        check_eq!(record.level, LogLevel::Error)?;
-        check!(!record.content.contains("payload must not appear"))?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    /// 验证任务容量被占满时后续入队会等待，并遵守统一的入队超时。
-    async fn bounded_queue_waits_and_honors_enqueue_timeout() -> TestResult {
-        let queue = PriorityWriteQueue::new(1, 32)
-            .map_err(|error| test_error(format!("create queue: {error:?}")))?;
-        let shutdown = CancellationToken::new();
-        let first = queue
-            .enqueue(
-                "first".to_string(),
-                Some(1),
-                Message::Text("first".into()),
-                5,
-                WSRequestConfig::default(),
-                &shutdown,
-                CancellationToken::new(),
-                crate::module::ws_client::write::queued_request::DispatchPhase::new(),
-                CancellationToken::new(),
-            )
-            .await;
-        check!(first.is_ok())?;
-
-        let second = queue
-            .enqueue(
-                "second".to_string(),
-                Some(2),
-                Message::Text("second".into()),
-                6,
-                WSRequestConfig {
-                    enqueue_timeout: Some(Duration::from_millis(10)),
-                    ..WSRequestConfig::default()
-                },
-                &shutdown,
-                CancellationToken::new(),
-                crate::module::ws_client::write::queued_request::DispatchPhase::new(),
-                CancellationToken::new(),
-            )
-            .await;
-        check!(matches!(second, Err(NetError::TimeoutError)))?;
-        for request in queue.drain() {
-            request.complete(Err(NetError::Cancelled));
-        }
-        Ok(())
-    }
-
-    #[test]
-    /// 验证断线时默认拒绝请求会被移出，而正在执行的幂等重试会被保留。
-    fn reconnect_retains_only_waiting_or_idempotent_retry_tasks() -> TestResult {
-        let queue = PriorityWriteQueue::new(4, 128)
-            .map_err(|error| test_error(format!("create queue: {error:?}")))?;
-        let rejected = request(WSRequestPriority::Normal, 1);
-        let mut retrying = request(WSRequestPriority::Normal, 2);
-        retrying.config.idempotent = true;
-        retrying.config.send_retry_count = 1;
-        retrying.attempt = 1;
-        check!(queue.push_existing(rejected).is_ok())?;
-        check!(queue.push_existing(retrying).is_ok())?;
-
-        let rejected = queue.drain_rejected_on_disconnect();
-        check_eq!(rejected.len(), 1)?;
-        check_eq!(rejected[0].uuid, "1")?;
-        let retained = queue.drain();
-        check_eq!(retained.len(), 1)?;
-        check_eq!(retained[0].uuid, "2")?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    /// 验证 shutdown 清队列不会覆盖幂等重试此前发生的投递不确定性。
-    async fn terminal_drain_preserves_prior_delivery_unknown() -> TestResult {
-        let (result_tx, result_rx) = oneshot::channel();
-        let request = QueuedRequest {
-            uuid: "uncertain".to_string(),
-            pending_token: None,
-            message: Message::Text("uncertain".into()),
-            config: WSRequestConfig::default(),
-            attempt: 1,
-            prior_delivery_unknown: true,
-            result_tx: Some(result_tx),
-            dispatch_cancel: CancellationToken::new(),
-            dispatch_phase: crate::module::ws_client::write::queued_request::DispatchPhase::new(),
-            admission_cancel: None,
-            sequence: 1,
-            slot_permit: None,
-            byte_permit: None,
-        };
-
-        fail_requests(
-            vec![request],
-            &PendingRequestView::default(),
-            NetError::Cancelled,
-        );
-
-        check_eq!(result_rx.await, Ok(Err(NetError::DeliveryUnknown)))?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    /// writer 在 sink commit 后、通知发送方前被中止时仍保守报告投递不确定。
-    async fn drop_after_sink_commit_reports_delivery_unknown() -> TestResult {
-        let (result_tx, result_rx) = oneshot::channel();
-        let dispatch_phase = crate::module::ws_client::write::queued_request::DispatchPhase::new();
-        check!(dispatch_phase.start_writing())?;
-        check!(dispatch_phase.commit())?;
-        let request = QueuedRequest {
-            uuid: "committed-drop".to_string(),
-            pending_token: None,
-            message: Message::Text("committed-drop".into()),
-            config: WSRequestConfig::default(),
-            attempt: 0,
-            prior_delivery_unknown: false,
-            result_tx: Some(result_tx),
-            dispatch_cancel: CancellationToken::new(),
-            dispatch_phase,
-            admission_cancel: None,
-            sequence: 1,
-            slot_permit: None,
-            byte_permit: None,
-        };
-
-        drop(request);
-
-        check_eq!(result_rx.await, Ok(Err(NetError::DeliveryUnknown)))?;
-        Ok(())
-    }
-
     #[test]
     /// 验证 Binary 使用首个 Binary 帧、后续 continuation 和唯一 FIN 末帧。
     fn binary_fragmentation_preserves_payload_and_frame_sequence() -> TestResult {
@@ -2513,9 +2111,8 @@ mod tests {
             &mut control_rx,
             Duration::from_secs(1),
             Duration::from_secs(1),
-            &mut heartbeat,
+            &mut HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200)),
             &heartbeat_state,
-            Duration::from_secs(7_200),
             &cancel,
             &CancellationToken::new(),
         )
@@ -2693,9 +2290,10 @@ mod tests {
         let connection_cancel = CancellationToken::new();
         let dispatch_cancel = CancellationToken::new();
         let period = Duration::from_secs(3_600);
-        let mut heartbeat = tokio::time::interval_at(Instant::now() + period, period);
+        let heartbeat = tokio::time::interval_at(Instant::now() + period, period);
         let heartbeat_state = HeartbeatState::new(1);
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut heartbeat = HeartbeatSchedule::from_interval(heartbeat, period);
         let mut sending = Box::pin(send_request_message(
             &mut sink,
             message,
@@ -2707,7 +2305,6 @@ mod tests {
             Duration::from_secs(10),
             &mut heartbeat,
             &heartbeat_state,
-            period,
             &connection_cancel,
             &dispatch_cancel,
         ));
@@ -2771,26 +2368,22 @@ mod tests {
         let data_started = preceding_data_frames > 0;
         let (expected_error, expected_action, expected_requeue) = match interruption {
             BoundaryInterruption::DispatchCancelled => (
+                NetError::from(crate::error::ErrorKind::Cancelled),
                 if data_started {
-                    NetError::DeliveryUnknown
-                } else {
-                    NetError::Cancelled
-                },
-                if data_started {
-                    RequestAction::StopWithError(NetError::DeliveryUnknown)
+                    RequestAction::StopWithError(NetError::from(
+                        crate::error::ErrorKind::DeliveryUnknown,
+                    ))
                 } else {
                     RequestAction::Continue
                 },
                 RequestRequeue::Never,
             ),
             BoundaryInterruption::Deadline => (
+                NetError::from(crate::error::ErrorKind::TimedOut),
                 if data_started {
-                    NetError::DeliveryUnknown
-                } else {
-                    NetError::TimeoutError
-                },
-                if data_started {
-                    RequestAction::StopWithError(NetError::DeliveryUnknown)
+                    RequestAction::StopWithError(NetError::from(
+                        crate::error::ErrorKind::DeliveryUnknown,
+                    ))
                 } else {
                     RequestAction::Continue
                 },
@@ -2798,9 +2391,9 @@ mod tests {
             ),
             BoundaryInterruption::ConnectionCancelled => (
                 if data_started {
-                    NetError::DeliveryUnknown
+                    NetError::from(crate::error::ErrorKind::DeliveryUnknown)
                 } else {
-                    NetError::Cancelled
+                    NetError::from(crate::error::ErrorKind::Cancelled)
                 },
                 RequestAction::Stop,
                 if data_started {
@@ -2810,8 +2403,11 @@ mod tests {
                 },
             ),
         };
-        check_eq!(failure.request_error, expected_error)?;
-        check_eq!(failure.connection_action, expected_action)?;
+        check_eq!((failure.request_error).kind(), (expected_error).kind())?;
+        check_eq!(
+            request_action_key(&(failure.connection_action)),
+            request_action_key(&(expected_action))
+        )?;
         check_eq!(failure.requeue, expected_requeue)?;
         Ok(())
     }
@@ -2862,862 +2458,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_close_before_first_frame_requeues_without_mutating_order_or_attempt() -> TestResult
-    {
-        let source_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("source queue: {error:?}")))?;
-        let config = WSRequestConfig {
-            disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-            ..WSRequestConfig::default()
-        };
-        let sequence = 77;
-        let (request, mut receipt) = request_with_receipt(
-            "peer-close-before-first-frame",
-            Message::Text("business".into()),
-            config,
-            sequence,
-            CancellationToken::new(),
-        );
-        let (control_tx, mut control_rx) = mpsc::channel(1);
-        let (done_tx, done_rx) = oneshot::channel();
-        control_tx
-            .send(ControlMessage::PeerClose(done_tx))
-            .await
-            .map_err(|error| test_error(format!("queue peer Close: {error:?}")))?;
-        let due_at = Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .ok_or_else(|| test_error("test instant supports subtraction"))?;
-        let mut heartbeat = tokio::time::interval_at(due_at, Duration::from_secs(3_600));
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        tokio::task::yield_now().await;
-        let mut sink = RecordingSink::new(None);
-        let recorded = sink.recorded();
-        let flushes = sink.flushes();
-
-        let action = handle_queued_request(
-            &mut sink,
-            request,
-            &source_queue,
-            &PendingRequestView::default(),
-            71,
-            None,
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut heartbeat,
-            &HeartbeatState::new(71),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-
-        check_eq!(action, RequestAction::Stop)?;
-        check_eq!(done_rx.await, Ok(()), "peer Close reply must be flushed")?;
-        check_eq!(flushes.load(Ordering::Relaxed), 1)?;
-        check!(
-            recorded
-                .lock()
-                .map_err(|error| test_error(format!("recorded messages lock: {error:?}")))?
-                .is_empty(),
-            "neither heartbeat Ping nor business data may overtake peer Close"
-        )?;
-        check!(matches!(
-            receipt.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ))?;
-        let requeued = source_queue
-            .try_next()
-            .ok_or_else(|| test_error("request must wait for reconnect"))?;
-        check_eq!(requeued.sequence, sequence)?;
-        check_eq!(requeued.attempt, 0)?;
-        check!(!requeued.prior_delivery_unknown)?;
-        requeued.complete(Err(NetError::Cancelled));
-        check_eq!(receipt.await, Ok(Err(NetError::Cancelled)))?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn disconnected_control_channel_before_first_frame_requeues_waiting_request() -> TestResult
-    {
-        let source_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("source queue: {error:?}")))?;
-        let config = WSRequestConfig {
-            disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-            ..WSRequestConfig::default()
-        };
-        let (request, mut receipt) = request_with_receipt(
-            "control-channel-disconnected",
-            Message::Text("business".into()),
-            config,
-            79,
-            CancellationToken::new(),
-        );
-        let (control_tx, mut control_rx) = mpsc::channel(1);
-        drop(control_tx);
-        let heartbeat_interval = Duration::from_secs(3_600);
-        let mut heartbeat =
-            tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut sink = RecordingSink::new(None);
-
-        let action = handle_queued_request(
-            &mut sink,
-            request,
-            &source_queue,
-            &PendingRequestView::default(),
-            73,
-            None,
-            0,
-            &mut control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut heartbeat,
-            &HeartbeatState::new(73),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-
-        check_eq!(action, RequestAction::Stop)?;
-        check!(matches!(
-            receipt.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ))?;
-        let requeued = source_queue
-            .try_next()
-            .ok_or_else(|| test_error("request must wait for reconnect"))?;
-        check_eq!(requeued.sequence, 79)?;
-        check_eq!(requeued.attempt, 0)?;
-        check!(!requeued.prior_delivery_unknown)?;
-        requeued.complete(Err(NetError::Cancelled));
-        check_eq!(receipt.await, Ok(Err(NetError::Cancelled)))?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn heartbeat_timeout_before_first_frame_requeues_waiting_request() -> TestResult {
-        let source_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("source queue: {error:?}")))?;
-        let config = WSRequestConfig {
-            disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-            ..WSRequestConfig::default()
-        };
-        let (request, mut receipt) = request_with_receipt(
-            "heartbeat-before-first-frame",
-            Message::Text("business".into()),
-            config,
-            83,
-            CancellationToken::new(),
-        );
-        let (_control_tx, mut control_rx) = mpsc::channel(1);
-        let heartbeat_interval = Duration::from_secs(3_600);
-        let mut heartbeat =
-            tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let heartbeat_state = HeartbeatState::new(75);
-        let now = Instant::now();
-        let HeartbeatTick::SendProbe(payload) = heartbeat_state.on_tick(now, Duration::ZERO) else {
-            return Err(test_error("first heartbeat tick must create a probe"));
-        };
-        check!(heartbeat_state.mark_sent(payload.as_ref(), now))?;
-        let mut sink = RecordingSink::new(None);
-
-        let action = handle_queued_request(
-            &mut sink,
-            request,
-            &source_queue,
-            &PendingRequestView::default(),
-            75,
-            None,
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut heartbeat,
-            &heartbeat_state,
-            Duration::ZERO,
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-
-        check_eq!(
-            action,
-            RequestAction::StopWithError(NetError::SocketRecvTimeout)
-        )?;
-        check!(matches!(
-            receipt.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ))?;
-        let requeued = source_queue
-            .try_next()
-            .ok_or_else(|| test_error("request must wait for reconnect"))?;
-        check_eq!(requeued.sequence, 83)?;
-        check_eq!(requeued.attempt, 0)?;
-        check!(!requeued.prior_delivery_unknown)?;
-        requeued.complete(Err(NetError::Cancelled));
-        check_eq!(receipt.await, Ok(Err(NetError::Cancelled)))?;
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn control_timeout_before_first_frame_is_known_unsent_for_reject_policy() -> TestResult {
-        let mut sink = PendingSink::default();
-        let source_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("source queue: {error:?}")))?;
-        let (request, receipt) = request_with_receipt(
-            "reject-known-unsent",
-            Message::Text("business".into()),
-            WSRequestConfig::default(),
-            89,
-            CancellationToken::new(),
-        );
-        let (control_tx, mut control_rx) = mpsc::channel(1);
-        control_tx
-            .send(ControlMessage::FlushAutomatic)
-            .await
-            .map_err(|error| test_error(format!("queue automatic Pong flush: {error:?}")))?;
-        let heartbeat_interval = Duration::from_secs(3_600);
-        let mut heartbeat =
-            tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        let action = handle_queued_request(
-            &mut sink,
-            request,
-            &source_queue,
-            &PendingRequestView::default(),
-            77,
-            None,
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut control_rx,
-            Duration::from_millis(25),
-            Duration::from_secs(1),
-            &mut heartbeat,
-            &HeartbeatState::new(77),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-
-        sink.verify()?;
-        check_eq!(
-            action,
-            RequestAction::StopWithError(NetError::DeliveryUnknown),
-            "the ambiguous control write still retires the shared connection"
-        )?;
-        check_eq!(receipt.await, Ok(Err(NetError::ConnectionClosed)))?;
-        check!(source_queue.try_next().is_none())?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn local_close_dispatch_cancel_and_deadline_never_requeue() -> TestResult {
-        let pending = PendingRequestView::default();
-        let waiting_config = WSRequestConfig {
-            disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-            ..WSRequestConfig::default()
-        };
-
-        let close_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("close queue: {error:?}")))?;
-        let (close_request, close_receipt) = request_with_receipt(
-            "local-close",
-            Message::Text("business".into()),
-            waiting_config.clone(),
-            97,
-            CancellationToken::new(),
-        );
-        let (close_tx, mut close_rx) = mpsc::channel(1);
-        let (done_tx, done_rx) = oneshot::channel();
-        close_tx
-            .send(ControlMessage::Close(done_tx))
-            .await
-            .map_err(|error| test_error(format!("queue local Close: {error:?}")))?;
-        let period = Duration::from_secs(3_600);
-        let mut close_heartbeat = tokio::time::interval_at(Instant::now() + period, period);
-        let mut close_sink = RecordingSink::new(None);
-        let close_messages = close_sink.recorded();
-        let close_action = handle_queued_request(
-            &mut close_sink,
-            close_request,
-            &close_queue,
-            &pending,
-            79,
-            None,
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut close_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut close_heartbeat,
-            &HeartbeatState::new(79),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-        check_eq!(close_action, RequestAction::Stop)?;
-        check_eq!(done_rx.await, Ok(()))?;
-        check_eq!(close_receipt.await, Ok(Err(NetError::Cancelled)))?;
-        check!(close_queue.try_next().is_none())?;
-        check!(matches!(
-            close_messages
-                .lock()
-                .map_err(|error| test_error(format!("recorded close messages lock: {error:?}")))?
-                .as_slice(),
-            [Message::Close(None)]
-        ))?;
-
-        let cancel_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("cancel queue: {error:?}")))?;
-        let dispatch_cancel = CancellationToken::new();
-        dispatch_cancel.cancel();
-        let (cancel_request, cancel_receipt) = request_with_receipt(
-            "dispatch-cancel",
-            Message::Text("business".into()),
-            waiting_config.clone(),
-            101,
-            dispatch_cancel,
-        );
-        let (_cancel_control_tx, mut cancel_control_rx) = mpsc::channel(1);
-        let mut cancel_heartbeat = tokio::time::interval_at(Instant::now() + period, period);
-        let cancel_action = handle_queued_request(
-            &mut RecordingSink::new(None),
-            cancel_request,
-            &cancel_queue,
-            &pending,
-            81,
-            None,
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut cancel_control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut cancel_heartbeat,
-            &HeartbeatState::new(81),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-        check_eq!(cancel_action, RequestAction::Continue)?;
-        check_eq!(cancel_receipt.await, Ok(Err(NetError::Cancelled)))?;
-        check!(cancel_queue.try_next().is_none())?;
-
-        let deadline_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("deadline queue: {error:?}")))?;
-        let (deadline_request, deadline_receipt) = request_with_receipt(
-            "request-deadline",
-            Message::Text("business".into()),
-            WSRequestConfig {
-                write_timeout: Duration::ZERO,
-                ..waiting_config
-            },
-            103,
-            CancellationToken::new(),
-        );
-        let (_deadline_control_tx, mut deadline_control_rx) = mpsc::channel(1);
-        let mut deadline_heartbeat = tokio::time::interval_at(Instant::now() + period, period);
-        let deadline_action = handle_queued_request(
-            &mut RecordingSink::new(None),
-            deadline_request,
-            &deadline_queue,
-            &pending,
-            83,
-            None,
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut deadline_control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut deadline_heartbeat,
-            &HeartbeatState::new(83),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-        check_eq!(deadline_action, RequestAction::Continue)?;
-        check_eq!(deadline_receipt.await, Ok(Err(NetError::TimeoutError)))?;
-        check!(deadline_queue.try_next().is_none())?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn first_fragment_failure_keeps_delivery_unknown_and_allows_idempotent_retry(
-    ) -> TestResult {
-        let source_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("source queue: {error:?}")))?;
-        let config = WSRequestConfig {
-            idempotent: true,
-            send_retry_count: 1,
-            ..WSRequestConfig::default()
-        };
-        let (request, mut receipt) = request_with_receipt(
-            "idempotent-fragment-retry",
-            Message::Binary(Bytes::from_static(b"abcdef")),
-            config,
-            107,
-            CancellationToken::new(),
-        );
-        let (first_control_tx, mut first_control_rx) = mpsc::channel(1);
-        let mut first_sink = RecordingSink::with_peer_close(first_control_tx);
-        let first_period = Duration::from_secs(3_600);
-        let mut first_heartbeat =
-            tokio::time::interval_at(Instant::now() + first_period, first_period);
-        first_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        let first_action = handle_queued_request(
-            &mut first_sink,
-            request,
-            &source_queue,
-            &PendingRequestView::default(),
-            85,
-            Some(3),
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut first_control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut first_heartbeat,
-            &HeartbeatState::new(85),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-
-        first_sink.finish_injection().await?;
-        check_eq!(first_action, RequestAction::Stop)?;
-        check!(matches!(
-            receipt.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ))?;
-        let retry = source_queue
-            .try_next()
-            .ok_or_else(|| test_error("idempotent retry must be queued"))?;
-        check_eq!(retry.sequence, 107)?;
-        check_eq!(retry.attempt, 1)?;
-        check!(retry.prior_delivery_unknown)?;
-
-        let (_second_control_tx, mut second_control_rx) = mpsc::channel(1);
-        let mut second_heartbeat =
-            tokio::time::interval_at(Instant::now() + first_period, first_period);
-        second_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut second_sink = RecordingSink::new(None);
-        let second_action = handle_queued_request(
-            &mut second_sink,
-            retry,
-            &source_queue,
-            &PendingRequestView::default(),
-            87,
-            Some(3),
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut second_control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut second_heartbeat,
-            &HeartbeatState::new(87),
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-
-        check_eq!(second_action, RequestAction::Continue)?;
-        check_eq!(receipt.await, Ok(Ok(())))?;
-        check!(source_queue.try_next().is_none())?;
-        Ok(())
-    }
-
-    async fn write_scope_test_request<W>(
-        sink: &mut W,
-        request: QueuedRequest,
-        queue: &Arc<PriorityWriteQueue>,
-        pending: &PendingRequestView,
-        generation: u64,
-        connection_cancel: &CancellationToken,
-    ) -> RequestAction
-    where
-        W: Sink<Message, Error = WsError> + Unpin,
-    {
-        let (_controls, mut controls_rx) = mpsc::channel(1);
-        let period = Duration::from_secs(3_600);
-        let mut heartbeat = tokio::time::interval_at(Instant::now() + period, period);
-        handle_queued_request(
-            sink,
-            request,
-            queue,
-            pending,
-            generation,
-            Some(3),
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut controls_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut heartbeat,
-            &HeartbeatState::new(generation),
-            period,
-            Duration::from_secs(1),
-            connection_cancel,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn scope_retry_keeps_registration_body_and_original_cancellation_owner() -> TestResult {
-        for revoke_before_retry in [false, true] {
-            let scope = CancellationToken::new();
-            let next_owner = CancellationToken::new();
-            let dispatch = scope.child_token();
-            let config = WSRequestConfig {
-                idempotent: true,
-                send_retry_count: 1,
-                disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-                ..WSRequestConfig::default()
-            };
-            let uuid = "scope-bound-retry";
-            let body = Message::Text(uuid.into());
-            let pending = PendingRequestView::default();
-            let (token, completion) = pending
-                .reserve(Arc::new(TimeoutTestRequest(uuid)), &config)
-                .map_err(|error| test_error(format!("reserve scoped retry: {error:?}")))?;
-            let (mut request, mut receipt) =
-                request_with_receipt(uuid, body.clone(), config, 211, dispatch.clone());
-            request.pending_token = Some(token);
-            request.admission_cancel = Some(CancellationToken::new());
-            request
-                .dispatch_phase
-                .set_pending_cleanup(pending.clone(), uuid.to_owned(), token)?;
-            let queue = PriorityWriteQueue::new(1, 128)?;
-            let mut first_sink = NthFlushErrorSink::new(1);
-            let first_action = write_scope_test_request(
-                &mut first_sink,
-                request,
-                &queue,
-                &pending,
-                601,
-                &CancellationToken::new(),
-            )
-            .await;
-            check_eq!(
-                first_action,
-                RequestAction::StopWithError(NetError::DeliveryUnknown)
-            )?;
-            check!(matches!(
-                receipt.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ))?;
-            let retry = queue
-                .try_next()
-                .ok_or_else(|| test_error("same-scope retry was not retained"))?;
-            check_eq!(retry.pending_token, Some(token))?;
-            check_eq!(retry.message, body)?;
-            check_eq!(retry.uuid, uuid)?;
-            check_eq!(retry.sequence, 211)?;
-            check_eq!(retry.attempt, 1)?;
-            check!(retry.admission_cancel.is_none())?;
-            check!(retry.dispatch_cancel == dispatch)?;
-            check!(retry.prior_delivery_unknown)?;
-            if revoke_before_retry {
-                scope.cancel();
-                check!(retry.dispatch_cancel.is_cancelled())?;
-                check!(!next_owner.is_cancelled())?;
-            }
-            let mut second_sink = RecordingSink::new(None);
-            let second_action = write_scope_test_request(
-                &mut second_sink,
-                retry,
-                &queue,
-                &pending,
-                602,
-                &CancellationToken::new(),
-            )
-            .await;
-            check_eq!(second_action, RequestAction::Continue)?;
-            check!(queue.try_next().is_none())?;
-            if revoke_before_retry {
-                check_eq!(receipt.await?, Err(NetError::DeliveryUnknown))?;
-                check_eq!(completion.wait().await, Err(NetError::DeliveryUnknown))?;
-                check!(pending.is_empty())?;
-                check!(second_sink
-                    .recorded()
-                    .lock()
-                    .map_err(|error| test_error(format!("scoped retry messages: {error}")))?
-                    .is_empty())?;
-            } else {
-                check_eq!(receipt.await?, Ok(()))?;
-                check!(pending.take_request(uuid, 601).is_none())?;
-                check!(pending.take_request(uuid, 602).is_some())?;
-                check_eq!(completion.wait().await, Ok(()))?;
-                let frames = second_sink.recorded();
-                let messages = frames
-                    .lock()
-                    .map_err(|error| test_error(format!("scoped retry messages: {error}")))?;
-                let mut restored = Vec::new();
-                for message in messages.iter() {
-                    let Message::Frame(frame) = message else {
-                        return Err(test_error("scoped retry did not preserve fragmentation"));
-                    };
-                    restored.extend_from_slice(frame.payload());
-                }
-                check_eq!(restored.as_slice(), uuid.as_bytes())?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn check_registration_termination_after_unknown_retry(
-        expire: bool,
-        before_queue_publication: bool,
-    ) -> TestResult {
-        use crate::api::wsc::request_registration::{
-            RegistrationControl, RequestTerminationOutcome,
-        };
-        let uuid = "registration-unknown-retry";
-        let config = WSRequestConfig {
-            idempotent: true,
-            send_retry_count: 1,
-            disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-            ..WSRequestConfig::default()
-        };
-        let queue = PriorityWriteQueue::new(1, 128)?;
-        let pending = PendingRequestView::default();
-        let cancel = CancellationToken::new();
-        let (mut request, receipt) = request_with_receipt(
-            uuid,
-            Message::Text("original body".into()),
-            config.clone(),
-            701,
-            cancel.clone(),
-        );
-        let control = RegistrationControl::new(
-            request.dispatch_phase.clone(),
-            cancel,
-            Arc::downgrade(&queue),
-        );
-        let (registration, completion) = pending.reserve_snapshot_observed(
-            uuid.to_owned(),
-            Arc::new(TimeoutTestRequest(uuid)),
-            &config,
-            None,
-            None,
-            Some(control),
-            None,
-        )?;
-        request.pending_token = Some(registration.raw_token());
-        request.dispatch_phase.set_pending_cleanup(
-            pending.clone(),
-            uuid.to_owned(),
-            registration.raw_token(),
-        )?;
-        let mut sink = NthFlushErrorSink::new(1);
-        let action = write_scope_test_request(
-            &mut sink,
-            request,
-            &queue,
-            &pending,
-            701,
-            &CancellationToken::new(),
-        )
-        .await;
-        check_eq!(
-            action,
-            RequestAction::StopWithError(NetError::DeliveryUnknown)
-        )?;
-        let retained = queue
-            .try_next()
-            .ok_or_else(|| test_error("missing ambiguous retry"))?;
-        check!(retained.prior_delivery_unknown)?;
-        check_eq!(retained.attempt, 1)?;
-        // Holding the already-requeued dispatch outside the heap reproduces the
-        // writer's gap between its requeue CAS and push_existing publication.
-        let unpublished = if before_queue_publication {
-            Some(retained)
-        } else {
-            queue
-                .push_existing(retained)
-                .map_err(|_| test_error("could not restore ambiguous retry"))?;
-            None
-        };
-        let outcome = if expire {
-            registration.expire()?
-        } else {
-            registration.cancel()?
-        };
-        if let Some(unpublished) = unpublished {
-            let rejected = queue
-                .push_existing(unpublished)
-                .err()
-                .ok_or_else(|| test_error("cancelled retry was published after cancellation"))?;
-            rejected.complete(Err(NetError::Cancelled));
-        }
-        let written = receipt.await?;
-        let response = completion.wait().await;
-        check!(
-            written == Err(NetError::DeliveryUnknown)
-                && response == Err(NetError::DeliveryUnknown)
-                && outcome == RequestTerminationOutcome::Terminated { error: NetError::DeliveryUnknown },
-            "ambiguous retry lost terminal identity: written={written:?}, pending={response:?}, outcome={outcome:?}"
-        )?;
-        check!(pending.is_empty())?;
-        check!(queue.try_next().is_none())?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn registration_cancel_of_queued_unknown_retry_preserves_both_receipts() -> TestResult {
-        check_registration_termination_after_unknown_retry(false, false).await
-    }
-
-    #[tokio::test]
-    async fn registration_expire_of_queued_unknown_retry_preserves_both_receipts() -> TestResult {
-        check_registration_termination_after_unknown_retry(true, false).await
-    }
-
-    #[tokio::test]
-    async fn registration_cancel_before_unknown_retry_publication_preserves_both_receipts(
-    ) -> TestResult {
-        check_registration_termination_after_unknown_retry(false, true).await
-    }
-
-    #[tokio::test]
-    async fn registration_expire_before_unknown_retry_publication_preserves_both_receipts(
-    ) -> TestResult {
-        check_registration_termination_after_unknown_retry(true, true).await
-    }
-
-    #[tokio::test]
-    async fn scope_cancel_before_first_write_is_unsent_and_never_requeued() -> TestResult {
-        let scope = CancellationToken::new();
-        let dispatch = scope.child_token();
-        let (request, receipt) = request_with_receipt(
-            "scope-before-write",
-            Message::Text("body".into()),
-            WSRequestConfig {
-                idempotent: true,
-                send_retry_count: 2,
-                disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-                ..WSRequestConfig::default()
-            },
-            213,
-            dispatch,
-        );
-        scope.cancel();
-        let queue = PriorityWriteQueue::new(1, 128)?;
-        let mut sink = RecordingSink::new(None);
-        let action = write_scope_test_request(
-            &mut sink,
-            request,
-            &queue,
-            &PendingRequestView::default(),
-            603,
-            &CancellationToken::new(),
-        )
-        .await;
-        check_eq!(action, RequestAction::Continue)?;
-        check_eq!(receipt.await?, Err(NetError::Cancelled))?;
-        check!(queue.try_next().is_none())?;
-        check!(sink
-            .recorded()
-            .lock()
-            .map_err(|error| test_error(format!("cancelled scope messages: {error}")))?
-            .is_empty())?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn scope_cancel_during_write_retires_socket_and_cannot_requeue_idempotent_request(
-    ) -> TestResult {
-        let scope = CancellationToken::new();
-        let connection_cancel = scope.child_token();
-        let (request, receipt) = request_with_receipt(
-            "scope-during-write",
-            Message::Text("body".into()),
-            WSRequestConfig {
-                idempotent: true,
-                send_retry_count: 2,
-                disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-                ..WSRequestConfig::default()
-            },
-            215,
-            scope.child_token(),
-        );
-        let phase = request.dispatch_phase.clone();
-        let queue = PriorityWriteQueue::new(1, 128)?;
-        let pending = PendingRequestView::default();
-        let (entered_tx, mut entered_rx) = oneshot::channel();
-        let mut sink = FlushPendingSink::new(entered_tx);
-        let mut writing = Box::pin(write_scope_test_request(
-            &mut sink,
-            request,
-            &queue,
-            &pending,
-            605,
-            &connection_cancel,
-        ));
-        check!(writing.as_mut().now_or_never().is_none())?;
-        entered_rx
-            .try_recv()
-            .map_err(|error| test_error(format!("scoped data never entered sink: {error}")))?;
-        // Scope propagation alone must work, without a registration-cancel phase CAS.
-        scope.cancel();
-        check!(!phase.is_cancelled())?;
-        let action = writing.await;
-        check_eq!(
-            action,
-            RequestAction::StopWithError(NetError::DeliveryUnknown)
-        )?;
-        check_eq!(receipt.await?, Err(NetError::DeliveryUnknown))?;
-        check!(queue.try_next().is_none())?;
-        check_eq!(
-            sink.recorded()
-                .lock()
-                .map_err(|error| test_error(format!("in-flight scoped messages: {error}")))?
-                .len(),
-            1
-        )?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn scope_cancel_during_final_flush_cannot_commit_success() -> TestResult {
-        let scope = CancellationToken::new();
-        let (request, receipt) = request_with_receipt(
-            "scope-final-flush",
-            Message::Text("abc".into()),
-            WSRequestConfig {
-                idempotent: true,
-                send_retry_count: 2,
-                ..WSRequestConfig::default()
-            },
-            217,
-            scope.child_token(),
-        );
-        let queue = PriorityWriteQueue::new(1, 128)?;
-        let mut sink = RecordingSink::new(None);
-        sink.cancel_after_flush = Some(scope.clone());
-        let action = write_scope_test_request(
-            &mut sink,
-            request,
-            &queue,
-            &PendingRequestView::default(),
-            607,
-            &scope.child_token(),
-        )
-        .await;
-        check!(scope.is_cancelled())?;
-        check_eq!(receipt.await?, Err(NetError::DeliveryUnknown))?;
-        check_eq!(
-            action,
-            RequestAction::StopWithError(NetError::DeliveryUnknown)
-        )?;
-        check!(queue.try_next().is_none())?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn one_frame_boundary_processes_only_a_bounded_control_burst() -> TestResult {
         let capacity = MAX_READY_CONTROLS_PER_BOUNDARY + 3;
         let (control_tx, mut control_rx) = mpsc::channel(capacity);
@@ -3730,7 +2470,7 @@ mod tests {
         let mut sink = RecordingSink::new(None);
         let flushes = sink.flushes();
         let heartbeat_interval = Duration::from_secs(3_600);
-        let mut heartbeat =
+        let heartbeat =
             tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
         let mut remaining_controls = MAX_READY_CONTROLS_PER_BOUNDARY;
 
@@ -3739,9 +2479,8 @@ mod tests {
             &mut control_rx,
             Duration::from_secs(1),
             &CancellationToken::new(),
-            &mut heartbeat,
+            &mut HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200)),
             &HeartbeatState::new(1),
-            Duration::from_secs(7_200),
             Instant::now() + Duration::from_secs(1),
             &mut remaining_controls,
         )
@@ -3784,9 +2523,8 @@ mod tests {
             &mut control_rx,
             Duration::from_secs(1),
             &CancellationToken::new(),
-            &mut heartbeat,
+            &mut HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200)),
             &HeartbeatState::new(7),
-            Duration::from_secs(7_200),
             Instant::now() + Duration::from_secs(1),
             &mut remaining_controls,
         )
@@ -3825,9 +2563,8 @@ mod tests {
             &mut control_rx,
             Duration::from_secs(30),
             Duration::from_secs(30),
-            &mut heartbeat,
+            &mut HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200)),
             &heartbeat_state,
-            Duration::from_secs(7_200),
             &CancellationToken::new(),
             &CancellationToken::new(),
         )
@@ -3836,7 +2573,7 @@ mod tests {
         sink.verify()?;
         check_eq!(
             result.map_err(|failure| failure.request_error),
-            Err(NetError::TimeoutError)
+            Err(NetError::from(crate::error::ErrorKind::TimedOut))
         )?;
         check_eq!(started_at.elapsed(), request_timeout)?;
         Ok(())
@@ -3864,9 +2601,8 @@ mod tests {
             &mut control_rx,
             Duration::from_secs(1),
             Duration::from_secs(1),
-            &mut heartbeat,
+            &mut HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200)),
             &heartbeat_state,
-            Duration::from_secs(7_200),
             &cancel,
             &CancellationToken::new(),
         )
@@ -3875,7 +2611,7 @@ mod tests {
         sink.finish_injection().await?;
         check_eq!(
             result.map_err(|failure| failure.request_error),
-            Err(NetError::DeliveryUnknown)
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
         )?;
         let messages = recorded
             .lock()
@@ -3911,9 +2647,8 @@ mod tests {
             &mut control_rx,
             Duration::from_secs(1),
             Duration::from_secs(1),
-            &mut heartbeat,
+            &mut HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200)),
             &heartbeat_state,
-            Duration::from_secs(7_200),
             &CancellationToken::new(),
             &CancellationToken::new(),
         )
@@ -3922,7 +2657,7 @@ mod tests {
         sink.finish_injection().await?;
         check_eq!(
             result.map_err(|failure| failure.request_error),
-            Err(NetError::DeliveryUnknown)
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
         )?;
         check_eq!(
             recorded
@@ -3930,89 +2665,6 @@ mod tests {
                 .map_err(|error| test_error(format!("recorded messages lock: {error:?}")))?
                 .len(),
             1
-        )?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn response_claim_wins_request_receipt_before_an_ambiguous_flush_error() -> TestResult {
-        let uuid = "response-before-flush-error";
-        let generation = 53;
-        let pending = PendingRequestView::with_capacity(1);
-        let config = WSRequestConfig {
-            idempotent: true,
-            send_retry_count: 1,
-            ..WSRequestConfig::default()
-        };
-        let (token, completion) = pending
-            .reserve(Arc::new(TimeoutTestRequest(uuid)), &config)
-            .map_err(|error| test_error(format!("reserve tracked request: {error:?}")))?;
-        let dispatch_phase = crate::module::ws_client::write::queued_request::DispatchPhase::new();
-        dispatch_phase.set_pending_cleanup(pending.clone(), uuid.to_string(), token)?;
-        let (result_tx, result_rx) = oneshot::channel();
-        let request = QueuedRequest {
-            uuid: uuid.to_string(),
-            pending_token: Some(token),
-            message: Message::Text(uuid.into()),
-            config,
-            attempt: 0,
-            prior_delivery_unknown: false,
-            result_tx: Some(result_tx),
-            dispatch_cancel: CancellationToken::new(),
-            dispatch_phase,
-            admission_cancel: None,
-            sequence: 1,
-            slot_permit: None,
-            byte_permit: None,
-        };
-        let source_queue = PriorityWriteQueue::new(1, 128)
-            .map_err(|error| test_error(format!("source queue: {error:?}")))?;
-        let (_control_tx, mut control_rx) = mpsc::channel(1);
-        let heartbeat_state = HeartbeatState::new(generation);
-        let heartbeat_interval = Duration::from_secs(3_600);
-        let mut heartbeat =
-            tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut sink = ResponseClaimThenFlushErrorSink {
-            pending: pending.clone(),
-            uuid,
-            generation,
-            claimed: false,
-            claim_result: None,
-        };
-
-        let action = handle_queued_request(
-            &mut sink,
-            request,
-            &source_queue,
-            &pending,
-            generation,
-            None,
-            MAX_READY_CONTROLS_PER_BOUNDARY,
-            &mut control_rx,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            &mut heartbeat,
-            &heartbeat_state,
-            Duration::from_secs(7_200),
-            Duration::from_secs(1),
-            &CancellationToken::new(),
-        )
-        .await;
-
-        sink.claim_result
-            .take()
-            .ok_or_else(|| test_error("flush must attempt response claim"))??;
-        check_eq!(
-            action,
-            RequestAction::StopWithError(NetError::DeliveryUnknown)
-        )?;
-        check_eq!(result_rx.await, Ok(Ok(())))?;
-        check_eq!(completion.wait().await, Ok(()))?;
-        check!(pending.is_empty())?;
-        check!(
-            source_queue.drain().is_empty(),
-            "response must suppress retry"
         )?;
         Ok(())
     }
@@ -4034,6 +2686,7 @@ mod tests {
         let started_at = Instant::now();
         let dispatch_cancel = CancellationToken::new();
 
+        let mut heartbeat = HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200));
         let send = send_request_message(
             &mut sink,
             Message::Binary(Bytes::from_static(b"abcdef")),
@@ -4045,7 +2698,6 @@ mod tests {
             frame_timeout,
             &mut heartbeat,
             &heartbeat_state,
-            Duration::from_secs(7_200),
             &cancel,
             &dispatch_cancel,
         );
@@ -4067,7 +2719,7 @@ mod tests {
 
         check_eq!(
             result.map_err(|failure| failure.request_error),
-            Err(NetError::DeliveryUnknown)
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
         )?;
         check_eq!(started_at.elapsed(), frame_timeout)?;
         check!(matches!(
@@ -4114,7 +2766,7 @@ mod tests {
         sink.verify()?;
         check_eq!(
             result.map_err(|failure| failure.request_error),
-            Err(NetError::Cancelled)
+            Err(NetError::from(crate::error::ErrorKind::Cancelled))
         )?;
         Ok(())
     }
@@ -4135,7 +2787,7 @@ mod tests {
 
         check_eq!(
             result.map_err(|failure| failure.request_error),
-            Err(NetError::DeliveryUnknown)
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
         )?;
         check_eq!(
             sink.recorded()
@@ -4168,9 +2820,8 @@ mod tests {
             &mut control_rx,
             Duration::from_secs(1),
             Duration::from_secs(1),
-            &mut heartbeat,
+            &mut HeartbeatSchedule::from_interval(heartbeat, Duration::from_secs(7_200)),
             &heartbeat_state,
-            Duration::from_secs(7_200),
             &CancellationToken::new(),
             &CancellationToken::new(),
         )
@@ -4178,7 +2829,7 @@ mod tests {
 
         check_eq!(
             result.map_err(|failure| failure.request_error),
-            Err(NetError::DeliveryUnknown)
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
         )?;
         check_eq!(
             recorded
@@ -4202,7 +2853,10 @@ mod tests {
         )
         .await;
         sink.verify()?;
-        check_eq!(error, Err(NetError::DeliveryUnknown))?;
+        check_eq!(
+            error,
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
+        )?;
         Ok(())
     }
 
@@ -4313,7 +2967,7 @@ mod tests {
                 &cancel,
             )
             .await,
-            Err(NetError::SocketRecvTimeout)
+            Err(NetError::from(crate::error::ErrorKind::TimedOut))
         )?;
         check_eq!(
             recorded
@@ -4322,6 +2976,100 @@ mod tests {
                 .len(),
             1
         )?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_ping_uses_control_write_timeout_not_pong_timeout() -> TestResult {
+        let mut sink = PendingSink::default();
+        let heartbeat_state = HeartbeatState::new(37);
+        let started_at = Instant::now();
+        let control_timeout = Duration::from_millis(25);
+
+        let result = handle_heartbeat_tick(
+            &mut sink,
+            &heartbeat_state,
+            Duration::from_millis(5),
+            control_timeout,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        sink.verify()?;
+        check_eq!(
+            result,
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
+        )?;
+        check_eq!(started_at.elapsed(), control_timeout)?;
+        check!(matches!(
+            heartbeat_state.on_tick(Instant::now(), Duration::from_millis(5)),
+            HeartbeatTick::SendProbe(payload) if !payload.is_empty()
+        ))?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_interval_skips_missed_ticks_instead_of_bursting() -> TestResult {
+        let period = Duration::from_secs(5);
+        let mut heartbeat = tokio::time::interval_at(Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        heartbeat.tick().await;
+
+        check!(heartbeat.tick().now_or_never().is_none())?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_heartbeat_keeps_controls_working_without_sending_probes() -> TestResult {
+        let sink = RecordingSink::new(None);
+        let recorded = sink.recorded();
+        let flushes = sink.flushes();
+        let (control_tx, control_rx) = mpsc::channel(2);
+        let (io_event_tx, mut io_event_rx) = mpsc::channel(1);
+        let writer = tokio::spawn(run_write_loop(
+            sink,
+            WriteLoopContext {
+                cancel_domain_gate: None,
+                queue: PriorityWriteQueue::new(1, 64)?,
+                urgent_queue: PriorityWriteQueue::new(1, 64)?,
+                control_rx,
+                pending_requests: crate::module::ws_client::v2_test_support::pending(1)?,
+                io_event_tx,
+                generation: 34,
+                cancel: CancellationToken::new(),
+                data_frame_payload_size: Some(1024),
+                control_write_timeout: Duration::from_secs(1),
+                data_frame_write_timeout: Duration::from_secs(1),
+                heartbeat_config: None,
+                heartbeat: Arc::new(HeartbeatState::new(34)),
+            },
+            CancellationToken::new(),
+        ));
+        // Confirm the writer has initialized its schedule before advancing time.
+        control_tx.send(ControlMessage::FlushAutomatic).await?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while flushes.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        // The peer-Close acknowledgement is a barrier after both queued controls.
+        control_tx.send(ControlMessage::FlushAutomatic).await?;
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(ControlMessage::PeerClose(closed_tx))
+            .await?;
+        closed_rx.await??;
+        writer.await?;
+        check!(recorded
+            .lock()
+            .map_err(|e| test_error(e.to_string()))?
+            .is_empty())?;
+        check!(flushes.load(Ordering::SeqCst) >= 3)?;
+        check!(io_event_rx.recv().await.is_none())?;
         Ok(())
     }
 
@@ -4345,19 +3093,21 @@ mod tests {
         let writer = tokio::spawn(run_write_loop(
             RecordingSink::new(None),
             WriteLoopContext {
+                cancel_domain_gate: None,
                 queue: business_queue,
                 urgent_queue,
                 control_rx,
-                pending_requests: PendingRequestView::default(),
+                pending_requests: crate::module::ws_client::v2_test_support::pending(1)?,
                 io_event_tx,
                 generation: 33,
                 cancel: CancellationToken::new(),
                 data_frame_payload_size: Some(1024),
                 control_write_timeout: Duration::from_secs(1),
                 data_frame_write_timeout: Duration::from_secs(1),
-                heartbeat_interval: Duration::from_secs(60),
-                pong_timeout: Duration::from_secs(5),
-                response_dispatch_grace: Duration::from_secs(1),
+                heartbeat_config: Some(crate::ws::HeartbeatConfig {
+                    interval: Duration::from_secs(60),
+                    pong_timeout: Duration::from_secs(5),
+                }),
                 heartbeat: heartbeat_state,
             },
             CancellationToken::new(),
@@ -4375,9 +3125,9 @@ mod tests {
             event,
             IoEvent::WriteEnded {
                 generation: 33,
-                error: NetError::SocketRecvTimeout
-            }
-        ))?;
+                error,
+                ..
+            } if matches!(error.kind(), crate::error::ErrorKind::TimedOut)))?;
         Ok(())
     }
 
@@ -4408,19 +3158,21 @@ mod tests {
         let writer = tokio::spawn(run_write_loop(
             sink,
             WriteLoopContext {
+                cancel_domain_gate: None,
                 queue: business_queue,
                 urgent_queue,
                 control_rx,
-                pending_requests: PendingRequestView::default(),
+                pending_requests: crate::module::ws_client::v2_test_support::pending(1)?,
                 io_event_tx,
                 generation: 35,
                 cancel: CancellationToken::new(),
                 data_frame_payload_size: Some(1024),
                 control_write_timeout: Duration::from_secs(1),
                 data_frame_write_timeout: Duration::from_secs(1),
-                heartbeat_interval: Duration::from_secs(60),
-                pong_timeout: Duration::from_secs(5),
-                response_dispatch_grace: Duration::from_secs(1),
+                heartbeat_config: Some(crate::ws::HeartbeatConfig {
+                    interval: Duration::from_secs(60),
+                    pong_timeout: Duration::from_secs(5),
+                }),
                 heartbeat: heartbeat_state,
             },
             CancellationToken::new(),
@@ -4434,9 +3186,9 @@ mod tests {
             event,
             Some(IoEvent::WriteEnded {
                 generation: 35,
-                error: NetError::SocketRecvTimeout,
-            })
-        ))?;
+                error,
+                ..
+            }) if matches!(error.kind(), crate::error::ErrorKind::TimedOut)))?;
         check_eq!(
             flushes.load(Ordering::Relaxed),
             1,
@@ -4451,21 +3203,12 @@ mod tests {
             .map_err(|error| test_error(format!("business queue: {error:?}")))?;
         let urgent_queue = PriorityWriteQueue::new(1, 64)
             .map_err(|error| test_error(format!("urgent queue: {error:?}")))?;
-        let shutdown = CancellationToken::new();
-        let business_result = business_queue
-            .enqueue(
-                "bounded-control-fairness".to_string(),
-                None,
-                Message::Text("business".into()),
-                8,
-                WSRequestConfig::default(),
-                &shutdown,
-                CancellationToken::new(),
-                crate::module::ws_client::write::queued_request::DispatchPhase::new(),
-                CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| test_error(format!("enqueue business request: {error:?}")))?;
+        let request = crate::module::ws_client::v2_test_support::queued(
+            1,
+            crate::ws::SendOptions::default(),
+        )?;
+        let business_result = request.dispatch_phase.clone();
+        business_queue.push_existing(request).map_err(|(_, e)| e)?;
 
         let ready_controls = MAX_READY_CONTROLS_PER_BOUNDARY * 3 + 3;
         let (control_tx, control_rx) = mpsc::channel(ready_controls);
@@ -4483,25 +3226,27 @@ mod tests {
         let writer = tokio::spawn(run_write_loop(
             sink,
             WriteLoopContext {
+                cancel_domain_gate: None,
                 queue: Arc::clone(&business_queue),
                 urgent_queue,
                 control_rx,
-                pending_requests: PendingRequestView::default(),
+                pending_requests: crate::module::ws_client::v2_test_support::pending(1)?,
                 io_event_tx,
                 generation: 36,
                 cancel: cancel.clone(),
                 data_frame_payload_size: Some(1024),
                 control_write_timeout: Duration::from_secs(1),
                 data_frame_write_timeout: Duration::from_secs(1),
-                heartbeat_interval: Duration::from_secs(3_600),
-                pong_timeout: Duration::from_secs(7_200),
-                response_dispatch_grace: Duration::from_secs(1),
+                heartbeat_config: Some(crate::ws::HeartbeatConfig {
+                    interval: Duration::from_secs(3_600),
+                    pong_timeout: Duration::from_secs(7_200),
+                }),
                 heartbeat: Arc::new(HeartbeatState::new(36)),
             },
             CancellationToken::new(),
         ));
 
-        let business_result = business_result.await;
+        let business_result = business_result.written().await;
         let controls_before_data = flushes_before_first_data.load(Ordering::Relaxed);
         cancel.cancel();
         drop(control_tx);
@@ -4509,7 +3254,7 @@ mod tests {
             .await
             .map_err(|error| test_error(format!("writer task: {error:?}")))?;
 
-        check_eq!(business_result, Ok(Ok(())))?;
+        check_eq!(business_result, Ok(crate::ws::WriteOutcome::Written))?;
         check!(
             controls_before_data <= MAX_READY_CONTROLS_PER_BOUNDARY,
             "main-loop controls and the first frame boundary must share one total budget"
@@ -4518,125 +3263,115 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_blocked_ping_uses_control_write_timeout_not_pong_timeout() -> TestResult {
-        let mut sink = PendingSink::default();
-        let heartbeat_state = HeartbeatState::new(37);
-        let started_at = Instant::now();
-        let control_timeout = Duration::from_millis(25);
-
-        let result = handle_heartbeat_tick(
-            &mut sink,
-            &heartbeat_state,
-            Duration::from_millis(5),
-            control_timeout,
-            &CancellationToken::new(),
-        )
-        .await;
-
-        sink.verify()?;
-        check_eq!(result, Err(NetError::DeliveryUnknown))?;
-        check_eq!(started_at.elapsed(), control_timeout)?;
-        check!(matches!(
-            heartbeat_state.on_tick(Instant::now(), Duration::from_millis(5)),
-            HeartbeatTick::SendProbe(payload) if !payload.is_empty()
-        ))?;
+    async fn before_first_frame_control_failure_preserves_delivery_and_reconnect_policy(
+    ) -> TestResult {
+        use crate::module::ws_client::v2_test_support as fixture;
+        use crate::ws::{DeliveryEvidence, DisconnectedPolicy, OperationPhase, SendOptions};
+        for wait in [false, true] {
+            for cause in [0, 1, 2] {
+                let source = PriorityWriteQueue::new(1, 32)?;
+                let request = fixture::queued(
+                    79,
+                    SendOptions {
+                        disconnected: if wait {
+                            DisconnectedPolicy::WaitForReconnect
+                        } else {
+                            DisconnectedPolicy::Reject
+                        },
+                        ..Default::default()
+                    },
+                )?;
+                let core = request.dispatch_phase.clone();
+                let (control_tx, mut controls) = mpsc::channel(1);
+                if cause == 2 {
+                    control_tx.send(ControlMessage::FlushAutomatic).await?;
+                }
+                let _control_owner = if cause == 0 {
+                    drop(control_tx);
+                    None
+                } else {
+                    Some(control_tx)
+                };
+                let heartbeat = HeartbeatState::new(1);
+                if cause == 1 {
+                    let now = Instant::now();
+                    let HeartbeatTick::SendProbe(payload) = heartbeat.on_tick(now, Duration::ZERO)
+                    else {
+                        return Err(test_error("probe missing"));
+                    };
+                    check!(heartbeat.mark_sent(&payload, now))?;
+                }
+                let mut sink = PendingSink::default();
+                let period = Duration::from_secs(3600);
+                let mut schedule = HeartbeatSchedule::from_interval(
+                    tokio::time::interval_at(Instant::now() + period, period),
+                    period,
+                );
+                let action = handle_queued_request(
+                    &mut sink,
+                    request,
+                    &source,
+                    &fixture::pending(1)?,
+                    1,
+                    None,
+                    MAX_READY_CONTROLS_PER_BOUNDARY,
+                    &mut controls,
+                    Duration::from_millis(25),
+                    Duration::from_secs(1),
+                    &mut schedule,
+                    &heartbeat,
+                    &CancellationToken::new(),
+                )
+                .await;
+                sink.verify()?;
+                match cause {
+                    0 => check_eq!(action, RequestAction::Stop)?,
+                    1 => {
+                        let RequestAction::StopWithError(error) = action else {
+                            return Err(test_error("heartbeat did not retire writer"));
+                        };
+                        check_eq!(error.kind(), crate::error::ErrorKind::TimedOut)?;
+                        check_eq!(
+                            error.context().stage,
+                            Some(crate::error::ErrorStage::Heartbeat)
+                        )?;
+                    }
+                    _ => check_eq!(
+                        action,
+                        RequestAction::StopWithError(NetError::from(
+                            crate::error::ErrorKind::DeliveryUnknown
+                        ))
+                    )?,
+                }
+                check_eq!(core.snapshot()?.delivery, DeliveryEvidence::NotStarted)?;
+                if wait {
+                    check_eq!(core.snapshot()?.phase, OperationPhase::Queued)?;
+                    check!(core.snapshot()?.result.is_none())?;
+                    let retained = source
+                        .try_next()
+                        .ok_or_else(|| test_error("unsent request not retained"))?;
+                    check_eq!(retained.sequence, 79)?;
+                    check_eq!(retained.attempt, 0)?;
+                    retained.complete(Err(NetError::from(crate::error::ErrorKind::Cancelled)));
+                } else {
+                    check!(source.try_next().is_none())?;
+                    check!(core.written().await.is_err())?;
+                }
+            }
+        }
         Ok(())
     }
+}
 
-    #[tokio::test(start_paused = true)]
-    async fn heartbeat_interval_skips_missed_ticks_instead_of_bursting() -> TestResult {
-        let period = Duration::from_secs(5);
-        let mut heartbeat = tokio::time::interval_at(Instant::now() + period, period);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        tokio::time::advance(Duration::from_secs(60)).await;
+#[cfg(test)]
+#[path = "ws_write/send_chain_component_tests.rs"]
+mod send_chain_component_tests;
 
-        heartbeat.tick().await;
-
-        check!(heartbeat.tick().now_or_never().is_none())?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn urgent_application_message_precedes_ready_business_message() -> TestResult {
-        let business_queue = PriorityWriteQueue::new(2, 64)
-            .map_err(|error| test_error(format!("business queue: {error:?}")))?;
-        let urgent_queue = PriorityWriteQueue::new(2, 64)
-            .map_err(|error| test_error(format!("urgent queue: {error:?}")))?;
-        let shutdown = CancellationToken::new();
-        let business_result = business_queue
-            .enqueue(
-                "business".to_string(),
-                None,
-                Message::Text("business".into()),
-                8,
-                WSRequestConfig::default(),
-                &shutdown,
-                CancellationToken::new(),
-                crate::module::ws_client::write::queued_request::DispatchPhase::new(),
-                CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| test_error(format!("enqueue business: {error:?}")))?;
-        let urgent_result = urgent_queue
-            .enqueue(
-                "urgent".to_string(),
-                None,
-                Message::Text("urgent".into()),
-                6,
-                WSRequestConfig::default(),
-                &shutdown,
-                CancellationToken::new(),
-                crate::module::ws_client::write::queued_request::DispatchPhase::new(),
-                CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| test_error(format!("enqueue urgent: {error:?}")))?;
-
-        let sink = RecordingSink::new(None);
-        let recorded = sink.recorded();
-        let (control_tx, control_rx) = mpsc::channel(4);
-        let (io_event_tx, _io_event_rx) = mpsc::channel(4);
-        let cancel = CancellationToken::new();
-        let writer = tokio::spawn(run_write_loop(
-            sink,
-            WriteLoopContext {
-                queue: Arc::clone(&business_queue),
-                urgent_queue: Arc::clone(&urgent_queue),
-                control_rx,
-                pending_requests: PendingRequestView::default(),
-                io_event_tx,
-                generation: 1,
-                cancel: cancel.clone(),
-                data_frame_payload_size: Some(1024),
-                control_write_timeout: Duration::from_secs(1),
-                data_frame_write_timeout: Duration::from_secs(1),
-                heartbeat_interval: Duration::from_secs(3_600),
-                pong_timeout: Duration::from_secs(7_200),
-                response_dispatch_grace: Duration::from_secs(1),
-                heartbeat: Arc::new(HeartbeatState::new(1)),
-            },
-            CancellationToken::new(),
-        ));
-
-        let urgent_result = urgent_result.await;
-        let business_result = business_result.await;
-        cancel.cancel();
-        drop(control_tx);
-        writer
-            .await
-            .map_err(|error| test_error(format!("writer task: {error:?}")))?;
-        check_eq!(urgent_result, Ok(Ok(())))?;
-        check_eq!(business_result, Ok(Ok(())))?;
-
-        let messages = recorded
-            .lock()
-            .map_err(|error| test_error(format!("recorded messages lock: {error:?}")))?;
-        check!(
-            matches!(messages.first(), Some(Message::Text(value)) if value.as_str() == "urgent")
-        )?;
-        check!(
-            matches!(messages.get(1), Some(Message::Text(value)) if value.as_str() == "business")
-        )?;
-        Ok(())
+#[cfg(test)]
+fn request_action_key(action: &RequestAction) -> (u8, Option<crate::error::ErrorKind>) {
+    match action {
+        RequestAction::Continue => (0, None),
+        RequestAction::Stop => (1, None),
+        RequestAction::StopWithError(error) => (2, Some(error.kind())),
     }
 }

@@ -25,6 +25,8 @@
 
 use std::net::Ipv4Addr;
 
+use crate::NetError;
+
 /// Priority score for a LAN interface candidate (a larger rank wins).
 ///
 /// Used to pick the "most like a real physical LAN interface" address in
@@ -175,19 +177,14 @@ fn pick_lan_ipv4_from(candidates: &[IfaceCandidate]) -> Option<Ipv4Addr> {
     best.map(|(_, ip)| ip)
 }
 
-/// Enumerate the local interfaces and pick the LAN IPv4 address most suitable
-/// to advertise to LAN peers.
-///
-/// Replaces the old `connect(8.8.8.8)` route probe: under a VPN / Clash
-/// global TUN setup that probe resolves to a virtual adapter address (e.g.
-/// `198.18.x.x`), which LAN peers cannot reach. Enumerating interfaces plus
-/// the curated subnet/name filters avoids virtual adapters by construction.
-///
-/// Returns `None` when no usable LAN address exists (the caller should then
-/// refrain from advertising an address at all, rather than pretending with a
-/// fallback like `127.0.0.1`).
-pub(crate) fn preferred_lan_ipv4() -> Option<Ipv4Addr> {
-    let ifaces = if_addrs::get_if_addrs().ok()?;
+pub(crate) fn preferred_lan_ipv4() -> Result<Option<Ipv4Addr>, NetError> {
+    select_interface_address(if_addrs::get_if_addrs())
+}
+
+fn select_interface_address(
+    interfaces: std::io::Result<Vec<if_addrs::Interface>>,
+) -> Result<Option<Ipv4Addr>, NetError> {
+    let ifaces = interfaces.map_err(NetError::from)?;
 
     let mut candidates: Vec<IfaceCandidate> = Vec::new();
     for iface in &ifaces {
@@ -203,7 +200,7 @@ pub(crate) fn preferred_lan_ipv4() -> Option<Ipv4Addr> {
         });
     }
 
-    pick_lan_ipv4_from(&candidates)
+    Ok(pick_lan_ipv4_from(&candidates))
 }
 
 #[cfg(test)]
@@ -309,5 +306,53 @@ mod tests {
             classify_lan_ipv4(Ipv4Addr::new(172, 32, 0, 1)),
             Some(LanScore::OtherRoutable)
         );
+    }
+}
+
+#[cfg(test)]
+mod fallible_query_tests {
+    use super::*;
+
+    #[test]
+    fn enumeration_failure_is_not_an_empty_address() -> Result<(), Box<dyn std::error::Error>> {
+        let failure = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "interface lookup");
+        if !matches!(
+            select_interface_address(Err(failure)),
+            Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), crate::error::ErrorKind::Io))
+        {
+            return Err("interface enumeration failure was hidden".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn successful_empty_enumeration_has_no_address() -> Result<(), Box<dyn std::error::Error>> {
+        if select_interface_address(Ok(Vec::new()))?.is_some() {
+            return Err("empty interface enumeration invented an address".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod source_retention_tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn enumeration_error_retains_the_original_io_source() -> Result<(), Box<dyn Error>> {
+        let failure = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "interface lookup");
+        let error = select_interface_address(Err(failure))
+            .err()
+            .ok_or("enumeration unexpectedly succeeded")?;
+        if error.io_kind() != Some(std::io::ErrorKind::PermissionDenied)
+            || error
+                .source()
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_none()
+        {
+            return Err("interface enumeration lost its original I/O source".into());
+        }
+        Ok(())
     }
 }

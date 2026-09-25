@@ -6,8 +6,14 @@ use crate::log_e;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use threadpool::ThreadPool;
 use tokio::sync::mpsc::{channel, Sender};
+
+/// Library policy for explicitly configured management runtime workers.
+pub(crate) const MAX_RUNTIME_WORKER_THREADS: usize = 256;
+
+#[path = "lazy_callback_pool.rs"]
+mod lazy_callback_pool;
+pub(crate) use lazy_callback_pool::LazyCallbackPool;
 
 #[path = "owned_runtime.rs"]
 mod owned_runtime;
@@ -21,7 +27,7 @@ mod execution_tests;
 mod runtime_tests;
 
 pub struct CommonEngine {
-    pub(crate) cb_pool: ThreadPool,
+    pub(crate) cb_pool: LazyCallbackPool,
     pub(crate) async_tx: Sender<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     pub(crate) sync_tx: Sender<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     pub(crate) rt: Arc<OwnedRuntime>,
@@ -40,16 +46,36 @@ impl CommonEngine {
         channel_buffer_size: usize,
         sync_channel_buffer_size: usize,
     ) -> Result<CommonEngine, CommonError> {
+        Self::new_with_runtime_worker_threads(channel_buffer_size, sync_channel_buffer_size, None)
+    }
+
+    pub(crate) fn new_with_runtime_worker_threads(
+        channel_buffer_size: usize,
+        sync_channel_buffer_size: usize,
+        worker_threads: Option<usize>,
+    ) -> Result<CommonEngine, CommonError> {
         crate::log_t!(LogType::Common; "new", "channel_buffer_size|sync_channel_buffer_size", channel_buffer_size, sync_channel_buffer_size);
+        if [channel_buffer_size, sync_channel_buffer_size]
+            .into_iter()
+            .any(|capacity| capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS)
+            || worker_threads
+                .is_some_and(|threads| threads == 0 || threads > MAX_RUNTIME_WORKER_THREADS)
+        {
+            return Err(CommonError::RuntimeError);
+        }
         let (async_tx, mut async_rx) = channel(channel_buffer_size);
         let (sync_tx, mut sync_rx) = channel(sync_channel_buffer_size);
 
         #[cfg(not(target_arch = "wasm32"))]
         let rt = {
             // 非 WASM 环境使用多线程运行时
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all();
+            if let Some(threads) = worker_threads {
+                builder.worker_threads(threads);
+            }
             let rt = Arc::new(OwnedRuntime::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
+                builder
                     .build()
                     .map_err(|error| {
                         log_e!(LogType::Common; "new", "stage|error", "create_runtime", crate::common::log::summary::error(&error));
@@ -58,7 +84,7 @@ impl CommonEngine {
             ));
 
             let rt_clone = Arc::clone(&rt);
-            std::thread::spawn(move || {
+            std::thread::Builder::new().name("open-net-engine".to_string()).spawn(move || {
                 rt_clone.block_on(async move {
                     // 分别处理同步和异步任务
                     let mut sync_handle = tokio::spawn(async move {
@@ -89,12 +115,15 @@ impl CommonEngine {
                         }
                     }
                 });
-            });
+            }).map_err(|error| {
+                log_e!(LogType::Common; "new", "stage|error", "spawn_engine", crate::common::log::summary::error(&error));
+                CommonError::RuntimeError
+            })?;
             rt
         };
         crate::log_s!(LogType::Common; "new", "stage", "runtime_ready");
         Ok(CommonEngine {
-            cb_pool: ThreadPool::new(4),
+            cb_pool: LazyCallbackPool::new(4),
             async_tx,
             sync_tx,
             rt,

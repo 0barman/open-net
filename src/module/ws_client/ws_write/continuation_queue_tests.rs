@@ -1,34 +1,21 @@
 //! Exercise a fragmented interruption through the queue-owning writer.
 
 use super::*;
-use crate::api::traits::ws::ws_body::WsBody;
-use crate::api::traits::ws::ws_request_config::{DisconnectedTaskPolicy, WSRequestConfig};
-use crate::api::traits::ws::ws_request_trait::WSRequestTrait;
-use crate::module::ws_client::test_support::{check, check_eq, test_error, TestResult};
-use crate::module::ws_client::write::queued_request::DispatchPhase;
+use crate::module::ws_client::{
+    test_support::{check, check_eq, test_error, TestResult},
+    v2_test_support as fixture,
+};
+use crate::ws::{DisconnectedPolicy, RequestOptions, SendOptions};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
 const FIRST_ID: &str = "interrupted-continuation";
-const NEXT_ID: &str = "next-complete-message";
 const FIRST_BODY: &[u8] = b"abcdefghi";
 const NEXT_BODY: &[u8] = b"next";
-const GENERATION: u64 = 914;
+const GENERATION: u64 = 1;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-struct TrackedRequest;
-
-impl WSRequestTrait for TrackedRequest {
-    fn uuid(&self) -> String {
-        FIRST_ID.to_owned()
-    }
-
-    fn body(&self) -> Result<WsBody, NetError> {
-        Ok(WsBody::Binary(Bytes::from_static(FIRST_BODY)))
-    }
-}
 
 struct QueueBoundarySink {
     messages: Arc<Mutex<Vec<Message>>>,
@@ -102,28 +89,6 @@ impl Sink<Message> for QueueBoundarySink {
     }
 }
 
-fn enqueue_untracked(
-    queue: &PriorityWriteQueue,
-    id: &str,
-    body: &'static [u8],
-) -> Result<oneshot::Receiver<Result<(), NetError>>, NetError> {
-    queue.try_enqueue(
-        id.to_owned(),
-        None,
-        Message::Binary(Bytes::from_static(body)),
-        body.len(),
-        WSRequestConfig {
-            expect_response: false,
-            disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-            ..WSRequestConfig::default()
-        },
-        &CancellationToken::new(),
-        CancellationToken::new(),
-        DispatchPhase::new(),
-        CancellationToken::new(),
-    )
-}
-
 fn verify_only_prefix(messages: &Mutex<Vec<Message>>) -> TestResult {
     let messages = messages
         .lock()
@@ -139,36 +104,39 @@ fn verify_only_prefix(messages: &Mutex<Vec<Message>>) -> TestResult {
 }
 
 async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> TestResult {
-    let source = PriorityWriteQueue::new(
-        2,
-        FIRST_BODY.len() + if urgent_followup { 0 } else { NEXT_BODY.len() },
-    )?;
-    let urgent = PriorityWriteQueue::new(2, NEXT_BODY.len())?;
+    let mut config = crate::ws::WebSocketClientConfig::default();
+    config.queues.normal.max_items = 2;
+    config.queues.normal.max_bytes =
+        FIRST_BODY.len() + if urgent_followup { 0 } else { NEXT_BODY.len() };
+    config.queues.urgent.max_items = 2;
+    config.queues.urgent.max_bytes = NEXT_BODY.len();
+    config.requests.max_pending = 1;
+    let runtime = fixture::runtime(config, crate::ws::ResponseRouting::Manual, true).await?;
+    runtime.activate_connection(crate::ws::ConnectionId::from_allocated(GENERATION))?;
+    let source = runtime.queue.clone();
+    let urgent = runtime.urgent_queue.clone();
     let next_queue = if urgent_followup { &urgent } else { &source };
-    let pending = PendingRequestView::with_capacity(1);
-    // Both terminal causes must suppress retries even when the request qualifies.
-    let config = WSRequestConfig {
+    let pending = runtime.pending.clone();
+    let requests = fixture::requests(&runtime);
+    let sender = fixture::sender(&runtime);
+    let options = SendOptions {
         write_timeout: WRITE_TIMEOUT,
-        idempotent: true,
-        send_retry_count: 2,
-        disconnected_policy: DisconnectedTaskPolicy::WaitForReconnect,
-        ..WSRequestConfig::default()
+        retry: crate::ws::SendRetryPolicy::Idempotent { max_retries: 2 },
+        disconnected: DisconnectedPolicy::WaitForReconnect,
+        ..Default::default()
     };
-    let (token, completion) = pending.reserve(Arc::new(TrackedRequest), &config)?;
-    let phase = DispatchPhase::new();
-    phase.set_pending_cleanup(pending.clone(), FIRST_ID.to_owned(), token)?;
-    let dispatch_cancel = CancellationToken::new();
-    let mut first_receipt = source.try_enqueue(
-        FIRST_ID.to_owned(),
-        Some(token),
-        Message::Binary(Bytes::from_static(FIRST_BODY)),
-        FIRST_BODY.len(),
-        config.clone(),
-        &CancellationToken::new(),
-        dispatch_cancel.clone(),
-        phase,
-        CancellationToken::new(),
-    )?;
+    let first_receipt = requests
+        .request(crate::ws::Request::new(
+            crate::ws::RequestId::new(FIRST_ID)?,
+            crate::ws::Message::binary(Bytes::from_static(FIRST_BODY)),
+        ))
+        .options(RequestOptions {
+            send: options.clone(),
+            ..Default::default()
+        })
+        .try_enqueue()
+        .map_err(|e| e.into_error())?;
+    let first_handle = first_receipt.handle().clone();
     let (control_tx, control_rx) = mpsc::channel(MAX_READY_CONTROLS_PER_BOUNDARY);
     let (io_event_tx, mut io_event_rx) = mpsc::channel(2);
     let (entered_tx, mut entered_rx) = oneshot::channel();
@@ -186,6 +154,7 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
     let mut writer = Box::pin(run_write_loop(
         sink,
         WriteLoopContext {
+            cancel_domain_gate: None,
             queue: source.clone(),
             urgent_queue: urgent.clone(),
             control_rx,
@@ -196,9 +165,10 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
             data_frame_payload_size: Some(3),
             control_write_timeout: Duration::from_secs(10),
             data_frame_write_timeout: Duration::from_secs(10),
-            heartbeat_interval: Duration::from_secs(3600),
-            pong_timeout: Duration::from_secs(7200),
-            response_dispatch_grace: Duration::ZERO,
+            heartbeat_config: Some(crate::ws::HeartbeatConfig {
+                interval: Duration::from_secs(3600),
+                pong_timeout: Duration::from_secs(7200),
+            }),
             heartbeat: Arc::new(HeartbeatState::new(GENERATION)),
         },
         CancellationToken::new(),
@@ -220,14 +190,30 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
     }
     check!(reached, "writer did not reach the control-flush gate")?;
     verify_only_prefix(&messages)?;
-    check_eq!(pending.len(), 1)?;
+    check_eq!(requests.pending_snapshot()?.len(), 1)?;
 
     // Queue B after A starts so the urgent variant cannot precede A's first frame.
-    let mut next_receipt = enqueue_untracked(next_queue, NEXT_ID, NEXT_BODY)?;
-    check!(matches!(
-        enqueue_untracked(&source, "capacity-while-writing", FIRST_BODY),
-        Err(NetError::QueueFull)
-    ))?;
+    let next_receipt = sender
+        .message(crate::ws::Message::binary(Bytes::from_static(NEXT_BODY)))
+        .options(SendOptions {
+            lane: if urgent_followup {
+                crate::ws::MessageLane::Urgent
+            } else {
+                crate::ws::MessageLane::Normal
+            },
+            ..options.clone()
+        })
+        .try_enqueue()
+        .map_err(|e| e.into_error())?;
+    check_eq!(
+        sender
+            .message(crate::ws::Message::binary(Bytes::from_static(FIRST_BODY)))
+            .options(options.clone())
+            .try_enqueue()
+            .err()
+            .map(|e| e.error().kind()),
+        Some(crate::error::ErrorKind::QueueFull)
+    )?;
     release_tx
         .send(())
         .map_err(|_| test_error("release gate receiver closed"))?;
@@ -242,7 +228,7 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
             .ok_or_else(|| test_error("test write deadline overflow"))?;
         tokio::time::advance(expires.saturating_duration_since(Instant::now())).await;
     } else {
-        dispatch_cancel.cancel();
+        first_handle.cancel()?;
     }
     check!(
         writer.as_mut().now_or_never().is_some(),
@@ -250,104 +236,63 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
     )?;
     drop(writer);
     verify_only_prefix(&messages)?;
-    check_eq!(first_receipt.try_recv()?, Err(NetError::DeliveryUnknown))?;
     check_eq!(
-        completion.wait().now_or_never(),
-        Some(Err(NetError::DeliveryUnknown))
+        first_handle.written().await.err().map(|e| e.kind()),
+        Some(crate::error::ErrorKind::DeliveryUnknown)
     )?;
-    check!(pending.is_empty())?;
+    check_eq!(
+        first_receipt.response().await.err().map(|e| e.kind()),
+        Some(crate::error::ErrorKind::DeliveryUnknown)
+    )?;
+    check!(requests.pending_snapshot()?.is_empty())?;
     check!(matches!(
         io_event_rx.try_recv(),
         Ok(IoEvent::WriteEnded {
             generation: GENERATION,
-            error: NetError::DeliveryUnknown
-        })
-    ))?;
+            error,
+            ..
+        }) if matches!(error.kind(), crate::error::ErrorKind::DeliveryUnknown)))?;
     check!(matches!(
         io_event_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Disconnected)
     ))?;
-    check!(matches!(
-        next_receipt.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ))?;
-
-    // A's task AND byte permits are reusable before B finishes, with no A retry.
-    let mut capacity_receipt =
-        enqueue_untracked(&source, "capacity-after-interruption", FIRST_BODY)?;
-    let next = next_queue
-        .try_next()
-        .ok_or_else(|| test_error("B was lost"))?;
-    check_eq!(next.uuid, NEXT_ID)?;
+    check!(next_receipt.state()?.result.is_none())?;
+    let capacity = sender
+        .message(crate::ws::Message::binary(Bytes::from_static(FIRST_BODY)))
+        .options(options)
+        .try_enqueue()
+        .map_err(|e| e.into_error())?;
+    let next = next_queue.try_next().ok_or_else(|| test_error("B lost"))?;
+    check_eq!(next.message, Message::Binary(Bytes::from_static(NEXT_BODY)))?;
     check_eq!(next.attempt, 0)?;
+    next.complete(Err(NetError::from(crate::error::ErrorKind::Cancelled)));
     check_eq!(
-        &next.message,
-        &Message::Binary(Bytes::from_static(NEXT_BODY))
+        next_receipt.written().await.err().map(|e| e.kind()),
+        Some(crate::error::ErrorKind::Cancelled)
     )?;
-    next.complete(Err(NetError::Cancelled));
-    check_eq!(next_receipt.try_recv()?, Err(NetError::Cancelled))?;
-    let capacity = source
+    let probe = source
         .try_next()
-        .ok_or_else(|| test_error("capacity probe missing"))?;
-    check_eq!(capacity.uuid, "capacity-after-interruption")?;
-    capacity.complete(Err(NetError::Cancelled));
-    check_eq!(capacity_receipt.try_recv()?, Err(NetError::Cancelled))?;
-    check!(source.try_next().is_none(), "cancel/deadline requeued A")?;
+        .ok_or_else(|| test_error("permit probe missing"))?;
+    probe.complete(Err(NetError::from(crate::error::ErrorKind::Cancelled)));
+    check!(capacity.written().await.is_err())?;
+    check!(source.try_next().is_none())?;
     check!(urgent.try_next().is_none())?;
-
-    // A late old-token cleanup must not remove a replacement registration.
-    let (replacement_token, replacement_completion) =
-        pending.reserve(Arc::new(TrackedRequest), &config)?;
-    check!(replacement_token != token)?;
-    check!(pending
-        .remove_if_token(FIRST_ID, token, NetError::DeliveryUnknown)
-        .is_none())?;
-    check_eq!(pending.len(), 1)?;
-    check!(pending
-        .remove_if_token(FIRST_ID, replacement_token, NetError::Cancelled)
-        .is_some())?;
+    // Reuse the same request identity after old cancellation. The old handle may not affect it.
+    let replacement = requests
+        .request(crate::ws::Request::new(
+            crate::ws::RequestId::new(FIRST_ID)?,
+            crate::ws::Message::binary(Bytes::from_static(FIRST_BODY)),
+        ))
+        .try_enqueue()
+        .map_err(|e| e.into_error())?;
     check_eq!(
-        replacement_completion.wait().now_or_never(),
-        Some(Err(NetError::Cancelled))
+        first_handle.cancel()?,
+        crate::ws::TerminationOutcome::AlreadyFinished
     )?;
-    check!(pending.is_empty())?;
-
-    verify_capacity_limits(
-        &source,
-        if urgent_followup {
-            FIRST_BODY
-        } else {
-            b"abcdefghijklm"
-        },
-    )?;
-    verify_capacity_limits(&urgent, NEXT_BODY)?;
-    Ok(())
-}
-
-fn verify_capacity_limits(queue: &PriorityWriteQueue, full_body: &'static [u8]) -> TestResult {
-    // Exhaust only task slots, leaving spare byte capacity.
-    let mut first = enqueue_untracked(queue, "task-capacity-1", b"x")?;
-    let mut second = enqueue_untracked(queue, "task-capacity-2", b"x")?;
-    check!(matches!(
-        enqueue_untracked(queue, "extra-task", b"x"),
-        Err(NetError::QueueFull)
-    ))?;
-    for request in queue.drain() {
-        request.complete(Err(NetError::Cancelled));
-    }
-    check_eq!(first.try_recv()?, Err(NetError::Cancelled))?;
-    check_eq!(second.try_recv()?, Err(NetError::Cancelled))?;
-
-    // Exhaust only byte slots, leaving one free task slot.
-    let mut bytes = enqueue_untracked(queue, "byte-capacity", full_body)?;
-    check!(matches!(
-        enqueue_untracked(queue, "extra-byte", b"x"),
-        Err(NetError::QueueFull)
-    ))?;
-    for request in queue.drain() {
-        request.complete(Err(NetError::Cancelled));
-    }
-    check_eq!(bytes.try_recv()?, Err(NetError::Cancelled))?;
+    check_eq!(requests.pending_snapshot()?.len(), 1)?;
+    replacement.handle().cancel()?;
+    check!(replacement.response().await.is_err())?;
+    check!(requests.pending_snapshot()?.is_empty())?;
     Ok(())
 }
 

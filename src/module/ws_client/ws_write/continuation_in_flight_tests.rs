@@ -4,6 +4,7 @@ use super::{
     send_request_message, HeartbeatState, NetError, OpCode, OpData, RequestAction, RequestRequeue,
     MAX_READY_CONTROLS_PER_BOUNDARY,
 };
+use crate::module::ws_client::heartbeat_schedule::HeartbeatSchedule;
 use crate::module::ws_client::test_support::{check, check_eq, test_error, TestResult};
 use bytes::Bytes;
 use futures::{FutureExt, Sink};
@@ -104,7 +105,10 @@ async fn check_in_flight_continuation(interruption: InFlightInterruption) -> Tes
     let dispatch_cancel = CancellationToken::new();
     let period = Duration::from_secs(3_600);
     let started_at = Instant::now();
-    let mut heartbeat = tokio::time::interval_at(started_at + period, period);
+    let mut heartbeat = HeartbeatSchedule::from_interval(
+        tokio::time::interval_at(started_at + period, period),
+        period,
+    );
     let heartbeat_state = HeartbeatState::new(1);
     let short_timeout = Duration::from_secs(5);
     let long_timeout = Duration::from_secs(30);
@@ -128,7 +132,6 @@ async fn check_in_flight_continuation(interruption: InFlightInterruption) -> Tes
         frame_timeout,
         &mut heartbeat,
         &heartbeat_state,
-        period,
         &connection_cancel,
         &dispatch_cancel,
     ));
@@ -180,10 +183,19 @@ async fn check_in_flight_continuation(interruption: InFlightInterruption) -> Tes
         )?;
         check_eq!(frame.payload(), expected_payload)?;
     }
-    check_eq!(failure.request_error, NetError::DeliveryUnknown)?;
+    // Frame primitives retain the interruption cause; the queue-owned OperationControl
+    // supplies final DeliveryUnknown evidence (covered by continuation_queue_tests).
+    let expected_cause = match interruption {
+        InFlightInterruption::DispatchCancelled => crate::error::ErrorKind::Cancelled,
+        InFlightInterruption::RequestDeadline | InFlightInterruption::EqualDeadlines => {
+            crate::error::ErrorKind::TimedOut
+        }
+        _ => crate::error::ErrorKind::DeliveryUnknown,
+    };
+    check_eq!(failure.request_error.kind(), expected_cause)?;
     let expected_action = match interruption {
         InFlightInterruption::ConnectionCancelled => RequestAction::Stop,
-        _ => RequestAction::StopWithError(NetError::DeliveryUnknown),
+        _ => RequestAction::StopWithError(NetError::from(crate::error::ErrorKind::DeliveryUnknown)),
     };
     let expected_requeue = match interruption {
         InFlightInterruption::DispatchCancelled
@@ -193,7 +205,10 @@ async fn check_in_flight_continuation(interruption: InFlightInterruption) -> Tes
         | InFlightInterruption::FrameTimeout
         | InFlightInterruption::IoError => RequestRequeue::IdempotentRetry,
     };
-    check_eq!(failure.connection_action, expected_action)?;
+    check_eq!(
+        super::request_action_key(&(failure.connection_action)),
+        super::request_action_key(&(expected_action))
+    )?;
     check_eq!(failure.requeue, expected_requeue)?;
     let expected_elapsed = match interruption {
         InFlightInterruption::FrameTimeout

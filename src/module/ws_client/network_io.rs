@@ -1,31 +1,39 @@
 //! Prevent a retired network epoch from starting or flushing more socket writes.
 
-use crate::api::wsc::RequestScope;
 use crate::module::net_status::inner::network_status_snapshot::NetworkStatusSnapshot;
 use crate::module::net_status::NetworkStatus;
 use futures::{future::BoxFuture, Sink, Stream};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_util::sync::CancellationToken;
+#[path = "domain_io.rs"]
+mod domain_io;
+pub(crate) use domain_io::DomainIoGate;
 
 pub(crate) struct NetworkAwareSink<W> {
     inner: W,
     guard: NetworkEpoch,
+    cancel_domain_gate: Option<Arc<DomainIoGate>>,
 }
 
 struct NetworkEpoch {
     network: Option<watch::Receiver<NetworkStatusSnapshot>>,
     loss_epoch: u64,
     invalidated: BoxFuture<'static, ()>,
-    request_scope: Option<RequestScope>,
-    scope_invalidated: BoxFuture<'static, ()>,
+    session_cancel: Option<CancellationToken>,
+    session_invalidated: BoxFuture<'static, ()>,
     write_retirement: Option<CancellationToken>,
     write_retired: BoxFuture<'static, ()>,
 }
 
 impl<W> NetworkAwareSink<W> {
+    pub(crate) fn with_cancel_domain_gate(mut self, gate: Arc<DomainIoGate>) -> Self {
+        self.cancel_domain_gate = Some(gate);
+        self
+    }
     pub(crate) fn new(
         inner: W,
         network: Option<watch::Receiver<NetworkStatusSnapshot>>,
@@ -34,11 +42,12 @@ impl<W> NetworkAwareSink<W> {
         Self {
             inner,
             guard: NetworkEpoch::new(network, loss_epoch),
+            cancel_domain_gate: None,
         }
     }
 
-    pub(crate) fn with_request_scope(mut self, scope: Option<&RequestScope>) -> Self {
-        self.guard.bind_request_scope(scope);
+    pub(crate) fn with_session_cancel(mut self, cancel: &CancellationToken) -> Self {
+        self.guard.bind_session_cancel(cancel);
         self
     }
 
@@ -70,19 +79,16 @@ impl NetworkEpoch {
             network,
             loss_epoch,
             invalidated,
-            request_scope: None,
-            scope_invalidated: Box::pin(std::future::pending()),
+            session_cancel: None,
+            session_invalidated: Box::pin(std::future::pending()),
             write_retirement: None,
             write_retired: Box::pin(std::future::pending()),
         }
     }
 
-    fn bind_request_scope(&mut self, scope: Option<&RequestScope>) {
-        self.request_scope = scope.cloned();
-        self.scope_invalidated = match scope {
-            Some(scope) => Box::pin(scope.cancel_token().cancelled_owned()),
-            None => Box::pin(std::future::pending()),
-        };
+    fn bind_session_cancel(&mut self, cancel: &CancellationToken) {
+        self.session_cancel = Some(cancel.clone());
+        self.session_invalidated = Box::pin(cancel.clone().cancelled_owned());
     }
 
     fn bind_write_retirement(&mut self, retirement: &CancellationToken) {
@@ -102,13 +108,13 @@ impl NetworkEpoch {
 
     fn error(&self) -> Error {
         if self
-            .request_scope
+            .session_cancel
             .as_ref()
-            .is_some_and(RequestScope::is_cancelled)
+            .is_some_and(CancellationToken::is_cancelled)
         {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
-                "request_scope_cancelled",
+                "session_cancelled",
             ))
         } else {
             network_error()
@@ -116,9 +122,9 @@ impl NetworkEpoch {
     }
 
     fn is_invalid(&self) -> bool {
-        self.request_scope
+        self.session_cancel
             .as_ref()
-            .is_some_and(RequestScope::is_cancelled)
+            .is_some_and(CancellationToken::is_cancelled)
             || self.network.as_ref().is_some_and(|receiver| {
                 let mut receiver = receiver.clone();
                 let snapshot = *receiver.borrow_and_update();
@@ -132,7 +138,7 @@ impl NetworkEpoch {
         // to wake it when the local route disappears.
         self.is_invalid()
             || self.invalidated.as_mut().poll(cx).is_ready()
-            || self.scope_invalidated.as_mut().poll(cx).is_ready()
+            || self.session_invalidated.as_mut().poll(cx).is_ready()
     }
 }
 
@@ -159,9 +165,14 @@ fn write_retired_error() -> Error {
 pub(crate) struct NetworkAwareStream<R> {
     inner: R,
     guard: NetworkEpoch,
+    cancel_domain_gate: Option<Arc<DomainIoGate>>,
 }
 
 impl<R> NetworkAwareStream<R> {
+    pub(crate) fn with_cancel_domain_gate(mut self, gate: Arc<DomainIoGate>) -> Self {
+        self.cancel_domain_gate = Some(gate);
+        self
+    }
     pub(crate) fn new(
         inner: R,
         network: Option<watch::Receiver<NetworkStatusSnapshot>>,
@@ -170,11 +181,12 @@ impl<R> NetworkAwareStream<R> {
         Self {
             inner,
             guard: NetworkEpoch::new(network, loss_epoch),
+            cancel_domain_gate: None,
         }
     }
 
-    pub(crate) fn with_request_scope(mut self, scope: Option<&RequestScope>) -> Self {
-        self.guard.bind_request_scope(scope);
+    pub(crate) fn with_session_cancel(mut self, cancel: &CancellationToken) -> Self {
+        self.guard.bind_session_cancel(cancel);
         self
     }
 
@@ -197,7 +209,14 @@ impl<R: Stream<Item = Result<Message, Error>> + Unpin> Stream for NetworkAwareSt
         if self.guard.poll_invalid(cx) {
             return Poll::Ready(Some(Err(self.guard.error())));
         }
-        Pin::new(&mut self.inner).poll_next(cx)
+        match self.cancel_domain_gate.clone() {
+            Some(gate) => match gate.run(|| Pin::new(&mut self.inner).poll_next(cx)) {
+                Ok(result) => result,
+                Err(error) if error.kind() == crate::error::ErrorKind::Cancelled => Poll::Pending,
+                Err(_) => Poll::Ready(Some(Err(write_retired_error()))),
+            },
+            None => Pin::new(&mut self.inner).poll_next(cx),
+        }
     }
 }
 
@@ -211,7 +230,13 @@ impl<W: Sink<Message, Error = Error> + Unpin> Sink<Message> for NetworkAwareSink
         if self.guard.poll_invalid(cx) {
             return Poll::Ready(Err(self.guard.error()));
         }
-        Pin::new(&mut self.inner).poll_ready(cx)
+        match self.cancel_domain_gate.clone() {
+            Some(gate) => match gate.run(|| Pin::new(&mut self.inner).poll_ready(cx)) {
+                Ok(result) => result,
+                Err(_) => Poll::Ready(Err(write_retired_error())),
+            },
+            None => Pin::new(&mut self.inner).poll_ready(cx),
+        }
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Error> {
@@ -221,7 +246,12 @@ impl<W: Sink<Message, Error = Error> + Unpin> Sink<Message> for NetworkAwareSink
         if self.guard.is_invalid() {
             return Err(self.guard.error());
         }
-        Pin::new(&mut self.inner).start_send(item)
+        match self.cancel_domain_gate.clone() {
+            Some(gate) => gate
+                .run(|| Pin::new(&mut self.inner).start_send(item))
+                .map_err(|_| write_retired_error())?,
+            None => Pin::new(&mut self.inner).start_send(item),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
@@ -231,7 +261,13 @@ impl<W: Sink<Message, Error = Error> + Unpin> Sink<Message> for NetworkAwareSink
         if self.guard.poll_invalid(cx) {
             return Poll::Ready(Err(self.guard.error()));
         }
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match self.cancel_domain_gate.clone() {
+            Some(gate) => match gate.run(|| Pin::new(&mut self.inner).poll_flush(cx)) {
+                Ok(result) => result,
+                Err(_) => Poll::Ready(Err(write_retired_error())),
+            },
+            None => Pin::new(&mut self.inner).poll_flush(cx),
+        }
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
@@ -241,7 +277,13 @@ impl<W: Sink<Message, Error = Error> + Unpin> Sink<Message> for NetworkAwareSink
         if self.guard.poll_invalid(cx) {
             return Poll::Ready(Err(self.guard.error()));
         }
-        Pin::new(&mut self.inner).poll_close(cx)
+        match self.cancel_domain_gate.clone() {
+            Some(gate) => match gate.run(|| Pin::new(&mut self.inner).poll_close(cx)) {
+                Ok(result) => result,
+                Err(_) => Poll::Ready(Err(write_retired_error())),
+            },
+            None => Pin::new(&mut self.inner).poll_close(cx),
+        }
     }
 }
 

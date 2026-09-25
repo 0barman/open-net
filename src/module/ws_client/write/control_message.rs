@@ -11,13 +11,11 @@ pub(crate) enum ControlMessage {
     /// the read half progressed first, so the writer only drives the shared sink flush.
     FlushAutomatic,
     /// Flush Tungstenite's automatically queued peer-Close reply, then stop the writer.
-    PeerClose(oneshot::Sender<()>),
-    /// 尝试发送 Close 帧并关闭写 sink。
-    Close(
-        /// 关闭尝试完成后的通知发送端。
-        ///
-        /// 收到通知只表示写循环已执行 Close 帧发送与 sink 关闭操作，
-        /// 不保证对端已完成关闭握手；底层发送或关闭错误也不会通过该通道返回。
-        oneshot::Sender<()>,
-    ),
+    PeerClose(oneshot::Sender<Result<(), crate::error::NetError>>),
+    /// Send the selected Close and flush within the original shutdown budget.
+    CloseWith {
+        frame: Option<crate::ws::CloseFrame>,
+        deadline: tokio::time::Instant,
+        reply: oneshot::Sender<Result<(), crate::error::NetError>>,
+    },
 }

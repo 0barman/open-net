@@ -3,7 +3,7 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2021"
 rust-version = "1.89"
 description = "A cross-platform async networking library with WebSocket clients and network status monitoring."
@@ -13,13 +13,20 @@ documentation = "https://docs.rs/open-net"
 keywords = ["networking", "websocket", "async", "tokio", "cross-platform"]
 categories = ["network-programming", "asynchronous"]
 readme = "README.md"
-include = ["/src/**", "/libs/common/src/**", "/tests/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/rust-toolchain.toml", "/rustfmt.toml"]
+include = ["/src/**", "/libs/common/src/**", "/tests/**", "/examples/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/rust-toolchain.toml", "/rustfmt.toml"]
+
+[[example]]
+name = "examples_messages"
+required-features = ["ws-client"]
+
+[[example]]
+name = "examples_requests"
+required-features = ["ws-client"]
 
 [features]
-default = ["http", "ws-client", "ws-server"]
-http = ["dep:reqwest"]
-ws-client = ["dep:tokio-tungstenite", "dep:tokio-util", "dep:socket2", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:httparse", "dep:base64"]
-ws-server = []
+default = ["ws-client"]
+ws-client = ["dep:tokio-tungstenite", "dep:tokio-util", "dep:socket2", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:httparse", "dep:base64", "dep:uuid", "dep:getrandom"]
+http-client = ["dep:async-trait", "dep:reqwest", "dep:rustls", "dep:hyper"]
 
 [dependencies]
 serde_json = "1.0.151"
@@ -34,26 +41,38 @@ tokio = { version = "1.53.1", default-features = false, features = [
     "net",
 ] }
 chrono = "0.4.45"
-indexmap = { version = "2.14.0", features = ["serde"] }
+indexmap = { version = "2.14.1", features = ["serde"] }
 lazy_static = "1.5.0"
 if-addrs = "0.15.0"
 n0-watcher = "=1.0.0-rc.0"
 netwatch = "0.18.0"
 
-reqwest = { version = "0.13.4", optional = true }
 futures = "0.3.34"
 futures-util = "0.3.34"
-threadpool = "1.8.1"
 bytes = "1.12.1"
+http = "1.5.0"
 
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"], optional = true }
 tokio-util = { version = "0.7.19", features = ["rt"], optional = true }
-socket2 = { version = "0.6.2", optional = true }
+socket2 = { version = "0.6.5", optional = true }
 rustls = { version = "0.23.43", default-features = false, features = ["std", "aws-lc-rs", "tls12"], optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"], optional = true }
 webpki-roots = { version = "0.26.11", optional = true }
 httparse = { version = "1.10.1", optional = true }
 base64 = { version = "0.22.1", optional = true }
+uuid = { version = "1.26.1", default-features = false, features = ["std"], optional = true }
+getrandom = { version = "0.3.4", features = ["std"], optional = true }
+
+# http
+async-trait = { version = "0.1.92", optional = true }
+reqwest = { version = "0.12.28", default-features = false, optional = true, features = [
+    "multipart",
+    "stream",
+    "rustls-tls",
+    "json",
+] }
+hyper = { version = "1.11.1", default-features = false, optional = true, features = ["http1"] }
+
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_Networking_NetworkListManager", "Win32_System_Com"] }

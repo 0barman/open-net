@@ -1,7 +1,10 @@
 use super::*;
+use crate::api::network_config::{NetworkConfig, ProxyConfig};
+use crate::module::transport::compiled_network_config::CompiledNetworkConfig;
 use rustls::CertificateError;
 use std::error::Error;
 use std::io::{Error as IoError, ErrorKind};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -37,12 +40,12 @@ fn network_status_policy_builder_preserves_proxy_and_tls_configuration() -> Test
         .with_proxy(ProxyConfig::http_connect("http://127.0.0.1:8080", None)?)
         .with_tls(TlsConfig::default().with_root_certificates(
             include_bytes!("../../../tests/fixtures/network/ca.pem"),
-            RootCertificateMode::Only,
+            RootCertificateMode::Replace,
         )?);
     let configured = original
         .clone()
         .with_network_status_policy(NetworkStatusPolicy::PauseOnUnavailable);
-    if configured.tls.root_mode != RootCertificateMode::Only
+    if configured.tls.root_mode != RootCertificateMode::Replace
         || configured.tls.roots != original.tls.roots
         || configured.proxy.endpoint.as_ref().map(|proxy| proxy.port) != Some(8080)
         || original.network_status_policy != NetworkStatusPolicy::Ignore
@@ -67,8 +70,8 @@ fn plain_upgrade_io_data_error_is_not_reported_as_tls() -> TestResult {
         ErrorKind::InvalidData,
         "test protocol data",
     )));
-    if result.stage() != WebSocketConnectStage::WebSocketUpgrade
-        || result.error() != NetError::NetworkError
+    if result.stage() != ConnectStage::WebSocketUpgrade
+        || result.error().kind() != crate::error::ErrorKind::Io
     {
         return Err("plain upgrade I/O was incorrectly reported as TLS".into());
     }
@@ -81,8 +84,8 @@ fn tls_certificate_error_keeps_tls_origin_after_upgrade_read() -> TestResult {
         ErrorKind::InvalidData,
         rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer),
     )));
-    if result.stage() != WebSocketConnectStage::Tls
-        || result.error() != NetError::TlsConnectError
+    if result.stage() != ConnectStage::Tls
+        || result.error().kind() != crate::error::ErrorKind::Tls
         || result.retryable()
         || result.http_status().is_some()
     {
@@ -93,12 +96,9 @@ fn tls_certificate_error_keeps_tls_origin_after_upgrade_read() -> TestResult {
 
 #[test]
 fn connection_reset_during_tls_is_still_a_transient_transport_failure() -> TestResult {
-    let result = classify_tls_io(
-        &IoError::from(ErrorKind::ConnectionReset),
-        WebSocketConnectStage::Tls,
-    );
-    if result.stage() != WebSocketConnectStage::Tls
-        || result.error() != NetError::NetworkError
+    let result = classify_tls_io(IoError::from(ErrorKind::ConnectionReset), ConnectStage::Tls);
+    if result.stage() != ConnectStage::Tls
+        || result.error().kind() != crate::error::ErrorKind::Io
         || !result.retryable()
     {
         return Err("temporary TLS transport interruption became terminal".into());
@@ -139,7 +139,9 @@ async fn expired_attempt_deadline_does_not_create_tcp_connection() -> TestResult
         Ok(_) => return Err("expired attempt connected".into()),
         Err(failure) => failure,
     };
-    if failure.stage() != WebSocketConnectStage::Dns || failure.error() != NetError::TimeoutError {
+    if failure.stage() != ConnectStage::Dns
+        || failure.error().kind() != crate::error::ErrorKind::TimedOut
+    {
         return Err("expired deadline reached a later network stage".into());
     }
     if tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
@@ -155,9 +157,9 @@ async fn expired_attempt_deadline_does_not_create_tcp_connection() -> TestResult
 async fn stalled_transport_stages_keep_the_original_deadline_and_error_stage() -> TestResult {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     for stage in [
-        WebSocketConnectStage::ProxyConnect,
-        WebSocketConnectStage::Tls,
-        WebSocketConnectStage::WebSocketUpgrade,
+        ConnectStage::ProxyConnect,
+        ConnectStage::Tls,
+        ConnectStage::WebSocketUpgrade,
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -167,7 +169,7 @@ async fn stalled_transport_stages_keep_the_original_deadline_and_error_stage() -
             let _ = wait_release.await;
             accepted.map(|_| ())
         });
-        let policy = if stage == WebSocketConnectStage::ProxyConnect {
+        let policy = if stage == ConnectStage::ProxyConnect {
             NetworkConfig::default().with_proxy(ProxyConfig::http_connect(
                 &format!("http://{address}"),
                 None,
@@ -176,7 +178,7 @@ async fn stalled_transport_stages_keep_the_original_deadline_and_error_stage() -
             NetworkConfig::default()
         };
         let config = CompiledNetworkConfig::new(policy)?;
-        let scheme = if stage == WebSocketConnectStage::Tls {
+        let scheme = if stage == ConnectStage::Tls {
             "wss"
         } else {
             "ws"
@@ -199,7 +201,7 @@ async fn stalled_transport_stages_keep_the_original_deadline_and_error_stage() -
             Err(error) => error,
         };
         if error.stage() != stage
-            || error.error() != NetError::TimeoutError
+            || error.error().kind() != crate::error::ErrorKind::TimedOut
             || error.http_status().is_some()
         {
             return Err(format!("transport timeout lost the original stage: {error:?}").into());
@@ -213,9 +215,9 @@ async fn cancelling_partial_tunnels_and_tls_closes_the_owned_socket() -> TestRes
     use tokio::io::AsyncReadExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     for stage in [
-        WebSocketConnectStage::ProxyConnect,
-        WebSocketConnectStage::Tls,
-        WebSocketConnectStage::WebSocketUpgrade,
+        ConnectStage::ProxyConnect,
+        ConnectStage::Tls,
+        ConnectStage::WebSocketUpgrade,
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -229,7 +231,7 @@ async fn cancelling_partial_tunnels_and_tls_closes_the_owned_socket() -> TestRes
             socket.read_to_end(&mut drained).await?;
             Result::<(), std::io::Error>::Ok(())
         });
-        let policy = if stage == WebSocketConnectStage::ProxyConnect {
+        let policy = if stage == ConnectStage::ProxyConnect {
             NetworkConfig::default().with_proxy(ProxyConfig::http_connect(
                 &format!("http://{address}"),
                 None,
@@ -238,7 +240,7 @@ async fn cancelling_partial_tunnels_and_tls_closes_the_owned_socket() -> TestRes
             NetworkConfig::default()
         };
         let config = CompiledNetworkConfig::new(policy)?;
-        let scheme = if stage == WebSocketConnectStage::Tls {
+        let scheme = if stage == ConnectStage::Tls {
             "wss"
         } else {
             "ws"
@@ -317,8 +319,8 @@ async fn proxy_delay_and_tls_share_one_absolute_budget() -> TestResult {
         Ok(_) => return Err("stalled TLS succeeded".into()),
         Err(failure) => failure,
     };
-    if failure.error() != NetError::TimeoutError
-        || failure.stage() != WebSocketConnectStage::Tls
+    if failure.error().kind() != crate::error::ErrorKind::TimedOut
+        || failure.stage() != ConnectStage::Tls
         || elapsed > std::time::Duration::from_millis(350)
     {
         return Err("TLS restarted the original CONNECT attempt deadline".into());
@@ -329,12 +331,12 @@ async fn proxy_delay_and_tls_share_one_absolute_budget() -> TestResult {
 #[tokio::test(start_paused = true)]
 async fn dns_and_tcp_stalls_are_bounded_without_external_network_services() -> TestResult {
     use std::net::SocketAddr;
-    for stage in [WebSocketConnectStage::Dns, WebSocketConnectStage::Tcp] {
+    for stage in [ConnectStage::Dns, ConnectStage::Tcp] {
         let deadline = Instant::now()
             .checked_add(std::time::Duration::from_secs(1))
             .ok_or("unrepresentable deadline")?;
         let resolver = async move {
-            if stage == WebSocketConnectStage::Dns {
+            if stage == ConnectStage::Dns {
                 std::future::pending::<()>().await;
             }
             Ok::<Vec<SocketAddr>, std::io::Error>(vec![SocketAddr::from(([127, 0, 0, 1], 1))])
@@ -349,12 +351,147 @@ async fn dns_and_tcp_stalls_are_bounded_without_external_network_services() -> T
             Ok(_) => return Err("injected network stall succeeded".into()),
             Err(error) => error,
         };
-        if error.error() != NetError::TimeoutError
+        if error.error().kind() != crate::error::ErrorKind::TimedOut
             || error.stage() != stage
             || Instant::now() != deadline
         {
             return Err("DNS/TCP stall did not preserve stage or absolute deadline".into());
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dns_failure_retains_original_io_source() -> TestResult {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .ok_or("invalid deadline")?;
+    let outcome = resolve_and_connect(
+        async {
+            Err::<Vec<SocketAddr>, _>(IoError::new(
+                ErrorKind::PermissionDenied,
+                "private-dns-detail",
+            ))
+        },
+        |_| async { Ok::<(), IoError>(()) },
+        deadline,
+    )
+    .await;
+    let failure = outcome.err().ok_or("DNS failure was accepted")?;
+    let error = failure.error();
+    if error.io_kind() != Some(ErrorKind::PermissionDenied)
+        || error
+            .source()
+            .and_then(|source| source.downcast_ref::<IoError>())
+            .is_none()
+        || error.context().stage != Some(crate::error::ErrorStage::Dns)
+    {
+        return Err("DNS failure lost original source or stage".into());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_failure_retains_original_io_source() -> TestResult {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .ok_or("invalid deadline")?;
+    let outcome = race_tcp_addresses(
+        VecDeque::from([SocketAddr::from(([127, 0, 0, 1], 12345))]),
+        |_| async {
+            Err::<(), _>(IoError::new(
+                ErrorKind::ConnectionRefused,
+                "private-tcp-detail",
+            ))
+        },
+        deadline,
+    )
+    .await;
+    let failure = outcome.err().ok_or("TCP failure was accepted")?;
+    let error = failure.error();
+    if error.io_kind() != Some(ErrorKind::ConnectionRefused)
+        || error
+            .source()
+            .and_then(|source| source.downcast_ref::<IoError>())
+            .is_none()
+        || error.context().stage != Some(crate::error::ErrorStage::Tcp)
+    {
+        return Err("TCP failure lost original source or stage".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn tls_failure_retains_original_io_source() -> TestResult {
+    let failure = classify_upgrade_error(WsError::Io(IoError::new(
+        ErrorKind::InvalidData,
+        rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer),
+    )));
+    let error = failure.error();
+    if error.kind() != crate::error::ErrorKind::Tls
+        || error.io_kind() != Some(ErrorKind::InvalidData)
+        || error
+            .source()
+            .and_then(|source| source.downcast_ref::<IoError>())
+            .is_none()
+        || error.context().stage != Some(crate::error::ErrorStage::Tls)
+    {
+        return Err("TLS classification discarded its original source or stage".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_upgrade_retains_http_source_without_default_disclosure() -> TestResult {
+    let response = http::Response::builder()
+        .status(401)
+        .header("set-cookie", "private-session-cookie")
+        .body(Some(b"private-response-body".to_vec()))?;
+    let failure = classify_upgrade_error(WsError::Http(Box::new(response)));
+    let error = failure.error();
+    if error
+        .source()
+        .and_then(|source| source.downcast_ref::<WsError>())
+        .is_none()
+        || error.context().http_status != Some(http::StatusCode::UNAUTHORIZED)
+    {
+        return Err("HTTP rejection lost response source or status".into());
+    }
+    let formatted = format!("{error} {error:?}");
+    if formatted.contains("private-session-cookie") || formatted.contains("private-response-body") {
+        return Err("HTTP rejection leaked response material".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn socket_option_errors_keep_source_and_diagnostic_category() -> TestResult {
+    let options = crate::ws::HandshakeDiagnosticOptions::default();
+    let failure = TransportFailure::io(
+        IoError::new(ErrorKind::PermissionDenied, "private-socket-option-error"),
+        ConnectStage::Tcp,
+        Some(&options),
+    );
+    let error = failure.failure.error();
+    if error.io_kind() != Some(ErrorKind::PermissionDenied)
+        || error
+            .source()
+            .and_then(|source| source.downcast_ref::<IoError>())
+            .is_none()
+        || error.context().stage != Some(crate::error::ErrorStage::Tcp)
+        || failure
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.kind())
+            != Some(crate::ws::HandshakeDiagnosticKind::Io(
+                ErrorKind::PermissionDenied,
+            ))
+        || !failure.failure.retryable()
+    {
+        return Err("socket option error classification or source was lost".into());
+    }
+    if format!("{failure:?}").contains("private-socket-option-error") {
+        return Err("socket option diagnostic leaked source text".into());
     }
     Ok(())
 }
