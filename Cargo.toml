@@ -3,7 +3,7 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.1.0-beta.2"
+version = "0.1.0-beta.3"
 edition = "2021"
 rust-version = "1.89"
 description = "A cross-platform async networking library with WebSocket clients and network status monitoring."
