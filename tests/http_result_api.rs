@@ -2,7 +2,10 @@
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use open_net::api::http::{HttpClient, HttpClientConfig, HttpRequest, HttpStatusPolicy};
+use open_net::api::http::{
+    Backoff, HttpClient, HttpClientConfig, HttpRequest, HttpStatusPolicy, RetryOn, RetryPolicy,
+    RetrySetting,
+};
 use open_net::error::ErrorKind;
 use open_net::{NetError, OpenNet};
 use std::future::Future;
@@ -403,23 +406,86 @@ async fn result_api_post_empty_body_is_explicitly_transmitted() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn result_api_shortcuts_do_not_inherit_global_retry_defaults() -> TestResult {
+async fn result_api_shortcuts_inherit_global_retry_defaults() -> TestResult {
+    let server = spawn_server(vec![
+        Reply::Fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain",
+            b"retry-me".to_vec(),
+        ),
+        Reply::Fixed(StatusCode::OK, "text/plain", b"recovered".to_vec()),
+    ])
+    .await?;
+    let config = HttpClientConfig::new(format!("http://{}", server.address))?
+        .with_timeout(Duration::from_secs(1))?
+        .with_default_retry_policy(open_net::api::http::RetryPolicy::new(1));
+    let (net, client) = make_client_with_config("result-inherit-default-retry", config).await?;
+    let response = bounded(client.get("/retry")).await??;
+    check(
+        response.status == StatusCode::OK && response.body.as_ref() == b"recovered",
+        "convenience request did not inherit the client retry policy",
+    )?;
+    check(
+        response.attempts == 2,
+        "inherited retry policy used the wrong attempt count",
+    )?;
+    destroy_client(net, "result-inherit-default-retry").await?;
+    server.finish().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_api_application_predicate_retries_buffered_response() -> TestResult {
+    let server = spawn_server(vec![
+        Reply::Fixed(StatusCode::OK, "text/plain", b"retry-once".to_vec()),
+        Reply::Fixed(StatusCode::OK, "text/plain", b"done".to_vec()),
+    ])
+    .await?;
+    let (net, client) = make_client(&server, "result-application-predicate").await?;
+    let policy = RetryPolicy::builder()
+        .max_attempts(2)
+        .backoff(Backoff::None)
+        .retry_on(RetryOn::none().with_application(true))
+        .application_predicate(|response| response.body.as_ref() == b"retry-once")
+        .build()?;
+    let request = HttpRequest::builder()
+        .path("/application")
+        .retry_setting(RetrySetting::Policy(policy))
+        .build()?;
+    let response = bounded(client.request(request)).await??;
+    check(
+        response.body.as_ref() == b"done" && response.attempts == 2,
+        "application predicate did not retry the buffered response",
+    )?;
+    destroy_client(net, "result-application-predicate").await?;
+    server.finish().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_api_request_policy_explicitly_disables_client_retry() -> TestResult {
     let server = spawn_server(vec![Reply::Fixed(
         StatusCode::SERVICE_UNAVAILABLE,
         "text/plain",
-        b"retry-me".to_vec(),
+        b"no-retry".to_vec(),
     )])
     .await?;
     let config = HttpClientConfig::new(format!("http://{}", server.address))?
         .with_timeout(Duration::from_secs(1))?
         .with_default_retry_policy(open_net::api::http::RetryPolicy::new(1));
-    let (net, client) = make_client_with_config("result-no-default-retry", config).await?;
-    let response = bounded(client.get("/retry")).await??;
+    let (net, client) = make_client_with_config("result-explicit-no-retry", config).await?;
+    let request = HttpRequest::builder()
+        .path("/retry")
+        .retry_setting(RetrySetting::None)
+        .build()?;
+    let response = bounded(client.request(request)).await??;
     check(
         response.status == StatusCode::SERVICE_UNAVAILABLE,
-        "convenience request inherited an unexpected retry",
+        "explicit no-retry policy changed the response status",
     )?;
-    destroy_client(net, "result-no-default-retry").await?;
+    check(
+        response.attempts == 1,
+        "explicit no-retry policy was ignored",
+    )?;
+    destroy_client(net, "result-explicit-no-retry").await?;
     server.finish().await
 }
 

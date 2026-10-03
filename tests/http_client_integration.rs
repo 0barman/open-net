@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use open_net::api::http::{
-    HttpClientConfig, HttpRequestId, HttpRequestTrait, HttpResponseResult, RetryPolicy,
+    HttpClientConfig, HttpRequestId, HttpRequestMethod, HttpRequestTrait, HttpResponseResult,
+    RetryPolicy,
 };
 use open_net::OpenNet;
 use std::io::{Read, Write};
@@ -52,8 +53,8 @@ impl HttpRequestTrait for FlexibleRequest {
         self.path.clone()
     }
 
-    fn get_method(&self) -> Method {
-        self.method.clone()
+    fn get_method(&self) -> HttpRequestMethod {
+        self.method.clone().into()
     }
 
     fn get_req_data(&self) -> String {
@@ -98,8 +99,8 @@ impl HttpRequestTrait for BlockingRequest {
         self.path.clone()
     }
 
-    fn get_method(&self) -> Method {
-        Method::GET
+    fn get_method(&self) -> HttpRequestMethod {
+        HttpRequestMethod::GET
     }
 
     async fn deal_with_response(self: Box<Self>, result: HttpResponseResult) {
@@ -131,8 +132,8 @@ impl HttpRequestTrait for TestRequest {
         self.path.clone()
     }
 
-    fn get_method(&self) -> Method {
-        Method::GET
+    fn get_method(&self) -> HttpRequestMethod {
+        HttpRequestMethod::GET
     }
 
     fn headers(&self) -> HeaderMap {

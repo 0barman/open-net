@@ -346,6 +346,10 @@ async fn terminal(
                 {
                     return Err(NetError::from(open_net::error::ErrorKind::Internal));
                 }
+                // A terminal journal fact/EOF does not finish lifecycle
+                // publication. Await the public completion barrier before a
+                // replacement tests provider quota on this same client.
+                let _completed = events.session.closed().await;
                 return result;
             }
             _ => return Err(NetError::from(open_net::error::ErrorKind::Internal)),

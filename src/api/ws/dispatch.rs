@@ -356,6 +356,7 @@ fn install(
         slot_permit: Some(permits.item),
         byte_permit: Some(permits.bytes),
         completed: false,
+        retirement: None,
     };
     match queue.prepare(queued) {
         Ok(()) => Ok(()),

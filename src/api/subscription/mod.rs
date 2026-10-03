@@ -83,6 +83,12 @@ impl<T> fmt::Debug for StateReceiver<T> {
     }
 }
 impl<T: Clone> StateReceiver<T> {
+    /// Attach SDK observation ownership to this registration. Callback conversion
+    /// keeps the same registration, so it transfers this ownership without a gap.
+    #[cfg_attr(not(any(feature = "http-client", test)), allow(dead_code))]
+    pub(crate) fn bind_lifetime(&self, lifetime: impl Send + Sync + 'static) -> Result<()> {
+        self.registration.bind_lifetime(Box::new(lifetime))
+    }
     /// Return the subscription identifier associated with this receiver.
     pub fn id(&self) -> SubscriptionId {
         self.registration.id
@@ -232,6 +238,8 @@ impl fmt::Debug for CallbackContext {
     }
 }
 
+#[cfg(test)]
+mod lifetime_tests;
 #[cfg(test)]
 mod tests;
 

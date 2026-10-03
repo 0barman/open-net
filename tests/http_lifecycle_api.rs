@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use open_net::api::error::ErrorKind;
 use open_net::api::http::{
-    HttpClientConfig, HttpRequestId, HttpRequestOptions, HttpRequestTrait, HttpResponseResult,
+    HttpClientConfig, HttpRequestId, HttpRequestMethod, HttpRequestOptions, HttpRequestTrait,
+    HttpResponseResult,
 };
 use open_net::api::http::{HttpRequest, HttpStreamResponse};
 use open_net::OpenNet;
@@ -45,8 +46,8 @@ impl HttpRequestTrait for CallbackRequest {
         self.path.clone()
     }
 
-    fn get_method(&self) -> Method {
-        Method::GET
+    fn get_method(&self) -> HttpRequestMethod {
+        HttpRequestMethod::GET
     }
 
     async fn deal_with_response(self: Box<Self>, result: HttpResponseResult) {
@@ -80,8 +81,8 @@ impl HttpRequestTrait for BlockingCallbackRequest {
         self.path.clone()
     }
 
-    fn get_method(&self) -> Method {
-        Method::GET
+    fn get_method(&self) -> HttpRequestMethod {
+        HttpRequestMethod::GET
     }
 
     async fn deal_with_response(self: Box<Self>, _result: HttpResponseResult) {

@@ -184,6 +184,7 @@ pub(crate) fn queued(sequence: u64, options: SendOptions) -> Result<QueuedReques
         slot_permit: None,
         byte_permit: None,
         completed: false,
+        retirement: None,
     })
 }
 

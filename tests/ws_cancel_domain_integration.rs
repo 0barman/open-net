@@ -1,5 +1,7 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/backpressure.rs"]
+mod backpressure;
 #[path = "support/session.rs"]
 mod session;
 
@@ -397,7 +399,11 @@ async fn run_real_backpressure(lane: Option<MessageLane>, cancel_in_flight: bool
     let (finish_tx, finish_rx) = oneshot::channel();
     let mut peer = AbortOnDrop(tokio::spawn(async move {
         let (stream, _) = bounded("accept backpressure socket", listener.accept()).await??;
-        SockRef::from(&stream).set_recv_buffer_size(4096)?;
+        // Preserve the tiny-window revocation cases. In the surviving control,
+        // the paused peer and Pending receipt prove pressure before queued cancel.
+        if cancel_in_flight {
+            SockRef::from(&stream).set_recv_buffer_size(4096)?;
+        }
         let mut socket = bounded(
             "accept backpressure Upgrade",
             tokio_tungstenite::accept_async(stream),
@@ -443,6 +449,9 @@ async fn run_real_backpressure(lane: Option<MessageLane>, cancel_in_flight: bool
             .send(())
             .map_err(|_| error("first-byte receiver closed"))?;
         bounded("release peer backpressure", resume_rx).await??;
+        if !cancel_in_flight {
+            backpressure::release_receive_window(socket.get_mut())?;
+        }
         let received = bounded("drain blocked data", async {
             let mut received = prefix.len();
             let mut buffer = [0_u8; 8192];

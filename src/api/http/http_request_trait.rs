@@ -1,8 +1,9 @@
+use crate::api::http::http_request_method::HttpRequestMethod;
 use crate::api::http::http_response::HttpResponseResult;
 use crate::api::http::retry::RetryPolicy;
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, Method};
+use http::HeaderMap;
 
 /// Request object consumed by an HTTP client.
 ///
@@ -17,7 +18,7 @@ pub trait HttpRequestTrait: Send + 'static {
     fn get_path(&self) -> String;
 
     /// Return the HTTP method for this request.
-    fn get_method(&self) -> Method;
+    fn get_method(&self) -> HttpRequestMethod;
 
     /// Return a textual request body for legacy request implementations.
     ///
@@ -36,13 +37,14 @@ pub trait HttpRequestTrait: Send + 'static {
         Bytes::from(self.get_req_data())
     }
 
-    /// Report whether this request has a non-empty body.
+    /// Report whether this request has a body even when its byte representation is empty.
     ///
-    /// The default derives the answer from [`Self::get_req_body`]. Override it
-    /// only when body presence has a meaning that cannot be represented by the
-    /// returned bytes.
+    /// The default is `false` and does not call a body provider. Requests with
+    /// non-empty bytes are recognized from [`Self::get_req_body`]; override
+    /// this method only for an explicit empty body that still needs a body
+    /// framing header.
     fn has_req_body(&self) -> bool {
-        !self.get_req_body().is_empty()
+        false
     }
 
     /// Return request headers to merge over the client's common headers.
@@ -99,8 +101,8 @@ mod tests {
             "/health".to_owned()
         }
 
-        fn get_method(&self) -> Method {
-            Method::GET
+        fn get_method(&self) -> HttpRequestMethod {
+            HttpRequestMethod::GET
         }
 
         async fn deal_with_response(self: Box<Self>, result: HttpResponseResult) {
@@ -113,7 +115,7 @@ mod tests {
         let request = EmptyRequest;
         check(request.get_path() == "/health", "path contract changed")?;
         check(
-            request.get_method() == Method::GET,
+            request.get_method() == HttpRequestMethod::GET,
             "method contract changed",
         )?;
         check(

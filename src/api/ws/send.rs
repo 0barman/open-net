@@ -87,17 +87,22 @@ impl Sender {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::{Priority, SendOptions, Sender}, Result};
+    /// use open_net::{
+    ///     ws::{Priority, SendOptions, Sender},
+    ///     Result,
+    /// };
     /// use std::time::Duration;
     ///
     /// async fn publish_alert(sender: &Sender) -> Result<()> {
-    ///     sender.message("alert:temperature-high")
+    ///     sender
+    ///         .message("alert:temperature-high")
     ///         .options(SendOptions {
     ///             priority: Priority::High,
     ///             enqueue_timeout: Some(Duration::from_secs(1)),
     ///             ..Default::default()
     ///         })
-    ///         .send().await
+    ///         .send()
+    ///         .await
     /// }
     /// ```
     pub fn message(&self, message: impl Into<Message>) -> MessageBuilder {
@@ -123,14 +128,231 @@ impl Sender {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::{Message, Sender}, Result};
+    /// use open_net::error::ReceiveError;
+    /// use open_net::network::{NetworkConfig, NetworkStatusPolicy};
+    /// use open_net::subscription::{CallbackContext, Subscription};
+    /// use open_net::ws::{
+    ///     ConnectOptions, ConnectionEvent, ConnectionEventKind, ConnectionSnapshot, HeartbeatConfig,
+    ///     IncomingMessage, Message, RetryDecision, TaskEvent, TaskEventOptions, TcpKeepaliveConfig,
+    ///     WebSocketClientConfig,
+    /// };
+    /// use open_net::{HeaderValue, OpenNet, OpenNetConfig};
+    /// use std::thread;
+    /// use std::time::Duration;
     ///
-    /// async fn publish_presence(sender: &Sender) -> Result<()> {
-    ///     // The sender comes from a connected Session still held by the application.
-    ///     sender.send(Message::text("presence:online")).await?;
-    ///     println!("Presence status was written locally");
-    ///     Ok(())
-    /// }
+    /// # const WS_BASE_URL: &str = "wss://example.com/api/ws";
+    /// # async fn example() -> open_net::Result<()> {
+    /// let net = OpenNet::new_with_config(OpenNetConfig::default().with_runtime_worker_threads(2))?;
+    /// let mut config = WebSocketClientConfig::default();
+    /// config.queues.normal.max_items = 128;
+    /// config.queues.urgent.max_items = 32;
+    /// config.requests.max_pending = 128;
+    /// config.frames.max_message_size = Some(8 * 1024 * 1024);
+    /// config.frames.data_frame_payload_size = Some(32 * 1024); // Large messages are framed automatically.
+    /// config.tcp.nodelay = true;
+    /// config.tcp.keepalive = Some(TcpKeepaliveConfig::default());
+    /// // The SDK handles Ping/Pong; the application does not need to emulate PB heartbeats with control frames.
+    /// config.heartbeat = Some(HeartbeatConfig {
+    ///     interval: Duration::from_secs(20),
+    ///     pong_timeout: Duration::from_secs(45),
+    /// });
+    /// config.close_timeout = Duration::from_secs(2);
+    /// config.validate()?;
+    ///
+    /// let network = NetworkConfig::default().with_network_status_policy(NetworkStatusPolicy::Ignore);
+    /// // Explicitly override the client network configuration here; the default is direct access,
+    /// // and wss uses the default trusted root certificates.
+    /// // Other creation methods: net.create_ws_client(CLIENT_NAME).await?;
+    /// // net.create_ws_client_with_config(CLIENT_NAME, config).await?.
+    /// let client = net
+    ///     .create_ws_client_with_network_config("ws_1_thread_name", config, network)
+    ///     .await?;
+    /// let _shared = net.get_ws_client("ws_1_thread_name")?; // Like clone(), this points to the same client.
+    ///
+    /// let mut options = ConnectOptions::new(WS_BASE_URL);
+    /// options.headers.insert(
+    ///     "authorization",
+    ///     HeaderValue::from_static("Bearer example-token"),
+    /// );
+    /// options
+    ///     .headers
+    ///     .insert("x-client-name", HeaderValue::from_static("demo"));
+    ///
+    /// let current_thread = thread::current();
+    /// // A-thread_name: main, thread_id: ThreadId(1)
+    /// println!(
+    ///     "A-thread_name: {}, thread_id: {:?}",
+    ///     current_thread.name().unwrap_or("unnamed"),
+    ///     current_thread.id()
+    /// );
+    /// let mut session = client.connect(options).await?;
+    ///
+    /// // Keep subscription handles alive until the function returns; dropping a handle unsubscribes it.
+    /// let _state_subscription: Subscription = session.on_state(
+    ///     |context: CallbackContext, state: open_net::Result<ConnectionSnapshot>| match state {
+    ///         Ok(state) => {
+    ///             let current_thread = thread::current();
+    ///             //  thread_name: open-net-ws-status-0, thread_id: ThreadId(18)
+    ///             println!(
+    ///                 "State callback[{}]: {state:?}, thread_name: {}, thread_id: {:?}",
+    ///                 context.id(),
+    ///                 current_thread.name().unwrap_or("unnamed"),
+    ///                 current_thread.id()
+    ///             );
+    ///         }
+    ///         Err(error) => {
+    ///             eprintln!("Failed to receive state[{}]: {error}", context.id())
+    ///         }
+    ///     },
+    /// )?;
+    ///
+    /// let callback_sender = session.sender();
+    /// let _message_subscription: Subscription = session.on_message(
+    ///     move |context: CallbackContext, message: Result<IncomingMessage, ReceiveError>| {
+    ///         match message {
+    ///             Ok(message) => {
+    ///                 // thread_name: open-net-ws-data-callback, thread_id: ThreadId(20)
+    ///                 let current_thread = thread::current();
+    ///                 println!("message_subscription->IncomingMessage: {:?}, thread_name: {}, thread_id: {:?}", message,
+    ///                          current_thread.name().unwrap_or("unnamed"),
+    ///                          current_thread.id());
+    ///             }
+    ///             Err(error) => {
+    ///                 println!("message_subscription->error: {}", error);
+    ///             }
+    ///         }
+    ///     },
+    /// )?;
+    ///
+    /// let _event_subscription: Subscription = session.on_event(
+    ///     |context: CallbackContext, event: Result<ConnectionEvent, ReceiveError>| match event {
+    ///         Ok(event) => {
+    ///             //  thread_name: open-net-ws-events-1, thread_id: ThreadId(22)
+    ///             let current_thread = thread::current();
+    ///             println!(
+    ///                 "Connection event[{}] #{}: client={} session={} at={:?}, thread_name: {}, thread_id: {:?}",
+    ///                 context.id(),
+    ///                 event.sequence,
+    ///                 event.client_id,
+    ///                 event.session_id,
+    ///                 event.occurred_at,
+    ///                 current_thread.name().unwrap_or("unnamed"),
+    ///                 current_thread.id());
+    ///             // on_event records lifecycle events; observe immediate states such as network waits through on_state.
+    ///             match event.kind {
+    ///                 ConnectionEventKind::AttemptStarted { attempt } => {
+    ///                     println!(
+    ///                         "           Starting connection attempt: cycle={} attempt={} (initial connection or retry)",
+    ///                         attempt.cycle_id, attempt.attempt_id
+    ///                     );
+    ///                 }
+    ///                 ConnectionEventKind::Established { connection } => {
+    ///                     println!(
+    ///                         "           Connection established: connection={} cycle={} attempt={} connected_at={:?}",
+    ///                         connection.connection_id,
+    ///                         connection.cycle_id,
+    ///                         connection.attempt_id,
+    ///                         connection.connected_at
+    ///                     );
+    ///                 }
+    ///                 ConnectionEventKind::AttemptFailed {
+    ///                     attempt,
+    ///                     error,
+    ///                     retry,
+    ///                     ..
+    ///                 } => {
+    ///                     eprintln!(
+    ///                         "           Connection attempt failed: cycle={} attempt={} kind={:?} stage={:?} error={error}",
+    ///                         attempt.cycle_id,
+    ///                         attempt.attempt_id,
+    ///                         error.kind(),
+    ///                         error.context().stage
+    ///                     );
+    ///                     match retry {
+    ///                         RetryDecision::Scheduled { after } => {
+    ///                             println!(
+    ///                                 "           Retry scheduled: trying to connect again after a backoff of {} ms",
+    ///                                 after.as_millis()
+    ///                             );
+    ///                         }
+    ///                         RetryDecision::Stop => {
+    ///                             println!("          Stopping retries; waiting for the session-closed event");
+    ///                         }
+    ///                     }
+    ///                 }
+    ///                 ConnectionEventKind::Disconnected { connection, end } => {
+    ///                     // A single connection can disconnect and still reconnect; Closed marks the end of the session.
+    ///                     println!(
+    ///                         "               Connection disconnected: connection={} reason={:?} io_end={:?}",
+    ///                         connection.connection_id, end.reason, end.io_end
+    ///                     );
+    ///                     if let Some(close) = end.peer_close {
+    ///                         println!(
+    ///                             "           Peer close information: code={:?} reason={}",
+    ///                             close.code, close.reason
+    ///                         );
+    ///                     }
+    ///                     if let Some(error) = end.error {
+    ///                         eprintln!("         Disconnection error: kind={:?} error={error}", error.kind());
+    ///                     }
+    ///                 }
+    ///                 ConnectionEventKind::Closed { result } => match result {
+    ///                     Ok(end) => {
+    ///                         println!("          Session closed; will not reconnect: reason={:?}", end.reason);
+    ///                         if let Some(last) = end.last_connection {
+    ///                             println!("          Last connection end information: {last:?}");
+    ///                         }
+    ///                     }
+    ///                     Err(error) => {
+    ///                         eprintln!(
+    ///                             "           Session ended unexpectedly; will not reconnect: kind={:?} error={error}",
+    ///                             error.kind()
+    ///                         );
+    ///                     }
+    ///                 },
+    ///                 // ConnectionEventKind is marked non_exhaustive to support future event variants.
+    ///                 other => println!("         Other connection event: {other:?}"),
+    ///             }
+    ///         }
+    ///         Err(error) => eprintln!("           Failed to receive connection event[{}]: {error}", context.id()),
+    ///     },
+    /// )?;
+    ///
+    /// let _task_subscription: Subscription = session.on_task(
+    ///     TaskEventOptions::default(),
+    ///     |context: CallbackContext, event: Result<TaskEvent, ReceiveError>| match event {
+    ///         Ok(event) => {
+    ///             // thread_name: open-net-task-events-1-0, thread_id: ThreadId(23)
+    ///             let current_thread = thread::current();
+    ///             println!(
+    ///                 "Task callback[{}]: {event:?}, thread_name: {}, thread_id: {:?}",
+    ///                 context.id(),
+    ///                 current_thread.name().unwrap_or("unnamed"),
+    ///                 current_thread.id()
+    ///             );
+    ///         }
+    ///         Err(error) => eprintln!("Failed to receive task event[{}]: {error}", context.id()),
+    ///     },
+    /// )?;
+    ///
+    /// let sender = session.sender();
+    ///
+    /// // Omit the code for building the PB protocol
+    /// let message = Message::text("demo:message");
+    /// sender.send(message).await?;
+    ///
+    /// thread::sleep(Duration::from_secs(15));
+    ///
+    /// let shutdown = client.shutdown().await; // Permanently closes the client; no clone can reconnect.
+    /// let destroy = net.destroy_ws_client("ws_1_thread_name").await; // Also removes the registered name from the engine.
+    /// println!(
+    ///     "Client closed={}, shutdown={shutdown:?}, destroy={destroy:?}",
+    ///     client.is_shutdown()
+    /// );
+    /// shutdown?;
+    /// destroy?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn send(&self, message: impl Into<Message>) -> Result<()> {
         self.message(message).send().await
@@ -149,7 +371,10 @@ impl Sender {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::{Message, MessageReceipt, Sender}, Result};
+    /// use open_net::{
+    ///     ws::{Message, MessageReceipt, Sender},
+    ///     Result,
+    /// };
     ///
     /// async fn enqueue_report(
     ///     sender: &Sender,
@@ -256,18 +481,23 @@ impl MessageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::{DisconnectedPolicy, SendOptions, Sender}, Result};
+    /// use open_net::{
+    ///     ws::{DisconnectedPolicy, SendOptions, Sender},
+    ///     Result,
+    /// };
     /// use std::time::{Duration, Instant};
     ///
     /// async fn publish_latest_state(sender: &Sender) -> Result<()> {
-    ///     sender.message("state:active")
+    ///     sender
+    ///         .message("state:active")
     ///         .options(SendOptions {
     ///             disconnected: DisconnectedPolicy::WaitForReconnect,
     ///             enqueue_timeout: Some(Duration::from_secs(2)),
     ///             deadline: Some(Instant::now() + Duration::from_secs(15)),
     ///             ..Default::default()
     ///         })
-    ///         .send().await
+    ///         .send()
+    ///         .await
     /// }
     /// ```
     pub fn options(mut self, options: SendOptions) -> Self {
@@ -289,16 +519,21 @@ impl MessageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::{SendOptions, Sender}, Result};
+    /// use open_net::{
+    ///     ws::{SendOptions, Sender},
+    ///     Result,
+    /// };
     /// use std::time::{Duration, Instant};
     ///
     /// async fn publish_with_deadline(sender: &Sender) -> Result<()> {
-    ///     sender.message("status:ready")
+    ///     sender
+    ///         .message("status:ready")
     ///         .options(SendOptions {
     ///             deadline: Some(Instant::now() + Duration::from_secs(5)),
     ///             ..Default::default()
     ///         })
-    ///         .send().await?;
+    ///         .send()
+    ///         .await?;
     ///     Ok(())
     /// }
     /// ```
@@ -324,17 +559,22 @@ impl MessageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::{MessageReceipt, Priority, SendOptions, Sender}, Result};
+    /// use open_net::{
+    ///     ws::{MessageReceipt, Priority, SendOptions, Sender},
+    ///     Result,
+    /// };
     /// use std::time::Duration;
     ///
     /// async fn queue_alert(sender: &Sender) -> Result<MessageReceipt> {
-    ///     let receipt = sender.message("alert:disk-low")
+    ///     let receipt = sender
+    ///         .message("alert:disk-low")
     ///         .options(SendOptions {
     ///             priority: Priority::High,
     ///             enqueue_timeout: Some(Duration::from_millis(500)),
     ///             ..Default::default()
     ///         })
-    ///         .enqueue().await?;
+    ///         .enqueue()
+    ///         .await?;
     ///     println!("Enqueued operation: {}", receipt.id());
     ///     Ok(receipt) // The caller can await receipt.written() later.
     /// }
@@ -402,7 +642,10 @@ impl MessageBuilder {
     ///
     /// async fn publish_if_needed(sender: &Sender, still_needed: bool) -> Result<()> {
     ///     let prepared = sender.message("refresh:inventory").prepare().await?;
-    ///     println!("Registered operation before sending: {}", prepared.receipt().id());
+    ///     println!(
+    ///         "Registered operation before sending: {}",
+    ///         prepared.receipt().id()
+    ///     );
     ///     if !still_needed {
     ///         drop(prepared); // It was not submitted, so this message will not be written.
     ///         return Ok(());
@@ -431,7 +674,11 @@ impl MessageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{error::ErrorKind, ws::{MessageReceipt, Sender}, Result};
+    /// use open_net::{
+    ///     error::ErrorKind,
+    ///     ws::{MessageReceipt, Sender},
+    ///     Result,
+    /// };
     ///
     /// fn submit_optional_report(sender: &Sender) -> Result<Option<MessageReceipt>> {
     ///     let prepared = match sender.message("metrics:snapshot").try_prepare() {
@@ -441,7 +688,10 @@ impl MessageBuilder {
     ///         }
     ///         Err(failure) => return Err(failure.into_error()),
     ///     };
-    ///     println!("Registered operation before commit: {}", prepared.receipt().id());
+    ///     println!(
+    ///         "Registered operation before commit: {}",
+    ///         prepared.receipt().id()
+    ///     );
     ///     Ok(Some(prepared.commit()?))
     /// }
     /// ```
@@ -505,7 +755,11 @@ impl MessageReceipt {
     ///
     /// async fn log_submission(sender: &Sender) -> Result<()> {
     ///     let receipt = sender.enqueue("report:ready").await?;
-    ///     println!("Send operation {} for session {}", receipt.id(), receipt.session_id());
+    ///     println!(
+    ///         "Send operation {} for session {}",
+    ///         receipt.id(),
+    ///         receipt.session_id()
+    ///     );
     ///     receipt.written().await
     /// }
     /// ```
@@ -550,7 +804,10 @@ impl MessageReceipt {
     ///
     /// fn show_progress(receipt: &MessageReceipt) -> Result<()> {
     ///     let snapshot = receipt.state()?;
-    ///     println!("Phase: {:?}; delivery evidence: {:?}", snapshot.phase, snapshot.delivery);
+    ///     println!(
+    ///         "Phase: {:?}; delivery evidence: {:?}",
+    ///         snapshot.phase, snapshot.delivery
+    ///     );
     ///     if let Some(result) = snapshot.result {
     ///         println!("Final result: {result:?}");
     ///     }
@@ -575,15 +832,22 @@ impl MessageReceipt {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::{MessageReceipt, TerminationOutcome}, Result};
+    /// use open_net::{
+    ///     ws::{MessageReceipt, TerminationOutcome},
+    ///     Result,
+    /// };
     ///
     /// fn withdraw_message(receipt: &MessageReceipt) -> Result<()> {
     ///     match receipt.cancel()? {
     ///         TerminationOutcome::TerminatedBeforeWrite => println!("Canceled before writing"),
-    ///         TerminationOutcome::DeliveryUnknown => println!("Delivery may have occurred; reconcile in the application"),
+    ///         TerminationOutcome::DeliveryUnknown => {
+    ///             println!("Delivery may have occurred; reconcile in the application")
+    ///         }
     ///         TerminationOutcome::AlreadyFinished => println!("Operation had already finished"),
     ///         // Request-only variant of the shared enum; ordinary messages never wait for a response.
-    ///         TerminationOutcome::TerminatedAfterWrite => println!("Terminated after confirmed write"),
+    ///         TerminationOutcome::TerminatedAfterWrite => {
+    ///             println!("Terminated after confirmed write")
+    ///         }
     ///     }
     ///     Ok(())
     /// }

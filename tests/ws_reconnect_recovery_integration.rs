@@ -374,6 +374,12 @@ async fn terminal_http_rejection_blocks_hints_but_allows_explicit_recovery() -> 
                 "HTTP terminal failure lost its stable error snapshot",
             )?;
             check(peer.count() == 1, "non-retryable HTTP failure was retried")?;
+            check(
+                bounded("failed session cleanup", failed_session.closed())
+                    .await?
+                    .is_err(),
+                "failed session cleanup changed its terminal result",
+            )?;
             for _ in 0..8 {
                 failed_session.notify_network_available();
             }
@@ -488,6 +494,12 @@ async fn local_provider_and_header_failures_do_not_restart_on_hints() -> TestRes
                     == Some(open_net::error::ErrorKind::ProviderFailed),
                 "local failure lost its stable error snapshot",
             )?;
+            check(
+                bounded("failed session cleanup", failed_session.closed())
+                    .await?
+                    .is_err(),
+                "failed session cleanup changed its terminal result",
+            )?;
             for _ in 0..8 {
                 failed_session.notify_network_available();
             }
@@ -562,6 +574,12 @@ async fn proxy_authentication_rejection_does_not_restart_on_hints() -> TestResul
                         && error.context().stage == Some(open_net::error::ErrorStage::Proxy)
                 }),
             "proxy rejection lost its typed Proxy-stage HTTP context",
+        )?;
+        check(
+            bounded("failed session cleanup", failed_session.closed())
+                .await?
+                .is_err(),
+            "failed session cleanup changed its terminal result",
         )?;
         for _ in 0..8 {
             failed_session.notify_network_available();
@@ -658,6 +676,10 @@ async fn transient_exhaustion_requires_a_new_session_and_hints_preserve_healthy_
             check(
                 calls.load(Ordering::SeqCst) == attempts,
                 "provider count disagreed with handshakes",
+            )?;
+            check(
+                bounded("exhausted session cleanup", old.session.closed()).await?.is_err(),
+                "exhausted session cleanup changed its terminal result",
             )?;
             for _ in 0..8 {
                 old.session.notify_network_available();
@@ -800,6 +822,12 @@ async fn context_exhaustion_recovers_explicitly_without_a_network_hint() -> Test
             "context did not consume exactly two attempts",
         )?;
         let previous = terminal.ok_or_else(|| error("old context omitted its terminal event"))?;
+        check(
+            bounded("old context cleanup", old.session.closed())
+                .await?
+                .is_err(),
+            "exhausted old context cleanup changed its terminal result",
+        )?;
         // No network hint or simulated network edge occurs between the terminal
         // event and this explicit new session.
         let mut current = bounded(
@@ -896,6 +924,12 @@ async fn disabled_reconnect_stops_after_one_attempt_and_ignores_hints() -> TestR
         check(
             peer.count() == 1,
             "disabled reconnect consumed additional attempts",
+        )?;
+        check(
+            bounded("failed session cleanup", failed_session.closed())
+                .await?
+                .is_err(),
+            "failed session cleanup changed its terminal result",
         )?;
         for _ in 0..8 {
             failed_session.notify_network_available();

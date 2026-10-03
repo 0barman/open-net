@@ -281,13 +281,20 @@ pub struct HttpClientConfig {
     pub base_url: reqwest::Url,
     /// Headers copied into every request before request-specific headers are merged.
     pub common_headers: HeaderMap,
-    /// Maximum amount of time allowed for one HTTP request.
+    /// Timeout for each network attempt, including response headers and body.
+    ///
+    /// This starts when reqwest executes the attempt, excludes SDK admission
+    /// waiting, and resets for a retry. Paused stream consumption still uses time.
     pub timeout: Duration,
     /// Optional TCP keepalive interval applied to pooled connections.
     pub tcp_keepalive: Option<Duration>,
     /// Maximum response body size accepted by the receive lane.
     pub max_response_bytes: usize,
-    /// Capacity of the request queue owned by the send lane.
+    /// Capacity of the admission queue and in-flight operation quota.
+    ///
+    /// One permit is held from admission until the final callback completes, or
+    /// a stream observes its terminal item/EOF or is dropped. Retries retain
+    /// capacity between attempts; an unpolled retained stream does not release it.
     pub request_queue_capacity: usize,
     /// Capacity of the response queue owned by the receive lane.
     pub response_queue_capacity: usize,

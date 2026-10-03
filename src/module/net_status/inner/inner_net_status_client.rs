@@ -136,6 +136,8 @@ pub(crate) struct InnerNetStatusClient {
     // 测试专用的安全初始化工厂，用于精确控制失败与并发时机，不改变生产构建。
     #[cfg(test)]
     monitor_factory: Mutex<Option<initialization_tests::MonitorFactory>>,
+    #[cfg(test)]
+    monitor_task: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl InnerNetStatusClient {
@@ -149,6 +151,8 @@ impl InnerNetStatusClient {
             observations,
             #[cfg(test)]
             monitor_factory: Mutex::new(None),
+            #[cfg(test)]
+            monitor_task: Mutex::new(None),
         })
     }
 
@@ -160,29 +164,115 @@ impl InnerNetStatusClient {
         self.observations.subscribe()
     }
 
+    pub(crate) fn subscribe_facts(&self) -> watch::Receiver<NetworkSnapshot> {
+        self.observations.subscribe_facts()
+    }
+
+    pub(crate) fn subscribe_failure(&self) -> watch::Receiver<Option<NetError>> {
+        self.observations.subscribe_failure()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_monitor_factory_for_test(
+        &self,
+        factory: initialization_tests::MonitorFactory,
+    ) -> Result<(), NetError> {
+        *self.monitor_factory.lock().map_err(NetError::from_poison)? = Some(factory);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_monitor_task_for_test(&self) -> Result<(), NetError> {
+        let task = self.monitor_task.lock().map_err(NetError::from_poison)?;
+        match task.as_ref() {
+            Some(task) => {
+                task.abort();
+                Ok(())
+            }
+            None => Err(NetError::from(crate::error::ErrorKind::Internal)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_source_revision_for_test(&self) -> Result<(), NetError> {
+        self.observations.exhaust_revision_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_observation_for_test(
+        &self,
+        status: NetworkStatus,
+        ip: IpStack,
+        name: Option<String>,
+    ) -> Result<(), NetError> {
+        let state = self
+            .current_state()?
+            .ok_or_else(|| NetError::from(crate::error::ErrorKind::Internal))?;
+        let publication = {
+            let state = state.lock().map_err(NetError::from_poison)?;
+            let publisher = state
+                .observation
+                .as_ref()
+                .ok_or_else(|| NetError::from(crate::error::ErrorKind::Internal))?;
+            publisher.prepare_observation(status, Some(ip), name)?
+        };
+        publication.dispatch()
+    }
+
     // 幂等启动并等待同代初始化结果；失败代先完成退休，再将错误交付所有等待者。
     // stop 取消初始化时返回当前快照；永久销毁优先返回 Closed。
     pub(crate) async fn start(&self) -> Result<NetworkSnapshot, NetError> {
-        let (mut initial_state, task, publication) = {
-            let mut lifecycle = self.lifecycle.lock().map_err(NetError::from_poison)?;
-            if lifecycle.destroyed {
-                return Err(NetError::from(crate::error::ErrorKind::Closed));
-            }
-            lifecycle
-                .stopping
-                .retain(|finished| !*::tokio::sync::watch::Receiver::borrow(finished));
-            let (task, publication) = if lifecycle.monitor.is_none() {
-                let (monitor, task, publication) = self.prepare_monitor_task()?;
-                lifecycle.monitor = Some(monitor);
-                (Some(task), Some(publication))
-            } else {
-                (None, None)
+        let (mut initial_state, task, publication) = loop {
+            let retiring = {
+                let mut lifecycle = self.lifecycle.lock().map_err(NetError::from_poison)?;
+                if lifecycle.destroyed {
+                    return Err(NetError::from(crate::error::ErrorKind::Closed));
+                }
+                lifecycle
+                    .stopping
+                    .retain(|finished| !*::tokio::sync::watch::Receiver::borrow(finished));
+                if lifecycle.stopping.is_empty() {
+                    let (task, publication) = if lifecycle.monitor.is_none() {
+                        match self.prepare_monitor_task() {
+                            Ok((monitor, task, publication)) => {
+                                lifecycle.monitor = Some(monitor);
+                                (Some(task), Some(publication))
+                            }
+                            Err(error) => {
+                                // The source must remember an infrastructure
+                                // preparation failure before another lease can
+                                // retry it. Commit the failure only after the
+                                // lifecycle lock is released so no notification
+                                // can re-enter this lock.
+                                drop(lifecycle);
+                                match self.observations.fail(error.clone()) {
+                                    Ok(publication) => {
+                                        if let Err(dispatch_error) = publication.dispatch() {
+                                            crate::log_e!(LogType::Engine; "network_status_start_failure", "error", crate::common::log::summary::error(&dispatch_error));
+                                        }
+                                    }
+                                    Err(failure_error) => {
+                                        crate::log_e!(LogType::Engine; "network_status_start_failure", "error", crate::common::log::summary::error(&failure_error));
+                                    }
+                                }
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    let monitor = lifecycle
+                        .monitor
+                        .as_ref()
+                        .ok_or(NetError::from(crate::error::ErrorKind::Internal))?;
+                    break (monitor.initial_state.clone(), task, publication);
+                }
+                lifecycle.stopping.clone()
             };
-            let monitor = lifecycle
-                .monitor
-                .as_ref()
-                .ok_or(NetError::from(crate::error::ErrorKind::Internal))?;
-            (monitor.initial_state.clone(), task, publication)
+            // A retired outer future can finish before netwatch's actor and
+            // platform tasks do. Recheck under the lock only after all of that
+            // generation's provider resources have left their private runtime.
+            Self::wait_until_finished(retiring).await?;
         };
         // A failed preparation owns deferred cleanup. Retire its unpolled task first;
         // normal notifications must follow submission because a user waker may await shutdown.
@@ -201,7 +291,14 @@ impl InnerNetStatusClient {
         }
         // 退出守卫也会获取生命周期锁；在锁外提交，覆盖运行时拒绝未轮询任务的路径。
         if let Some(task) = task {
-            self.engine.runtime_handle().spawn(task);
+            let submitted = self.engine.runtime_handle().spawn(task);
+            #[cfg(test)]
+            {
+                *self.monitor_task.lock().map_err(NetError::from_poison)? =
+                    Some(submitted.abort_handle());
+            }
+            #[cfg(not(test))]
+            drop(submitted);
         }
         if let Some(publication) = publication {
             publication.dispatch()?;
@@ -270,20 +367,61 @@ impl InnerNetStatusClient {
             observation: publisher,
             completion: Some(MonitorCompletion(finished_sender)),
         };
-        // 长期任务直接交给共享运行时，不进入逐项等待的引擎工作队列。
+        // CommonEngine coordinates submission; each provider generation owns a
+        // dedicated runtime because netwatch detaches nested platform tasks and
+        // exposes no join API. Dropping that runtime on its ordinary thread
+        // drains async tasks and blocking work before the completion guard runs.
         let task = async move {
-            let mut completion = completion;
-            if let Err(error) = Self::monitor_until_stopped(
-                shared_state,
-                stop_receiver,
-                initial_sender,
-                #[cfg(test)]
-                factory,
-            )
-            .await
-            {
-                completion.initialization_error = Some(error);
+            let (submission_alive, submission_cancelled) = oneshot::channel::<()>();
+            let (thread_finished, thread_wait) = oneshot::channel();
+            let spawned = std::thread::Builder::new()
+                .name("open-net-network-monitor".to_owned())
+                .spawn(move || {
+                    // Declared before runtime: unwinding also destroys runtime
+                    // resources before publishing this generation's completion.
+                    let mut completion = completion;
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            completion.initialization_error = Some(NetError::with_source(
+                                crate::error::ErrorKind::RuntimeUnavailable,
+                                error,
+                            ));
+                            return;
+                        }
+                    };
+                    let outcome = runtime.block_on(async move {
+                        tokio::select! {
+                            biased;
+                            _ = submission_cancelled => Err(NetError::from(crate::error::ErrorKind::RuntimeUnavailable)),
+                            result = Self::monitor_until_stopped(
+                                shared_state,
+                                stop_receiver,
+                                initial_sender,
+                                #[cfg(test)]
+                                factory,
+                            ) => result,
+                        }
+                    });
+                    drop(runtime);
+                    if let Err(error) = outcome {
+                        completion.initialization_error = Some(error);
+                    }
+                    drop(completion);
+                    let _ = thread_finished.send(());
+                });
+            if let Err(error) = spawned {
+                // The rejected closure already dropped its unpolled guard;
+                // initialization waiters receive RuntimeUnavailable.
+                crate::log_e!(LogType::Engine; "network_status_provider_thread", "error", crate::common::log::summary::error(&error));
             }
+            // Cancelling CommonEngine's task cancels the provider future, but
+            // the independent thread retains ownership of its real exit guard.
+            let _ = thread_wait.await;
+            drop(submission_alive);
         };
         let monitor = MonitorRuntime {
             stop_sender: Some(stop_sender),
@@ -296,7 +434,10 @@ impl InnerNetStatusClient {
     }
 
     // Commit the stop while holding the lifecycle lock; notify public observers afterwards.
-    fn request_stop(&self, permanent: bool) -> (Vec<watch::Receiver<bool>>, Option<NetError>) {
+    pub(crate) fn request_stop(
+        &self,
+        permanent: bool,
+    ) -> (Vec<watch::Receiver<bool>>, Option<NetError>) {
         let mut error = None;
         let (finished, retired, publication) = {
             let mut lifecycle = match self.lifecycle.lock() {
@@ -333,21 +474,24 @@ impl InnerNetStatusClient {
         (finished, error)
     }
 
-    // 逐一等待已退役监控完成；发送端关闭也结束对应等待，全程不占用客户端生命周期锁。
-    async fn wait_until_finished(finished: Vec<watch::Receiver<bool>>) {
+    // 逐一等待真实退出；丢失完成发送端不等于资源已退出，不允许据此重启。
+    pub(crate) async fn wait_until_finished(
+        finished: Vec<watch::Receiver<bool>>,
+    ) -> Result<(), NetError> {
         for mut receiver in finished {
             while !*receiver.borrow_and_update() {
                 if receiver.changed().await.is_err() {
-                    break;
+                    return Err(NetError::from(crate::error::ErrorKind::RuntimeUnavailable));
                 }
             }
         }
+        Ok(())
     }
 
     // 停止当前监控并等待所有退役监控释放资源，之后允许重新启动；透传同步清理阶段的错误。
     pub(crate) async fn stop(&self) -> Result<(), NetError> {
         let (finished, error) = self.request_stop(false);
-        Self::wait_until_finished(finished).await;
+        Self::wait_until_finished(finished).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -359,7 +503,7 @@ impl InnerNetStatusClient {
     // 永久销毁客户端并等待已有监控清理完成，返回停止过程中记录的错误。
     pub(crate) async fn destroy(&self) -> Result<(), NetError> {
         let (finished, error) = self.request_stop(true);
-        Self::wait_until_finished(finished).await;
+        Self::wait_until_finished(finished).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -392,6 +536,7 @@ impl InnerNetStatusClient {
     }
 
     // 按默认路由与 IP 能力推导可达性：同时具备默认路由及至少一种 IP 能力时为 Available。
+    #[cfg(any(not(target_os = "linux"), test))]
     fn reachability_from_flags(
         has_default_route: bool,
         have_v4: bool,
@@ -405,6 +550,7 @@ impl InnerNetStatusClient {
     }
 
     // 从 netwatch 接口快照提取默认路由与 IPv4/IPv6 标志，转换为本库的可达性枚举。
+    #[cfg(not(target_os = "linux"))]
     fn reachability_from_state(state: &netwatch::netmon::State) -> NetworkStatus {
         Self::reachability_from_flags(
             state.default_route_interface.is_some(),
@@ -422,6 +568,7 @@ impl InnerNetStatusClient {
     }
 
     // 获取当前可达性；Windows 优先使用系统连接状态，查询无结果或其他平台则使用 netwatch 快照。
+    #[cfg(not(target_os = "linux"))]
     fn current_reachability(state: &netwatch::netmon::State) -> NetworkStatus {
         #[cfg(target_os = "windows")]
         if let Some(reachability) = Self::windows_network_reachability() {
@@ -429,6 +576,27 @@ impl InnerNetStatusClient {
         }
 
         Self::reachability_from_state(state)
+    }
+
+    // Linux additionally checks operational links and IPv6 on-link defaults.
+    // Cancel slow platform reads on stop; the read-only worker cannot publish
+    // into this or a later generation. Other platforms retain their exact query.
+    async fn reachability_or_stop(
+        snapshot: &netwatch::netmon::State,
+        _stop_receiver: &mut oneshot::Receiver<()>,
+    ) -> Result<Option<NetworkStatus>, NetError> {
+        #[cfg(target_os = "linux")]
+        {
+            tokio::select! {
+                biased;
+                _ = &mut *_stop_receiver => Ok(None),
+                result = super::platform::linux::current_reachability(snapshot) => result.map(Some),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Some(Self::current_reachability(snapshot)))
+        }
     }
 
     // One authoritative snapshot contains reachability and IP capability. Public wakeups,
@@ -497,7 +665,9 @@ impl InnerNetStatusClient {
         let mut interface_state = monitor.interface_state();
 
         let initial = interface_state.get();
-        let current = Self::current_reachability(&initial);
+        let Some(current) = Self::reachability_or_stop(&initial, &mut stop_receiver).await? else {
+            return Ok(());
+        };
         let ip_stack = Self::ip_stack_from_state(&initial);
         // If the initial state update fails (lock poisoned), end the task.
         if let Err(error) = Self::update_state_inner(&state, current, ip_stack) {
@@ -523,7 +693,9 @@ impl InnerNetStatusClient {
                 update = interface_state.updated() => {
                     match update {
                         Ok(new_state) => {
-                            let reachability = Self::current_reachability(&new_state);
+                            let Some(reachability) = Self::reachability_or_stop(&new_state, &mut stop_receiver).await? else {
+                                break;
+                            };
                             let ip_stack = Self::ip_stack_from_state(&new_state);
                             // Exit the monitor loop if the lock is poisoned.
                             Self::update_state_inner(&state, reachability, ip_stack)?;
@@ -543,8 +715,21 @@ impl InnerNetStatusClient {
                     }
                 }
                 _ = refresh_interval.tick() => {
+                    // netwatch 0.18 does not subscribe to Linux link changes.
+                    // Re-sample instead of only re-reading its cached state;
+                    // the request is asynchronous and updates arrive above.
+                    #[cfg(target_os = "linux")]
+                    match request_refresh_or_stop(
+                        &mut stop_receiver,
+                        || monitor.network_change(),
+                    ).await {
+                        RefreshWorkOutcome::Stopped => break,
+                        RefreshWorkOutcome::Requested | RefreshWorkOutcome::RequestFailed => {}
+                    }
                     let snapshot = interface_state.get();
-                    let reachability = Self::current_reachability(&snapshot);
+                    let Some(reachability) = Self::reachability_or_stop(&snapshot, &mut stop_receiver).await? else {
+                        break;
+                    };
                     let ip_stack = Self::ip_stack_from_state(&snapshot);
                     Self::update_state_inner(&state, reachability, ip_stack)?;
                 }

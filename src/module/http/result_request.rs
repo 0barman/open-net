@@ -1,7 +1,7 @@
-use crate::api::http::{HttpRequest, HttpRequestTrait, HttpResponseResult};
+use crate::api::http::{HttpRequest, HttpRequestMethod, HttpRequestTrait, HttpResponseResult};
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, Method};
+use http::HeaderMap;
 use tokio::sync::oneshot;
 
 pub struct ResultRequest {
@@ -24,8 +24,8 @@ impl HttpRequestTrait for ResultRequest {
         self.request.path.clone()
     }
 
-    fn get_method(&self) -> Method {
-        self.request.method.clone()
+    fn get_method(&self) -> HttpRequestMethod {
+        self.request.method.clone().into()
     }
 
     fn get_req_body(&self) -> Bytes {

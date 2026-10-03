@@ -50,8 +50,13 @@ impl OpenNetInner {
                 config.sync_queue_capacity,
                 config.runtime_worker_threads,
             )?);
+            let network_status =
+                crate::module::net_status::inner::shared::SharedNetworkService::new(
+                    common_engine.clone(),
+                )?;
             Ok(Self {
                 common_engine,
+                network_status,
                 net_status_clients: Arc::new(Mutex::new(HashMap::new())),
                 #[cfg(feature = "ws-client")]
                 network,
@@ -90,8 +95,12 @@ impl OpenNetInner {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let clients = Arc::clone(&self.clients);
         let default_network = Arc::clone(&self.network);
-        let common_engine = Arc::clone(&self.common_engine);
+        let network_status = self.network_status.context();
+        let operation_engine = self.common_engine.clone();
         self.common_engine.post(async move {
+            // Accepted creation owns its runtime through failure cleanup without
+            // retaining the OpenNet owner or reopening its closed service.
+            let _operation_engine = operation_engine;
             // Compile an explicit client override once, outside the registry lock.
             // None inherits the existing compiled default; Some(Default) is an
             // explicit direct/WebPKI policy and must not be treated as inheritance.
@@ -101,22 +110,27 @@ impl OpenNetInner {
                 None => Ok(default_network),
             };
             let created = network.and_then(|network| {
-                create_client_worker(thread_name.as_str(), config, network, common_engine)
+                create_client_worker(thread_name.as_str(), config, network, network_status.clone())
             });
             let result =
                 match created {
                     Ok((client, worker_thread)) => {
+                        let mut worker_thread = Some(worker_thread);
                         let stored = clients.lock().map_err(|_| NetError::from(crate::error::ErrorKind::Internal)).map(
                             |mut clients| {
+                                if network_status.is_closed() {
+                                    return Err(NetError::from(crate::error::ErrorKind::Closed));
+                                }
                                 clients.insert(
                                     thread_name.clone(),
                                     ClientSlot::Ready(ClientEntry {
                                         client: client.clone(),
-                                        worker_thread: Some(worker_thread),
+                                        worker_thread: worker_thread.take(),
                                     }),
                                 );
+                                Ok(())
                             },
-                        );
+                        ).and_then(|result| result);
                         match stored {
                             Ok(()) => {
                                 crate::log_s!(LogType::WSC; "create_ws_client", "thread_name|status", thread_name, "Ready");
@@ -124,6 +138,20 @@ impl OpenNetInner {
                             },
                             Err(error) => {
                                 client.inner.request_shutdown();
+                                // Preserve ownership after a rejected Ready commit.
+                                // Joining outside the registry lock also covers a
+                                // completed Ignore worker racing engine teardown.
+                                if let Some(worker_thread) = worker_thread {
+                                    match tokio::task::spawn_blocking(move || worker_thread.join()).await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(_)) => {
+                                            crate::log_e!(LogType::WSC; "create_ws_client_cleanup", "error", "worker_thread_panicked");
+                                        }
+                                        Err(join_error) => {
+                                            crate::log_e!(LogType::WSC; "create_ws_client_cleanup", "error", crate::common::log::summary::error(&join_error));
+                                        }
+                                    }
+                                }
                                 Err(error)
                             }
                         }
@@ -229,9 +257,11 @@ impl OpenNetInner {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let clients = Arc::clone(&self.http_clients);
         let name = thread_name.clone();
+        let network_status = self.network_status.context();
         self.common_engine.post(async move {
+            let creation_context = network_status.clone();
             let created = match tokio::task::spawn_blocking(move || {
-                crate::module::http::http_client_inner::create_http_client(name, config)
+                crate::module::http::http_client_inner::create_http_client(name, config, creation_context)
             })
             .await
             {
@@ -243,14 +273,17 @@ impl OpenNetInner {
                     let stored = clients
                         .lock()
                         .map_err(NetError::from_poison)
-                        .map(|mut slots| {
+                        .and_then(|mut slots| {
+                            if network_status.is_closed() {
+                                return Err(NetError::from(crate::error::ErrorKind::Closed));
+                            }
                             slots.insert(
                                 thread_name.clone(),
                                 crate::inner::net_impl::http_client_slot::HttpClientSlot::Ready(
                                     client.clone(),
                                 ),
                             );
-                            client.clone()
+                            Ok(client.clone())
                         });
                     match stored {
                         Ok(client) => {
@@ -477,20 +510,21 @@ fn create_client_worker(
     thread_name: &str,
     config: WebSocketClientConfig,
     network: Arc<CompiledNetworkConfig>,
-    common_engine: Arc<CommonEngine>,
+    network_status: crate::net_status::NetworkStatusContext,
 ) -> Result<(WebSocketClient, JoinHandle<()>), NetError> {
     crate::log_t!(LogType::WSC; "create_client_worker", "thread_name|config", thread_name, format!("{:?}", config));
     let result: Result<(WebSocketClient, JoinHandle<()>), NetError> = (|| {
         if thread_name.contains('\0') {
             return Err(NetError::from(crate::error::ErrorKind::InvalidConfig));
         }
-        let net_status_client = match network.network_status_policy() {
+        let network_observation = match network.network_status_policy() {
             crate::NetworkStatusPolicy::Ignore => None,
-            crate::NetworkStatusPolicy::PauseOnUnavailable => Some(Arc::new(
-                crate::module::net_status::inner::inner_net_status_client::InnerNetStatusClient::new(common_engine)?,
-            )),
+            crate::NetworkStatusPolicy::PauseOnUnavailable => {
+                Some((network_status.acquire()?, network_status.subscribe_gate()))
+            }
         };
-        let (inner, worker) = WSClientInner::new_with_network(config, network, net_status_client)?;
+        let (inner, worker) =
+            WSClientInner::new_with_network(config, network, network_observation)?;
         let client = WebSocketClient::from_inner(inner);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker_thread = std::thread::Builder::new()
@@ -524,6 +558,7 @@ fn create_client_worker(
 
 impl Drop for OpenNetInner {
     fn drop(&mut self) {
+        self.network_status.request_close();
         self.stop_net_status_clients();
         #[cfg(feature = "ws-client")]
         {
@@ -544,19 +579,21 @@ impl Drop for OpenNetInner {
         #[cfg(feature = "http-client")]
         {
             crate::log_t!(LogType::HTTP; "drop");
-            match self.http_clients.lock() {
-                Ok(mut clients) => {
-                    for (_, slot) in clients.drain() {
-                        if let Some(client) = slot.into_client() {
-                            client.request_shutdown();
-                            drop(client);
-                        }
-                    }
-                }
+            let clients = match self.http_clients.lock() {
+                Ok(mut clients) => clients.drain().map(|(_, slot)| slot).collect::<Vec<_>>(),
                 Err(_) => {
                     crate::log_e!(LogType::HTTP; "drop", "error", "http_registry_lock_poisoned");
+                    Vec::new()
+                }
+            };
+            for slot in clients {
+                if let Some(client) = slot.into_client() {
+                    client.request_shutdown();
                 }
             }
         }
     }
 }
+
+#[cfg(test)]
+mod shared_network_tests;

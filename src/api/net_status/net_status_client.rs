@@ -1,40 +1,47 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::common::CommonEngine;
 use crate::net_status::NetworkSnapshot;
+use crate::net_status::NetworkStatusContext;
 use crate::subscription::{CallbackContext, StateReceiver, Subscription};
-use crate::Result;
+use crate::{LogType, Result};
 
-use crate::module::net_status::inner::inner_net_status_client::InnerNetStatusClient;
+use crate::module::net_status::inner::facade::NetworkObservationOwner;
 
-/// A network monitor created by `OpenNet`; clones share one lifecycle.
+/// An independent view of the engine's shared network monitor.
+/// Clones share this view's lifecycle; other named views remain independent.
 #[derive(Clone)]
 pub struct NetStatusClient {
-    inner: Arc<InnerNetStatusClient>,
+    inner: Arc<NetworkObservationOwner>,
 }
 
 impl NetStatusClient {
-    pub(crate) fn new(engine: Arc<CommonEngine>) -> Result<Self> {
+    pub(crate) fn new(context: NetworkStatusContext) -> Result<Self> {
+        crate::log_s!(LogType::Engine; "NetStatusClient-new");
         Ok(Self {
-            inner: Arc::new(InnerNetStatusClient::new(engine)?),
+            inner: NetworkObservationOwner::new(context)?,
         })
     }
 
     /// Start monitoring and await the first coherent observation.
     /// Repeated calls share the active monitor and its initialization result.
     pub async fn start(&self) -> Result<NetworkSnapshot> {
+        crate::log_s!(LogType::Engine; "NetStatusClient-start");
         self.inner.start().await
     }
 
     /// Stop monitoring while keeping subscriptions alive for a later restart.
     pub async fn stop(&self) -> Result<()> {
-        self.inner.stop().await
+        crate::log_s!(LogType::Engine; "NetStatusClient-stop");
+        self.inner.request_stop()?;
+        self.inner.wait_cleanup().await
     }
 
     /// Permanently close monitoring and publish its final Closed snapshot.
     pub async fn shutdown(&self) -> Result<()> {
-        self.inner.shutdown().await
+        crate::log_s!(LogType::Engine; "NetStatusClient-shutdown");
+        self.inner.request_close();
+        self.inner.wait_cleanup().await
     }
 
     /// Read the latest coherent snapshot, including an inactive or final state.
@@ -44,7 +51,7 @@ impl NetStatusClient {
 
     /// Subscribe to the current snapshot and later changes across stop/restart.
     pub fn subscribe(&self) -> Result<StateReceiver<NetworkSnapshot>> {
-        self.inner.subscribe_state()
+        self.inner.subscribe_terminal()
     }
 
     /// Observe the same snapshots as an asynchronous subscription on the shared
@@ -57,11 +64,13 @@ impl NetStatusClient {
     }
 
     pub(crate) fn request_destroy(&self) {
-        self.inner.request_destroy();
+        self.inner.request_close();
     }
 
     pub(crate) async fn destroy(&self) -> Result<()> {
-        self.inner.destroy().await
+        crate::log_s!(LogType::Engine; "NetStatusClient-destroy");
+        self.inner.request_close();
+        self.inner.wait_cleanup().await
     }
 }
 

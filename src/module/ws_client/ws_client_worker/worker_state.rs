@@ -57,8 +57,8 @@ pub(crate) struct WSClientWorker {
     ///
     /// 提前结束当前会话重试前的退避等待；会话终态后必须显式新建会话。
     pub(in crate::module::ws_client) network_available: Arc<Notify>,
-    /// 可选的共享网络状态监控客户端，工作器启动时请求开启监控。
-    pub(in crate::module::ws_client) net_status_client: Option<Arc<InnerNetStatusClient>>,
+    /// 本逻辑客户端的共享监控需求；不具有停止或销毁底层服务的权限。
+    pub(in crate::module::ws_client) network_lease: Option<NetworkLease>,
     /// 订阅到的网络状态快照，用于暂停或恢复连接尝试。
     pub(in crate::module::ws_client) network_status: Option<watch::Receiver<NetworkStatusSnapshot>>,
     /// 最近一次观测到的网络丢失代次，用于识别连接过程中错过的断网。

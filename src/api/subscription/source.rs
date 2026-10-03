@@ -29,7 +29,7 @@ struct PublisherOwner<T> {
     core: Arc<SourceCore<T>>,
 }
 pub(super) struct SourceCore<T> {
-    pub(super) state: Mutex<SourceState<T>>,
+    pub(super) state: Arc<Mutex<SourceState<T>>>,
     executor: Arc<dyn CallbackExecutor>,
     slots: Arc<Semaphore>,
     #[cfg(test)]
@@ -89,13 +89,13 @@ impl<T> StateSource<T> {
         quota: Arc<Semaphore>,
     ) -> Result<(StatePublisher<T>, Self)> {
         let core = Arc::new(SourceCore {
-            state: Mutex::new(SourceState {
+            state: Arc::new(Mutex::new(SourceState {
                 current: initial,
                 revision: 0,
                 closed: false,
                 failure: None,
                 registrations: HashMap::new(),
-            }),
+            })),
             executor,
             slots: quota,
             #[cfg(test)]
@@ -109,6 +109,14 @@ impl<T> StateSource<T> {
         ))
     }
     pub(crate) fn subscribe(&self) -> Result<StateReceiver<T>> {
+        self.subscribe_with_cache(false)
+    }
+    /// Reads committed state while user notification remains deferred. The initial
+    /// snapshot and receiver cursor retain the ordinary subscription contract.
+    pub(crate) fn subscribe_committed(&self) -> Result<StateReceiver<T>> {
+        self.subscribe_with_cache(true)
+    }
+    fn subscribe_with_cache(&self, read_committed: bool) -> Result<StateReceiver<T>> {
         let permit = self
             .core
             .slots
@@ -124,13 +132,14 @@ impl<T> StateSource<T> {
                 .map_err(|error| NetError::with_source(ErrorKind::ResourceExhausted, error))?;
             let registration = Arc::new(Registration::new(
                 id,
-                Arc::downgrade(&self.core),
+                &self.core,
                 self.core.executor.clone(),
                 source.current.clone(),
                 source.revision,
                 source.closed,
                 source.failure.clone(),
                 permit,
+                read_committed,
             ));
             source
                 .registrations
@@ -339,6 +348,9 @@ impl<T> SourceCore<T> {
 #[path = "source_shutdown_tests.rs"]
 mod shutdown_tests;
 
+#[cfg(test)]
+#[path = "source_committed_tests.rs"]
+mod committed_tests;
 #[cfg(test)]
 #[path = "source_shared_tests.rs"]
 mod shared_tests;

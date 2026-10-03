@@ -137,6 +137,10 @@ pub(crate) struct ConnectionSession {
     fixture_initial_cycle: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     before_snapshot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_finished: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    failed_state_read: AtomicBool,
     identity: Arc<()>,
     journal: Option<JournalBudget>,
     cancel_requested: CancellationToken,
@@ -280,6 +284,10 @@ impl ConnectionSession {
             fixture_initial_cycle: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             before_snapshot: Mutex::new(None),
+            #[cfg(test)]
+            before_finished: Mutex::new(None),
+            #[cfg(test)]
+            failed_state_read: AtomicBool::new(false),
             identity: Arc::new(()),
             journal,
             cancel_requested: CancellationToken::new(),
@@ -340,13 +348,22 @@ impl ConnectionSession {
 
     pub(crate) async fn closed(&self) -> Result<SessionEnd, NetError> {
         loop {
-            let notified = self.lifecycle_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(result) = self.terminal_result() {
-                return result;
+            // Register before reading to observe a failed transition after the
+            // waiter started, without ever confusing a chosen result with the
+            // worker's completion publication.
+            let changed = self.lifecycle_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            self.terminal_result_checked()?;
+            if self.finished.is_cancelled() {
+                // Re-read after observing completion: the earlier read may have
+                // happened immediately before the worker chose its result.
+                return self.terminal_result_checked()?.ok_or_else(Self::internal)?;
             }
-            notified.await;
+            tokio::select! {
+                _ = self.finished.cancelled() => {},
+                _ = changed => {},
+            }
         }
     }
 
@@ -942,9 +959,15 @@ impl ConnectionSession {
         result
     }
 
+    pub(crate) fn terminal_result_checked(
+        &self,
+    ) -> Result<Option<Result<SessionEnd, NetError>>, NetError> {
+        Ok(self.lock_state()?.terminal_result.clone())
+    }
+
     pub(crate) fn terminal_result(&self) -> Option<Result<SessionEnd, NetError>> {
-        match self.lock_state() {
-            Ok(state) => state.terminal_result.clone(),
+        match self.terminal_result_checked() {
+            Ok(result) => result,
             Err(error) => Some(Err(error)),
         }
     }
@@ -1113,6 +1136,17 @@ impl ConnectionSession {
         }
         drop(publication);
         if close {
+            #[cfg(test)]
+            {
+                let hook = self
+                    .before_finished
+                    .lock()
+                    .map_err(NetError::from_poison)?
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             self.cancel_selected.store(true, Ordering::Release);
             self.cancel_requested.cancel();
             self.close_journal_budget();
@@ -1143,7 +1177,8 @@ impl ConnectionSession {
         self.cancel_selected.store(true, Ordering::Release);
         self.cancel_requested.cancel();
         self.close_journal_budget();
-        self.finished.cancel();
+        // Only worker termination or the owning client recovery coordinator may
+        // declare completion after this failed state transition.
         self.lifecycle_changed.notify_waiters();
     }
 
@@ -1199,6 +1234,10 @@ impl ConnectionSession {
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, SessionState>, NetError> {
+        #[cfg(test)]
+        if self.failed_state_read.load(Ordering::Acquire) {
+            return Err(Self::internal());
+        }
         self.state.lock().map_err(|_| Self::internal())
     }
 
@@ -1362,6 +1401,25 @@ impl ConnectionSession {
     }
     fn internal() -> NetError {
         NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Dispatch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_state_read_for_test(&self) {
+        self.failed_state_read.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_finished_for_test(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> Result<(), NetError> {
+        let previous = self
+            .before_finished
+            .lock()
+            .map_err(NetError::from_poison)?
+            .replace(Box::new(hook));
+        drop(previous);
+        Ok(())
     }
 
     #[cfg(test)]

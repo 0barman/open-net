@@ -280,3 +280,35 @@ async fn network_interruption_does_not_publish_an_earlier_handshake_http_status(
     check!(worker.connect_target.is_none())?;
     Ok(())
 }
+
+#[tokio::test]
+async fn newly_joining_worker_baselines_existing_shared_loss_history() -> TestResult {
+    let engine = Arc::new(crate::common::CommonEngine::new(16, 16)?);
+    let service = crate::module::net_status::inner::shared::SharedNetworkService::new(engine)?;
+    let lease = service.context().acquire()?;
+    let (_sender, receiver) = watch::channel(NetworkStatusSnapshot {
+        revision: 19,
+        loss_epoch: 7,
+        status: Some(NetworkStatus::Available),
+    });
+    let network = Arc::new(CompiledNetworkConfig::new(
+        crate::NetworkConfig::default()
+            .with_network_status_policy(crate::NetworkStatusPolicy::PauseOnUnavailable),
+    )?);
+    let (inner, worker) =
+        crate::module::ws_client::ws_client_inner::WSClientInner::new_with_network(
+            WebSocketClientConfig::default(),
+            network,
+            Some((lease, receiver)),
+        )?;
+    let baseline = worker.network_loss_epoch;
+    inner.request_shutdown();
+    drop(worker);
+    service.shutdown().await?;
+    check_eq!(
+        baseline,
+        7,
+        "joining worker treated shared historical losses as new"
+    )?;
+    Ok(())
+}

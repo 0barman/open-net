@@ -218,7 +218,7 @@ let response = client.request(request).await?;
 response.check_status(open_net::api::http::HttpStatusPolicy::Success2xx)?;
 ```
 
-The builder starts with `GET`, empty headers, an empty body, and `RetryPolicy::no_retry()`. `build()` rejects an empty path; the client performs the same-origin path checks when the request is submitted. To add one header without constructing a `HeaderMap`, use `.header("x-trace-id", "abc")?` before `.build()`.
+The builder starts with `GET`, empty headers, an empty body, and an inherited retry setting. Its compatibility `retry_policy` field starts at `RetryPolicy::no_retry()`; an inherited request uses the client's configured default. `build()` rejects an empty path; the client performs the same-origin path checks when the request is submitted. To add one header without constructing a `HeaderMap`, use `.header("x-trace-id", "abc")?` before `.build()`.
 
 ## Handling HTTP errors versus transport errors
 
@@ -278,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
-`next_chunk()` returns `None` at clean EOF, `Some(Ok(Bytes))` for a chunk, and `Some(Err(NetError))` for a terminal stream/transport error. A stream does not replay bytes already consumed. Call `response.check_status(...)` before writing data if non-2xx responses should not be saved. `HttpClient::sse(path, headers)` is a convenience for opening a GET stream with an `Accept: text/event-stream` header supplied by you; it does not parse SSE frames. Decode lines/events in your application.
+`next_chunk()` returns `None` at clean EOF, `Some(Ok(Bytes))` for a chunk, and `Some(Err(NetError))` for a terminal stream/transport error. A delivered stream response is never replayed, even before its first body poll. Errors are delivered once and subsequent polls return EOF. Absolute attempt/config timeouts and total deadlines continue while consumption is paused; total deadlines also cover admission. Capacity is returned on the terminal poll or drop, so a retained unpolled stream can keep `drain()` waiting. Call `response.check_status(...)` before writing data if non-2xx responses should not be saved. `HttpClient::sse(path, headers)` is a convenience for opening a GET stream with an `Accept: text/event-stream` header supplied by you; it does not parse SSE frames. Decode lines/events in your application.
 
 ## Upload bodies and “streaming upload” expectations
 
@@ -288,7 +288,7 @@ For a large payload, prefer a multipart/object-storage client designed for uploa
 
 ## Timeouts, response limits, retries, and backpressure
 
-`HttpClientConfig::new` defaults to a 30-second request timeout, an enabled 15-second TCP keepalive, 8 MiB maximum buffered response body, and request/response/callback queue capacities of 128. Override them with:
+`HttpClientConfig::new` defaults to a 30-second timeout for each network attempt (headers and body, excluding SDK admission), an enabled 15-second TCP keepalive, 8 MiB maximum buffered response body, and request/response/callback queue capacities of 128. Override them with:
 
 ```rust
 let config = HttpClientConfig::new("https://api.example.com/")?
@@ -320,9 +320,9 @@ let request = HttpRequest::builder()
 let response = client.request(request).await?;
 ```
 
-For a custom request sent through `send_with_options`, use `HttpRequestOptions::with_retry_policy(...)` and, when appropriate, `.with_replayable_body(true)`. A non-idempotent request is never made retryable merely by setting a retry count; explicitly opt in and return the same body on every attempt. Retry backoff can be interrupted by cancellation. A partially consumed streaming response is not replayed.
+For a custom request sent through `send_with_options`, use `HttpRequestOptions::with_retry_policy(...)` and, when appropriate, `.with_replayable_body(true)`. A non-idempotent request is never made retryable merely by setting a retry count; explicitly opt in and return the same body on every attempt. Retry backoff can be interrupted by cancellation. A streaming response is never replayed after it has been returned to the caller.
 
-**Important convenience-method detail:** `request(HttpRequest)` supplies explicit options derived from the request's own `retry_policy`. Therefore `get`/`post` use the builder's no-retry policy even if `HttpClientConfig.default_retry_policy` is non-empty. To use the client default or custom options, build a request and call `send`/`send_with_options`, or attach `RetryPolicy` to the request as shown above.
+`get`, `post`, `request`, and `stream` inherit `HttpClientConfig.default_retry_policy` unless the request explicitly replaces or disables it. A one-attempt default still supplies its timeout, deadline, and observer. Use `HttpRequestBuilder::retry_setting(RetrySetting::None)` or an explicit `retry_policy(RetryPolicy::no_retry())` to disable inheritance for a concrete request. Callback submissions can use `HttpRequestOptions::with_retry_policy(RetryPolicy::no_retry())` for the same explicit override.
 
 ### Queue admission and `send_wait`
 
@@ -342,22 +342,21 @@ client.shutdown_graceful().await?; // cancel accepted requests, then join worker
 
 ## Optional advanced API: custom callback request
 
-Most applications should use `request`, `get`, `post`, or `stream`. Implement `HttpRequestTrait` only when you need a callback that runs on the client's callback lane, custom request state, or access to a request ID without awaiting a response future. This is a fragment: add `async-trait = "0.1"` to your application dependencies and import `bytes`/`http` as shown.
+Most applications should use `request`, `get`, `post`, or `stream`. Implement `HttpRequestTrait` only when you need a callback that runs on the client's callback lane, custom request state, or access to a request ID without awaiting a response future. This is a fragment: enable the `http-client` feature and import `bytes`/`http` as shown. The `async_trait` attribute is re-exported by `open_net`.
 
 ```rust
-use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, Method};
-use open_net::api::http::{HttpRequestId, HttpRequestOptions, HttpRequestTrait, HttpResponseResult, RetryPolicy};
+use http::HeaderMap;
+use open_net::api::http::{HttpRequestId, HttpRequestMethod, HttpRequestOptions, HttpRequestTrait, HttpResponseResult, RetryPolicy};
 
 struct SaveReply {
     path: String,
 }
 
-#[async_trait]
+#[open_net::async_trait]
 impl HttpRequestTrait for SaveReply {
     fn get_path(&self) -> String { self.path.clone() }
-    fn get_method(&self) -> Method { Method::GET }
+    fn get_method(&self) -> HttpRequestMethod { HttpRequestMethod::GET }
     fn get_req_body(&self) -> Bytes { Bytes::new() }
     fn headers(&self) -> HeaderMap { HeaderMap::new() }
     fn retry_policy(&self) -> RetryPolicy { RetryPolicy::new(2) }
@@ -767,7 +766,7 @@ protocol's acknowledgement when business delivery matters.
 
 ## Network status monitoring
 
-Network status is always available, even when `ws-client` and `http-client` are disabled. The first `start()` waits for a coherent snapshot:
+Network status is always available, even when `ws-client` and `http-client` are disabled. Each `OpenNet` owns one shared network monitor. Its named status clients, network-aware WebSocket clients, and HTTP observations use the same network facts; separate engines have independent monitors. Each named status client keeps its own start, stop, shutdown, and subscription lifecycle. Stopping one client leaves other active consumers running. The first `start()` waits for a coherent snapshot:
 
 ```rust,no_run
 use open_net::{OpenNet, Result};
@@ -794,6 +793,77 @@ async fn monitor() -> Result<()> {
 ```
 
 `reachability` and `ip_stack` can be `None` while the monitor is stopped or before an observation exists. `on_change` is a callback alternative; retain its returned `Subscription` for as long as you need updates.
+
+With the `http-client` feature, HTTP clients created by `OpenNet` receive its network context automatically. `network_snapshot()` reads committed cached facts without starting, refreshing, or retrying the monitor. `subscribe_network_status()` and `on_network_status_change()` register an observation synchronously and start monitoring in the background. Initialization errors appear as `MonitorState::Failed` in the stream; a new observation registration can request another attempt. Monitoring does not pause or reject HTTP requests.
+
+```rust,no_run
+use open_net::api::http::{HttpClient, HttpClientConfig};
+use open_net::{OpenNet, Result};
+
+async fn observe_http_network() -> Result<()> {
+    let net = OpenNet::new()?;
+    let config = HttpClientConfig::new("https://api.example.com/")?;
+    let client = net.create_http_client_with_config("api", config.clone()).await?;
+
+    println!("cached network state: {:?}", client.network_snapshot()?.state);
+    let mut states = client.subscribe_network_status()?;
+    if let Some(snapshot) = states.recv().await? {
+        println!("current network state: {:?}", snapshot.state);
+    }
+    let callback = client.on_network_status_change(|_, result| {
+        match result {
+            Ok(snapshot) => println!("network update: {:?}", snapshot.state),
+            Err(error) => eprintln!("observation error: {error}"),
+        }
+    })?;
+
+    // Independent HTTP workers can explicitly observe this engine's monitor.
+    let standalone = HttpClient::new_with_network_status(
+        config, "independent-api", net.network_status_context(),
+    )?;
+
+    net.destroy_http_client("api").await?;
+    callback.close().await?; // Explicitly wait for any running network callback.
+    drop(net);
+    println!("closed source: {:?}", standalone.network_snapshot()?.state);
+    // The standalone request workers remain available until their own shutdown.
+    standalone.shutdown().await?;
+    Ok(())
+}
+```
+
+HTTP clones and all active observations on one logical client share one monitoring lease. Dropping or unsubscribing the last observation releases that lease; later subscriptions can start observing again. Converting a receiver with `into_callback` transfers its existing observation. HTTP shutdown and the final client drop close that client's observations, while other clients remain independent. A retained receiver or callback handle does not keep the HTTP workers alive, although an application callback that captures a client clone does retain that clone.
+
+HTTP shutdown waits for request workers and request callbacks, and releases its network observation resources. It does not wait for a running network callback. A network callback can therefore call HTTP shutdown; call `Subscription::close` from outside the callback when you need to wait for its retirement. Calling `close` from that same callback would wait for itself.
+
+The synchronous `HttpClient::new(config, thread_name)` constructor still creates standalone request workers. Its network observation APIs return `InvalidConfig` because it has no network context. An explicitly supplied context always belongs to its original engine: dropping that engine closes network observation and preserves the final cached state, while standalone HTTP request workers keep their independent lifecycle.
+
+On Linux (kernel 5.x and later), monitoring uses kernel interface/route information
+through Netlink and procfs; it needs neither NetworkManager nor external commands
+or root privileges. Linux also requests a fresh interface sample every two seconds
+to recover from missing link notifications. Updates include the underlying
+monitor's debounce and scheduling delay.
+
+Linux `Available` means a default-route interface has an operational link and a
+usable local address. IPv6 defaults with and without a gateway are supported.
+This is a host configuration observation, not an Internet or service probe.
+`ip_stack` continues to describe the local address capability reported by
+`netwatch`, so a link outage can change `reachability` without changing `ip_stack`.
+`network_name` is `None` on Linux. Restricted environments must permit interface
+queries and access to procfs; query failures are reported through the existing
+monitor error/lifecycle API.
+
+The Linux network-change regression test creates its own user/network namespace
+and modifies only interfaces inside it. Run it explicitly on a Linux test host
+with `unshare`, `ip` (iproute2), and unprivileged user/network namespaces enabled:
+
+```sh
+cargo test --no-default-features --test net_status_linux -- --ignored --nocapture
+```
+
+The test fails if namespace isolation or network configuration is unavailable;
+ordinary `cargo test` leaves it ignored. The library itself does not depend on
+these test tools.
 
 ## Logging and errors
 

@@ -4,6 +4,7 @@ mod ip_stack;
 mod net_status_client;
 mod network_status;
 
+pub use crate::module::net_status::inner::shared::NetworkStatusContext;
 use crate::NetError;
 pub use ip_stack::IpStack;
 pub use net_status_client::NetStatusClient;

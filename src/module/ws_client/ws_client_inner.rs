@@ -1,5 +1,6 @@
 use crate::error::{ErrorKind, NetError};
-use crate::module::net_status::inner::inner_net_status_client::InnerNetStatusClient;
+use crate::module::net_status::inner::network_status_snapshot::NetworkStatusSnapshot;
+use crate::module::net_status::inner::shared::NetworkLease;
 use crate::module::transport::compiled_network_config::CompiledNetworkConfig;
 use crate::module::transport::failure::{ConnectStage, ConnectionFailure};
 use crate::module::ws_client::callback_event::CallbackEvent;
@@ -21,7 +22,7 @@ use crate::ws::{
     WebSocketClientConfig,
 };
 use crate::NetworkConfig;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -60,10 +61,11 @@ pub(crate) struct WSClientInner {
     config: Arc<WebSocketClientConfig>,
     network_config: Arc<NetworkConfig>,
     close_timeout: std::time::Duration,
-    net_status_client: Option<Arc<InnerNetStatusClient>>,
+    network_lease: Option<NetworkLease>,
     instance_id: ClientId,
     next_session_id: AtomicU64,
     session_admission: Mutex<Weak<ConnectionSession>>,
+    admission_failed: AtomicBool,
     task_observers: Arc<NativeTaskObserver>,
     message_resources: Arc<MessageResources>,
     pending_slots: Arc<Semaphore>,
@@ -83,7 +85,10 @@ impl WSClientInner {
     pub(crate) fn new_with_network(
         config: WebSocketClientConfig,
         network: Arc<CompiledNetworkConfig>,
-        net_status_client: Option<Arc<InnerNetStatusClient>>,
+        network_observation: Option<(
+            NetworkLease,
+            tokio::sync::watch::Receiver<NetworkStatusSnapshot>,
+        )>,
     ) -> Result<(Arc<Self>, WSClientWorker), NetError> {
         config.validate()?;
         let queue = PriorityWriteQueue::new(
@@ -115,15 +120,24 @@ impl WSClientInner {
         )?;
         let task_observers = NativeTaskObserver::new(task_executor, &config.dispatch)?;
         let message_resources = MessageResources::new(&config.dispatch)?;
-        let network_status = net_status_client.as_ref().map(|client| client.subscribe());
+        let (network_lease, network_status) = match network_observation {
+            Some((lease, receiver)) => (Some(lease), Some(receiver)),
+            None => (None, None),
+        };
+        // Historical shared losses predate this client's connections. Future
+        // epochs are still checked by the gate, establishment and I/O paths.
+        let network_loss_epoch = network_status.as_ref().map_or(0, |receiver| {
+            ::tokio::sync::watch::Receiver::borrow(receiver).loss_epoch
+        });
         let inner = Arc::new(Self {
             config: Arc::new(config.clone()),
             network_config: network.original(),
             close_timeout: config.close_timeout,
-            net_status_client: net_status_client.clone(),
+            network_lease: network_lease.clone(),
             instance_id,
             next_session_id: AtomicU64::new(0),
             session_admission: Mutex::new(Weak::new()),
+            admission_failed: AtomicBool::new(false),
             task_observers: Arc::clone(&task_observers),
             message_resources,
             pending_slots: Arc::new(Semaphore::new(config.requests.max_pending)),
@@ -139,9 +153,9 @@ impl WSClientInner {
             network_available: Arc::clone(&network_available),
         });
         let worker = WSClientWorker {
-            net_status_client,
+            network_lease,
             network_status,
-            network_loss_epoch: 0,
+            network_loss_epoch,
             task_observers,
             network,
             context_provider_slots: Arc::new(Semaphore::new(
@@ -181,7 +195,7 @@ impl WSClientInner {
         &self.network_config
     }
     pub(crate) fn is_shutdown(&self) -> bool {
-        self.shutdown.is_cancelled()
+        self.shutdown.is_cancelled() || self.admission_failed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn start_session(
@@ -215,6 +229,10 @@ impl WSClientInner {
                 .session_admission
                 .lock()
                 .map_err(NetError::from_poison)?;
+            // Coordinate with failed-session recovery under the same gate.
+            if self.is_shutdown() {
+                return Err(NetError::from(ErrorKind::Closed));
+            }
             previous = admission.upgrade();
             if previous
                 .as_ref()
@@ -316,8 +334,8 @@ impl WSClientInner {
         self.task_observers.close();
         self.pending_slots.close();
         self.shutdown.cancel();
-        if let Some(client) = &self.net_status_client {
-            client.request_destroy();
+        if let Some(lease) = &self.network_lease {
+            lease.release();
         }
         let _ = self.command_tx.try_send(ClientCommand::Shutdown);
     }
