@@ -341,3 +341,161 @@ async fn network_status_policy_client_opt_in_does_not_change_default_siblings() 
     .await;
     finish_factory_case(&engine, result).await
 }
+
+#[tokio::test]
+async fn shared_network_demand_isolated_between_pause_ignore_and_failed_ws_creation() -> TestResult
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let policy = NetworkConfig::default()
+        .with_network_status_policy(crate::NetworkStatusPolicy::PauseOnUnavailable);
+    let engine = OpenNet::new_with_network_config(policy)?;
+    let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = calls.clone();
+    engine
+        .inner
+        .network_status
+        .inner_for_test()
+        .set_monitor_factory_for_test(Arc::new(move || {
+            factory_calls.fetch_add(1, Ordering::SeqCst);
+            let (release, pending) = oneshot::channel::<()>();
+            let _ = attempted.send(release);
+            Box::pin(async move {
+                let _ = pending.await;
+                Err(NetError::from(crate::error::ErrorKind::Io))
+            })
+        }))?;
+    let result: TestResult = async {
+        let a = engine.create_ws_client("shared-pause-a").await?;
+        let attempt = tokio::time::timeout(FACTORY_TEST_TIMEOUT, attempts.recv())
+            .await?
+            .ok_or_else(|| test_error("shared provider did not initialize"))?;
+        let b = engine.create_ws_client("shared-pause-b").await?;
+        let ignore = engine
+            .create_ws_client_with_network_config(
+                "shared-ignore",
+                WebSocketClientConfig::default(),
+                NetworkConfig::default(),
+            )
+            .await?;
+        let _clone = b.clone();
+        check_eq!(engine.inner.network_status.active_consumers_for_test()?, 2)?;
+        let mut invalid = WebSocketClientConfig::default();
+        invalid.queues.commands = 0;
+        check!(engine
+            .create_ws_client_with_config("shared-invalid", invalid)
+            .await
+            .is_err())?;
+        check_eq!(
+            engine.inner.network_status.active_consumers_for_test()?,
+            2,
+            "failed construction leaked lease"
+        )?;
+        tokio::time::timeout(FACTORY_TEST_TIMEOUT, a.shutdown()).await??;
+        check_eq!(engine.inner.network_status.active_consumers_for_test()?, 1)?;
+        check!(
+            !attempt.is_closed(),
+            "one WS shutdown cancelled another's provider"
+        )?;
+        check_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "WS clients duplicated provider"
+        )?;
+        tokio::time::timeout(FACTORY_TEST_TIMEOUT, ignore.shutdown()).await??;
+        check_eq!(engine.inner.network_status.active_consumers_for_test()?, 1)?;
+        tokio::time::timeout(FACTORY_TEST_TIMEOUT, b.shutdown()).await??;
+        check!(
+            attempt.is_closed(),
+            "final WS shutdown retained provider initialization"
+        )?;
+        check_eq!(engine.inner.network_status.active_consumers_for_test()?, 0)?;
+        Ok(())
+    }
+    .await;
+    finish_factory_case(&engine, result).await
+}
+
+#[tokio::test]
+async fn accepted_factories_cannot_register_after_the_source_engine_drops() -> TestResult {
+    let engine = OpenNet::new_with_network_config(
+        NetworkConfig::default()
+            .with_network_status_policy(crate::NetworkStatusPolicy::PauseOnUnavailable),
+    )?;
+    let runtime = engine.inner.common_engine.clone();
+    let service = engine.inner.network_status.clone();
+    let context = service.context();
+    let ws_slots = engine.inner.clients.clone();
+    #[cfg(feature = "http-client")]
+    let http_slots = engine.inner.http_clients.clone();
+    let release = CancellationToken::new();
+    let _release_guard = release.clone().drop_guard();
+    let waiting = release.clone();
+    let (entered, entered_wait) = oneshot::channel();
+    runtime.post(async move {
+        let _ = entered.send(());
+        waiting.cancelled().await;
+    });
+    tokio::time::timeout(FACTORY_TEST_TIMEOUT, entered_wait).await??;
+    // Ignore skips lease admission, so its completed worker must still be
+    // rejected when the registry attempts a late Ready commit.
+    let mut ws = Box::pin(engine.create_ws_client_with_network_config(
+        "late-shared-ws",
+        WebSocketClientConfig::default(),
+        NetworkConfig::default(),
+    ));
+    check!(
+        poll_fn(|cx| Poll::Ready(ws.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "WS creation escaped its queue gate"
+    )?;
+    drop(ws);
+    let mut pause = Box::pin(engine.create_ws_client("late-shared-pause"));
+    check!(
+        poll_fn(|cx| Poll::Ready(pause.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "Pause creation escaped its queue gate"
+    )?;
+    drop(pause);
+    #[cfg(feature = "http-client")]
+    {
+        let config = crate::api::http::HttpClientConfig::new("http://127.0.0.1:9")?;
+        let mut http = Box::pin(engine.create_http_client_with_config("late-shared-http", config));
+        check!(
+            poll_fn(|cx| Poll::Ready(http.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "HTTP creation escaped its queue gate"
+        )?;
+        drop(http);
+    }
+    drop(engine);
+    check!(matches!(
+        context.snapshot()?.state,
+        crate::net_status::MonitorState::Closed
+    ))?;
+    release.cancel();
+    let (completed, completion) = oneshot::channel();
+    runtime.post(async move {
+        let _ = completed.send(());
+    });
+    tokio::time::timeout(FACTORY_TEST_TIMEOUT, completion).await??;
+    check_eq!(
+        service.active_consumers_for_test()?,
+        0,
+        "late factory retained observation demand"
+    )?;
+    check!(
+        ws_slots.lock().map_err(NetError::from_poison)?.is_empty(),
+        "late WS factory revived registry"
+    )?;
+    #[cfg(feature = "http-client")]
+    check!(
+        http_slots.lock().map_err(NetError::from_poison)?.is_empty(),
+        "late HTTP factory revived registry"
+    )?;
+    service.shutdown().await?;
+    Ok(())
+}

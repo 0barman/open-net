@@ -267,6 +267,9 @@ async fn drain(events: &mut ObservedSession) -> TestResult<Vec<ConnectionEvent>>
         check(result.len() <= 100, "unbounded event production")?;
     }
     check(terminal, "event stream omitted SessionTerminated")?;
+    // Journal EOF precedes lifecycle publication completion. Both Ok and Err
+    // from closed() complete the wait before the next session may be admitted.
+    let _completed = bounded("drained session cleanup", events.session.closed()).await?;
     Ok(result)
 }
 fn count(events: &[ConnectionEvent], predicate: impl Fn(&Kind) -> bool) -> usize {
@@ -1032,6 +1035,13 @@ async fn old_receiver_drop_does_not_cancel_new_session_and_recreation_changes_in
     let original = next_attempt_result(&mut old).await?;
     old.session.cancel();
     drain(&mut old).await?;
+    let terminal = bounded("old session cleanup", old.session.closed()).await?;
+    check(
+        terminal
+            .err()
+            .is_some_and(|error| error.kind() == open_net::error::ErrorKind::Cancelled),
+        "cancelled old session did not complete with its original cause",
+    )?;
     let mut current = session::observe(&client, options(&peer.url)).await?;
     peer.request().await?;
     let established = next_attempt_result(&mut current).await?;

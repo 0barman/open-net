@@ -14,6 +14,7 @@ pub(crate) struct OpenNetInner {
     pub(super) network: Arc<CompiledNetworkConfig>,
     #[allow(dead_code)]
     pub(crate) common_engine: Arc<CommonEngine>,
+    pub(crate) network_status: Arc<crate::module::net_status::inner::shared::SharedNetworkService>,
     pub(super) net_status_clients: Arc<Mutex<HashMap<String, NetStatusClientSlot>>>,
     #[cfg(feature = "ws-client")]
     pub(super) clients: Arc<Mutex<HashMap<String, ClientSlot>>>,

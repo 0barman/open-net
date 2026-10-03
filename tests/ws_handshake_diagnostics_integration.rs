@@ -288,6 +288,12 @@ async fn finish(
             .is_none(),
         "event appeared after Closed",
     )?;
+    // The journal can end before lifecycle cleanup publishes completion.
+    let completed = bounded("session cleanup completes", events.session.closed()).await?;
+    check(
+        matches!(completed, Err(ref terminal) if terminal.kind() == kind),
+        "closed changed terminal failure classification",
+    )?;
     Ok(failure)
 }
 
@@ -904,16 +910,13 @@ async fn late_old_session_diagnostics_survive_a_new_session_without_cancelling_i
     })
     .await?;
     peer.reply_sent().await?;
-    bounded("first session disconnected", async {
-        while !matches!(
-            old.session.state()?.state,
-            open_net::ws::ConnectionState::Closed(_)
-        ) {
-            tokio::task::yield_now().await;
-        }
-        Ok::<(), open_net::NetError>(())
-    })
-    .await??;
+    // Keep the old journal unread, but await its cleanup before admitting a new
+    // session. Observing a Closed state alone is not the completion barrier.
+    let completed = bounded("first session cleanup completes", old.session.closed()).await?;
+    check(
+        matches!(completed, Err(ref terminal) if terminal.kind() == ErrorKind::HandshakeRejected),
+        "first session changed terminal failure classification",
+    )?;
     old.session.cancel();
     let mut current = session::observe(&client, {
         let mut options = {

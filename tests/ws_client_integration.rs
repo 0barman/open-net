@@ -1,5 +1,7 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/backpressure.rs"]
+mod backpressure;
 #[path = "support/session.rs"]
 mod session;
 use session::{session_options, SessionGuard};
@@ -709,17 +711,18 @@ async fn fragmented_binary_is_reassembled_as_one_message_end_to_end() -> TestRes
 async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> TestResult {
     const FRAME_PAYLOAD_SIZE: usize = open_net::ws::FrameConfig::MIN_DATA_FRAME_PAYLOAD_SIZE;
     const PAYLOAD_SIZE: usize = 512 * 1_024;
-    const PEER_READ_DELAY: Duration = Duration::from_millis(3);
     const PONG_DELAY_LIMIT: Duration = Duration::from_millis(750);
     const PROBE_PAYLOAD: &[u8] = b"on-wire-ping-probe";
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let mut server = tokio::spawn(async move {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let mut server = backpressure::AbortOnDrop(tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
-        // Keep the peer's advertised receive window small as well: otherwise loopback TCP can
-        // acknowledge the whole message before this deliberately slow application reads it.
-        let _ = socket2::SockRef::from(&stream).set_recv_buffer_size(4 * 1_024);
+        // Establish pressure first, then restore the window when the test permits
+        // progress. Persistent tiny-window throughput is a separate native control.
+        socket2::SockRef::from(&stream).set_recv_buffer_size(4 * 1_024)?;
         accept_raw_websocket(&mut stream).await?;
 
         let first = read_masked_websocket_frame(&mut stream).await?;
@@ -732,12 +735,18 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> T
         let mut received_payload = first.payload;
         send_raw_control_frame(&mut stream, 0x9, PROBE_PAYLOAD).await?;
         let ping_sent_at = Instant::now();
+        blocked_tx
+            .send(())
+            .map_err(|_| io::Error::other("pressure observer closed"))?;
+        resume_rx
+            .await
+            .map_err(|_| io::Error::other("pressure release was dropped"))?;
+        backpressure::release_receive_window(&stream)?;
         let mut pong_elapsed = None;
         let mut data_complete = false;
         let mut data_frames_before_pong = 0_usize;
 
         while !data_complete || pong_elapsed.is_none() {
-            tokio::time::sleep(PEER_READ_DELAY).await;
             let frame = tokio::time::timeout(
                 Duration::from_secs(2),
                 read_masked_websocket_frame(&mut stream),
@@ -768,6 +777,11 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> T
                             "Pong payload does not match Ping payload",
                         ));
                     }
+                    if data_complete {
+                        return Err(io::Error::other(
+                            "Pong arrived after the complete data message",
+                        ));
+                    }
                     pong_elapsed.get_or_insert_with(|| ping_sent_at.elapsed());
                 }
                 0x8 => {
@@ -788,12 +802,12 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> T
         send_raw_control_frame(&mut stream, 0x8, &[]).await?;
         Ok::<_, io::Error>((
             received_payload,
-            pong_elapsed.expect("loop requires Pong"),
+            pong_elapsed.ok_or_else(|| io::Error::other("peer never observed Pong"))?,
             data_frames_before_pong,
         ))
-    });
+    }));
 
-    let open_net = OpenNet::new().expect("create open net");
+    let open_net = OpenNet::new()?;
     let client = open_net
         .create_ws_client_with_config("on-wire-pong-test", {
             let mut config = WebSocketClientConfig::default();
@@ -806,8 +820,7 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> T
             });
             config
         })
-        .await
-        .expect("create client");
+        .await?;
     let mut _session = SessionGuard::establish(
         &client,
         session_options(
@@ -821,7 +834,7 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> T
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>(),
     );
-    let send_result = tokio::time::timeout(Duration::from_secs(10), async {
+    let mut sending = Box::pin(async {
         _session
             .session
             .sender()
@@ -830,30 +843,31 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> T
             .await?
             .written()
             .await
-    })
-    .await;
-    let probe_result = tokio::time::timeout(Duration::from_secs(10), &mut server).await;
-    if probe_result.is_err() {
-        server.abort();
-        let _ = server.await;
-    }
+    });
+    check(
+        futures::poll!(sending.as_mut()).is_pending(),
+        "send did not reach a pending write",
+    )?;
+    tokio::time::timeout(Duration::from_secs(10), blocked_rx).await??;
+    check(
+        futures::poll!(sending.as_mut()).is_pending(),
+        "body completed before peer pressure release",
+    )?;
+    resume_tx
+        .send(())
+        .map_err(|_| io::Error::other("peer stopped before pressure release"))?;
+    let send_result = tokio::time::timeout(Duration::from_secs(10), sending).await;
+    let probe_result = tokio::time::timeout(Duration::from_secs(10), &mut server.0).await;
     let destroy_result = open_net.destroy_ws_client("on-wire-pong-test").await;
-
-    send_result
-        .expect("fragmented send timed out")
-        .expect("send fragmented binary");
-    let probe = probe_result
-        .expect("raw peer timed out")
-        .expect("raw peer task")
-        .expect("raw peer protocol");
-    destroy_result.expect("destroy client");
-
-    let (received_payload, pong_elapsed, data_frames_before_pong) = probe;
-    assert_eq!(received_payload.as_slice(), payload.as_ref());
-    assert!(
-        pong_elapsed <= PONG_DELAY_LIMIT,
-        "Pong arrived after {pong_elapsed:?} ({data_frames_before_pong} data frames were observed before it; limit {PONG_DELAY_LIMIT:?})"
-    );
+    send_result??;
+    let (received_payload, pong_elapsed, data_frames_before_pong) = probe_result???;
+    destroy_result?;
+    check(
+        received_payload.as_slice() == payload.as_ref(),
+        "fragmented payload changed",
+    )?;
+    check(pong_elapsed <= PONG_DELAY_LIMIT, &format!(
+        "Pong arrived after {pong_elapsed:?} ({data_frames_before_pong} data frames before it; limit {PONG_DELAY_LIMIT:?})"))?;
     Ok(())
 }
 

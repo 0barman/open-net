@@ -21,9 +21,39 @@ pub(crate) struct QueuedRequest {
     pub(crate) slot_permit: Option<OwnedSemaphorePermit>,
     pub(crate) byte_permit: Option<OwnedSemaphorePermit>,
     pub(crate) completed: bool,
+    pub(crate) retirement: Option<crate::module::ws_client::native_pending::DeferredTermination>,
 }
 impl QueuedRequest {
+    pub(crate) fn prepare_retirement(&mut self, error: &NetError) {
+        if self.retirement.is_none() && !self.completed {
+            let cause = match error.kind() {
+                crate::error::ErrorKind::Cancelled => TaskEndCause::Cancelled,
+                crate::error::ErrorKind::TimedOut => TaskEndCause::Expired,
+                crate::error::ErrorKind::Closed | crate::error::ErrorKind::NotConnected => {
+                    TaskEndCause::Disconnected
+                }
+                crate::error::ErrorKind::EngineDropped => TaskEndCause::Shutdown,
+                _ => TaskEndCause::Failed,
+            };
+            self.retirement = Some(
+                self.dispatch_phase
+                    .prepare_termination(error.clone(), cause),
+            );
+        }
+    }
+    /// Called only after Q is released. Capacity returns before any notification.
+    pub(crate) fn dispatch_retirement(&mut self) {
+        if let Some(retirement) = self.retirement.take() {
+            self.completed = true;
+            drop((self.slot_permit.take(), self.byte_permit.take()));
+            retirement.dispatch();
+        }
+    }
     pub(crate) fn complete(mut self, result: Result<()>) {
+        self.dispatch_retirement();
+        if self.completed {
+            return;
+        }
         self.completed = true;
         drop((self.slot_permit.take(), self.byte_permit.take()));
         let result = match (result, self.registration.as_ref()) {

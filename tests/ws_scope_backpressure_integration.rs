@@ -1,5 +1,7 @@
 #![cfg(feature = "ws-client")]
 
+#[path = "support/backpressure.rs"]
+mod backpressure;
 #[path = "support/session.rs"]
 mod session;
 
@@ -98,7 +100,13 @@ async fn terminated(events: &mut ObservedSession) -> TestResult {
             }
             seen_terminal = matches!(event.kind, ConnectionEventKind::Closed { .. });
         }
-        check(seen_terminal, "missing SessionTerminated")
+        check(seen_terminal, "missing SessionTerminated")?;
+        let completed = events.session.closed().await;
+        check(
+            matches!(completed, Err(ref cause)
+            if cause.kind() == open_net::error::ErrorKind::Cancelled),
+            "cancelled scope did not reach its completion barrier",
+        )
     })
     .await?
 }
@@ -125,7 +133,12 @@ async fn run_scope_backpressure(revoke_while_blocked: bool) -> TestResult {
     let (finish_peer_tx, finish_peer_rx) = oneshot::channel();
     let mut peer = PeerTask(tokio::spawn(async move {
         let (stream, _) = bounded("accept old socket", listener.accept()).await??;
-        SockRef::from(&stream).set_recv_buffer_size(4096)?;
+        // The revoked case keeps the original tiny-window control. For recovery,
+        // pausing reads plus the confirmed Pending write establishes pressure;
+        // a permanently tiny TCP window must not dominate the transfer budget.
+        if revoke_while_blocked {
+            SockRef::from(&stream).set_recv_buffer_size(4096)?;
+        }
         let receive_buffer = SockRef::from(&stream).recv_buffer_size()?;
         let mut socket = bounded(
             "accept old Upgrade",
@@ -176,6 +189,9 @@ async fn run_scope_backpressure(revoke_while_blocked: bool) -> TestResult {
         // Resume immediately after cancellation is published, before local tasks
         // have necessarily stopped. The control run resumes without cancellation.
         bounded("release old peer backpressure", resume_read_rx).await??;
+        if !revoke_while_blocked {
+            backpressure::release_receive_window(socket.get_mut())?;
+        }
         let received = bounded("drain retired socket to EOF or reset", async {
             let mut received = prefix.len();
             let mut buffer = [0_u8; 8192];

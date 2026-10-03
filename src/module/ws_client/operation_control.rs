@@ -1,7 +1,7 @@
 //! The single state and completion authority shared by writer and receipts.
 use crate::common::log::log_def::LogType;
 use crate::error::{ErrorKind, NetError};
-use crate::module::ws_client::native_pending::NativePending;
+use crate::module::ws_client::native_pending::{DeferredTermination, NativePending};
 use crate::module::ws_client::native_task_observer::TaskEventReservation;
 use crate::module::ws_client::write::priority_write_queue::PriorityWriteQueue;
 use crate::ws::cancellation::CancelHookGuard;
@@ -77,17 +77,18 @@ impl OperationPublication {
             hook,
             retired_error,
         } = self;
+        // Queue ownership and its capacity retire before waking terminal waiters.
+        if let Some((queue, token, error)) = queue {
+            if let Some(queue) = queue.upgrade() {
+                queue.cancel_queued_with_error(&token, error);
+            }
+        }
         drop((hook, retired_error));
         if let Some(token) = retirement {
             token.cancel();
         }
         if let Some(token) = cancelled {
             token.cancel();
-        }
-        if let Some((queue, token, error)) = queue {
-            if let Some(queue) = queue.upgrade() {
-                queue.cancel_queued_with_error(&token, error);
-            }
         }
         if let Some((reservation, event)) = task {
             if let Err(error) = reservation.publish(event) {
@@ -518,6 +519,52 @@ impl OperationControl {
     pub(crate) fn expire(&self) -> Result<TerminationOutcome> {
         self.terminate(NetError::from(ErrorKind::TimedOut), TaskEndCause::Expired)
     }
+    /// Choose a queue retirement while Q is held, without executing side effects.
+    /// Release C before acquiring P; a last strong pending owner travels out of Q.
+    pub(crate) fn prepare_termination(
+        &self,
+        error: NetError,
+        cause: TaskEndCause,
+    ) -> DeferredTermination {
+        let mut state = self.lock();
+        if let Some(identity) = state.pending.clone() {
+            drop(state);
+            if let Some(table) = identity.table.upgrade() {
+                let mut deferred = table.prepare_termination(
+                    &identity.id,
+                    identity.token,
+                    error,
+                    cause,
+                    Some(self),
+                );
+                deferred.pending = Some(table);
+                return deferred;
+            }
+            // Table Drop has begun. Only this original control is eligible, and
+            // a previously selected response/cancellation remains the winner.
+            let (_, publication) = self.select_failure(
+                NetError::from(ErrorKind::EngineDropped),
+                TaskEndCause::Shutdown,
+            );
+            return DeferredTermination {
+                publication: Some(publication),
+                retired_error: Some(error),
+                ..Default::default()
+            };
+        }
+        let publication = OperationPublication {
+            retired_error: Some(error.clone()),
+            ..Default::default()
+        };
+        let (outcome, publication) =
+            self.select_failure_locked(&mut state, error, cause, publication);
+        DeferredTermination {
+            outcome: Some(outcome),
+            publication: Some(publication),
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn terminate(
         &self,
         error: NetError,

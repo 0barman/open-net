@@ -9,7 +9,9 @@ use std::pin::Pin;
 ///
 /// Each item is an independently owned [`Bytes`] chunk. `None` marks clean EOF;
 /// an error item terminates delivery for the associated response. The stream is
-/// `'static` so it can outlive the worker future that opened the response.
+/// `'static` so it can outlive the worker future that opened the response. After
+/// its first error it returns permanent EOF. Absolute attempt and total deadlines
+/// continue elapsing while consumption is paused; the next poll observes expiry.
 pub type HttpByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, NetError>> + Send + 'static>>;
 
 /// A response whose body is consumed incrementally.
@@ -17,6 +19,11 @@ pub type HttpByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, NetError>> + S
 /// Headers and status are available immediately; body bytes are pulled from
 /// [`Self::stream`] with [`Self::next_chunk`]. The response does not buffer the
 /// whole body and therefore is appropriate for large or long-lived payloads.
+///
+/// The stream retains admission capacity until a poll observes EOF, cancellation,
+/// error, or timeout, or until it is dropped. An unpolled, retained stream does not
+/// clean itself up in the background and may keep `HttpClient::drain` waiting.
+/// The opening runtime must remain alive while its network I/O is consumed.
 pub struct HttpStreamResponse {
     /// Response status code returned by the peer.
     pub status: StatusCode,

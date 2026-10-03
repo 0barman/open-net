@@ -24,6 +24,8 @@ pub(crate) struct PriorityWriteQueue {
     task_slots: Arc<Semaphore>,
     byte_slots: Arc<Semaphore>,
     max_bytes: u32,
+    #[cfg(test)]
+    before_retired_dispatch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl PriorityWriteQueue {
     pub(crate) fn new(max_tasks: usize, max_bytes: usize) -> Result<Arc<Self>> {
@@ -42,6 +44,8 @@ impl PriorityWriteQueue {
             task_slots: Arc::new(Semaphore::new(max_tasks)),
             byte_slots: Arc::new(Semaphore::new(max_bytes)),
             max_bytes: max_bytes as u32,
+            #[cfg(test)]
+            before_retired_dispatch: Mutex::new(None),
         }))
     }
     pub(crate) fn sequence() -> Result<u64> {
@@ -174,7 +178,7 @@ impl PriorityWriteQueue {
     }
     pub(crate) fn commit_prepared(&self, cancel: &CancellationToken) -> Result<()> {
         let mut state = self.state.lock().map_err(NetError::from_poison)?;
-        let request = state
+        let mut request = state
             .prepared
             .remove(cancel)
             .ok_or_else(|| NetError::from(ErrorKind::Cancelled))?;
@@ -186,6 +190,7 @@ impl PriorityWriteQueue {
         {
             Ok(guard) => guard,
             Err(error) => {
+                request.prepare_retirement(&error);
                 drop(state);
                 request.complete(Err(error.clone()));
                 return Err(error);
@@ -195,14 +200,16 @@ impl PriorityWriteQueue {
             Self::can_admit(&state, &request).and_then(|()| request.dispatch_phase.enqueue());
         if let Err(error) = admission {
             drop(group_guard);
+            request.prepare_retirement(&error);
             drop(state);
             request.complete(Err(error.clone()));
             return Err(error);
         }
-        if let Err(request) = state.heap.push(request) {
+        if let Err(mut request) = state.heap.push(request) {
             drop(group_guard);
-            drop(state);
             let error = NetError::from(ErrorKind::ResourceExhausted);
+            request.prepare_retirement(&error);
+            drop(state);
             request.complete(Err(error.clone()));
             return Err(error);
         }
@@ -218,13 +225,17 @@ impl PriorityWriteQueue {
     ) -> bool {
         let removed = {
             let mut state = self.lock();
-            state
+            let mut removed = state
                 .prepared
                 .remove(token)
-                .or_else(|| state.heap.remove(token))
+                .or_else(|| state.heap.remove(token));
+            if let Some(request) = &mut removed {
+                request.prepare_retirement(&error);
+            }
+            removed
         };
-        if let Some(request) = removed {
-            request.complete(Err(error));
+        if let Some(mut request) = removed {
+            request.dispatch_retirement();
             true
         } else {
             false
@@ -250,15 +261,24 @@ impl PriorityWriteQueue {
     pub(crate) fn try_next(&self) -> Option<QueuedRequest> {
         self.lock().heap.pop()
     }
-    pub(crate) fn drain_with_error(&self, _error: NetError) -> Vec<QueuedRequest> {
+    pub(crate) fn drain_with_error(&self, error: NetError) -> Vec<QueuedRequest> {
         let mut state = self.lock();
         let mut requests = state.heap.drain();
         requests.extend(state.prepared.drain().map(|(_, request)| request));
+        for request in &mut requests {
+            request.prepare_retirement(&error);
+        }
+        drop(state);
+        #[cfg(test)]
+        self.before_retired_dispatch_for_test();
+        for request in &mut requests {
+            request.dispatch_retirement();
+        }
         requests
     }
     pub(crate) fn drain_rejected_on_disconnect_with_error(
         &self,
-        _error: NetError,
+        error: NetError,
     ) -> Vec<QueuedRequest> {
         let mut state = self.lock();
         let mut rejected = Vec::new();
@@ -286,8 +306,28 @@ impl PriorityWriteQueue {
             }
         }
         state.prepared = retained;
+        for request in &mut rejected {
+            request.prepare_retirement(&error);
+        }
+        drop(state);
+        #[cfg(test)]
+        self.before_retired_dispatch_for_test();
+        for request in &mut rejected {
+            request.dispatch_retirement();
+        }
         rejected
     }
+    #[cfg(test)]
+    fn before_retired_dispatch_for_test(&self) {
+        let hook = match self.before_retired_dispatch.lock() {
+            Ok(mut hook) => hook.take(),
+            Err(error) => error.into_inner().take(),
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.lock().closed = true;
         self.task_slots.close();
@@ -472,3 +512,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "retirement_race_tests.rs"]
+mod retirement_race_tests;

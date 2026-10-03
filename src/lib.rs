@@ -15,6 +15,8 @@ pub use api::{
     LogListener, LogSubscription, LogType, Logger, Metadata, MonitorState, NetError,
     NetStatusClient, NetworkSnapshot, NetworkStatus, OpenNet, OpenNetConfig, Result, StatusCode,
 };
+#[cfg(feature = "http-client")]
+pub use async_trait::async_trait;
 #[cfg(feature = "ws-client")]
 pub(crate) use network::{NetworkConfig, NetworkStatusPolicy, ProxyConfig};
 

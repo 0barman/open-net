@@ -1,9 +1,24 @@
 use super::{ClientId, ConnectOptions, JournalOptions, Session, WebSocketClientConfig};
 use crate::module::ws_client::ws_client_inner::WSClientInner;
-use crate::{network::NetworkConfig, Result};
+use crate::{network::NetworkConfig, LogType, Result};
 use std::{fmt, sync::Arc};
 
 /// Shared entry point for WebSocket clients, used to create sessions, query configuration, and close the client.
+///
+/// # Example
+///
+/// ```no_run
+/// use open_net::{ws::WebSocketClient, OpenNet, Result};
+///
+/// # async fn example() -> Result<()> {
+/// let net = OpenNet::new()?;
+/// let client: WebSocketClient = net.create_ws_client("market-feed").await?;
+/// println!("Client id: {}", client.id());
+/// client.shutdown().await?;
+/// net.destroy_ws_client("market-feed").await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct WebSocketClient {
     /// Configuration, session management, and shutdown state common to all client clones.
@@ -34,7 +49,10 @@ impl WebSocketClient {
     /// fn log_client(client: &WebSocketClient) {
     ///     let worker_client = client.clone();
     ///     assert_eq!(client.id(), worker_client.id());
-    ///     println!("Preparing to process business messages from client {}", client.id());
+    ///     println!(
+    ///         "Preparing to process business messages from client {}",
+    ///         client.id()
+    ///     );
     /// }
     /// ```
     pub fn id(&self) -> ClientId {
@@ -60,7 +78,10 @@ impl WebSocketClient {
     ///
     /// fn config_for_another_client(client: &WebSocketClient) -> WebSocketClientConfig {
     ///     let current = client.config();
-    ///     println!("Normal sending queue can hold up to {} messages", current.queues.normal.max_items);
+    ///     println!(
+    ///         "Normal sending queue can hold up to {} messages",
+    ///         current.queues.normal.max_items
+    ///     );
     ///
     ///     // Pass the adjusted configuration to OpenNet::create_ws_client_with_config.
     ///     let mut next = current.clone();
@@ -91,7 +112,10 @@ impl WebSocketClient {
     ///
     /// fn direct_config_for_another_client(client: &WebSocketClient) -> NetworkConfig {
     ///     let current = client.network_config();
-    ///     println!("Network status policy: {:?}", current.network_status_policy());
+    ///     println!(
+    ///         "Network status policy: {:?}",
+    ///         current.network_status_policy()
+    ///     );
     ///
     ///     // Keep current TLS and network state policies, only change to direct for new clients.
     ///     // Pass the return value to OpenNet::create_ws_client_with_network_config.
@@ -150,7 +174,10 @@ impl WebSocketClient {
     /// let session = client.connect(options).await?;
     /// // The connection has succeeded; keep holding the session while the
     /// // subscription is active.
-    /// session.sender().send(r#"{"op":"subscribe","topic":"prices"}"#).await?;
+    /// session
+    ///     .sender()
+    ///     .send(r#"{"op":"subscribe","topic":"prices"}"#)
+    ///     .await?;
     ///
     /// // Close the session when the work is complete; the client can create
     /// // another session afterward.
@@ -160,6 +187,8 @@ impl WebSocketClient {
     /// # }
     /// ```
     pub async fn connect(&self, options: impl Into<ConnectOptions>) -> Result<Session> {
+        let options = options.into();
+        crate::log_s!(LogType::WSC; "connect", "options", format!("{:?}", options));
         let session = self.start_session(options, None).await?;
         session.wait_connected().await?;
         Ok(session)
@@ -238,7 +267,9 @@ impl WebSocketClient {
         options: impl Into<ConnectOptions>,
         journal: Option<JournalOptions>,
     ) -> Result<Session> {
-        self.inner.start_session(options.into(), journal).await
+        let options = options.into();
+        crate::log_s!(LogType::WSC; "start_session", "options|journal", format!("{:?}", options), format!("{:?}", journal));
+        self.inner.start_session(options, journal).await
     }
 
     /// Determine whether the client has received a shutdown request.
@@ -316,6 +347,7 @@ impl WebSocketClient {
     /// }
     /// ```
     pub async fn shutdown(&self) -> Result<()> {
+        crate::log_s!(LogType::WSC; "shutdown");
         self.inner.shutdown().await
     }
 }

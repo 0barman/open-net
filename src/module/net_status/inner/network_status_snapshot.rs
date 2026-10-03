@@ -32,6 +32,8 @@ struct SourceState {
 pub(super) struct NetworkStatusSource {
     state: Arc<Mutex<SourceState>>,
     sender: watch::Sender<NetworkStatusSnapshot>,
+    facts: watch::Sender<NetworkSnapshot>,
+    failure: watch::Sender<Option<NetError>>,
     publisher: StatePublisher<NetworkSnapshot>,
     observations: StateSource<NetworkSnapshot>,
 }
@@ -100,6 +102,8 @@ impl NetworkStatusSource {
         let (publisher, observations) =
             StateSource::new_arc(snapshot.clone(), executor, max_subscriptions)?;
         let (sender, _) = watch::channel(NetworkStatusSnapshot::default());
+        let (facts, _) = watch::channel((*snapshot).clone());
+        let (failure, _) = watch::channel(None);
         Ok(Self {
             state: Arc::new(Mutex::new(SourceState {
                 generation: 0,
@@ -111,6 +115,8 @@ impl NetworkStatusSource {
                 publication_error: None,
             })),
             sender,
+            facts,
+            failure,
             publisher,
             observations,
         })
@@ -119,8 +125,25 @@ impl NetworkStatusSource {
     pub(super) fn subscribe(&self) -> watch::Receiver<NetworkStatusSnapshot> {
         self.sender.subscribe()
     }
+    pub(super) fn subscribe_facts(&self) -> watch::Receiver<NetworkSnapshot> {
+        self.facts.subscribe()
+    }
+    pub(super) fn subscribe_failure(&self) -> watch::Receiver<Option<NetError>> {
+        self.failure.subscribe()
+    }
     pub(super) fn observe(&self) -> Result<StateReceiver<NetworkSnapshot>, NetError> {
         self.observations.subscribe()
+    }
+    pub(super) fn fail(&self, error: NetError) -> Result<NetworkPublication, NetError> {
+        let mut state = self.state.lock().map_err(NetError::from_poison)?;
+        // A permanent close wins over a late preparation failure. The caller
+        // still receives its original start error, while the shared source
+        // keeps the readable Closed terminal state and does not reopen its
+        // failure channel after destruction.
+        if matches!(state.snapshot.state, MonitorState::Closed) {
+            return Ok(NetworkPublication::empty());
+        }
+        Ok(self.fail_publication(&mut state, error, None))
     }
     pub(super) fn snapshot(&self) -> Result<NetworkSnapshot, NetError> {
         let snapshot = {
@@ -221,6 +244,7 @@ impl NetworkStatusSource {
         state.revision = next.revision;
         state.loss_epoch = next.loss_epoch;
         let retired = std::mem::replace(&mut state.snapshot, next);
+        self.facts.send_replace((*state.snapshot).clone());
         if let Some(gating) = gating {
             state.gating = gating;
             // Preserve the existing internal gate commit timing. This watch is never
@@ -244,6 +268,7 @@ impl NetworkStatusSource {
         let terminal = self.publisher.prepare_failure(error.clone());
         state.active = false;
         state.publication_error = Some(error.clone());
+        self.failure.send_replace(Some(error.clone()));
         if state.gating.status.is_some() {
             // On exhaustion there is no next version. Revoke the internal fact without
             // wrapping its counter; the public observation ends explicitly with an error.

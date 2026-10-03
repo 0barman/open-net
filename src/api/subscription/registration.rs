@@ -1,4 +1,4 @@
-use super::source::SourceCore;
+use super::source::{SourceCore, SourceState};
 use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::task::{Context, Poll, Waker};
@@ -10,6 +10,10 @@ type Driver = dyn Fn() -> Result<()> + Send + Sync + 'static;
 pub(super) struct Registration<T> {
     pub(super) id: SubscriptionId,
     source: Weak<SourceCore<T>>,
+    read_committed: bool,
+    // Retain only snapshots after the source owner goes away. In particular,
+    // this does not retain the source's executor or subscription budget.
+    committed_state: Option<Arc<Mutex<SourceState<T>>>>,
     pub(super) state: Mutex<RegistrationState<T>>,
     #[cfg(all(test, feature = "ws-client"))]
     after_pending: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -32,6 +36,7 @@ pub(super) struct RegistrationState<T> {
     permit: Option<Arc<OwnedSemaphorePermit>>,
     receive_waker: Option<Waker>,
     close_waker: Option<Waker>,
+    lifetime: Option<Box<dyn Send + Sync>>,
 }
 enum Delivery<T> {
     Value(Arc<T>),
@@ -72,17 +77,20 @@ impl<T> Registration<T> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         id: SubscriptionId,
-        source: Weak<SourceCore<T>>,
+        source: &Arc<SourceCore<T>>,
         executor: Arc<dyn CallbackExecutor>,
         current: Arc<T>,
         revision: u64,
         closed: bool,
         failure: Option<NetError>,
         permit: OwnedSemaphorePermit,
+        read_committed: bool,
     ) -> Self {
         Self {
             id,
-            source,
+            source: Arc::downgrade(source),
+            read_committed,
+            committed_state: read_committed.then(|| source.state.clone()),
             #[cfg(all(test, feature = "ws-client"))]
             after_pending: Mutex::new(None),
             state: Mutex::new(RegistrationState {
@@ -103,11 +111,26 @@ impl<T> Registration<T> {
                 permit: Some(Arc::new(permit)),
                 receive_waker: None,
                 close_waker: None,
+                lifetime: None,
             }),
         }
     }
     pub(super) fn is_active(&self) -> bool {
         lock(&self.state).active
+    }
+    #[cfg_attr(not(any(feature = "http-client", test)), allow(dead_code))]
+    pub(super) fn bind_lifetime(&self, lifetime: Box<dyn Send + Sync>) -> Result<()> {
+        let mut state = lock(&self.state);
+        if !state.active || state.source_closed {
+            drop(state);
+            return Err(NetError::from(ErrorKind::Closed));
+        }
+        if state.lifetime.is_some() {
+            drop(state);
+            return Err(NetError::from(ErrorKind::InvalidInput));
+        }
+        state.lifetime = Some(lifetime);
+        Ok(())
     }
     #[cfg(all(test, feature = "ws-client"))]
     pub(super) fn after_pending_for_test(&self, hook: impl FnOnce() + Send + 'static) {
@@ -130,22 +153,78 @@ impl<T> Registration<T> {
     ) {
         let retired = {
             let mut state = lock(&self.state);
-            if !state.active || state.source_closed || revision < state.revision {
+            if !state.active || revision < state.revision {
                 return;
             }
-            let old = std::mem::replace(&mut state.latest, value.clone());
-            state.revision = revision;
-            state.source_closed = closed;
-            let old_pending = std::mem::replace(&mut state.pending_error, failure.clone());
-            let old_error = std::mem::replace(&mut state.final_error, failure.clone());
-            (old, old_pending, old_error, state.receive_waker.take())
+            if state.source_closed {
+                // A committed-cache read may have imported the terminal value
+                // before its deferred notification. Preserve that notification
+                // without reinstalling an already consumed terminal error.
+                if !self.read_committed || !closed || revision != state.revision {
+                    return;
+                }
+                (None, None, None, state.receive_waker.take(), None)
+            } else {
+                let old = std::mem::replace(&mut state.latest, value.clone());
+                state.revision = revision;
+                state.source_closed = closed;
+                let old_pending = std::mem::replace(&mut state.pending_error, failure.clone());
+                let old_error = std::mem::replace(&mut state.final_error, failure.clone());
+                let lifetime = if closed { state.lifetime.take() } else { None };
+                (
+                    Some(old),
+                    old_pending,
+                    old_error,
+                    state.receive_waker.take(),
+                    lifetime,
+                )
+            }
         };
-        let (old, old_pending, old_error, waker) = retired;
+        let (old, old_pending, old_error, waker, lifetime) = retired;
+        // SDK ownership is retired before any user-controlled destructor or wake.
+        drop(lifetime);
         drop((old, old_pending, old_error));
         if let Some(waker) = waker {
             waker.wake();
         }
         let _ = self.schedule();
+    }
+    /// Refresh only on a consumer's own stack. No lifecycle publisher calls this
+    /// path, and no user value, lifetime token or waker is released under a lock.
+    fn refresh_committed(&self) {
+        let Some(source) = &self.committed_state else {
+            return;
+        };
+        let (value, revision, closed, failure) = {
+            let source = lock(source);
+            (
+                source.current.clone(),
+                source.revision,
+                source.closed,
+                source.failure.clone(),
+            )
+        };
+        let retired = {
+            let mut state = lock(&self.state);
+            if !state.active
+                || state.source_closed
+                || revision < state.revision
+                || (revision == state.revision && !closed)
+            {
+                drop(state);
+                return;
+            }
+            let old = std::mem::replace(&mut state.latest, value);
+            state.revision = revision;
+            state.source_closed = closed;
+            let pending_error = std::mem::replace(&mut state.pending_error, failure.clone());
+            let final_error = std::mem::replace(&mut state.final_error, failure);
+            let lifetime = if closed { state.lifetime.take() } else { None };
+            (old, pending_error, final_error, lifetime)
+        };
+        let (old, pending_error, final_error, lifetime) = retired;
+        drop(lifetime);
+        drop((old, pending_error, final_error));
     }
     pub(super) fn unsubscribe(&self) -> bool {
         let retired = {
@@ -168,12 +247,15 @@ impl<T> Registration<T> {
                 state.permit.take(),
                 state.receive_waker.take(),
                 close_waker,
+                state.lifetime.take(),
             )
         };
         if let Some(source) = self.source.upgrade() {
             source.remove(self.id);
         }
-        let (initial, error, callback, driver, executor, permit, receive, close) = retired;
+        let (initial, error, callback, driver, executor, permit, receive, close, lifetime) =
+            retired;
+        drop(lifetime);
         drop((initial, error, callback, driver, executor, permit));
         if let Some(waker) = receive {
             waker.wake();
@@ -228,10 +310,12 @@ impl<T> Registration<T> {
 }
 impl<T: Clone> Registration<T> {
     pub(super) fn current(&self) -> T {
+        self.refresh_committed();
         let value = lock(&self.state).latest.clone();
         (*value).clone()
     }
     pub(super) fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Result<T>>> {
+        self.refresh_committed();
         let new_waker = cx.waker().clone();
         let (delivery, old) = {
             let mut state = lock(&self.state);
@@ -322,6 +406,7 @@ impl<T: Clone + Send + Sync + 'static> Registration<T> {
     }
     fn run_callbacks(self: &Arc<Self>, completion: &mut RunnerCompletion<'_, T>) {
         loop {
+            self.refresh_committed();
             let (delivery, callback, close) = {
                 let mut state = lock(&self.state);
                 let delivery = state.next();

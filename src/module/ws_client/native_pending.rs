@@ -25,6 +25,14 @@ pub(crate) struct NativePending {
     admission_closed: CancellationToken,
     state: Mutex<PendingState>,
     changed: Arc<Notify>,
+    #[cfg(test)]
+    before_close_dispatch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    fail_disconnected_allocation: std::sync::atomic::AtomicBool,
 }
 
 struct PendingState {
@@ -52,6 +60,7 @@ struct PendingEntry {
     deferred_cause: Option<TaskEndCause>,
     response: oneshot::Sender<Result<Response>>,
     permit: OwnedSemaphorePermit,
+    retirement: Option<(OperationPublication, NetError)>,
 }
 
 struct DispatchRecord {
@@ -61,10 +70,43 @@ struct DispatchRecord {
     expires_at: Instant,
 }
 
-struct Completion {
+pub(crate) struct Completion {
     entry: PendingEntry,
     publication: OperationPublication,
     response: Result<Response>,
+}
+
+/// Owns terminal side effects and every possibly final table/error owner until
+/// the outer queue lock has been released. No Drop implementation dispatches it.
+#[must_use]
+#[derive(Default)]
+pub(crate) struct DeferredTermination {
+    pub(crate) outcome: Option<TerminationOutcome>,
+    pub(crate) publication: Option<OperationPublication>,
+    pub(crate) completion: Option<Completion>,
+    pub(crate) pending: Option<Arc<NativePending>>,
+    pub(crate) retired_error: Option<NetError>,
+}
+impl DeferredTermination {
+    pub(crate) fn dispatch(self) {
+        let Self {
+            completion,
+            publication,
+            pending,
+            retired_error,
+            ..
+        } = self;
+        if let Some(completion) = completion {
+            completion.dispatch();
+        }
+        if let Some(publication) = publication {
+            publication.dispatch();
+        }
+        if let Some(pending) = &pending {
+            pending.changed.notify_one();
+        }
+        drop((retired_error, pending));
+    }
 }
 
 struct TimerRetirement {
@@ -144,6 +186,14 @@ impl NativePending {
                 closed: false,
             }),
             changed: Arc::new(Notify::new()),
+            #[cfg(test)]
+            before_close_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            before_drop: Mutex::new(None),
+            #[cfg(test)]
+            before_prepare: Mutex::new(None),
+            #[cfg(test)]
+            fail_disconnected_allocation: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -260,6 +310,7 @@ impl NativePending {
                 deferred_cause: None,
                 response: sender,
                 permit,
+                retirement: None,
             },
         );
         drop(state);
@@ -447,6 +498,75 @@ impl NativePending {
         Ok(true)
     }
 
+    /// Q -> P -> C is permitted; this method only chooses a result and transfers
+    /// resources. The caller must dispatch after releasing its own locks.
+    pub(crate) fn prepare_termination(
+        &self,
+        id: &RequestId,
+        token: u64,
+        error: NetError,
+        cause: TaskEndCause,
+        original: Option<&OperationControl>,
+    ) -> DeferredTermination {
+        #[cfg(test)]
+        {
+            let hook = match self.before_prepare.lock() {
+                Ok(mut hook) => hook.take(),
+                Err(error) => error.into_inner().take(),
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut deferred = DeferredTermination {
+            retired_error: Some(error.clone()),
+            ..Default::default()
+        };
+        // Recover the private table to retire existing entries on a poisoned lock;
+        // never invoke user callbacks while the outer queue may still be locked.
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                crate::log_e!(LogType::WSC; "pending_retirement", "error", "lock_poisoned_recovered");
+                poisoned.into_inner()
+            }
+        };
+        let Some(entry) = state
+            .entries
+            .get(id)
+            .filter(|entry| entry.registration.token() == token)
+        else {
+            if let Some(original) = original {
+                // A missing/mismatched registration is only a completed result
+                // when the original control actually owns one. Never touch a
+                // replacement entry with the same application ID.
+                let (outcome, publication) = original.select_failure(
+                    NetError::from(ErrorKind::EngineDropped),
+                    TaskEndCause::Shutdown,
+                );
+                deferred.outcome = Some(outcome);
+                deferred.publication = Some(publication);
+            } else {
+                deferred.outcome = Some(TerminationOutcome::AlreadyFinished);
+            }
+            return deferred;
+        };
+        let (outcome, publication) = entry.core.select_failure(error.clone(), cause);
+        let response_error = selected_error(&entry.core, error);
+        deferred.outcome = Some(outcome);
+        match state.entries.remove(id) {
+            Some(entry) => {
+                deferred.completion = Some(Completion {
+                    entry,
+                    publication,
+                    response: Err(response_error),
+                })
+            }
+            None => deferred.publication = Some(publication),
+        }
+        deferred
+    }
+
     pub(crate) fn terminate(
         &self,
         id: &RequestId,
@@ -454,29 +574,12 @@ impl NativePending {
         error: NetError,
         cause: TaskEndCause,
     ) -> Result<TerminationOutcome> {
-        let mut state = self.lock()?;
-        let Some(entry) = state.entries.get(id) else {
-            return Ok(TerminationOutcome::AlreadyFinished);
-        };
-        if entry.registration.token() != token {
-            return Ok(TerminationOutcome::AlreadyFinished);
-        }
-        let (outcome, publication) = entry.core.select_failure(error.clone(), cause);
-        let response_error = selected_error(&entry.core, error);
-        let entry = state.entries.remove(id);
-        drop(state);
-        if let Some(entry) = entry {
-            Completion {
-                entry,
-                publication,
-                response: Err(response_error),
-            }
-            .dispatch();
-        } else {
-            publication.dispatch();
-        }
-        self.changed.notify_one();
-        Ok(outcome)
+        let deferred = self.prepare_termination(id, token, error, cause, None);
+        let outcome = deferred
+            .outcome
+            .ok_or_else(|| NetError::from(ErrorKind::Internal));
+        deferred.dispatch();
+        outcome
     }
 
     pub(crate) fn complete_response(
@@ -840,23 +943,93 @@ impl NativePending {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_before_drop_for_test(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
+        let previous = self
+            .before_drop
+            .lock()
+            .map_err(NetError::from_poison)?
+            .replace(Box::new(hook));
+        drop(previous);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn set_before_prepare_for_test(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
+        let previous = self
+            .before_prepare
+            .lock()
+            .map_err(NetError::from_poison)?
+            .replace(Box::new(hook));
+        drop(previous);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_disconnected_allocation_for_test(&self) {
+        self.fail_disconnected_allocation
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_close_dispatch_for_test(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
+        let previous = self
+            .before_close_dispatch
+            .lock()
+            .map_err(NetError::from_poison)?
+            .replace(Box::new(hook));
+        drop(previous);
+        Ok(())
+    }
+    #[cfg(test)]
+    fn before_close_dispatch_for_test(&self) {
+        let hook = match self.before_close_dispatch.lock() {
+            Ok(mut hook) => hook.take(),
+            Err(error) => error.into_inner().take(),
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     pub(crate) fn close(&self, error: NetError, cause: TaskEndCause) -> Result<()> {
         let mut state = self.lock()?;
         state.closed = true;
         state.active = None;
+        // Reuse each entry for its deferred publication: shutdown does not need a
+        // new Vec allocation, and a missing entry always has a stable winner.
+        for entry in state.entries.values_mut() {
+            let selected = entry
+                .deferred_error
+                .clone()
+                .map_or_else(|| error.clone(), |error| error);
+            let selected_cause = entry.deferred_cause.map_or(cause, |cause| cause);
+            let (_, publication) = entry.core.select_failure(selected.clone(), selected_cause);
+            let response = selected_error(&entry.core, selected);
+            entry.retirement = Some((publication, response));
+        }
         let entries = std::mem::take(&mut state.entries);
         state.dispatches.clear();
         drop(state);
+        #[cfg(test)]
+        self.before_close_dispatch_for_test();
         self.admission_closed.cancel();
-        for (_, entry) in entries {
-            let (_, publication) = entry.core.select_failure(error.clone(), cause);
-            let result = Err(selected_error(&entry.core, error.clone()));
-            Completion {
-                entry,
-                publication,
-                response: result,
+        for (_, mut entry) in entries {
+            if let Some((publication, error)) = entry.retirement.take() {
+                Completion {
+                    entry,
+                    publication,
+                    response: Err(error),
+                }
+                .dispatch();
             }
-            .dispatch();
         }
         self.changed.notify_one();
         Ok(())
@@ -868,6 +1041,13 @@ impl NativePending {
         let mut completions = Vec::new();
         let mut ids = Vec::new();
         let mut state = self.lock()?;
+        #[cfg(test)]
+        if self
+            .fail_disconnected_allocation
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(NetError::from(ErrorKind::ResourceExhausted));
+        }
         completions
             .try_reserve(state.entries.len())
             .map_err(|_| NetError::from(ErrorKind::ResourceExhausted))?;
@@ -1060,6 +1240,16 @@ impl PendingEntry {
 
 impl Drop for NativePending {
     fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            let hook = match self.before_drop.get_mut() {
+                Ok(hook) => hook.take(),
+                Err(error) => error.into_inner().take(),
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let state = match self.state.get_mut() {
             Ok(state) => state,
             Err(poisoned) => {

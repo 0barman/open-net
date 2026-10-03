@@ -157,9 +157,11 @@ impl Session {
     pub async fn wait_connected(&self) -> Result<ConnectionInfo> {
         self.runtime.lifecycle.wait_connected().await
     }
-    /// Waits for the session's terminal result.
+    /// Waits for lifecycle publication and cleanup to complete, then returns the
+    /// immutable terminal result. A cancelled session may return an error and
+    /// still permit a new session on a live client. Client shutdown is permanent.
     pub async fn closed(&self) -> Result<SessionEnd> {
-        self.runtime.lifecycle.closed().await
+        self.inner.wait_session_closed(&self.runtime).await
     }
     /// Notifies the client that network access may have returned.
     ///
@@ -187,18 +189,14 @@ impl Session {
     }
     /// Gracefully closes the session using the protocol's default close frame.
     pub async fn close(&self) -> Result<SessionEnd> {
-        self.inner
-            .close_session(&self.runtime.lifecycle, None)
-            .await
+        self.inner.close_session(&self.runtime, None).await
     }
     /// Gracefully closes the session with an application-supplied close frame.
     ///
     /// The returned value describes session termination; it does not guarantee
     /// that a peer has processed the close frame.
     pub async fn close_with(&self, frame: CloseFrame) -> Result<SessionEnd> {
-        self.inner
-            .close_session(&self.runtime.lifecycle, Some(frame))
-            .await
+        self.inner.close_session(&self.runtime, Some(frame)).await
     }
 }
 impl Drop for Session {

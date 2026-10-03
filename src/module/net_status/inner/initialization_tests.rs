@@ -14,11 +14,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 // 每次初始化调用返回独立 Future；成功分支使用真实 netwatch 检测器。
-pub(super) type MonitorFactory = Arc<
+pub(crate) type MonitorFactory = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<netwatch::netmon::Monitor, NetError>> + Send>>
         + Send
         + Sync,
 >;
+
+#[path = "provider_barrier_tests.rs"]
+mod provider_barrier_tests;
 
 // 每次检测器构造在此门前停留，使并发调用先共享同一个初始化结果。
 struct Attempt {
@@ -609,10 +612,12 @@ async fn dropping_unpolled_task_retires_generation_and_reports_failure() -> Test
 }
 
 #[tokio::test]
-// 旧任务在新代成功之后才被释放时，必须按代身份清理且不能清空新代内部观测。
-async fn late_old_task_drop_cannot_remove_or_clear_new_generation() -> TestResult {
+// 新代必须等待旧任务真退出；退出后迟到的旧观测仍不能覆盖新代。
+async fn retired_task_exits_before_restart_and_late_facts_cannot_clear_new_generation() -> TestResult
+{
     let (client, mut gate) = client_with_gate()?;
     let old = install_unpolled(&client)?;
+    let old_state = client.current_state()?.ok_or("old state missing")?;
     let (_, error) = client.request_stop(false);
     if let Some(error) = error {
         return Err(error.into());
@@ -622,11 +627,10 @@ async fn late_old_task_drop_cannot_remove_or_clear_new_generation() -> TestResul
         matches!(poll_once(fresh.as_mut()).await, Poll::Pending),
         "fresh start must wait",
     )?;
-    gate.next().await?.finish(Ok(()))?;
-    bounded(fresh).await??;
-    let current = client
-        .current_state()?
-        .ok_or_else(|| std::io::Error::other("fresh state missing"))?;
+    check(
+        client.current_state()?.is_none(),
+        "restart skipped old task completion",
+    )?;
     drop(old.task);
     check(
         matches!(
@@ -634,6 +638,20 @@ async fn late_old_task_drop_cannot_remove_or_clear_new_generation() -> TestResul
             MonitorInitialization::Stopped
         ) && *::tokio::sync::watch::Receiver::borrow(&old.done),
         "old stopped task did not settle",
+    )?;
+    check(
+        poll_once(fresh.as_mut()).await.is_pending(),
+        "fresh constructor did not wait",
+    )?;
+    gate.next().await?.finish(Ok(()))?;
+    bounded(fresh).await??;
+    let current = client
+        .current_state()?
+        .ok_or_else(|| std::io::Error::other("fresh state missing"))?;
+    InnerNetStatusClient::update_state_inner(
+        &old_state,
+        crate::module::net_status::NetworkStatus::Unavailable,
+        crate::module::net_status::IpStack::V4Only,
     )?;
     let after = client
         .current_state()?

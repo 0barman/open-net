@@ -24,7 +24,7 @@ impl OpenNetInner {
         }
         // Construction only allocates the facade; monitoring starts explicitly.
         // Admission and publication are atomic and have no cancellation point.
-        let client = NetStatusClient::new(Arc::clone(&self.common_engine))?;
+        let client = NetStatusClient::new(self.network_status.context())?;
         clients.insert(
             thread_name.to_owned(),
             NetStatusClientSlot::Ready(client.clone()),
@@ -78,9 +78,15 @@ impl OpenNetInner {
         // Cleanup belongs to the engine once submitted. Dropping the caller's
         // future cannot strand a Closing reservation or revive the old client.
         self.common_engine.runtime_handle().spawn(async move {
-            let result = client.destroy().await;
-            if let Ok(mut clients) = clients.lock() {
+            let result = client.destroy().await.and_then(|()| {
+                let mut clients = clients.lock().map_err(NetError::from_poison)?;
                 clients.remove(&name);
+                Ok(())
+            });
+            // An error is not proof that internal cleanup completed. Keep the
+            // Closing reservation and report failure, even if its waiter left.
+            if let Err(error) = &result {
+                crate::log_e!(crate::common::log::log_def::LogType::Engine; "net_status_destroy_cleanup", "error", crate::common::log::summary::error(error));
             }
             let _ = completed.send(result);
         });
@@ -91,10 +97,13 @@ impl OpenNetInner {
 
     pub(super) fn stop_net_status_clients(&self) {
         let entries = {
-            let mut clients = self
-                .net_status_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut clients = match self.net_status_clients.lock() {
+                Ok(clients) => clients,
+                Err(poisoned) => {
+                    crate::log_e!(crate::common::log::log_def::LogType::Engine; "net_status_registry_drop", "error", "poisoned_registry_recovered");
+                    poisoned.into_inner()
+                }
+            };
             clients.drain().map(|(_, slot)| slot).collect::<Vec<_>>()
         };
         for slot in entries {
@@ -104,5 +113,66 @@ impl OpenNetInner {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_error_tests {
+    use crate::{error::ErrorKind, OpenNet};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn failed_named_cleanup_retains_closing_name_reservation() -> Result<(), crate::BoxError>
+    {
+        let net = OpenNet::new()?;
+        let (entered, entry) = oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        net.inner
+            .network_status
+            .inner_for_test()
+            .set_monitor_factory_for_test(Arc::new(move || {
+                if let Ok(mut entered) = entered.lock() {
+                    if let Some(entered) = entered.take() {
+                        let _ = entered.send(());
+                    }
+                }
+                Box::pin(std::future::pending())
+            }))?;
+        let client = net.create_net_status_client("cleanup-error-name").await?;
+        let waiting = client.clone();
+        let start = tokio::spawn(async move { waiting.start().await });
+        tokio::time::timeout(Duration::from_secs(5), entry).await??;
+        net.inner
+            .network_status
+            .inner_for_test()
+            .exhaust_source_revision_for_test()?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            net.destroy_net_status_client("cleanup-error-name"),
+        )
+        .await?;
+        if !matches!(result, Err(error) if error.kind() == ErrorKind::Internal) {
+            return Err("cleanup did not report its source publication failure".into());
+        }
+        if tokio::time::timeout(Duration::from_secs(5), start)
+            .await??
+            .is_ok()
+        {
+            return Err("closed facade kept a successful pending start".into());
+        }
+        if !matches!(net.get_net_status_client("cleanup-error-name"), Err(error) if error.kind() == ErrorKind::ConnectionClosing)
+        {
+            return Err("failed cleanup prematurely released the Closing name".into());
+        }
+        if !matches!(net.create_net_status_client("cleanup-error-name").await, Err(error) if error.kind() == ErrorKind::ClientAlreadyExists)
+        {
+            return Err("unconfirmed cleanup allowed name reuse".into());
+        }
+        if net.inner.network_status.active_consumers_for_test()? != 0 {
+            return Err("failed cleanup retained monitoring demand".into());
+        }
+        Ok(())
     }
 }

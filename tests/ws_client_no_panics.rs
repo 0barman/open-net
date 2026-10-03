@@ -1,4 +1,4 @@
-//! Guard the entire source directory, including inline tests and macro bodies.
+//! Guard production source and the existing integration-test scope, including macro bodies.
 //! Tokenization ignores comments and string literals without hiding nested calls.
 
 use proc_macro2::{TokenStream, TokenTree};
@@ -47,10 +47,58 @@ fn is_absolute_tokio_watch_borrow(tokens: &[TokenTree], index: usize) -> bool {
     }
 }
 
+fn is_test_only_attribute(group: &proc_macro2::Group) -> bool {
+    if group.delimiter() != proc_macro2::Delimiter::Bracket {
+        return false;
+    }
+    let mut attribute = group.stream().into_iter();
+    matches!(attribute.next(), Some(TokenTree::Ident(name)) if name == "cfg")
+        && matches!(attribute.next(), Some(TokenTree::Group(condition))
+            if condition.delimiter() == proc_macro2::Delimiter::Parenthesis
+                && condition.stream().to_string() == "test")
+        && attribute.next().is_none()
+}
+
+fn test_function_or_module_follows(tokens: &[TokenTree], start: usize) -> bool {
+    let mut remaining = tokens.get(start..).into_iter().flatten();
+    while let Some(token) = remaining.next() {
+        match token {
+            TokenTree::Punct(punct) if punct.as_char() == '#' => {
+                if !matches!(remaining.next(), Some(TokenTree::Group(attribute))
+                    if attribute.delimiter() == proc_macro2::Delimiter::Bracket)
+                {
+                    return false;
+                }
+            }
+            TokenTree::Ident(name) if name == "pub" || name == "async" || name == "const" => {}
+            TokenTree::Ident(name) => return name == "fn" || name == "mod",
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn forbidden_operations(stream: TokenStream, findings: &mut Vec<String>, inherited_import: bool) {
     let tokens: Vec<_> = stream.into_iter().collect();
     let mut in_import = inherited_import;
+    let mut test_only_item = false;
     for (index, token) in tokens.iter().enumerate() {
+        if matches!(token, TokenTree::Punct(punct) if punct.as_char() == '#')
+            && matches!(tokens.get(index + 1), Some(TokenTree::Group(attribute)) if is_test_only_attribute(attribute))
+            && test_function_or_module_follows(&tokens, index + 2)
+        {
+            test_only_item = true;
+        }
+        if test_only_item {
+            // Only an exact outer cfg(test) proves that the item is absent from
+            // production. Other cfg expressions and all production macros remain scanned.
+            if matches!(token, TokenTree::Group(group) if group.delimiter() == proc_macro2::Delimiter::Brace)
+                || matches!(token, TokenTree::Punct(punct) if punct.as_char() == ';')
+            {
+                test_only_item = false;
+            }
+            continue;
+        }
         match token {
             TokenTree::Group(group) => forbidden_operations(group.stream(), findings, in_import),
             TokenTree::Punct(punct) if punct.as_char() == ';' => in_import = inherited_import,
@@ -760,6 +808,47 @@ fn scanner_ignores_literals_comments_and_fallible_alternatives() -> TestResult {
     "###;
     if !scan(source)?.is_empty() {
         return Err("scanner rejected comments, literals or safe alternatives".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn scanner_excludes_only_explicit_test_items_and_keeps_production_violations() -> TestResult {
+    let source = r#"
+        fn production_before() { value.unwrap(); }
+        #[cfg(test)]
+        mod tests { fn negative_control() { value.unwrap(); assert!(false); } }
+        #[cfg(test)] #[allow(dead_code)]
+        fn test_helper() { value.expect("test"); }
+        #[cfg(test)] mod external_tests;
+        fn production_after() { value.expect("production"); }
+        #[cfg(not(test))] fn release() { panic!("production"); }
+        #[cfg(any(test, feature = "production"))] fn shared() { todo!(); }
+        macro_rules! production_macro { () => { value.borrow_mut() }; }
+        struct Mixed { #[cfg(test)] test_field: (), production: [u8; value.unwrap_err()] }
+    "#;
+    let findings = scan(source)?;
+    for operation in [
+        "unwrap",
+        "expect",
+        "panic",
+        "todo",
+        "borrow_mut",
+        "unwrap_err",
+    ] {
+        if findings
+            .iter()
+            .filter(|finding| finding.ends_with(&format!(": {operation}")))
+            .count()
+            != 1
+        {
+            return Err(
+                format!("production operation {operation} was hidden: {findings:?}").into(),
+            );
+        }
+    }
+    if findings.len() != 6 {
+        return Err(format!("test-only code was misclassified: {findings:?}").into());
     }
     Ok(())
 }

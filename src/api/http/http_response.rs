@@ -9,9 +9,10 @@ use std::str::Utf8Error;
 
 /// Monotonic identifier assigned to a request by an HTTP client.
 ///
-/// The identifier is unique within one client lifetime and is suitable for
-/// cancellation and correlation. It is not a server-visible request ID and is
-/// not persisted across client restarts.
+/// Automatically assigned identifiers increase without wrapping during a client
+/// lifetime. Custom identifiers must be unique among in-flight requests and may
+/// be reused after cleanup. Identifiers support cancellation and correlation;
+/// they are not server-visible and are not persisted across client restarts.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HttpRequestId(pub u64);
 

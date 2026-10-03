@@ -7,8 +7,8 @@ use crate::ws::WebSocketClientConfig;
 use crate::common::log::log_def::LogType;
 use crate::common::platform::spawn;
 use crate::error::NetError;
-use crate::module::net_status::inner::inner_net_status_client::InnerNetStatusClient;
 use crate::module::net_status::inner::network_status_snapshot::NetworkStatusSnapshot;
+use crate::module::net_status::inner::shared::NetworkLease;
 use crate::module::net_status::NetworkStatus;
 use crate::module::transport::compiled_network_config::CompiledNetworkConfig;
 use crate::module::transport::failure::{ConnectStage, ConnectionFailure};
@@ -143,19 +143,10 @@ impl WSClientWorker {
     /// 剩余回调任务随 runtime 退出。
     async fn run_async(mut self) {
         crate::log_t!(LogType::WSC; "run_async", "generation", self.generation);
-        if let Some(client) = self.net_status_client.clone() {
-            let shutdown = self.shutdown.clone();
-            spawn(async move {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {}
-                    result = client.start() => {
-                        if let Err(error) = &result {
-                            crate::log_e!(LogType::WSC; "network_monitor_start", "error", format!("{error:?}"));
-                        }
-                    }
-                }
-            });
+        if let Some(lease) = &self.network_lease {
+            if let Err(error) = lease.ensure_started() {
+                crate::log_e!(LogType::WSC; "network_monitor_start", "error", format!("{error:?}"));
+            }
         }
         if let Some(callback_rx) = self.data_callback_rx.take() {
             spawn(data_callback_loop(
@@ -288,9 +279,9 @@ impl WSClientWorker {
         self.drain_data_callbacks_until(terminal_response_deadline)
             .await;
         self.clear_listeners();
-        if let Some(client) = self.net_status_client.take() {
-            if let Err(error) = client.destroy().await {
-                crate::log_e!(LogType::WSC; "network_monitor_destroy", "error", format!("{error:?}"));
+        if let Some(lease) = self.network_lease.take() {
+            if let Err(error) = lease.release().wait().await {
+                crate::log_e!(LogType::WSC; "network_monitor_release", "error", format!("{error:?}"));
             }
         }
         self.shutdown_complete.cancel();

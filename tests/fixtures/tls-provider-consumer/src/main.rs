@@ -1,5 +1,7 @@
 use futures_util::StreamExt;
-use open_net::{NetworkConfig, OpenNet, ReconnectPolicy, RootCertificateMode, TlsConfig};
+use open_net::network::{NetworkConfig, RootCertificateMode, TlsConfig};
+use open_net::ws::ReconnectPolicy;
+use open_net::OpenNet;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::error::Error;

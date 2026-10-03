@@ -253,15 +253,13 @@ async fn real_tcp_blackhole_times_out_without_network_events_and_explicit_connec
         bounded(relay.entered.recv())
             .await?
             .ok_or("relay ended before retaining its blackholed sockets")?;
-        tokio::time::timeout(BLACKHOLE_BUDGET, async {
-            while session
-                .state()
-                .is_ok_and(|s| matches!(s.state, ConnectionState::Connected(_)))
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await?;
+        // Leaving Connected can first publish Closing. Await lifecycle cleanup
+        // before checking the terminal state or immediately creating a session.
+        let completed = tokio::time::timeout(BLACKHOLE_BUDGET, session.closed()).await?;
+        if !matches!(completed, Err(ref error) if error.kind() == open_net::error::ErrorKind::TimedOut)
+        {
+            return Err(format!("blackhole completion changed its timeout result: {completed:?}").into());
+        }
         if !matches!(session.state()?.state, ConnectionState::Closed(_))
             || session
                 .state()?

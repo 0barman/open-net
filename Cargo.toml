@@ -3,7 +3,7 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.1.0-beta.2"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.89"
 description = "A cross-platform async networking library with WebSocket clients and network status monitoring."
@@ -26,7 +26,7 @@ required-features = ["ws-client"]
 [features]
 default = ["ws-client"]
 ws-client = ["dep:tokio-tungstenite", "dep:tokio-util", "dep:socket2", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:httparse", "dep:base64", "dep:uuid", "dep:getrandom"]
-http-client = ["dep:async-trait", "dep:reqwest", "dep:rustls", "dep:hyper"]
+http-client = ["dep:async-trait", "dep:reqwest", "dep:rustls", "dep:hyper", "dep:hyper-util", "dep:tower-service"]
 
 [dependencies]
 serde_json = "1.0.151"
@@ -72,6 +72,9 @@ reqwest = { version = "0.12.28", default-features = false, optional = true, feat
     "json",
 ] }
 hyper = { version = "1.11.1", default-features = false, optional = true, features = ["http1"] }
+# These private typed-error compatibility boundaries are tied to the audited lock versions.
+hyper-util = { version = "=0.1.20", default-features = false, optional = true, features = ["client-legacy", "client-proxy", "tokio"] }
+tower-service = { version = "=0.3.3", optional = true }
 
 
 [target.'cfg(windows)'.dependencies]

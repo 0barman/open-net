@@ -160,7 +160,8 @@ async fn disconnect_rebuild_failure_returns_owned_request_for_cleanup() -> TestR
     queue.lock().heap.reject_next_reservation();
     let rejected = queue.drain_rejected_on_disconnect_with_error(NetError::from(ErrorKind::Closed));
     check_eq!(rejected.len(), 1)?;
-    capacity(&queue, 0)?;
+    // Failure retirement has returned capacity before terminal notification.
+    capacity(&queue, 1)?;
     for request in rejected {
         request.complete(Err(NetError::from(ErrorKind::Closed)));
     }
@@ -405,11 +406,13 @@ fn drain_closes_all_indexes_and_error_source_drops_outside_queue_lock() -> TestR
             queue.drain_with_error(error)
         };
         check_eq!(drained.len(), 2)?;
+        // The selected terminal error now stays owned by the retired controls.
+        // Its last reference must still be destroyed only after releasing Q.
+        drop(drained);
         check!(
             unlocked.load(Ordering::SeqCst),
             "error source dropped under queue lock"
         )?;
-        drop(drained);
         capacity(&queue, 2)?;
         check!(queue.lock().heap.valid())?;
         check!(queue.lock().prepared.is_empty())?;

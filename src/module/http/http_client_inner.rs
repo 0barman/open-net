@@ -2,29 +2,41 @@
 
 use crate::api::error::{ErrorKind, ErrorStage, NetError};
 use crate::api::http::HttpClient;
+use crate::module::http::http_failure::{
+    map_body_error, map_reqwest_error, retry_reason_for_error,
+};
+use crate::module::http::network_observation::HttpNetworkObservation;
+use crate::net_status::{NetworkSnapshot, NetworkStatusContext};
+use crate::subscription::StateReceiver;
+#[path = "http_stream_body.rs"]
+mod stream_body;
 use crate::api::http::{
     HttpClientConfig, HttpRequest, HttpRequestId, HttpRequestOptions, HttpRequestTrait,
-    HttpResponse, HttpResponseResult, HttpStreamResponse,
+    HttpResponse, HttpResponseResult, HttpStreamResponse, RetryEvent, RetryObserverHandle,
+    RetryReason, RetryReport,
 };
 use bytes::BytesMut;
 use futures_util::{FutureExt, StreamExt};
 use http::Method;
 use reqwest::{Client, Response};
 use std::collections::HashMap;
+#[cfg(test)]
 use std::error::Error as StdError;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use std::time::{Duration, Instant};
+use stream_body::{FusedHttpBody, StreamBudget, StreamOwner};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 pub(crate) fn create_http_client(
     thread_name: String,
     config: HttpClientConfig,
+    context: NetworkStatusContext,
 ) -> Result<HttpClient, NetError> {
-    HttpClient::new(config, thread_name)
+    HttpClient::new_with_network_status(config, thread_name, context)
 }
 
 pub(crate) struct SendJob {
@@ -33,6 +45,8 @@ pub(crate) struct SendJob {
     pub(crate) request_id: HttpRequestId,
     pub(crate) control: Arc<CancellationSignal>,
     pub(crate) registry: Arc<RequestRegistry>,
+    pub(crate) permit: OwnedSemaphorePermit,
+    pub(crate) operation_start: Instant,
 }
 
 type ReceiveJob = CallbackJob;
@@ -43,6 +57,7 @@ struct CallbackJob {
     request_id: HttpRequestId,
     control: Arc<CancellationSignal>,
     registry: Arc<RequestRegistry>,
+    _permit: OwnedSemaphorePermit,
 }
 
 enum SendCommand {
@@ -54,17 +69,124 @@ pub(crate) struct HttpClientInner {
     shutdown_sent: AtomicBool,
     admission_gate: Mutex<()>,
     shutdown_notify: Arc<Notify>,
-    next_request_id: AtomicU64,
     shutdown_state: Arc<ShutdownState>,
     client: Client,
     config: Arc<HttpClientConfig>,
     registry: Arc<RequestRegistry>,
+    in_flight: Arc<Semaphore>,
+    network_observation: Option<Arc<HttpNetworkObservation>>,
 }
 
 struct ShutdownState {
     joins: Mutex<Option<Vec<JoinHandle<()>>>>,
     result: Mutex<Option<Result<(), NetError>>>,
     notify: Notify,
+}
+
+struct RetryObserverLifecycle {
+    observer: Option<RetryObserverHandle>,
+    operation_start: Instant,
+    attempts: u32,
+    retry_count: u32,
+    current_attempt: Option<u32>,
+    terminal_reason: Option<RetryReason>,
+    last_retry_reason: Option<RetryReason>,
+    completed: bool,
+}
+
+impl RetryObserverLifecycle {
+    fn new(observer: Option<RetryObserverHandle>, operation_start: Instant) -> Self {
+        Self {
+            observer,
+            operation_start,
+            attempts: 0,
+            retry_count: 0,
+            current_attempt: None,
+            terminal_reason: None,
+            last_retry_reason: None,
+            completed: false,
+        }
+    }
+
+    fn attempt_started(&mut self, attempt: u32) {
+        self.attempts = self.attempts.max(attempt);
+        self.current_attempt = Some(attempt);
+        if let Some(observer) = &self.observer {
+            observer.notify(RetryEvent::AttemptStarted { attempt });
+        }
+    }
+
+    fn note_reason(&mut self, reason: RetryReason) {
+        self.terminal_reason = Some(reason);
+    }
+
+    fn retry_scheduled(&mut self, attempt: u32, delay: Duration, reason: RetryReason) {
+        self.retry_count = self.retry_count.saturating_add(1);
+        self.last_retry_reason = Some(reason);
+        if let Some(observer) = &self.observer {
+            observer.notify(RetryEvent::RetryScheduled { attempt, delay });
+            observer.notify(RetryEvent::AttemptFinished {
+                attempt,
+                final_attempt: false,
+            });
+        }
+        self.current_attempt = None;
+    }
+
+    fn complete(&mut self, result: &HttpResponseResult, exhausted: bool) {
+        self.complete_summary(result.as_ref().map(|response| response.status), exhausted);
+    }
+
+    fn complete_summary(&mut self, result: Result<http::StatusCode, &NetError>, exhausted: bool) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        self.emit_terminal(Some(result), exhausted);
+    }
+
+    fn emit_terminal(
+        &mut self,
+        result: Option<Result<http::StatusCode, &NetError>>,
+        exhausted: bool,
+    ) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        if let Some(attempt) = self.current_attempt.take() {
+            observer.notify(RetryEvent::AttemptFinished {
+                attempt,
+                final_attempt: true,
+            });
+        }
+        let final_reason = match result {
+            Some(Ok(status)) if status.is_success() => None,
+            Some(Ok(status)) => Some(RetryReason::HttpStatus(status)),
+            Some(Err(error)) => self
+                .terminal_reason
+                .or_else(|| Some(retry_reason_for_error(error))),
+            None => self.terminal_reason.or(self.last_retry_reason),
+        };
+        observer.notify(RetryEvent::Completed(RetryReport {
+            attempts: self.attempts,
+            retry_count: self.retry_count,
+            elapsed: self.operation_start.elapsed(),
+            final_reason,
+            exhausted,
+            last_error: result
+                .and_then(Result::err)
+                .map(|error| format!("{:?}", error.kind())),
+        }));
+    }
+}
+
+impl Drop for RetryObserverLifecycle {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.emit_terminal(None, false);
+        }
+    }
 }
 
 pub(crate) struct RegistrationGuard {
@@ -101,7 +223,7 @@ impl CancellationSignal {
         }
     }
 
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         if !self.cancelled.swap(true, Ordering::AcqRel) {
             self.notify.notify_waiters();
         }
@@ -123,60 +245,120 @@ impl CancellationSignal {
     }
 }
 
+struct StreamRegistrationLease {
+    registry: Arc<RequestRegistry>,
+    request_id: HttpRequestId,
+    control: Arc<CancellationSignal>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for StreamRegistrationLease {
+    fn drop(&mut self) {
+        self.registry.finish(self.request_id, &self.control);
+    }
+}
+
+pub(crate) struct RegisteredRequest {
+    pub(crate) id: HttpRequestId,
+    pub(crate) control: Arc<CancellationSignal>,
+}
+
+struct RegistryState {
+    entries: HashMap<HttpRequestId, Arc<CancellationSignal>>,
+    next_id: Option<u64>,
+}
+
 pub(crate) struct RequestRegistry {
-    entries: Mutex<HashMap<HttpRequestId, Arc<CancellationSignal>>>,
+    state: Mutex<RegistryState>,
     changed: Notify,
 }
 
 impl RequestRegistry {
     fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(RegistryState {
+                entries: HashMap::new(),
+                next_id: Some(1),
+            }),
             changed: Notify::new(),
         }
     }
 
     fn register(
         self: &Arc<Self>,
-        request_id: HttpRequestId,
-    ) -> Result<(Arc<CancellationSignal>, RegistrationGuard), NetError> {
-        let mut entries = self.entries.lock().map_err(NetError::from_poison)?;
-        if entries.contains_key(&request_id) {
-            return Err(NetError::from(ErrorKind::DuplicateRequestId).with_stage(ErrorStage::Queue));
-        }
+        requested: Option<HttpRequestId>,
+    ) -> Result<(RegisteredRequest, RegistrationGuard), NetError> {
+        let mut state = self.state.lock().map_err(NetError::from_poison)?;
+        let request_id = match requested {
+            Some(id) => {
+                if state.entries.contains_key(&id) {
+                    return Err(
+                        NetError::from(ErrorKind::DuplicateRequestId).with_stage(ErrorStage::Queue)
+                    );
+                }
+                id
+            }
+            None => loop {
+                let value = state.next_id.ok_or_else(|| {
+                    NetError::from(ErrorKind::ResourceExhausted).with_stage(ErrorStage::Queue)
+                })?;
+                state.next_id = value.checked_add(1);
+                let id = HttpRequestId(value);
+                if !state.entries.contains_key(&id) {
+                    break id;
+                }
+            },
+        };
+        state.entries.try_reserve(1).map_err(|_| {
+            NetError::from(ErrorKind::ResourceExhausted).with_stage(ErrorStage::Queue)
+        })?;
         let signal = Arc::new(CancellationSignal::new());
-        entries.insert(request_id, Arc::clone(&signal));
+        state.entries.insert(request_id, Arc::clone(&signal));
         let guard = RegistrationGuard {
             registry: Arc::clone(self),
             request_id,
             control: Arc::clone(&signal),
             committed: AtomicBool::new(false),
         };
-        Ok((signal, guard))
+        Ok((
+            RegisteredRequest {
+                id: request_id,
+                control: signal,
+            },
+            guard,
+        ))
     }
 
     fn finish(&self, request_id: HttpRequestId, control: &Arc<CancellationSignal>) {
-        match self.entries.lock() {
-            Ok(mut entries) => {
-                if entries
+        let removed = match self.state.lock() {
+            Ok(mut state) => {
+                if state
+                    .entries
                     .get(&request_id)
                     .is_some_and(|entry| Arc::ptr_eq(entry, control))
                 {
-                    entries.remove(&request_id);
-                    self.changed.notify_waiters();
+                    state.entries.remove(&request_id)
+                } else {
+                    None
                 }
             }
             Err(_) => {
                 crate::log_e!(crate::LogType::HTTP; "request_registry", "error", "registry_poisoned");
+                None
             }
+        };
+        if removed.is_some() {
+            self.changed.notify_waiters();
         }
+        drop(removed);
     }
 
     fn cancel(&self, request_id: HttpRequestId) -> Result<(), NetError> {
         let signal = self
-            .entries
+            .state
             .lock()
             .map_err(NetError::from_poison)?
+            .entries
             .get(&request_id)
             .cloned();
         if let Some(signal) = signal {
@@ -187,9 +369,10 @@ impl RequestRegistry {
 
     fn cancel_all(&self) -> Result<(), NetError> {
         let signals = self
-            .entries
+            .state
             .lock()
             .map_err(NetError::from_poison)?
+            .entries
             .values()
             .cloned()
             .collect::<Vec<_>>();
@@ -201,9 +384,10 @@ impl RequestRegistry {
 
     fn is_empty(&self) -> Result<bool, NetError> {
         Ok(self
-            .entries
+            .state
             .lock()
             .map_err(NetError::from_poison)?
+            .entries
             .is_empty())
     }
 
@@ -226,12 +410,22 @@ impl HttpClientInner {
         thread_name: String,
         config: HttpClientConfig,
     ) -> Result<Arc<Self>, NetError> {
+        Self::new_with_network_status(thread_name, config, None)
+    }
+
+    pub(crate) fn new_with_network_status(
+        thread_name: String,
+        config: HttpClientConfig,
+        context: Option<NetworkStatusContext>,
+    ) -> Result<Arc<Self>, NetError> {
         config.validate()?;
         let client = build_client(&config)?;
+        let network_observation = context.map(HttpNetworkObservation::new).transpose()?;
         let (request_tx, request_rx) = mpsc::channel(config.request_queue_capacity);
         let (response_tx, response_rx) = mpsc::channel(config.response_queue_capacity);
         let (callback_tx, callback_rx) = mpsc::channel(config.callback_queue_capacity);
         let config = Arc::new(config);
+        let in_flight = Arc::new(Semaphore::new(config.request_queue_capacity));
         let shutdown_notify = Arc::new(Notify::new());
 
         let callback_name = format!("{thread_name}-callback");
@@ -306,7 +500,6 @@ impl HttpClientInner {
             shutdown_sent: AtomicBool::new(false),
             admission_gate: Mutex::new(()),
             shutdown_notify,
-            next_request_id: AtomicU64::new(1),
             shutdown_state: Arc::new(ShutdownState {
                 joins: Mutex::new(Some(vec![send_thread, receive_thread, callback_thread])),
                 result: Mutex::new(None),
@@ -315,11 +508,47 @@ impl HttpClientInner {
             client,
             config,
             registry: Arc::new(RequestRegistry::new()),
+            in_flight,
+            network_observation,
         }))
     }
 
-    pub(crate) fn allocate_request_id(&self) -> HttpRequestId {
-        HttpRequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed))
+    pub(crate) fn network_snapshot(&self) -> Result<NetworkSnapshot, NetError> {
+        self.network_observation()?.snapshot()
+    }
+
+    pub(crate) fn subscribe_network_status(
+        &self,
+    ) -> Result<StateReceiver<NetworkSnapshot>, NetError> {
+        self.network_observation()?.subscribe()
+    }
+
+    fn network_observation(&self) -> Result<&Arc<HttpNetworkObservation>, NetError> {
+        self.network_observation.as_ref().ok_or_else(|| {
+            NetError::config(
+                "http.network_status",
+                "no network status context was configured",
+            )
+        })
+    }
+
+    pub(crate) fn try_acquire_permit(&self) -> Result<OwnedSemaphorePermit, NetError> {
+        Arc::clone(&self.in_flight)
+            .try_acquire_owned()
+            .map_err(|error| {
+                let kind = match error {
+                    tokio::sync::TryAcquireError::NoPermits => ErrorKind::QueueFull,
+                    tokio::sync::TryAcquireError::Closed => ErrorKind::QueueClosed,
+                };
+                NetError::from(kind).with_stage(ErrorStage::Queue)
+            })
+    }
+
+    pub(crate) async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit, NetError> {
+        Arc::clone(&self.in_flight)
+            .acquire_owned()
+            .await
+            .map_err(|_| NetError::from(ErrorKind::QueueClosed).with_stage(ErrorStage::Queue))
     }
 
     pub(crate) fn registry(&self) -> Arc<RequestRegistry> {
@@ -328,8 +557,8 @@ impl HttpClientInner {
 
     pub(crate) fn register_request(
         &self,
-        request_id: HttpRequestId,
-    ) -> Result<(Arc<CancellationSignal>, RegistrationGuard), NetError> {
+        request_id: Option<HttpRequestId>,
+    ) -> Result<(RegisteredRequest, RegistrationGuard), NetError> {
         let _admission = self.admission_gate.lock().map_err(NetError::from_poison)?;
         if self.shutdown_sent.load(Ordering::Acquire) {
             return Err(NetError::from(ErrorKind::QueueClosed).with_stage(ErrorStage::Queue));
@@ -350,19 +579,21 @@ impl HttpClientInner {
     }
 
     pub(crate) fn submit(&self, job: SendJob) -> Result<(), NetError> {
-        let _admission = self.admission_gate.lock().map_err(NetError::from_poison)?;
-        if self.shutdown_sent.load(Ordering::Acquire) {
-            return Err(NetError::from(ErrorKind::QueueClosed).with_stage(ErrorStage::Queue));
-        }
-        self.request_tx
-            .try_send(SendCommand::Job(job))
-            .map_err(|error| {
-                let kind = match error {
-                    mpsc::error::TrySendError::Full(_) => ErrorKind::QueueFull,
-                    mpsc::error::TrySendError::Closed(_) => ErrorKind::QueueClosed,
-                };
-                NetError::from(kind).with_stage(ErrorStage::Queue)
-            })
+        let result = {
+            let _admission = self.admission_gate.lock().map_err(NetError::from_poison)?;
+            if self.shutdown_sent.load(Ordering::Acquire) {
+                return Err(NetError::from(ErrorKind::QueueClosed).with_stage(ErrorStage::Queue));
+            }
+            self.request_tx.try_send(SendCommand::Job(job))
+        };
+        // A rejected job owns a user request; release it outside the admission gate.
+        result.map_err(|error| {
+            let kind = match &error {
+                mpsc::error::TrySendError::Full(_) => ErrorKind::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => ErrorKind::QueueClosed,
+            };
+            NetError::from(kind).with_stage(ErrorStage::Queue)
+        })
     }
 
     pub(crate) async fn submit_wait(&self, job: SendJob) -> Result<(), NetError> {
@@ -386,26 +617,161 @@ impl HttpClientInner {
         &self,
         request: HttpRequest,
     ) -> Result<HttpStreamResponse, NetError> {
-        let request_id = self.allocate_request_id();
-        let method = request.method.clone();
-        let built = build_spec_request(&request, &self.config, &self.client, &method)?;
-        let response = self
-            .client
-            .execute(built)
-            .await
-            .map_err(|error| map_reqwest_error(error, ErrorStage::Receive))?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let stream = response
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(|error| map_reqwest_error(error, ErrorStage::Receive)));
-        Ok(HttpStreamResponse {
-            status,
-            headers,
+        let operation_start = Instant::now();
+        let policy = request
+            .retry_setting()
+            .resolve(&self.config.default_retry_policy);
+        let mut owner = StreamOwner::new(&policy, operation_start);
+        let result = self
+            .open_stream(request, &policy, operation_start, &mut owner)
+            .await;
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                owner.complete(Err(&error), false);
+                Err(error)
+            }
+        }
+    }
+
+    async fn open_stream(
+        &self,
+        request: HttpRequest,
+        policy: &crate::api::http::RetryPolicy,
+        operation_start: Instant,
+        owner: &mut StreamOwner,
+    ) -> Result<HttpStreamResponse, NetError> {
+        let total = StreamBudget::total(operation_start, policy.total_deadline())?;
+        let permit = match total.deadline() {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), self.acquire_permit())
+                .await
+                .map_err(|_| {
+                    NetError::from(ErrorKind::DeadlineExceeded).with_stage(ErrorStage::Queue)
+                })??,
+            None => self.acquire_permit().await?,
+        };
+        owner.permit = Some(permit);
+        if let Some(error) = total.expired(Instant::now(), ErrorStage::Queue) {
+            return Err(error);
+        }
+        let (registered, registration) = self.register_request(None)?;
+        let request_id = registered.id;
+        let control = registered.control;
+        let permit = owner
+            .permit
+            .take()
+            .ok_or_else(|| NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Queue))?;
+        owner.lease = Some(StreamRegistrationLease {
+            registry: self.registry(),
             request_id,
-            attempts: 1,
-            stream: Box::pin(stream),
-        })
+            control: Arc::clone(&control),
+            _permit: permit,
+        });
+        registration.commit();
+        let method = request.method.clone();
+        let retry_allowed = policy.max_retries() > 0 && policy.allows_method(&method, true);
+        let mut attempt = 1_u32;
+        loop {
+            check_stream_start(total, &control)?;
+            if let Some(lifecycle) = owner.lifecycle.as_mut() {
+                lifecycle.attempt_started(attempt);
+            }
+            check_stream_start(total, &control)?;
+            let built = build_spec_request(&request, &self.config, &self.client, &method)?;
+            check_stream_start(total, &control)?;
+            let budget = total.attempt(
+                Instant::now(),
+                policy.attempt_timeout(),
+                self.config.timeout,
+            )?;
+            let mut timer = budget.timer();
+            let result = tokio::select! {
+                _ = control.wait() => Err(NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch)),
+                _ = wait_budget(&mut timer) => Err(budget.expired(Instant::now(), ErrorStage::Receive)
+                    .map_or_else(|| NetError::from(ErrorKind::TimedOut).with_stage(ErrorStage::Receive), |error| error)),
+                response = self.client.execute(built) => {
+                    match budget.expired(Instant::now(), ErrorStage::Receive) {
+                        Some(error) => Err(error),
+                        None => response.map_err(|error| map_reqwest_error(error, ErrorStage::Receive)),
+                    }
+                }
+            };
+            let retry = match &result {
+                Ok(response)
+                    if retry_allowed
+                        && policy.can_retry_attempt(attempt)
+                        && policy.should_retry_status(response.status()) =>
+                {
+                    Some((
+                        RetryReason::HttpStatus(response.status()),
+                        policy.retry_delay(attempt, parse_retry_after(response.headers())),
+                    ))
+                }
+                Err(error)
+                    if retry_allowed
+                        && policy.can_retry_attempt(attempt)
+                        && policy.should_retry_error(error) =>
+                {
+                    Some((
+                        retry_reason_for_error(error),
+                        policy.retry_delay(attempt, None),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((reason, delay)) = retry {
+                drop(result);
+                drop(timer);
+                if let Some(lifecycle) = owner.lifecycle.as_mut() {
+                    lifecycle.retry_scheduled(attempt, delay, reason);
+                }
+                check_stream_start(total, &control)?;
+                if !wait_for_retry(delay, total.deadline(), &control).await {
+                    check_stream_start(total, &control)?;
+                    return Err(
+                        NetError::from(ErrorKind::DeadlineExceeded).with_stage(ErrorStage::Receive)
+                    );
+                }
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    drop(timer);
+                    owner.complete(Err(&error), policy.max_attempts() == attempt);
+                    return Err(error);
+                }
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(map_body_error)),
+            );
+            let body_owner = StreamOwner {
+                lease: owner.lease.take(),
+                permit: owner.permit.take(),
+                lifecycle: owner.lifecycle.take(),
+            };
+            let stream = FusedHttpBody::new(
+                body,
+                timer,
+                control,
+                budget,
+                body_owner,
+                status,
+                policy.max_attempts() == attempt,
+            );
+            return Ok(HttpStreamResponse {
+                status,
+                headers,
+                request_id,
+                attempts: attempt,
+                stream: Box::pin(stream),
+            });
+        }
     }
 
     /// Close admission under the same gate as queue publication, independently of capacity.
@@ -417,14 +783,28 @@ impl HttpClientInner {
                 poisoned.into_inner()
             }
         };
+        if let Some(observation) = &self.network_observation {
+            observation.request_close();
+        }
         if self.shutdown_sent.swap(true, Ordering::AcqRel) {
             return;
         }
+        drop(_admission);
+        self.in_flight.close();
         self.shutdown_notify.notify_one();
     }
 
     pub(crate) async fn shutdown_and_join(&self) -> Result<(), NetError> {
         self.request_shutdown();
+        let workers = self.join_workers().await;
+        let observations = match &self.network_observation {
+            Some(observation) => observation.wait_cleanup().await,
+            None => Ok(()),
+        };
+        workers.and(observations)
+    }
+
+    async fn join_workers(&self) -> Result<(), NetError> {
         let joins = self.shutdown_state.joins.lock().map_or_else(
             |poisoned| poisoned.into_inner().take(),
             |mut joins| joins.take(),
@@ -489,6 +869,14 @@ fn publish_shutdown_result(state: &ShutdownState, result: &Result<(), NetError>)
 
 impl Drop for HttpClientInner {
     fn drop(&mut self) {
+        if let Err(error) = self.cancel_all() {
+            crate::log_e!(
+                crate::LogType::HTTP;
+                "drop",
+                "error",
+                format!("request_cancellation_failed:{:?}", error.kind())
+            );
+        }
         self.request_shutdown();
         let joins = match self.shutdown_state.joins.lock() {
             Ok(mut joins) => joins.take(),
@@ -679,6 +1067,7 @@ async fn process_job(
         request_id: job.request_id,
         control: job.control,
         registry: job.registry,
+        _permit: job.permit,
     };
     if let Err(error) = response_tx.send(response).await {
         crate::log_e!(crate::LogType::HTTP; "request_response_queue", "error", "response_queue_closed");
@@ -692,25 +1081,70 @@ async fn run_request(
     config: &HttpClientConfig,
     initial_attempt: u32,
 ) -> HttpResponseResult {
-    let method = job.request.get_method();
+    let method: Method = job.request.get_method().into();
     let replayable = job.options.replayable_body;
     let mut policy = job.options.retry_policy.clone();
-    if job.options.use_default_retry_policy
-        && policy.max_retries() == 0
-        && config.default_retry_policy.max_retries() > 0
-    {
+    if job.options.use_default_retry_policy && policy.max_retries() == 0 {
         policy = config.default_retry_policy.clone();
     }
-    let retry_allowed = policy.allows_method(&method, replayable);
+    let retry_allowed = policy.max_retries() > 0 && policy.allows_method(&method, replayable);
+    let operation_start = job.operation_start;
+    let mut lifecycle = RetryObserverLifecycle::new(policy.observer(), operation_start);
+    let operation_deadline = match policy.total_deadline() {
+        Some(duration) => match operation_start.checked_add(duration) {
+            Some(deadline) => Some(deadline),
+            None => {
+                return terminal_error(
+                    &mut lifecycle,
+                    NetError::from(ErrorKind::InvalidPolicy).with_stage(ErrorStage::Configuration),
+                )
+            }
+        },
+        None => None,
+    };
     let mut attempt = initial_attempt.max(1);
     loop {
         if job.control.is_cancelled() {
-            return Err(NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch));
+            return terminal_error(
+                &mut lifecycle,
+                NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch),
+            );
         }
-        let request = build_request(job.request.as_ref(), config, client, &method)?;
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return terminal_error(
+                &mut lifecycle,
+                NetError::from(ErrorKind::DeadlineExceeded).with_stage(ErrorStage::Receive),
+            );
+        }
+        if attempt > 1 && !replayable {
+            return terminal_error(
+                &mut lifecycle,
+                NetError::from(ErrorKind::BodyNotReplayable).with_stage(ErrorStage::RequestBuild),
+            );
+        }
+        lifecycle.attempt_started(attempt);
+        let (request, _has_body) =
+            match build_request(job.request.as_ref(), config, client, &method) {
+                Ok(request) => request,
+                Err(error) => return terminal_error(&mut lifecycle, error),
+            };
+        if job.control.is_cancelled() {
+            return terminal_error(
+                &mut lifecycle,
+                NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch),
+            );
+        }
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return terminal_error(
+                &mut lifecycle,
+                NetError::from(ErrorKind::DeadlineExceeded).with_stage(ErrorStage::Receive),
+            );
+        }
+        let attempt_started = Instant::now();
+        let attempt_timeout = remaining_timeout(&policy, operation_deadline);
         let response = tokio::select! {
             _ = job.control.wait() => Err(NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch)),
-            response = client.execute(request) => response.map_err(|error| map_reqwest_error(error, ErrorStage::Receive)),
+            response = execute_with_timeout(client, request, attempt_timeout) => response,
         };
         let result = match response {
             Ok(response) => {
@@ -718,42 +1152,121 @@ async fn run_request(
                     && policy.can_retry_attempt(attempt)
                     && policy.should_retry_status(response.status())
                 {
+                    if !replayable {
+                        lifecycle.note_reason(RetryReason::HttpStatus(response.status()));
+                        return terminal_error(
+                            &mut lifecycle,
+                            NetError::from(ErrorKind::BodyNotReplayable)
+                                .with_stage(ErrorStage::RequestBuild),
+                        );
+                    }
+                    let status = response.status();
+                    let retry_after = parse_retry_after(response.headers());
                     drop(response);
-                    if !wait_before_retry(&policy, attempt, &job.control).await {
-                        return Err(
-                            NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch)
+                    let delay = policy.retry_delay(attempt, retry_after);
+                    lifecycle.retry_scheduled(attempt, delay, RetryReason::HttpStatus(status));
+                    if !wait_for_retry(delay, operation_deadline, &job.control).await {
+                        if job.control.is_cancelled() {
+                            return terminal_error(
+                                &mut lifecycle,
+                                NetError::from(ErrorKind::Cancelled)
+                                    .with_stage(ErrorStage::Dispatch),
+                            );
+                        }
+                        return terminal_error(
+                            &mut lifecycle,
+                            NetError::from(ErrorKind::DeadlineExceeded)
+                                .with_stage(ErrorStage::Receive),
                         );
                     }
                     attempt = attempt.saturating_add(1);
                     continue;
                 }
-                read_response(
+                let read_timeout = attempt_timeout
+                    .map(|duration| duration.saturating_sub(attempt_started.elapsed()));
+                read_response_with_timeout(
                     response,
                     attempt,
                     job.request_id,
                     config.max_response_bytes,
                     Arc::clone(&job.control),
+                    read_timeout,
                 )
                 .await
             }
             Err(error) => Err(error),
         };
-        if let Err(error) = &result {
+        if let Ok(buffered) = &result {
             if retry_allowed
                 && policy.can_retry_attempt(attempt)
-                && policy.should_retry_error(error)
+                && policy.should_retry_application(buffered)
             {
-                if !wait_before_retry(&policy, attempt, &job.control).await {
-                    return Err(
-                        NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Receive)
+                if !replayable {
+                    lifecycle.note_reason(RetryReason::Application);
+                    return terminal_error(
+                        &mut lifecycle,
+                        NetError::from(ErrorKind::BodyNotReplayable)
+                            .with_stage(ErrorStage::RequestBuild),
+                    );
+                }
+                let delay = policy.retry_delay(attempt, None);
+                lifecycle.retry_scheduled(attempt, delay, RetryReason::Application);
+                if !wait_for_retry(delay, operation_deadline, &job.control).await {
+                    if job.control.is_cancelled() {
+                        return terminal_error(
+                            &mut lifecycle,
+                            NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Receive),
+                        );
+                    }
+                    return terminal_error(
+                        &mut lifecycle,
+                        NetError::from(ErrorKind::DeadlineExceeded).with_stage(ErrorStage::Receive),
                     );
                 }
                 attempt = attempt.saturating_add(1);
                 continue;
             }
         }
+        if let Err(error) = &result {
+            if retry_allowed
+                && policy.can_retry_attempt(attempt)
+                && policy.should_retry_error(error)
+            {
+                if !replayable {
+                    lifecycle.note_reason(retry_reason_for_error(error));
+                    return terminal_error(
+                        &mut lifecycle,
+                        NetError::from(ErrorKind::BodyNotReplayable)
+                            .with_stage(ErrorStage::RequestBuild),
+                    );
+                }
+                let delay = policy.retry_delay(attempt, None);
+                lifecycle.retry_scheduled(attempt, delay, retry_reason_for_error(error));
+                if !wait_for_retry(delay, operation_deadline, &job.control).await {
+                    if job.control.is_cancelled() {
+                        return terminal_error(
+                            &mut lifecycle,
+                            NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Receive),
+                        );
+                    }
+                    return terminal_error(
+                        &mut lifecycle,
+                        NetError::from(ErrorKind::DeadlineExceeded).with_stage(ErrorStage::Receive),
+                    );
+                }
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        }
+        lifecycle.complete(&result, policy.max_attempts() == attempt);
         return result;
     }
+}
+
+fn terminal_error(lifecycle: &mut RetryObserverLifecycle, error: NetError) -> HttpResponseResult {
+    let result = Err(error);
+    lifecycle.complete(&result, false);
+    result
 }
 
 fn build_request(
@@ -761,23 +1274,28 @@ fn build_request(
     config: &HttpClientConfig,
     client: &Client,
     method: &Method,
-) -> Result<reqwest::Request, NetError> {
+) -> Result<(reqwest::Request, bool), NetError> {
     let path = request.get_path();
     let url = config.resolve_request_path(path.as_str())?;
     let headers = config.merge_headers(&request.headers())?;
+    // Materialize the provider exactly once for this attempt.  The presence
+    // hook is evaluated only after materialization and its default is
+    // side-effect free, so a one-shot provider cannot be consumed twice.
     let body = request.get_req_body();
     let body_is_empty = body.is_empty();
+    let body_present = !body_is_empty || request.has_req_body();
     let mut builder = client.request(method.clone(), url);
     builder = builder.headers(headers);
-    if request.has_req_body() || matches!(*method, Method::POST | Method::PUT | Method::PATCH) {
+    if body_present || matches!(*method, Method::POST | Method::PUT | Method::PATCH) {
         builder = builder.body(body);
         if body_is_empty {
             builder = builder.header(http::header::CONTENT_LENGTH, "0");
         }
     }
-    builder
+    let built = builder
         .build()
-        .map_err(|error| map_reqwest_error(error, ErrorStage::RequestBuild))
+        .map_err(|error| map_reqwest_error(error, ErrorStage::RequestBuild))?;
+    Ok((built, body_present))
 }
 
 fn build_spec_request(
@@ -800,19 +1318,104 @@ fn build_spec_request(
         .map_err(|error| map_reqwest_error(error, ErrorStage::RequestBuild))
 }
 
-async fn wait_before_retry(
-    policy: &crate::api::http::RetryPolicy,
-    attempt: u32,
+fn check_stream_start(budget: StreamBudget, control: &CancellationSignal) -> Result<(), NetError> {
+    if let Some(error) = budget.expired(Instant::now(), ErrorStage::Receive) {
+        return Err(error);
+    }
+    if control.is_cancelled() {
+        return Err(NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch));
+    }
+    Ok(())
+}
+
+async fn wait_budget(timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>) {
+    match timer.as_mut() {
+        Some(timer) => timer.as_mut().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn wait_for_retry(
+    delay: Duration,
+    deadline: Option<Instant>,
     control: &CancellationSignal,
 ) -> bool {
-    let exponent = attempt.saturating_sub(1).min(6);
-    let multiplier = 1_u64 << exponent;
-    let millis = 50_u64.saturating_mul(multiplier);
-    let delay = Duration::from_millis(millis).min(policy.max_delay());
+    let delay = match deadline {
+        Some(limit) => match limit.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining.min(delay),
+            None => return false,
+        },
+        None => delay,
+    };
     tokio::select! {
         _ = control.wait() => false,
-        _ = tokio::time::sleep(delay) => true,
+        _ = tokio::time::sleep(delay) => !control.is_cancelled() && deadline.is_none_or(|limit| Instant::now() < limit),
     }
+}
+
+fn remaining_timeout(
+    policy: &crate::api::http::RetryPolicy,
+    deadline: Option<Instant>,
+) -> Option<Duration> {
+    let deadline_remaining = deadline.map(|limit| {
+        limit
+            .checked_duration_since(Instant::now())
+            .map_or(Duration::ZERO, |remaining| remaining)
+    });
+    match (policy.attempt_timeout(), deadline_remaining) {
+        (Some(attempt), Some(total)) => Some(attempt.min(total)),
+        (Some(attempt), None) => Some(attempt),
+        (None, Some(total)) => Some(total),
+        (None, None) => None,
+    }
+}
+
+async fn execute_with_timeout(
+    client: &Client,
+    request: reqwest::Request,
+    timeout: Option<Duration>,
+) -> Result<Response, NetError> {
+    let future = client.execute(request);
+    let result = match timeout {
+        Some(duration) => tokio::time::timeout(duration, future)
+            .await
+            .map_err(|_| NetError::from(ErrorKind::TimedOut).with_stage(ErrorStage::Receive))?,
+        None => future.await,
+    };
+    result.map_err(|error| map_reqwest_error(error, ErrorStage::Receive))
+}
+
+async fn read_response_with_timeout(
+    response: Response,
+    attempts: u32,
+    request_id: HttpRequestId,
+    max_response_bytes: usize,
+    control: Arc<CancellationSignal>,
+    timeout: Option<Duration>,
+) -> HttpResponseResult {
+    let future = read_response(response, attempts, request_id, max_response_bytes, control);
+    match timeout {
+        Some(duration) => tokio::time::timeout(duration, future)
+            .await
+            .map_err(|_| NetError::from(ErrorKind::TimedOut).with_stage(ErrorStage::Receive))?,
+        None => future.await,
+    }
+}
+
+fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
+    let value = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let now = chrono::Utc::now();
+    if date <= now {
+        return Some(Duration::ZERO);
+    }
+    (date - now).to_std().ok()
 }
 
 async fn receive_loop(
@@ -844,7 +1447,7 @@ async fn read_response(
         }
         chunk = stream.next() => chunk,
     } {
-        let chunk = chunk.map_err(|error| map_reqwest_error(error, ErrorStage::Receive))?;
+        let chunk = chunk.map_err(map_body_error)?;
         if body.len().saturating_add(chunk.len()) > max_response_bytes {
             return Err(NetError::from(ErrorKind::ItemTooLarge).with_stage(ErrorStage::Receive));
         }
@@ -914,91 +1517,10 @@ async fn run_callback(job: CallbackJob) {
     }
 }
 
-fn map_reqwest_error(error: reqwest::Error, stage: ErrorStage) -> NetError {
-    let detail = error.to_string().to_ascii_lowercase();
-    let body_failure = classify_body_failure(&error);
-    let is_dns = error.is_connect()
-        && (detail.contains("dns")
-            || detail.contains("resolve")
-            || detail.contains("name or service")
-            || detail.contains("getaddrinfo")
-            || detail.contains("lookup address"));
-    let is_tls = error.is_connect()
-        && (detail.contains("tls")
-            || detail.contains("certificate")
-            || detail.contains("cert")
-            || detail.contains("handshake"));
-    let is_proxy = detail.contains("proxy");
-    let (kind, mapped_stage) = if error.is_timeout() {
-        (ErrorKind::TimedOut, stage)
-    } else if is_dns {
-        (ErrorKind::Dns, ErrorStage::Dns)
-    } else if is_tls {
-        (ErrorKind::Tls, ErrorStage::Tls)
-    } else if body_failure == BodyFailure::Protocol {
-        (ErrorKind::Protocol, ErrorStage::Receive)
-    } else if body_failure == BodyFailure::Transport {
-        (ErrorKind::Io, stage)
-    } else if error.is_decode() {
-        (ErrorKind::Protocol, ErrorStage::Receive)
-    } else if error.is_connect() || error.is_body() {
-        let mapped_stage = if is_proxy { ErrorStage::Proxy } else { stage };
-        (ErrorKind::Io, mapped_stage)
-    } else if error.is_request() {
-        (ErrorKind::Io, stage)
-    } else if error.is_builder() {
-        (ErrorKind::InvalidInput, ErrorStage::RequestBuild)
-    } else {
-        (ErrorKind::Protocol, stage)
-    };
-    NetError::with_source(kind, error).with_stage(mapped_stage)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BodyFailure {
-    Transport,
-    Protocol,
-    Other,
-}
-
-fn classify_body_failure(error: &reqwest::Error) -> BodyFailure {
-    let mut source = StdError::source(error);
-    for _ in 0..16 {
-        let Some(current) = source else {
-            return BodyFailure::Other;
-        };
-        if let Some(hyper_error) = current.downcast_ref::<hyper::Error>() {
-            if hyper_error.is_incomplete_message() {
-                return BodyFailure::Transport;
-            }
-            if hyper_error.is_parse() {
-                return BodyFailure::Protocol;
-            }
-        }
-        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
-            if is_transport_io_kind(io_error.kind()) {
-                return BodyFailure::Transport;
-            }
-        }
-        source = current.source();
-    }
-    BodyFailure::Other
-}
-
-fn is_transport_io_kind(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::UnexpectedEof
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::http::HttpRequestMethod;
 
     struct CountingRequest(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -1007,8 +1529,8 @@ mod tests {
         fn get_path(&self) -> String {
             "/".to_owned()
         }
-        fn get_method(&self) -> Method {
-            Method::GET
+        fn get_method(&self) -> HttpRequestMethod {
+            HttpRequestMethod::GET
         }
         async fn deal_with_response(self: Box<Self>, _result: HttpResponseResult) {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -1033,6 +1555,7 @@ mod tests {
                 request_id: job.request_id,
                 control: job.control,
                 registry: job.registry,
+                _permit: job.permit,
             })
             .await
             .map_err(|_| NetError::from(ErrorKind::Internal))?;
@@ -1077,7 +1600,7 @@ mod tests {
         )
     }
 
-    struct NoopRequest;
+    pub(super) struct NoopRequest;
 
     #[async_trait::async_trait]
     impl HttpRequestTrait for NoopRequest {
@@ -1085,23 +1608,24 @@ mod tests {
             "/".to_owned()
         }
 
-        fn get_method(&self) -> Method {
-            Method::GET
+        fn get_method(&self) -> HttpRequestMethod {
+            HttpRequestMethod::GET
         }
 
         async fn deal_with_response(self: Box<Self>, _result: HttpResponseResult) {}
     }
 
-    fn paused_worker() -> Result<(HttpClientInner, mpsc::Receiver<SendCommand>), NetError> {
+    pub(super) fn paused_worker() -> Result<(HttpClientInner, mpsc::Receiver<SendCommand>), NetError>
+    {
         let config = Arc::new(HttpClientConfig::new("http://127.0.0.1:1")?);
         let (request_tx, request_rx) = mpsc::channel(1);
         Ok((
             HttpClientInner {
+                network_observation: None,
                 request_tx,
                 shutdown_sent: AtomicBool::new(false),
                 admission_gate: Mutex::new(()),
                 shutdown_notify: Arc::new(Notify::new()),
-                next_request_id: AtomicU64::new(1),
                 shutdown_state: Arc::new(ShutdownState {
                     joins: Mutex::new(None),
                     result: Mutex::new(Some(Ok(()))),
@@ -1110,17 +1634,19 @@ mod tests {
                 client: build_client(&config)?,
                 config,
                 registry: Arc::new(RequestRegistry::new()),
+                in_flight: Arc::new(Semaphore::new(128)),
             },
             request_rx,
         ))
     }
 
-    fn test_job(
+    pub(super) fn test_job(
         worker: &HttpClientInner,
         id: u64,
     ) -> Result<(SendJob, RegistrationGuard), NetError> {
         let request_id = HttpRequestId(id);
-        let (control, registration) = worker.register_request(request_id)?;
+        let (registered, registration) = worker.register_request(Some(request_id))?;
+        let control = registered.control;
         Ok((
             SendJob {
                 request: Box::new(NoopRequest),
@@ -1128,6 +1654,8 @@ mod tests {
                 request_id,
                 control,
                 registry: worker.registry(),
+                permit: worker.try_acquire_permit()?,
+                operation_start: Instant::now(),
             },
             registration,
         ))
@@ -1159,20 +1687,20 @@ mod tests {
     ) -> Result<(), Box<dyn StdError + Send + Sync>> {
         let registry = Arc::new(RequestRegistry::new());
         let id = HttpRequestId(803);
-        let (stale_control, stale) = registry.register(id)?;
-        registry.finish(id, &stale_control);
-        let (replacement_control, replacement) = registry.register(id)?;
+        let (stale_control, stale) = registry.register(Some(id))?;
+        registry.finish(id, &stale_control.control);
+        let (replacement_control, replacement) = registry.register(Some(id))?;
         replacement.commit();
         drop(stale);
         check(
             !registry.is_empty()?,
             "stale guard removed replacement registration",
         )?;
-        registry.finish(id, &replacement_control);
+        registry.finish(id, &replacement_control.control);
         Ok(())
     }
 
-    fn check(
+    pub(super) fn check(
         condition: bool,
         message: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1188,11 +1716,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let registry = Arc::new(RequestRegistry::new());
         let request_id = HttpRequestId(7001);
-        let (_, guard) = registry.register(request_id)?;
+        let (_, guard) = registry.register(Some(request_id))?;
         drop(guard);
-        let (replacement_control, replacement) = registry.register(request_id)?;
+        let (replacement_control, replacement) = registry.register(Some(request_id))?;
         replacement.commit();
-        registry.finish(request_id, &replacement_control);
+        registry.finish(request_id, &replacement_control.control);
         check(
             registry.is_empty()?,
             "uncommitted registration was not released",
@@ -1204,17 +1732,46 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let registry = Arc::new(RequestRegistry::new());
         let request_id = HttpRequestId(7002);
-        let (control, guard) = registry.register(request_id)?;
+        let (control, guard) = registry.register(Some(request_id))?;
         guard.commit();
         drop(guard);
         check(
             !registry.is_empty()?,
             "committed registration was released too early",
         )?;
-        registry.finish(request_id, &control);
+        registry.finish(request_id, &control.control);
         check(
             registry.is_empty()?,
             "terminal finish did not release registration",
         )
     }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_date(
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RETRY_AFTER,
+            http::HeaderValue::from_static("3"),
+        );
+        check(
+            parse_retry_after(&headers) == Some(Duration::from_secs(3)),
+            "delta-seconds Retry-After was not parsed",
+        )?;
+
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc2822();
+        let value = http::HeaderValue::from_str(future.as_str())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        headers.insert(http::header::RETRY_AFTER, value);
+        let delay = parse_retry_after(&headers)
+            .ok_or_else(|| std::io::Error::other("HTTP-date Retry-After was not parsed"))?;
+        check(
+            delay <= Duration::from_secs(2) && delay >= Duration::from_millis(500),
+            "HTTP-date Retry-After produced an unexpected delay",
+        )
+    }
 }
+
+#[cfg(test)]
+#[path = "http_regression_tests.rs"]
+mod regression_tests;

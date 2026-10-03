@@ -68,10 +68,16 @@ pub enum ErrorKind {
     Cancelled,
     /// The operation exceeded its configured deadline.
     TimedOut,
+    /// The operation exceeded its total retry deadline.
+    DeadlineExceeded,
     /// The message may have been written partially or its final delivery state is unknown.
     DeliveryUnknown,
     /// All configured connection or request retry attempts were consumed.
     RetryExhausted,
+    /// A retry policy or deadline configuration cannot be used.
+    InvalidPolicy,
+    /// The request body cannot be materialized again for another attempt.
+    BodyNotReplayable,
     /// A request identifier is already registered in the session.
     DuplicateRequestId,
     /// Response routing is disabled for the session.

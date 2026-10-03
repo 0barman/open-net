@@ -30,12 +30,13 @@ impl OpenNet {
     pub fn new_with_network_config(
         config: crate::network::NetworkConfig,
     ) -> Result<Self, NetError> {
+        crate::log_s!(LogType::Engine; "OpenNet-new_with_network_config", "config", format!("{:?}", config));
         Self::new_with_config(OpenNetConfig::default().with_network_config(config))
     }
 
     /// Creates an engine with default settings and queue capacities of 128.
     pub fn new() -> Result<Self, NetError> {
-        crate::log_t!(LogType::Engine; "new");
+        crate::log_s!(LogType::Engine; "OpenNet-new");
         Self::new_with_config(OpenNetConfig::default())
     }
 
@@ -56,7 +57,7 @@ impl OpenNet {
     /// # }
     /// ```
     pub fn new_with_config(config: OpenNetConfig) -> Result<Self, NetError> {
-        crate::log_t!(LogType::Engine; "new_with_config");
+        crate::log_s!(LogType::Engine; "OpenNet-new_with_config","config", format!("{:?}", config));
         let result: Result<Self, NetError> = (|| {
             Ok(Self {
                 inner: OpenNetInner::new_with_config(config)?,
@@ -193,6 +194,13 @@ impl OpenNet {
 }
 
 impl OpenNet {
+    /// Export this engine's cached network state for an explicitly configured
+    /// standalone HTTP client. Reading the context never starts monitoring.
+    /// The context remains bound to this engine and becomes Closed on engine drop.
+    pub fn network_status_context(&self) -> crate::net_status::NetworkStatusContext {
+        self.inner.network_status.context()
+    }
+
     /// Creates a network-status client; call `start().await` to begin monitoring.
     ///
     /// Names are trimmed and must be unique within an engine. This feature is always available.
@@ -215,6 +223,7 @@ impl OpenNet {
         thread_name: &str,
     ) -> Result<NetStatusClient, NetError> {
         let thread_name = thread_name.trim();
+        crate::log_s!(LogType::Engine; "create_net_status_client", "thread_name", thread_name);
         if thread_name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
@@ -233,9 +242,10 @@ impl OpenNet {
     /// Permanently stops a client, waits for monitoring to exit, and releases its name.
     ///
     /// Cancelling the wait does not cancel submitted destruction; the name remains
-    /// reserved until cleanup completes. Use `NetStatusClient::shutdown` to pause instead.
+    /// reserved until cleanup completes. Use `NetStatusClient::stop` to pause instead.
     pub async fn destroy_net_status_client(&self, thread_name: &str) -> Result<(), NetError> {
         let thread_name = thread_name.trim();
+        crate::log_s!(LogType::Engine; "destroy_net_status_client", "thread_name", thread_name);
         if thread_name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }

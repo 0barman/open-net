@@ -127,6 +127,16 @@ fn classify_lan_ipv4(ip: Ipv4Addr) -> Option<LanScore> {
 /// Whether an interface name hits a virtual/proxy feature word.
 fn looks_like_virtual_iface(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
+    // Linux container/VM networks commonly use these interface-name prefixes.
+    // Keep this platform-specific and prefix-only: a host LAN may legitimately
+    // live on br0 or bond0, and eth0 may be the usable LAN inside a container.
+    #[cfg(target_os = "linux")]
+    if ["veth", "virbr", "br-", "cni", "flannel"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return true;
+    }
     VIRTUAL_IFACE_NAME_HINTS
         .iter()
         .any(|hint| lower.contains(hint))
@@ -260,6 +270,52 @@ mod tests {
             pick_lan_ipv4_from(&ifaces),
             Some(Ipv4Addr::new(192, 168, 1, 20))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_container_and_vm_interfaces_do_not_outrank_the_physical_lan() {
+        let physical_ip = Ipv4Addr::new(10, 1, 2, 3);
+        for name in [
+            "veth123abc",
+            "virbr0",
+            "br-a1b2c3d4e5f6",
+            "docker0",
+            "cni0",
+            "flannel.1",
+            "VETH123ABC",
+        ] {
+            let ifaces = vec![
+                cand(name, [192, 168, 122, 1]),
+                cand("enp3s0", physical_ip.octets()),
+            ];
+            assert_eq!(pick_lan_ipv4_from(&ifaces), Some(physical_ip), "{name}");
+            assert_eq!(pick_lan_ipv4_from(&ifaces[..1]), None, "{name}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keeps_host_bridges_bonds_and_container_lan_interfaces() {
+        let lan_ip = Ipv4Addr::new(192, 168, 1, 20);
+        for name in ["br0", "bond0", "eth0", "enp3s0", "wlp2s0", "lan-veth"] {
+            let ifaces = vec![cand(name, lan_ip.octets())];
+            assert_eq!(pick_lan_ipv4_from(&ifaces), Some(lan_ip), "{name}");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn linux_interface_prefixes_do_not_change_other_platforms() {
+        for name in [
+            "veth123abc",
+            "virbr0",
+            "br-a1b2c3d4e5f6",
+            "cni0",
+            "flannel.1",
+        ] {
+            assert!(!looks_like_virtual_iface(name), "{name}");
+        }
     }
 
     #[test]

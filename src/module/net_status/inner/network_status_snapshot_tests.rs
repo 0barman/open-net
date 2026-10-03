@@ -84,6 +84,26 @@ fn late_subscriber_receives_current_snapshot_without_callback_replay() -> TestRe
 }
 
 #[test]
+fn late_source_failure_cannot_overwrite_closed_terminal_state() -> TestResult {
+    use crate::net_status::MonitorState;
+    let source = NetworkStatusSource::for_test()?;
+    let (_, publication) = source.begin_generation()?;
+    publication.dispatch()?;
+    source.prepare_closed()?.dispatch()?;
+    source
+        .fail(NetError::from(crate::error::ErrorKind::ResourceExhausted))?
+        .dispatch()?;
+    let snapshot = source.snapshot()?;
+    if !matches!(snapshot.state, MonitorState::Closed) {
+        return Err("late source failure replaced the Closed terminal state".into());
+    }
+    if source.subscribe_failure().borrow().is_some() {
+        return Err("late source failure populated the Closed failure channel".into());
+    }
+    Ok(())
+}
+
+#[test]
 // 验证监控失败转为未知仅增加修订号，不制造一次网络失联。
 fn monitoring_failure_is_unknown_and_does_not_increment_loss_epoch() -> TestResult {
     let (source, mut receiver) = test_network_status_source()?;
