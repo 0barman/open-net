@@ -288,7 +288,7 @@ pub struct HttpClientConfig {
     pub timeout: Duration,
     /// Optional TCP keepalive interval applied to pooled connections.
     pub tcp_keepalive: Option<Duration>,
-    /// Maximum response body size accepted by the receive lane.
+    /// Maximum response body size accepted by the receive lane. Defaults to 1024 MiB.
     pub max_response_bytes: usize,
     /// Capacity of the admission queue and in-flight operation quota.
     ///
@@ -332,7 +332,7 @@ impl HttpClientConfig {
             timeout: Duration::from_secs(30),
             // reqwest 0.12 defaults to a 15 second TCP keepalive.
             tcp_keepalive: Some(Duration::from_secs(15)),
-            max_response_bytes: 8 * 1024 * 1024,
+            max_response_bytes: 1024 * 1024 * 1024,
             request_queue_capacity: 128,
             response_queue_capacity: 128,
             callback_queue_capacity: 128,

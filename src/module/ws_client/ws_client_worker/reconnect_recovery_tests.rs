@@ -127,6 +127,27 @@ fn retry_budget_counts_additional_attempts_and_respects_failure_boundary() -> Te
     Ok(())
 }
 
+#[test]
+fn unlimited_retry_budget_stays_allowed_until_count_representation_is_exhausted() -> TestResult {
+    let policy = ReconnectPolicy::long_running();
+    check!(retry_allowed(
+        &policy,
+        0,
+        Duration::from_secs(365 * 24 * 60 * 60)
+    ))?;
+    check!(retry_allowed(
+        &policy,
+        usize::MAX.saturating_sub(1),
+        Duration::from_secs(365 * 24 * 60 * 60),
+    ))?;
+    check!(!retry_allowed(
+        &policy,
+        usize::MAX,
+        Duration::from_secs(365 * 24 * 60 * 60),
+    ))?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn terminal_failures_remove_the_session_without_changing_error_snapshots() -> TestResult {
     use ConnectStage::{Provider, ProxyConnect, Tcp, Tls, WebSocketUpgrade};

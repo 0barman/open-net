@@ -1,8 +1,8 @@
 use super::{
-    ClientId, CloseFrame, ConnectionEvent, ConnectionEvents, ConnectionInfo, ConnectionJournal,
-    ConnectionSnapshot, IncomingMessage, MessageReceiver, ReceiveOptions, RequestClient,
-    ResponseResolver, ResponseRouting, Sender, SessionEnd, SessionId, TaskEvent, TaskEventOptions,
-    TaskEvents,
+    ApplicationHeartbeatConfig, ApplicationHeartbeatHandle, ClientId, CloseFrame, ConnectionEvent,
+    ConnectionEvents, ConnectionInfo, ConnectionJournal, ConnectionSnapshot, IncomingMessage,
+    MessageReceiver, ReceiveOptions, RequestClient, ResponseResolver, ResponseRouting, Sender,
+    SessionEnd, SessionId, TaskEvent, TaskEventOptions, TaskEvents,
 };
 use crate::error::{ErrorKind, ReceiveError};
 use crate::module::ws_client::{session_runtime::SessionRuntime, ws_client_inner::WSClientInner};
@@ -99,6 +99,29 @@ impl Session {
     /// Subscribes to incoming messages using the supplied bounded receive policy.
     pub fn subscribe_messages(&self, options: ReceiveOptions) -> Result<MessageReceiver> {
         self.runtime.messages.subscribe(options)
+    }
+    /// Starts a fixed-interval application-level heartbeat loop.
+    ///
+    /// A response matcher uses a dedicated bounded message subscription. When
+    /// the session keeps the default initial inbox, take that inbox first or
+    /// configure [`InitialMessages::DiscardUnmatched`](super::InitialMessages)
+    /// when creating the session. Write-only heartbeats do not allocate a
+    /// message subscription.
+    pub fn start_application_heartbeat(
+        &self,
+        config: ApplicationHeartbeatConfig,
+    ) -> Result<ApplicationHeartbeatHandle> {
+        config.validate()?;
+        let receiver = if config.matcher.is_some() {
+            Some(
+                self.runtime
+                    .messages
+                    .subscribe(config.receive_options.clone())?,
+            )
+        } else {
+            None
+        };
+        ApplicationHeartbeatHandle::new(self.sender(), receiver, config)
     }
     /// Subscribes to connection lifecycle events.
     pub fn subscribe_events(&self) -> Result<ConnectionEvents> {

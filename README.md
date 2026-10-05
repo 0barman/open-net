@@ -288,7 +288,7 @@ For a large payload, prefer a multipart/object-storage client designed for uploa
 
 ## Timeouts, response limits, retries, and backpressure
 
-`HttpClientConfig::new` defaults to a 30-second timeout for each network attempt (headers and body, excluding SDK admission), an enabled 15-second TCP keepalive, 8 MiB maximum buffered response body, and request/response/callback queue capacities of 128. Override them with:
+`HttpClientConfig::new` defaults to a 30-second timeout for each network attempt (headers and body, excluding SDK admission), an enabled 15-second TCP keepalive, 1024 MiB maximum buffered response body, and request/response/callback queue capacities of 128. Override them with:
 
 ```rust
 let config = HttpClientConfig::new("https://api.example.com/")?
