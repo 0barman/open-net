@@ -44,6 +44,33 @@ fn default_backoff_preserves_existing_retry_values() -> TestResult {
 }
 
 #[test]
+fn unlimited_backoff_removes_only_retry_count_and_elapsed_limits() -> TestResult {
+    let config = BackoffConfig::unlimited();
+    config.validate()?;
+    if config.max_retries != usize::MAX
+        || config.initial_delay != Duration::from_millis(250)
+        || config.max_delay != Duration::from_secs(8)
+        || config.max_elapsed.is_some()
+    {
+        return Err("unlimited backoff changed the default delay caps or kept a limit".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn long_running_policy_is_valid_unlimited_backoff() -> TestResult {
+    let policy = ReconnectPolicy::long_running();
+    policy.validate()?;
+    let ReconnectPolicy::Backoff(config) = policy else {
+        return Err("long-running policy did not select backoff".into());
+    };
+    if config.max_retries != usize::MAX || config.max_elapsed.is_some() {
+        return Err("long-running policy retained a retry limit".into());
+    }
+    Ok(())
+}
+
+#[test]
 fn disabled_policy_has_no_ignored_backoff_values() -> TestResult {
     let policy = ReconnectPolicy::Disabled;
     policy.validate()?;

@@ -11,6 +11,7 @@ use crate::ws::{
 };
 use crate::{NetError, Result};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
@@ -79,6 +80,21 @@ impl SessionRuntime {
     pub(crate) fn closed_token(&self) -> CancellationToken {
         self.closed.clone()
     }
+    /// Spawns a future on the already-running worker runtime.
+    ///
+    /// Public API tasks use this helper so a caller cannot accidentally create
+    /// an unrelated Tokio runtime for session-owned work.
+    pub(crate) fn spawn<F>(&self, future: F) -> Result<tokio::task::JoinHandle<F::Output>>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let runtime = self.worker_runtime.get().ok_or_else(|| {
+            NetError::from(ErrorKind::RuntimeUnavailable)
+                .with_stage(crate::error::ErrorStage::Runtime)
+        })?;
+        Ok(runtime.spawn(future))
+    }
     /// Bind the already-running, timer-enabled client worker before exposing
     /// the session. Caller executors and callback threads need no Tokio context.
     pub(crate) fn bind_worker_runtime(&self) -> Result<()> {
@@ -130,6 +146,21 @@ impl SessionRuntime {
                 Ok(token)
             }
             _ => Err(NetError::from(ErrorKind::NotConnected)),
+        }
+    }
+    pub(crate) fn current_connection_id(&self) -> Result<Option<ConnectionId>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(NetError::from_poison)
+            .map(|connection| connection.clone())?;
+        match (connection, self.lifecycle.snapshot()?.state) {
+            (Some((id, token)), ConnectionState::Connected(info))
+                if id == info.connection_id && !token.is_cancelled() =>
+            {
+                Ok(Some(id))
+            }
+            _ => Ok(None),
         }
     }
     pub(crate) fn activate_connection(&self, id: ConnectionId) -> Result<()> {

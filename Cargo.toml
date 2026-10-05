@@ -1,6 +1,6 @@
 [package]
 name = "open-net"
-# Development: `0.1.0-alpha.1`
+# Development: `0.1.2`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
 version = "0.1.1"

@@ -1,6 +1,11 @@
 //! WebSocket session API and owned value types.
+mod application_heartbeat;
 mod identity;
 pub use crate::subscription::SubscriptionId;
+pub use application_heartbeat::{
+    ApplicationHeartbeatConfig, ApplicationHeartbeatFailureAction, ApplicationHeartbeatHandle,
+    ApplicationHeartbeatMatcher, ApplicationHeartbeatSnapshot, ApplicationHeartbeatState,
+};
 pub use identity::{AttemptId, ClientId, ConnectionId, CycleId, OperationId, SessionId};
 mod close;
 mod incoming;

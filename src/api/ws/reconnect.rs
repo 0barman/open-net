@@ -20,6 +20,19 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
+    /// Creates a jittered exponential backoff policy without a retry-count or
+    /// cycle-elapsed-time limit.
+    ///
+    /// The delay caps remain the safe defaults from [`BackoffConfig::default`],
+    /// so an unavailable endpoint does not turn retries into a busy loop. A
+    /// session still stops promptly when it is cancelled or closed.
+    /// The policy does not change [`ConnectOptions::connect_timeout`]; callers
+    /// that also want an unlimited initial connection wait must set that option
+    /// to `None` explicitly.
+    pub fn long_running() -> Self {
+        Self::Backoff(BackoffConfig::unlimited())
+    }
+
     /// Validates the selected retry policy.
     pub fn validate(&self) -> Result<()> {
         match self {
@@ -54,6 +67,21 @@ impl Default for BackoffConfig {
 }
 
 impl BackoffConfig {
+    /// Creates a backoff configuration with no retry-count or cycle-elapsed-time
+    /// limit while retaining the default jitter delay caps.
+    ///
+    /// `usize::MAX` is used as the retry-count sentinel because the public
+    /// configuration stores a count. The worker treats it as the largest
+    /// representable number of additional attempts and still propagates
+    /// cancellation and shutdown immediately.
+    pub fn unlimited() -> Self {
+        Self {
+            max_retries: usize::MAX,
+            max_elapsed: None,
+            ..Self::default()
+        }
+    }
+
     /// Validates delay ordering and monotonic deadline representability.
     pub fn validate(&self) -> Result<()> {
         validate_duration(self.initial_delay, "reconnect.initial_delay")?;
