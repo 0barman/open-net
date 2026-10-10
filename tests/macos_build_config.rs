@@ -1,3 +1,5 @@
+#![cfg(feature = "net-status")]
+
 use std::io;
 
 #[path = "../src/module/net_status/inner/platform/native/build_config.rs"]

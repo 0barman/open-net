@@ -9,8 +9,10 @@ publish = false
 [workspace]
 
 [dependencies]
-open-net = { path = "../../.." }
-reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+open-net = { path = "../../..", features = ["http-client"] }
+# Deliberately add ring and HTTP/2 from the host. The SDK itself does not enable
+# http-client-http2; its HTTP/1.1 policy must survive dependency feature merging.
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "http2"] }
 rustls = { version = "=0.23.43", default-features = false, features = ["std", "tls12"] }
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "time", "io-util"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }

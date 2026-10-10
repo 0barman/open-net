@@ -1,3 +1,5 @@
+#![cfg(feature = "net-status")]
+
 use std::net::Ipv4Addr;
 
 #[test]

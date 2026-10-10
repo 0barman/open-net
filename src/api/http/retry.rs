@@ -4,6 +4,7 @@
 use crate::api::error::ErrorKind;
 use crate::api::error::NetError;
 use crate::api::http::http_response::HttpRequestId;
+use crate::api::http::HttpTimeouts;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1048,12 +1049,25 @@ pub struct HttpRequestOptions {
     pub request_id: Option<HttpRequestId>,
     pub(crate) use_default_retry_policy: bool,
     retry_setting: RetrySetting,
+    timeouts: HttpTimeouts,
 }
 
 impl HttpRequestOptions {
     /// Construct options using the client-default retry policy and a replayable body.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace this request's entire layer of phase timeout overrides.
+    pub fn with_timeouts(mut self, timeouts: HttpTimeouts) -> Result<Self, NetError> {
+        timeouts.validate_request()?;
+        self.timeouts = timeouts;
+        Ok(self)
+    }
+
+    /// Return the explicit overrides installed on these options.
+    pub fn timeouts(&self) -> &HttpTimeouts {
+        &self.timeouts
     }
 
     /// Override the retry policy for this request.
@@ -1110,6 +1124,7 @@ impl Default for HttpRequestOptions {
             request_id: None,
             use_default_retry_policy: true,
             retry_setting: RetrySetting::Inherit,
+            timeouts: HttpTimeouts::new(),
         }
     }
 }

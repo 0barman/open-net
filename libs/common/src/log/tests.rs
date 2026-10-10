@@ -1,4 +1,6 @@
-use open_net::{log_e, log_r, log_s, log_t, LogInfo, LogLevel, LogSubscription, LogType, Logger};
+use open_net::{
+    log_e, log_r, log_s, log_t, LogInfo, LogLevel, LogSubscription, LogType, OpenNetLogger,
+};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -15,7 +17,7 @@ fn receive(receiver: &Receiver<LogInfo>) -> LogInfo {
 }
 fn subscribe(types: &[LogType]) -> (LogSubscription, Receiver<LogInfo>) {
     let (sender, receiver) = mpsc::channel();
-    let subscription = Logger::register_log_listener(
+    let subscription = OpenNetLogger::register_log_listener(
         Box::new(move |record| {
             let _ = sender.send(record);
         }),
@@ -99,7 +101,7 @@ fn subscriptions_are_independent_and_dropping_releases_idle_callback() {
     assert!(first_records.recv_timeout(WAIT).is_err());
     let (dropped_sender, dropped_receiver) = mpsc::channel();
     let marker = NotifyDrop(dropped_sender);
-    let idle = Logger::register_log_listener(
+    let idle = OpenNetLogger::register_log_listener(
         Box::new(move |_| {
             let _keep_alive = &marker;
         }),
@@ -121,7 +123,7 @@ fn callback_can_unsubscribe_itself_and_recursive_logs_are_suppressed() {
     let callback_evaluated = Arc::clone(&evaluated);
     let (done_sender, done_receiver) = mpsc::channel();
     let (_other, other_records) = subscribe(&[LogType::WSC]);
-    let subscription = Logger::register_log_listener(Box::new(move |_| {
+    let subscription = OpenNetLogger::register_log_listener(Box::new(move |_| {
         log_t!(LogType::WSC; "recursive", "value", callback_evaluated.fetch_add(1, AtomicOrdering::SeqCst));
         let old = callback_holder.lock().unwrap().take();
         drop(old);
@@ -141,7 +143,7 @@ fn callback_can_unsubscribe_itself_and_recursive_logs_are_suppressed() {
 fn callback_panics_do_not_stop_later_delivery() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (sender, receiver) = mpsc::channel();
-    let _subscription = Logger::register_log_listener(
+    let _subscription = OpenNetLogger::register_log_listener(
         Box::new(move |record| {
             let should_panic = record.tag == "ON_WSC-panic-T";
             sender.send(record).unwrap();
@@ -165,7 +167,7 @@ fn full_queue_is_observable_and_slow_listener_does_not_block_other_listeners() {
     let (release_sender, release_receiver) = mpsc::channel();
     let release_receiver = Mutex::new(release_receiver);
     let (sender, receiver) = mpsc::channel();
-    let slow = Logger::register_log_listener_with_capacity(
+    let slow = OpenNetLogger::register_log_listener_with_capacity(
         Box::new(move |record| {
             if record.tag == "ON_WSC-block-T" {
                 entered_sender.send(()).unwrap();
@@ -206,7 +208,7 @@ fn dropping_a_blocked_callback_does_not_wait_and_worker_exits_after_return() {
     let release_receiver = Mutex::new(release_receiver);
     let (dropped_sender, dropped_receiver) = mpsc::channel();
     let marker = NotifyDrop(dropped_sender);
-    let subscription = Logger::register_log_listener(
+    let subscription = OpenNetLogger::register_log_listener(
         Box::new(move |_| {
             let _keep_alive = &marker;
             entered_sender.send(()).unwrap();
@@ -235,16 +237,16 @@ fn dropping_a_blocked_callback_does_not_wait_and_worker_exits_after_return() {
 fn invalid_registration_and_clear_are_explicit() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
-        matches!(Logger::register_log_listener(Box::new(|_| {}), &[]), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
+        matches!(OpenNetLogger::register_log_listener(Box::new(|_| {}), &[]), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
     );
     assert!(
-        matches!(Logger::register_log_listener_with_capacity(Box::new(|_| {}), &[LogType::WSC], 0), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
+        matches!(OpenNetLogger::register_log_listener_with_capacity(Box::new(|_| {}), &[LogType::WSC], 0), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
     );
     let (_one, _one_records) = subscribe(&[LogType::WSC]);
     let (_two, _two_records) = subscribe(&[LogType::Common]);
-    Logger::clear_global_log_listener();
-    assert!(!Logger::is_enabled(LogType::WSC));
-    assert!(!Logger::is_enabled(LogType::Common));
+    OpenNetLogger::clear_global_log_listener();
+    assert!(!OpenNetLogger::is_enabled(LogType::WSC));
+    assert!(!OpenNetLogger::is_enabled(LogType::Common));
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<LogSubscription>();
 }

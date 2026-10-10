@@ -1,6 +1,8 @@
 //! Network configuration and local-address discovery helpers.
 
+#[cfg(feature = "net-status")]
 use crate::api::NetError;
+#[cfg(feature = "net-status")]
 use std::net::Ipv4Addr;
 
 #[cfg(feature = "ws-client")]
@@ -20,6 +22,7 @@ pub use crate::api::network_config::{
 /// Returns `None` when no usable LAN address exists (the caller should then
 /// refrain from advertising an address at all, rather than pretending with a
 /// fallback like `127.0.0.1`).
+#[cfg(feature = "net-status")]
 pub fn preferred_lan_ipv4() -> Result<Option<Ipv4Addr>, NetError> {
     crate::module::net_status::lan_addr::preferred_lan_ipv4()
 }

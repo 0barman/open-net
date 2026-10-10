@@ -7,13 +7,15 @@ pub(crate) mod inner;
 pub(crate) mod module;
 
 // Keep existing import paths as re-exports of the canonical API modules.
-pub use api::{config, error, net_status, network, subscription};
+pub use api::{config, error, network, subscription};
+#[cfg(feature = "net-status")]
+pub use api::{net_status, IpStack, MonitorState, NetStatusClient, NetworkSnapshot, NetworkStatus};
 #[cfg(feature = "ws-client")]
 pub use api::{ws, WebSocketClient};
 pub use api::{
-    BoxError, Bytes, EnqueueError, HeaderMap, HeaderName, HeaderValue, IpStack, LogInfo, LogLevel,
-    LogListener, LogSubscription, LogType, Logger, Metadata, MonitorState, NetError,
-    NetStatusClient, NetworkSnapshot, NetworkStatus, OpenNet, OpenNetConfig, Result, StatusCode,
+    BoxError, Bytes, EnqueueError, HeaderMap, HeaderName, HeaderValue, LogInfo, LogLevel,
+    LogListener, LogSubscription, LogType, Metadata, NetError, OpenNet, OpenNetConfig,
+    OpenNetLogger, Result, StatusCode,
 };
 #[cfg(feature = "http-client")]
 pub use async_trait::async_trait;

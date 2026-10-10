@@ -1,4 +1,4 @@
-pub(crate) use crate::api::log::{LogSubscription, Logger};
+pub(crate) use crate::api::log::{LogSubscription, OpenNetLogger};
 use crate::common::log::listener::LogListener;
 use crate::common::log::log_def::{format_tag, timestamp_millis, LogType};
 use crate::common::log::log_info::LogInfo;

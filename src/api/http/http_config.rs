@@ -4,12 +4,24 @@
 //! creation and transport setup live in the HTTP worker module.
 
 use crate::api::error::{ErrorStage, NetError};
+#[cfg(feature = "http-client-auth")]
+use crate::api::http::auth::HttpAuth;
+#[cfg(feature = "http-client-cookies")]
+use crate::api::http::cookies::{CookieLimits, CookieStore};
+#[cfg(feature = "http-client-http2")]
+use crate::api::http::http2::{Http2Config, HttpVersionPolicy};
+use crate::api::http::http_timeouts::{validate_duration, HttpTimeouts};
 use crate::api::http::retry::RetryPolicy;
+use crate::api::http::HttpAdmissionPolicy;
+#[cfg(feature = "http-client-middleware")]
+use crate::api::http::HttpMiddleware;
 use http::{HeaderMap, HeaderName};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const MAX_TLS_PEM_BYTES: usize = 1024 * 1024;
 const MAX_TLS_CERTIFICATES: usize = 128;
@@ -25,12 +37,28 @@ pub enum HttpRootCertificateMode {
 }
 
 /// TLS settings used by the HTTP client.  Certificate material is retained only in owned,
-/// bounded buffers so a reqwest client can build its rustls connector once during startup.
+/// bounded buffers so the worker can build its rustls connector once during startup.
 #[derive(Clone)]
 pub struct HttpTlsConfig {
     root_certificates: Vec<Vec<u8>>,
     root_mode: HttpRootCertificateMode,
-    client_identity: Option<Vec<u8>>,
+    client_identity: Option<HttpClientIdentity>,
+}
+
+// Keep the key material rather than a provider-specific signing key: the
+// client's final provider must load the key used for its actual TLS handshakes.
+struct HttpClientIdentity {
+    certificates: Vec<CertificateDer<'static>>,
+    private_key: PrivatePkcs8KeyDer<'static>,
+}
+
+impl Clone for HttpClientIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            certificates: self.certificates.clone(),
+            private_key: self.private_key.clone_key(),
+        }
+    }
 }
 
 impl Default for HttpTlsConfig {
@@ -48,7 +76,7 @@ impl HttpTlsConfig {
     ///
     /// The bundle must contain one or more valid `CERTIFICATE` PEM blocks and
     /// remain within the library's bounded certificate limits. When
-    /// `replace_builtin_roots` is `false`, the roots are appended to reqwest's
+    /// `replace_builtin_roots` is `false`, the roots are appended to the SDK's
     /// built-in WebPKI roots; when it is `true`, only this custom set is used.
     pub fn with_root_certificates(
         mut self,
@@ -126,45 +154,62 @@ impl HttpTlsConfig {
         let key = PrivatePkcs8KeyDer::from_pem_slice(keys[0])
             .map_err(|_| invalid_config("tls.client_identity.private_key"))?;
         let certified = CertifiedKey::from_der(
-            chain,
-            PrivateKeyDer::Pkcs8(key),
-            &rustls::crypto::aws_lc_rs::default_provider(),
+            chain.clone(),
+            PrivateKeyDer::Pkcs8(key.clone_key()),
+            &crate::module::tls::local_provider(),
         )
         .map_err(|_| invalid_config("tls.client_identity"))?;
         certified
             .keys_match()
             .map_err(|_| invalid_config("tls.client_identity"))?;
-        let mut combined = Vec::with_capacity(certificates.len() + private_key.len());
-        combined.extend_from_slice(certificates);
-        if !certificates.ends_with(b"\n") {
-            combined.push(b'\n');
-        }
-        combined.extend_from_slice(private_key);
-        let identity = reqwest::Identity::from_pem(&combined)
-            .map_err(|_| invalid_config("tls.client_identity"))?;
-        let _ = identity;
-        self.client_identity = Some(combined);
+        self.client_identity = Some(HttpClientIdentity {
+            certificates: chain,
+            private_key: key,
+        });
         Ok(self)
     }
 
-    pub(crate) fn configure_builder(
+    pub(crate) fn compile(
         &self,
-        mut builder: reqwest::ClientBuilder,
-    ) -> Result<reqwest::ClientBuilder, NetError> {
-        if self.root_mode == HttpRootCertificateMode::Replace {
-            builder = builder.tls_built_in_root_certs(false);
-        }
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<rustls::ClientConfig, NetError> {
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| invalid_config("tls.provider"))?
+            .with_root_certificates(self.compile_roots()?);
+        let mut tls = if let Some(identity) = &self.client_identity {
+            builder
+                .with_client_auth_cert(
+                    identity.certificates.clone(),
+                    PrivateKeyDer::Pkcs8(identity.private_key.clone_key()),
+                )
+                .map_err(|_| invalid_config("tls.client_identity"))?
+        } else {
+            builder.with_no_client_auth()
+        };
+        // reqwest's preconfigured path does not apply its own SNI or ALPN
+        // options. Set them here so Cargo feature unification cannot expand
+        // the protocols advertised by the SDK.
+        tls.enable_sni = true;
+        tls.alpn_protocols = alpn_protocols;
+        Ok(tls)
+    }
+
+    fn compile_roots(&self) -> Result<rustls::RootCertStore, NetError> {
+        let mut roots =
+            crate::module::tls::root_store(self.root_mode == HttpRootCertificateMode::Append);
         for pem in &self.root_certificates {
-            let certificate = reqwest::Certificate::from_pem(pem)
-                .map_err(|_| invalid_config("tls.root_certificates"))?;
-            builder = builder.add_root_certificate(certificate);
+            for certificate in parse_certificates(pem, "tls.root_certificates")? {
+                roots
+                    .add(certificate)
+                    .map_err(|_| invalid_config("tls.root_certificates"))?;
+            }
         }
-        if let Some(identity) = &self.client_identity {
-            let identity = reqwest::Identity::from_pem(identity)
-                .map_err(|_| invalid_config("tls.client_identity"))?;
-            builder = builder.identity(identity);
+        if roots.is_empty() {
+            return Err(invalid_config("tls.root_certificates"));
         }
-        Ok(builder)
+        Ok(roots)
     }
 
     /// Return the number of custom trust roots currently configured.
@@ -281,11 +326,15 @@ pub struct HttpClientConfig {
     pub base_url: reqwest::Url,
     /// Headers copied into every request before request-specific headers are merged.
     pub common_headers: HeaderMap,
-    /// Timeout for each network attempt, including response headers and body.
+    /// Legacy timeout for each attempt, including preparation, response headers, and body.
     ///
-    /// This starts when reqwest executes the attempt, excludes SDK admission
-    /// waiting, and resets for a retry. Paused stream consumption still uses time.
+    /// This starts at SDK request preparation, excludes admission waiting, and
+    /// resets for a retry. Explicit [`HttpTimeouts`] attempt settings replace it.
+    /// Paused stream consumption still uses time.
     pub timeout: Duration,
+    connect_timeout: Option<Duration>,
+    timeouts: HttpTimeouts,
+    admission_policy: HttpAdmissionPolicy,
     /// Optional TCP keepalive interval applied to pooled connections.
     pub tcp_keepalive: Option<Duration>,
     /// Maximum response body size accepted by the receive lane. Defaults to 1024 MiB.
@@ -293,12 +342,18 @@ pub struct HttpClientConfig {
     /// Capacity of the admission queue and in-flight operation quota.
     ///
     /// One permit is held from admission until the final callback completes, or
-    /// a stream observes its terminal item/EOF or is dropped. Retries retain
-    /// capacity between attempts; an unpolled retained stream does not release it.
+    /// a stream terminates or is dropped. Retries retain capacity between attempts;
+    /// timeout, cancellation, and shutdown reclaim even an unpolled retained stream.
+    /// The value must be within `1..=tokio::sync::Semaphore::MAX_PERMITS`; values outside
+    /// this range return a structured configuration error.
     pub request_queue_capacity: usize,
     /// Capacity of the response queue owned by the receive lane.
+    /// The value must be within `1..=tokio::sync::Semaphore::MAX_PERMITS`; values outside
+    /// this range return a structured configuration error.
     pub response_queue_capacity: usize,
     /// Capacity of the callback queue owned by the callback lane.
+    /// The value must be within `1..=tokio::sync::Semaphore::MAX_PERMITS`; values outside
+    /// this range return a structured configuration error.
     pub callback_queue_capacity: usize,
     /// Policy applied when a request does not provide its own policy.
     pub default_retry_policy: RetryPolicy,
@@ -308,6 +363,23 @@ pub struct HttpClientConfig {
     pub proxy: Option<HttpProxyConfig>,
     /// Whether reqwest may read HTTP(S) proxy settings from the environment.
     pub environment_proxy: bool,
+    /// Optional SDK-owned Cookie store. Cookie handling remains disabled when absent.
+    #[cfg(feature = "http-client-cookies")]
+    pub(crate) cookie_store: Option<Arc<dyn CookieStore>>,
+    /// Bounded Cookie processing limits used by the HTTP worker.
+    #[cfg(feature = "http-client-cookies")]
+    pub(crate) cookie_limits: CookieLimits,
+    /// Optional asynchronous authentication provider applied to each request attempt.
+    #[cfg(feature = "http-client-auth")]
+    auth: Option<Arc<dyn HttpAuth>>,
+    /// HTTP protocol version policy and HTTP/2 tuning.
+    #[cfg(feature = "http-client-http2")]
+    http_version_policy: HttpVersionPolicy,
+    #[cfg(feature = "http-client-http2")]
+    http2: Http2Config,
+    /// Optional middleware applied to concrete request and stream APIs.
+    #[cfg(feature = "http-client-middleware")]
+    middlewares: Vec<Arc<dyn HttpMiddleware>>,
 }
 
 impl HttpClientConfig {
@@ -330,6 +402,9 @@ impl HttpClientConfig {
             base_url: parsed,
             common_headers: HeaderMap::new(),
             timeout: Duration::from_secs(30),
+            connect_timeout: None,
+            timeouts: HttpTimeouts::new(),
+            admission_policy: HttpAdmissionPolicy::default(),
             // reqwest 0.12 defaults to a 15 second TCP keepalive.
             tcp_keepalive: Some(Duration::from_secs(15)),
             max_response_bytes: 1024 * 1024 * 1024,
@@ -340,7 +415,78 @@ impl HttpClientConfig {
             tls: HttpTlsConfig::default(),
             proxy: None,
             environment_proxy: false,
+            #[cfg(feature = "http-client-cookies")]
+            cookie_store: None,
+            #[cfg(feature = "http-client-cookies")]
+            cookie_limits: CookieLimits::default(),
+            #[cfg(feature = "http-client-auth")]
+            auth: None,
+            #[cfg(feature = "http-client-http2")]
+            http_version_policy: HttpVersionPolicy::Auto,
+            #[cfg(feature = "http-client-http2")]
+            http2: Http2Config::default(),
+            #[cfg(feature = "http-client-middleware")]
+            middlewares: Vec::new(),
         })
+    }
+
+    /// Append a middleware to the concrete request and stream pipeline.
+    #[cfg(feature = "http-client-middleware")]
+    pub fn with_middleware<M>(mut self, middleware: M) -> Self
+    where
+        M: HttpMiddleware + 'static,
+    {
+        self.middlewares.push(Arc::new(middleware));
+        self
+    }
+
+    /// Append a shared middleware to the concrete request and stream pipeline.
+    #[cfg(feature = "http-client-middleware")]
+    pub fn with_middleware_arc(mut self, middleware: Arc<dyn HttpMiddleware>) -> Self {
+        self.middlewares.push(middleware);
+        self
+    }
+
+    /// Install an asynchronous authentication provider.
+    #[cfg(feature = "http-client-auth")]
+    pub fn with_auth<A>(mut self, auth: A) -> Self
+    where
+        A: HttpAuth + 'static,
+    {
+        self.auth = Some(Arc::new(auth));
+        self
+    }
+
+    /// Install a shared authentication provider.
+    #[cfg(feature = "http-client-auth")]
+    pub fn with_auth_arc(mut self, auth: Arc<dyn HttpAuth>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Select the HTTP protocol versions used by this client.
+    #[cfg(feature = "http-client-http2")]
+    pub fn with_http_version_policy(mut self, policy: HttpVersionPolicy) -> Self {
+        self.http_version_policy = policy;
+        self
+    }
+
+    /// Configure HTTP/2 transport tuning after validating its bounds.
+    #[cfg(feature = "http-client-http2")]
+    pub fn with_http2(mut self, http2: Http2Config) -> Result<Self, NetError> {
+        http2.validate()?;
+        self.http2 = http2;
+        Ok(self)
+    }
+
+    #[cfg(feature = "http-client-auth")]
+    pub(crate) fn auth(&self) -> Option<Arc<dyn HttpAuth>> {
+        self.auth.as_ref().map(Arc::clone)
+    }
+
+    #[cfg(feature = "http-client-middleware")]
+    pub(crate) fn middleware_chain(&self) -> std::sync::Arc<[Arc<dyn HttpMiddleware>]> {
+        std::sync::Arc::from(self.middlewares.clone())
     }
 
     /// Add or replace the public headers copied to each request.
@@ -350,14 +496,59 @@ impl HttpClientConfig {
         Ok(self)
     }
 
-    /// Replace the request timeout.  A zero timeout is rejected because it would make every
-    /// request fail before the transport can produce a useful response.
+    /// Replace the legacy attempt timeout. Explicit [`HttpTimeouts`] attempt
+    /// settings take precedence regardless of builder call order.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, NetError> {
-        if timeout.is_zero() {
-            return Err(invalid_config("timeout"));
-        }
+        validate_duration(timeout, "http.timeout", false)?;
         self.timeout = timeout;
         Ok(self)
+    }
+
+    /// Limit establishment of each new connection, including DNS, proxy, and TLS.
+    /// Reused pooled connections do not consume this dedicated budget.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Result<Self, NetError> {
+        validate_duration(timeout, "http.connect_timeout", false)?;
+        self.connect_timeout = Some(timeout);
+        Ok(self)
+    }
+
+    /// Disable only the dedicated connection budget.
+    pub fn without_connect_timeout(mut self) -> Self {
+        self.connect_timeout = None;
+        self
+    }
+
+    /// Return the dedicated connection establishment budget.
+    pub fn connect_timeout(&self) -> Option<Duration> {
+        self.connect_timeout
+    }
+
+    /// Select the default capacity policy for response-returning Future APIs.
+    ///
+    /// The default is [`HttpAdmissionPolicy::Wait`]. Request builders may override
+    /// this value. Callback `send` and `send_wait` keep their respective immediate
+    /// and waiting admission behavior regardless of this setting.
+    pub fn with_admission_policy(mut self, policy: HttpAdmissionPolicy) -> Self {
+        self.admission_policy = policy;
+        self
+    }
+
+    /// Return the default capacity policy for response-returning Future APIs.
+    pub fn admission_policy(&self) -> HttpAdmissionPolicy {
+        self.admission_policy
+    }
+
+    /// Replace this client's complete layer of phase timeout defaults.
+    /// Inherited Admission still falls back to 30 seconds after replacement.
+    pub fn with_timeouts(mut self, timeouts: HttpTimeouts) -> Result<Self, NetError> {
+        timeouts.validate()?;
+        self.timeouts = timeouts;
+        Ok(self)
+    }
+
+    /// Return the explicit client overrides, before request and legacy resolution.
+    pub fn timeouts(&self) -> &HttpTimeouts {
+        &self.timeouts
     }
 
     /// Set the TCP keepalive interval. A zero interval disables keepalive.
@@ -386,37 +577,40 @@ impl HttpClientConfig {
     }
 
     /// Set the bounded request queue capacity.
+    ///
+    /// The value must be within `1..=tokio::sync::Semaphore::MAX_PERMITS`; values outside
+    /// this range return a structured configuration error.
     pub fn with_request_queue_capacity(
         mut self,
         request_queue_capacity: usize,
     ) -> Result<Self, NetError> {
-        if request_queue_capacity == 0 {
-            return Err(invalid_config("request_queue_capacity"));
-        }
+        validate_queue_capacity(request_queue_capacity, "request_queue_capacity")?;
         self.request_queue_capacity = request_queue_capacity;
         Ok(self)
     }
 
     /// Set the bounded response queue capacity.
+    ///
+    /// The value must be within `1..=tokio::sync::Semaphore::MAX_PERMITS`; values outside
+    /// this range return a structured configuration error.
     pub fn with_response_queue_capacity(
         mut self,
         response_queue_capacity: usize,
     ) -> Result<Self, NetError> {
-        if response_queue_capacity == 0 {
-            return Err(invalid_config("response_queue_capacity"));
-        }
+        validate_queue_capacity(response_queue_capacity, "response_queue_capacity")?;
         self.response_queue_capacity = response_queue_capacity;
         Ok(self)
     }
 
     /// Set the bounded callback queue capacity.
+    ///
+    /// The value must be within `1..=tokio::sync::Semaphore::MAX_PERMITS`; values outside
+    /// this range return a structured configuration error.
     pub fn with_callback_queue_capacity(
         mut self,
         callback_queue_capacity: usize,
     ) -> Result<Self, NetError> {
-        if callback_queue_capacity == 0 {
-            return Err(invalid_config("callback_queue_capacity"));
-        }
+        validate_queue_capacity(callback_queue_capacity, "callback_queue_capacity")?;
         self.callback_queue_capacity = callback_queue_capacity;
         Ok(self)
     }
@@ -445,6 +639,43 @@ impl HttpClientConfig {
         self
     }
 
+    /// Install a Cookie store. `CookieJar::new()` creates independent state;
+    /// cloning an existing jar or this configuration explicitly shares it.
+    #[cfg(feature = "http-client-cookies")]
+    pub fn with_cookie_store<S>(mut self, store: S) -> Self
+    where
+        S: CookieStore + 'static,
+    {
+        self.cookie_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Install a Cookie store whose sharing is explicit through `Arc`.
+    #[cfg(feature = "http-client-cookies")]
+    pub fn with_cookie_store_arc(mut self, store: Arc<dyn CookieStore>) -> Self {
+        self.cookie_store = Some(store);
+        self
+    }
+
+    /// Configure bounded Cookie header and response processing limits.
+    /// Jar capacity is configured separately through `CookieJar::with_limits`.
+    #[cfg(feature = "http-client-cookies")]
+    pub fn with_cookie_limits(mut self, limits: CookieLimits) -> Result<Self, NetError> {
+        limits.validate()?;
+        self.cookie_limits = limits;
+        Ok(self)
+    }
+
+    #[cfg(feature = "http-client-cookies")]
+    pub(crate) fn cookie_store(&self) -> Option<Arc<dyn CookieStore>> {
+        self.cookie_store.as_ref().map(Arc::clone)
+    }
+
+    #[cfg(feature = "http-client-cookies")]
+    pub(crate) fn cookie_limits(&self) -> CookieLimits {
+        self.cookie_limits
+    }
+
     /// Validate a configuration assembled with public fields.
     pub fn validate(&self) -> Result<(), NetError> {
         let scheme = self.base_url.scheme();
@@ -457,9 +688,11 @@ impl HttpClientConfig {
         {
             return Err(invalid_config("base_url"));
         }
-        if self.timeout.is_zero() {
-            return Err(invalid_config("timeout"));
+        validate_duration(self.timeout, "http.timeout", false)?;
+        if let Some(timeout) = self.connect_timeout {
+            validate_duration(timeout, "http.connect_timeout", false)?;
         }
+        self.timeouts.validate()?;
         if self
             .tcp_keepalive
             .is_some_and(|duration| duration.is_zero())
@@ -469,25 +702,38 @@ impl HttpClientConfig {
         if self.max_response_bytes == 0 {
             return Err(invalid_config("max_response_bytes"));
         }
-        if self.request_queue_capacity == 0 {
-            return Err(invalid_config("request_queue_capacity"));
-        }
-        if self.response_queue_capacity == 0 {
-            return Err(invalid_config("response_queue_capacity"));
-        }
-        if self.callback_queue_capacity == 0 {
-            return Err(invalid_config("callback_queue_capacity"));
+        validate_queue_capacity(self.request_queue_capacity, "request_queue_capacity")?;
+        validate_queue_capacity(self.response_queue_capacity, "response_queue_capacity")?;
+        validate_queue_capacity(self.callback_queue_capacity, "callback_queue_capacity")?;
+        #[cfg(feature = "http-client-cookies")]
+        self.cookie_limits.validate()?;
+        #[cfg(feature = "http-client-http2")]
+        {
+            self.http2.validate()?;
+            if self.http_version_policy == HttpVersionPolicy::Http2Only
+                && self.base_url.scheme() != "https"
+            {
+                return Err(invalid_config("http_version_policy"));
+            }
         }
         validate_headers(&self.common_headers)
     }
 
     /// Merge request headers over the client-wide headers.
+    ///
+    /// Each request header name replaces all common values for that name.
+    /// Every request value is retained in its original per-name order, including
+    /// repeated or empty values. Unrelated common headers are preserved, and
+    /// neither input is modified.
     pub fn merge_headers(&self, request_headers: &HeaderMap) -> Result<HeaderMap, NetError> {
         self.validate()?;
         validate_headers(request_headers)?;
         let mut merged = self.common_headers.clone();
-        for (name, value) in request_headers {
-            merged.insert(name.clone(), value.clone());
+        for name in request_headers.keys() {
+            merged.remove(name);
+            for value in request_headers.get_all(name) {
+                merged.append(name.clone(), value.clone());
+            }
         }
         Ok(merged)
     }
@@ -496,14 +742,17 @@ impl HttpClientConfig {
 impl fmt::Debug for HttpClientConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let header_names: Vec<&str> = self.common_headers.keys().map(HeaderName::as_str).collect();
-        formatter
-            .debug_struct("HttpClientConfig")
+        let mut debug = formatter.debug_struct("HttpClientConfig");
+        debug
             // Keep query strings, credentials, and fragments out of logs.  A URL may contain
             // a signed token even though request headers are otherwise redacted.
             .field("base_scheme", &self.base_url.scheme())
             .field("base_has_host", &self.base_url.host_str().is_some())
             .field("common_header_names", &header_names)
             .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("timeouts", &self.timeouts)
+            .field("admission_policy", &self.admission_policy)
             .field("tcp_keepalive", &self.tcp_keepalive)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("request_queue_capacity", &self.request_queue_capacity)
@@ -512,12 +761,44 @@ impl fmt::Debug for HttpClientConfig {
             .field("default_retry_policy", &self.default_retry_policy)
             .field("tls", &self.tls)
             .field("proxy_configured", &self.proxy.is_some())
-            .field("environment_proxy", &self.environment_proxy)
-            .finish()
+            .field("environment_proxy", &self.environment_proxy);
+        #[cfg(feature = "http-client-cookies")]
+        debug
+            .field("cookie_store_configured", &self.cookie_store.is_some())
+            .field("cookie_limits", &self.cookie_limits);
+        #[cfg(feature = "http-client-auth")]
+        debug.field("auth_configured", &self.auth.is_some());
+        #[cfg(feature = "http-client-http2")]
+        debug
+            .field("http_version_policy", &self.http_version_policy)
+            .field("http2", &self.http2);
+        #[cfg(feature = "http-client-middleware")]
+        debug.field("middleware_count", &self.middlewares.len());
+        debug.finish()
     }
 }
 
 impl HttpClientConfig {
+    pub(crate) fn tls_alpn_protocols(&self) -> Vec<Vec<u8>> {
+        #[cfg(feature = "http-client-http2")]
+        match self.http_version_policy {
+            HttpVersionPolicy::Auto => return vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            HttpVersionPolicy::Http2Only => return vec![b"h2".to_vec()],
+            HttpVersionPolicy::Http1Only => {}
+        }
+        vec![b"http/1.1".to_vec()]
+    }
+
+    #[cfg(feature = "http-client-http2")]
+    pub(crate) fn http_version_policy(&self) -> HttpVersionPolicy {
+        self.http_version_policy
+    }
+
+    #[cfg(feature = "http-client-http2")]
+    pub(crate) fn http2(&self) -> &Http2Config {
+        &self.http2
+    }
+
     pub(crate) fn resolve_request_path(&self, path: &str) -> Result<reqwest::Url, NetError> {
         let path = path.trim();
         if path.is_empty()
@@ -652,6 +933,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
         name.as_str().to_ascii_lowercase().as_str(),
         "connection"
             | "keep-alive"
+            | "proxy-connection"
             | "proxy-authenticate"
             | "proxy-authorization"
             | "te"
@@ -661,6 +943,13 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "host"
             | "content-length"
     )
+}
+
+fn validate_queue_capacity(capacity: usize, field: &'static str) -> Result<(), NetError> {
+    if capacity == 0 || capacity > Semaphore::MAX_PERMITS {
+        return Err(invalid_config(field));
+    }
+    Ok(())
 }
 
 fn invalid_config(field: &'static str) -> NetError {
@@ -687,6 +976,37 @@ mod tests {
         } else {
             Err(std::io::Error::other(message).into())
         }
+    }
+
+    #[test]
+    fn admission_policy_defaults_to_wait_and_preserves_explicit_configuration() -> TestResult {
+        use crate::api::http::HttpAdmissionPolicy;
+
+        let default = HttpClientConfig::new("https://example.com")?;
+        check(
+            default.admission_policy() == HttpAdmissionPolicy::Wait
+                && HttpAdmissionPolicy::default() == HttpAdmissionPolicy::Wait,
+            "client admission policy must default to Wait",
+        )?;
+        let configured = default.with_admission_policy(HttpAdmissionPolicy::FailFast);
+        let cloned = configured.clone();
+        check(
+            configured.admission_policy() == HttpAdmissionPolicy::FailFast
+                && cloned.admission_policy() == HttpAdmissionPolicy::FailFast,
+            "explicit admission policy must survive clone",
+        )?;
+        let debug = format!("{cloned:?}");
+        check(
+            debug.contains("admission_policy: FailFast"),
+            "client debug must include the admission policy",
+        )?;
+        check(
+            configured
+                .with_admission_policy(HttpAdmissionPolicy::Wait)
+                .admission_policy()
+                == HttpAdmissionPolicy::Wait,
+            "the last client admission policy must win",
+        )
     }
 
     #[test]
@@ -845,6 +1165,130 @@ mod tests {
             config.replaces_builtin_roots(),
             "replace builtin root setting was lost",
         )
+    }
+
+    #[test]
+    fn compiled_roots_retain_every_certificate_in_each_bundle() -> TestResult {
+        let ca = include_bytes!("../../../tests/fixtures/network/ca.pem");
+        let other_ca = include_bytes!("../../../tests/fixtures/network/other-ca.pem");
+        let bundle = [ca.as_slice(), other_ca.as_slice()].concat();
+        let replaced = HttpTlsConfig::default().with_root_certificates(&bundle, true)?;
+        let replaced_roots = replaced.compile_roots()?;
+        check(
+            replaced_roots.len() == 2,
+            "PEM bundle lost a root certificate",
+        )?;
+        let appended = HttpTlsConfig::default().with_root_certificates(&bundle, false)?;
+        let appended_roots = appended.compile_roots()?;
+        check(
+            appended_roots.len() == webpki_roots::TLS_SERVER_ROOTS.len() + 2,
+            "Append did not retain both built-in and custom roots",
+        )?;
+        check(
+            replaced_roots
+                .roots
+                .iter()
+                .all(|root| appended_roots.roots.contains(root)),
+            "Append lost a custom trust anchor",
+        )?;
+        let additional = replaced.with_additional_root_certificate(ca)?;
+        check(
+            additional.compile_roots()?.len() == 3,
+            "adding another bundle lost the existing trust anchors",
+        )
+    }
+
+    #[test]
+    fn compiled_http_tls_uses_selected_provider_and_enables_sni() -> TestResult {
+        let provider = crate::module::tls::local_provider();
+        let alpn = vec![b"http/1.1".to_vec()];
+        let tls = HttpTlsConfig::default().compile(Arc::clone(&provider), alpn.clone())?;
+        check(
+            Arc::ptr_eq(&provider, tls.crypto_provider()),
+            "compiled HTTP TLS replaced the selected provider",
+        )?;
+        check(tls.enable_sni, "HTTP TLS must keep SNI enabled")?;
+        check(
+            tls.alpn_protocols == alpn,
+            "HTTP TLS changed the requested ALPN",
+        )?;
+        check(
+            !tls.enable_early_data,
+            "HTTP TLS unexpectedly enabled early data",
+        )?;
+        // Passing ClientConfig itself is essential: reqwest rejects an Arc or
+        // a different rustls version through its type-erased TLS boundary.
+        reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .build()?;
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_http_identity_is_loaded_by_the_selected_provider() -> TestResult {
+        #[derive(Debug)]
+        struct RejectSigningKeys;
+        impl rustls::crypto::KeyProvider for RejectSigningKeys {
+            fn load_private_key(
+                &self,
+                _key: PrivateKeyDer<'static>,
+            ) -> Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
+                Err(rustls::Error::General("test provider rejected key".into()))
+            }
+        }
+        static REJECT_KEYS: RejectSigningKeys = RejectSigningKeys;
+        let certificates = include_bytes!("../../../tests/fixtures/network/client.pem");
+        let key = include_bytes!("../../../tests/fixtures/network/client-key.pem");
+        let configured = HttpTlsConfig::default().with_client_identity_pem(certificates, key)?;
+        let clone = configured.clone();
+        let local = crate::module::tls::local_provider();
+        check(
+            clone
+                .compile(local, vec![b"http/1.1".to_vec()])?
+                .client_auth_cert_resolver
+                .has_certs(),
+            "cloning the configuration lost the client identity",
+        )?;
+        let mut custom = rustls::crypto::aws_lc_rs::default_provider();
+        custom.key_provider = &REJECT_KEYS;
+        let result = configured.compile(Arc::new(custom), vec![b"http/1.1".to_vec()]);
+        check(
+            result.is_err(),
+            "client identity bypassed the selected provider's key loader",
+        )
+    }
+
+    #[test]
+    fn http_alpn_matches_sdk_feature_and_version_policy() -> TestResult {
+        let config = HttpClientConfig::new("https://example.com")?;
+        #[cfg(not(feature = "http-client-http2"))]
+        check(
+            config.tls_alpn_protocols() == vec![b"http/1.1".to_vec()],
+            "base HTTP must only advertise HTTP/1.1",
+        )?;
+        #[cfg(feature = "http-client-http2")]
+        {
+            check(
+                config.tls_alpn_protocols() == vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                "Auto must advertise h2 followed by HTTP/1.1",
+            )?;
+            check(
+                config
+                    .clone()
+                    .with_http_version_policy(HttpVersionPolicy::Http1Only)
+                    .tls_alpn_protocols()
+                    == vec![b"http/1.1".to_vec()],
+                "Http1Only advertised another protocol",
+            )?;
+            check(
+                config
+                    .with_http_version_policy(HttpVersionPolicy::Http2Only)
+                    .tls_alpn_protocols()
+                    == vec![b"h2".to_vec()],
+                "Http2Only advertised another protocol",
+            )?;
+        }
+        Ok(())
     }
 
     #[test]

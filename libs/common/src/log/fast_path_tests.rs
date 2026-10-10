@@ -1,6 +1,6 @@
 //! These tests run in isolated child processes because the registry is global.
 
-use super::{LogSubscription, LogType, Logger, FAIL_NEXT_WORKER_SPAWN, SUBSCRIPTION_READS};
+use super::{LogSubscription, LogType, OpenNetLogger, FAIL_NEXT_WORKER_SPAWN, SUBSCRIPTION_READS};
 use crate::{log_s, log_t, LogInfo};
 use std::error::Error;
 use std::io;
@@ -61,7 +61,7 @@ fn isolated(name: &str) -> TestResult<bool> {
 
 fn subscribe(types: &[LogType]) -> TestResult<(LogSubscription, Receiver<LogInfo>)> {
     let (sender, receiver) = mpsc::channel();
-    let subscription = Logger::register_log_listener(
+    let subscription = OpenNetLogger::register_log_listener(
         Box::new(move |record| {
             let _ = sender.send(record);
         }),
@@ -79,7 +79,7 @@ fn verify_empty_without_reads(label: &str) -> TestResult {
     let evaluated = AtomicUsize::new(0);
     for _ in 0..1024 {
         check(
-            !Logger::is_enabled(LogType::WSC),
+            !OpenNetLogger::is_enabled(LogType::WSC),
             format!("{label}: WSC remained enabled"),
         )?;
         log_t!(LogType::WSC; "disabled", "value", evaluated.fetch_add(1, Ordering::SeqCst));
@@ -104,14 +104,14 @@ fn t12_empty_registry_avoids_read_lock_and_preserves_filtering() -> TestResult {
     if !isolated("t12_empty_registry_avoids_read_lock_and_preserves_filtering")? {
         return Ok(());
     }
-    Logger::clear_global_log_listener();
+    OpenNetLogger::clear_global_log_listener();
     verify_empty_without_reads("never registered")?;
     let (other, records) = subscribe(&[LogType::Common])?;
     read_count();
     let evaluated = AtomicUsize::new(0);
     log_t!(LogType::WSC; "filtered", "value", evaluated.fetch_add(1, Ordering::SeqCst));
     check(
-        !Logger::is_enabled(LogType::WSC),
+        !OpenNetLogger::is_enabled(LogType::WSC),
         "other origin enabled WSC",
     )?;
     check(
@@ -145,7 +145,7 @@ fn t13_registration_drop_clear_and_old_handles_preserve_new_subscriptions() -> T
     for old_before_new in [false, true] {
         FAIL_NEXT_WORKER_SPAWN.with(|fail| fail.set(true));
         check(
-            Logger::register_log_listener(Box::new(|_| {}), &[LogType::WSC]).is_err(),
+            OpenNetLogger::register_log_listener(Box::new(|_| {}), &[LogType::WSC]).is_err(),
             "injected worker failure succeeded",
         )?;
         verify_empty_without_reads("worker creation failure with empty registry")?;
@@ -162,10 +162,10 @@ fn t13_registration_drop_clear_and_old_handles_preserve_new_subscriptions() -> T
         )?;
         drop(second);
         check(
-            Logger::is_enabled(LogType::WSC),
+            OpenNetLogger::is_enabled(LogType::WSC),
             "dropping one subscription disabled survivor",
         )?;
-        Logger::clear_global_log_listener();
+        OpenNetLogger::clear_global_log_listener();
         verify_empty_without_reads("clear with old handle alive")?;
         let mut old = Some(old);
         if old_before_new {
@@ -174,7 +174,7 @@ fn t13_registration_drop_clear_and_old_handles_preserve_new_subscriptions() -> T
         let (new, new_records) = subscribe(&[LogType::WSC])?;
         drop(old.take());
         check(
-            Logger::is_enabled(LogType::WSC),
+            OpenNetLogger::is_enabled(LogType::WSC),
             "old handle disabled new subscription",
         )?;
         log_s!(LogType::WSC; "new");
@@ -187,24 +187,24 @@ fn t13_registration_drop_clear_and_old_handles_preserve_new_subscriptions() -> T
             "old subscription revived after clear",
         )?;
         check(
-            matches!(Logger::register_log_listener(Box::new(|_| {}), &[]), Err(error) if error.kind() == io::ErrorKind::InvalidInput),
+            matches!(OpenNetLogger::register_log_listener(Box::new(|_| {}), &[]), Err(error) if error.kind() == io::ErrorKind::InvalidInput),
             "empty origin registration accepted",
         )?;
         check(
-            matches!(Logger::register_log_listener_with_capacity(Box::new(|_| {}), &[LogType::WSC], 0), Err(error) if error.kind() == io::ErrorKind::InvalidInput),
+            matches!(OpenNetLogger::register_log_listener_with_capacity(Box::new(|_| {}), &[LogType::WSC], 0), Err(error) if error.kind() == io::ErrorKind::InvalidInput),
             "zero capacity registration accepted",
         )?;
         check(
-            Logger::is_enabled(LogType::WSC),
+            OpenNetLogger::is_enabled(LogType::WSC),
             "failed registration disabled existing subscription",
         )?;
         FAIL_NEXT_WORKER_SPAWN.with(|fail| fail.set(true));
         check(
-            Logger::register_log_listener(Box::new(|_| {}), &[LogType::WSC]).is_err(),
+            OpenNetLogger::register_log_listener(Box::new(|_| {}), &[LogType::WSC]).is_err(),
             "worker creation failure succeeded with active registry",
         )?;
         check(
-            Logger::is_enabled(LogType::WSC),
+            OpenNetLogger::is_enabled(LogType::WSC),
             "worker creation failure disabled survivor",
         )?;
         drop(new);
@@ -238,7 +238,7 @@ impl Worker {
                 while let Ok(step) = incoming.recv_timeout(WAIT) {
                     let result = match step {
                         Step::Observe(expected) => check(
-                            Logger::is_enabled(LogType::WSC) == expected,
+                            OpenNetLogger::is_enabled(LogType::WSC) == expected,
                             "cross-thread visibility mismatch",
                         ),
                         Step::Emit => {
@@ -250,7 +250,7 @@ impl Worker {
                             Ok(())
                         }
                         Step::Clear => {
-                            Logger::clear_global_log_listener();
+                            OpenNetLogger::clear_global_log_listener();
                             Ok(())
                         }
                         Step::DropAt(subscription, barrier) => {
@@ -260,7 +260,7 @@ impl Worker {
                         }
                         Step::ClearAt(barrier) => {
                             barrier.wait();
-                            Logger::clear_global_log_listener();
+                            OpenNetLogger::clear_global_log_listener();
                             Ok(())
                         }
                     };
@@ -331,7 +331,7 @@ fn t14_cross_thread_publication_clear_and_drop_are_ordered() -> TestResult {
         verify_empty_without_reads("cross-thread final drop")?;
 
         let (old, _) = subscribe(&[LogType::WSC])?;
-        Logger::clear_global_log_listener();
+        OpenNetLogger::clear_global_log_listener();
         let gate = Arc::new(Barrier::new(2));
         cleaner.begin(Step::DropAt(old, Arc::clone(&gate)))?;
         gate.wait();
@@ -393,13 +393,13 @@ fn p1_registry_check_release_diagnostic() -> TestResult {
                 LogType::WSC
             };
             for _ in 0..100_000 {
-                std::hint::black_box(Logger::is_enabled(std::hint::black_box(origin)));
+                std::hint::black_box(OpenNetLogger::is_enabled(std::hint::black_box(origin)));
             }
             read_count();
             let start = Instant::now();
             let mut enabled = 0usize;
             for _ in 0..CHECKS {
-                enabled += usize::from(std::hint::black_box(Logger::is_enabled(
+                enabled += usize::from(std::hint::black_box(OpenNetLogger::is_enabled(
                     std::hint::black_box(origin),
                 )));
             }
@@ -430,7 +430,7 @@ fn t14_callback_unsubscribe_preserves_recursion_suppression() -> TestResult {
     let callback_evaluated = Arc::clone(&evaluated);
     let (done, completed) = mpsc::channel();
     let (other, records) = subscribe(&[LogType::WSC])?;
-    let own = Logger::register_log_listener(
+    let own = OpenNetLogger::register_log_listener(
         Box::new(move |_| {
             let result = (|| -> TestResult {
                 log_t!(LogType::WSC; "recursive", "value", callback_evaluated.fetch_add(1, Ordering::SeqCst));
@@ -440,7 +440,7 @@ fn t14_callback_unsubscribe_preserves_recursion_suppression() -> TestResult {
                     .take();
                 drop(old);
                 check(
-                    !Logger::is_enabled(LogType::WSC),
+                    !OpenNetLogger::is_enabled(LogType::WSC),
                     "callback recursion guard became enabled",
                 )
             })();
@@ -463,7 +463,7 @@ fn t14_callback_unsubscribe_preserves_recursion_suppression() -> TestResult {
     )?;
     check(records.try_recv().is_err(), "recursive record leaked")?;
     check(
-        Logger::is_enabled(LogType::WSC),
+        OpenNetLogger::is_enabled(LogType::WSC),
         "callback drop disabled other listener",
     )?;
     drop(other);

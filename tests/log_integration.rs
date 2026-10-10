@@ -1,7 +1,7 @@
 #![cfg(feature = "ws-client")]
 #[path = "support/v2_peer.rs"]
 mod v2;
-use open_net::{LogInfo, LogLevel, LogSubscription, LogType, Logger, OpenNet};
+use open_net::{LogInfo, LogLevel, LogSubscription, LogType, OpenNet, OpenNetLogger};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -13,7 +13,7 @@ fn listen(
     types: &[LogType],
 ) -> TestResult<(LogSubscription, mpsc::UnboundedReceiver<LogInfo>)> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let subscription = Logger::register_log_listener(
+    let subscription = OpenNetLogger::register_log_listener(
         Box::new(move |log| {
             if log.tag.contains(prefix) {
                 let _ = tx.send(log);
@@ -121,7 +121,7 @@ async fn listener_can_query_and_unsubscribe_itself_without_feedback_or_runtime()
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let subscription = Logger::register_log_listener(
+    let subscription = OpenNetLogger::register_log_listener(
         Box::new(move |log| {
             if !log.tag.contains("reentry_probe") {
                 return;
@@ -162,7 +162,7 @@ async fn blocked_log_callback_does_not_block_network_io_or_shutdown() -> TestRes
     let gate = Gate::default();
     let release = ReleaseOnDrop(gate.clone());
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let subscription = Logger::register_log_listener(
+    let subscription = OpenNetLogger::register_log_listener(
         Box::new(move |log| {
             if log.tag.contains("slow_network_probe") {
                 let _ = tx.send(());
@@ -201,7 +201,7 @@ async fn dropping_log_subscription_releases_a_client_capture_outside_registry_lo
     }
     impl Drop for Capture {
         fn drop(&mut self) {
-            let _ = Logger::register_log_listener(Box::new(|_| {}), &[LogType::WSC]);
+            let _ = OpenNetLogger::register_log_listener(Box::new(|_| {}), &[LogType::WSC]);
             if let Some(tx) = self.released.take() {
                 let _ = tx.send(());
             }
@@ -214,7 +214,7 @@ async fn dropping_log_subscription_releases_a_client_capture_outside_registry_lo
         client: client.clone(),
         released: Some(tx),
     };
-    let subscription = Logger::register_log_listener(
+    let subscription = OpenNetLogger::register_log_listener(
         Box::new(move |_| {
             let _ = capture.client.is_shutdown();
         }),
