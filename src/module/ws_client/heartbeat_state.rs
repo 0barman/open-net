@@ -354,9 +354,6 @@ mod tests {
                 heartbeat.on_tick(Instant::now(), timeout),
                 HeartbeatTick::TimedOut
             )?;
-            println!(
-                "T19_STALE_PROBE source={stale_source} sending_unchanged=true deadline_unchanged=true expired_at_original_deadline=true"
-            );
         }
         Ok(())
     }

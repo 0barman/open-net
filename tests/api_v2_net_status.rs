@@ -1,3 +1,5 @@
+#![cfg(feature = "net-status")]
+
 use open_net::error::ErrorKind;
 use open_net::net_status::{
     IpStack, MonitorState, NetStatusClient, NetworkSnapshot, NetworkStatus,

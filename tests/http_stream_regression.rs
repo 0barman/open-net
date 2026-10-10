@@ -121,7 +121,7 @@ async fn stream_default_deadline_covers_admission_wait() -> TestResult {
     )
     .await?;
     check(
-        matches!(result, Err(ref e) if e.kind() == ErrorKind::DeadlineExceeded && e.context().stage == Some(ErrorStage::Queue)),
+        matches!(result, Err(ref e) if e.kind() == ErrorKind::DeadlineExceeded && e.context().stage == Some(ErrorStage::Admission)),
         "admission ignored default total deadline",
     )?;
     drop(first);
@@ -394,9 +394,14 @@ async fn zero_retry_defaults_apply_to_buffered_timeout() -> TestResult {
         config.default_retry_policy = policy;
         let client = HttpClient::new(config, format!("buffered-zero-retry-{total}"))?;
         let result = tokio::time::timeout(Duration::from_secs(2), client.get("/")).await?;
-        // Buffered timeout kinds intentionally retain their pre-existing contract.
+        // Total is now distinct from an individual attempt timeout.
+        let expected = if total {
+            ErrorKind::DeadlineExceeded
+        } else {
+            ErrorKind::TimedOut
+        };
         check(
-            matches!(result, Err(ref error) if error.kind() == ErrorKind::TimedOut),
+            matches!(result, Err(ref error) if error.kind() == expected),
             "zero retry default timeout did not apply",
         )?;
         let _ = release.send(());
@@ -457,6 +462,29 @@ async fn stream_config_timeout_includes_paused_consumption() -> TestResult {
 #[tokio::test]
 async fn dropped_stream_opening_cleans_before_completed_observer() -> TestResult {
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct CapacityProbe;
+
+    #[open_net::async_trait]
+    impl open_net::api::http::HttpRequestTrait for CapacityProbe {
+        fn get_path(&self) -> String {
+            "/".to_owned()
+        }
+
+        fn get_method(&self) -> HttpRequestMethod {
+            HttpRequestMethod::GET
+        }
+
+        async fn deal_with_response(
+            self: Box<Self>,
+            result: open_net::api::http::HttpResponseResult,
+        ) {
+            if let Err(error) = result {
+                eprintln!("capacity probe completed with {error}");
+            }
+        }
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let mut config = HttpClientConfig::new(format!("http://{}", listener.local_addr()?))?;
     config.request_queue_capacity = 1;
@@ -476,9 +504,7 @@ async fn dropped_stream_opening_cleans_before_completed_observer() -> TestResult
     let policy = RetryPolicy::builder().observer(move |event: &RetryEvent| {
         if matches!(event, RetryEvent::Completed(report) if report.attempts == 1 && report.last_error.as_deref() == Some("Cancelled")) {
             // This is a nonblocking capacity check using the public submit API.
-            if let Ok(request) = HttpRequest::builder().path("/").build() {
-                observed.store(reentrant.send(request).is_ok(), Ordering::SeqCst);
-            }
+            observed.store(reentrant.send(CapacityProbe).is_ok(), Ordering::SeqCst);
         }
     }).build()?;
     let opening_client = client.clone();

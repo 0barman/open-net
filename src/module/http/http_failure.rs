@@ -3,8 +3,9 @@
 //! Preserve execution evidence in the source chain so retry execution, queries,
 //! and observers all use the same classification without changing public APIs.
 
+use super::connect_timeout::ConnectTimedOut;
 use crate::api::error::{ErrorContext, ErrorKind, ErrorStage, NetError};
-use crate::api::http::{RetryReason, TransportErrorKind};
+use crate::api::http::{RetryReason, TimeoutPhase, TransportErrorKind};
 use std::error::Error;
 use std::fmt;
 
@@ -52,14 +53,20 @@ struct Causes {
     protocol: bool,
     transport: bool,
     hyper: bool,
+    body_write_aborted: bool,
+    connect_timeout: Option<tokio::time::Instant>,
 }
 
 impl Causes {
     fn http_transfer(&self) -> bool {
         // A decoder can produce UnexpectedEof even when HTTP framing completed.
         // Require the HTTP transport boundary before enabling body replay.
-        self.hyper && self.transport
+        self.hyper && self.transport && !self.body_write_aborted
     }
+}
+
+fn is_response_transport_boundary(causes: &Causes, response_boundary: bool) -> bool {
+    response_boundary && causes.http_transfer()
 }
 
 /// Walk both standard sources and io's retained inner error. The latter is not
@@ -132,6 +139,12 @@ fn visit_causes<'a>(
 fn inspect_causes(error: &(dyn Error + 'static)) -> Causes {
     let mut causes = Causes::default();
     visit_causes(error, |current| {
+        if let Some(timeout) = current.downcast_ref::<ConnectTimedOut>() {
+            causes.connect_timeout = Some(match causes.connect_timeout {
+                Some(previous) => previous.min(timeout.deadline),
+                None => timeout.deadline,
+            });
+        }
         if causes.boundary == Boundary::Unknown {
             // hyper-util 0.1.20 Display for this exact typed error emits only its
             // static operation label, never a host, URL, or nested source text.
@@ -154,6 +167,7 @@ fn inspect_causes(error: &(dyn Error + 'static)) -> Causes {
             causes.hyper = true;
             causes.protocol |= hyper.is_parse();
             causes.transport |= hyper.is_incomplete_message();
+            causes.body_write_aborted |= hyper.is_body_write_aborted();
         }
         if let Some(io) = current.downcast_ref::<std::io::Error>() {
             causes.transport |= matches!(
@@ -170,16 +184,64 @@ fn inspect_causes(error: &(dyn Error + 'static)) -> Causes {
 }
 
 pub(crate) fn map_reqwest_error(error: reqwest::Error, stage: ErrorStage) -> NetError {
-    classify(error, stage, false)
+    classify(error, stage, false, false)
+}
+
+/// Map an error returned while waiting for `Client::execute` to produce a
+/// response.  `execute` reports peer disconnects before response headers as a
+/// request error, but the request has already crossed the transport boundary;
+/// callers need the response receive stage for retry and observer decisions.
+pub(crate) fn map_response_error(error: reqwest::Error) -> NetError {
+    // `Client::execute` can fail while writing a request body.  Keep that
+    // failure at Write unless hyper proves that the HTTP transport boundary
+    // was reached and the peer closed while a response was pending.
+    let causes = inspect_causes(&error);
+    let is_request = error.is_request();
+    let is_body = error.is_body();
+    let mapped = classify(error, ErrorStage::Write, false, true);
+    // Keep the diagnostic event structured and bounded; reqwest's Debug output
+    // may contain the request URL and transport details.
+    crate::log_e!(
+        crate::LogType::HTTP;
+        "map_response_error",
+        "error_kind|stage|body_write_aborted|hyper|transport|http_transfer|request|body|protocol",
+        format!("{:?}", mapped.kind()),
+        format!("{:?}", mapped.context().stage),
+        causes.body_write_aborted,
+        causes.hyper,
+        causes.transport,
+        causes.http_transfer(),
+        is_request,
+        is_body,
+        causes.protocol,
+    );
+    mapped
 }
 
 pub(crate) fn map_body_error(error: reqwest::Error) -> NetError {
-    classify(error, ErrorStage::Receive, true)
+    classify(error, ErrorStage::Receive, true, false)
 }
 
-fn classify(error: reqwest::Error, stage: ErrorStage, body: bool) -> NetError {
+/// Only SDK-owned connector timers carry this marker. Generic reqwest or I/O
+/// timeout messages are not sufficient evidence for a Connect budget.
+pub(crate) fn connect_timeout_deadline(error: &NetError) -> Option<tokio::time::Instant> {
+    inspect_causes(error).connect_timeout
+}
+
+fn classify(
+    error: reqwest::Error,
+    stage: ErrorStage,
+    body: bool,
+    response_boundary: bool,
+) -> NetError {
     let causes = inspect_causes(&error);
-    let (kind, stage, reason) = if causes.boundary == Boundary::Dns {
+    let (kind, stage, reason) = if causes.connect_timeout.is_some() {
+        (
+            ErrorKind::TimedOut,
+            ErrorStage::Write,
+            RetryReason::Transport(TransportErrorKind::Connect),
+        )
+    } else if causes.boundary == Boundary::Dns {
         (
             ErrorKind::Dns,
             ErrorStage::Dns,
@@ -210,7 +272,12 @@ fn classify(error: reqwest::Error, stage: ErrorStage, body: bool) -> NetError {
             ErrorStage::RequestBuild,
             RetryReason::Application,
         )
-    } else if causes.protocol || (error.is_decode() && !causes.http_transfer()) {
+    } else if error.is_redirect()
+        || causes.protocol
+        || (error.is_decode() && !causes.http_transfer())
+    {
+        // A rejected redirect is evidence of a received response, including an
+        // HTTPS-only policy rejection before the next connection is attempted.
         (
             ErrorKind::Protocol,
             ErrorStage::Receive,
@@ -229,6 +296,12 @@ fn classify(error: reqwest::Error, stage: ErrorStage, body: bool) -> NetError {
         )
     } else if body && causes.http_transfer() {
         (ErrorKind::Io, ErrorStage::Receive, RetryReason::BodyRead)
+    } else if is_response_transport_boundary(&causes, response_boundary) {
+        (
+            ErrorKind::Io,
+            ErrorStage::Receive,
+            RetryReason::Transport(TransportErrorKind::ReadReset),
+        )
     } else if causes.transport || error.is_request() || error.is_body() {
         (
             ErrorKind::Io,
@@ -244,6 +317,9 @@ fn classify(error: reqwest::Error, stage: ErrorStage, body: bool) -> NetError {
     };
     let mut context = ErrorContext::default();
     context.stage = Some(stage);
+    if causes.connect_timeout.is_some() {
+        context.http_timeout_phase = Some(TimeoutPhase::Connect);
+    }
     if causes.boundary == Boundary::ProxyAuth {
         context.http_status = Some(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED);
     }
@@ -270,6 +346,26 @@ pub(crate) fn trusted_retry_reason(error: &NetError) -> Option<RetryReason> {
             | ErrorKind::HttpStatus
     ) {
         return None;
+    }
+    if error.kind() == ErrorKind::TimedOut {
+        match error.context().http_timeout_phase {
+            Some(TimeoutPhase::IdleRead) => return Some(RetryReason::BodyRead),
+            Some(TimeoutPhase::Attempt) if error.context().stage == Some(ErrorStage::Receive) => {
+                return Some(RetryReason::BodyRead);
+            }
+            Some(TimeoutPhase::Admission | TimeoutPhase::Total) => {
+                return Some(RetryReason::Application);
+            }
+            Some(TimeoutPhase::Headers | TimeoutPhase::Attempt) => {
+                // A transport-level headers/attempt timeout does not establish
+                // that no request bytes reached the peer.
+                return Some(RetryReason::Transport(TransportErrorKind::ReadReset));
+            }
+            Some(TimeoutPhase::Connect) => {
+                return Some(RetryReason::Transport(TransportErrorKind::Connect));
+            }
+            None => {}
+        }
     }
     if let Some(failure) = error
         .source()
@@ -533,6 +629,73 @@ mod tests {
     }
 
     #[test]
+    fn sdk_budget_metadata_preserves_body_read_retry_boundary() -> TestResult {
+        for (phase, stage, expected) in [
+            (
+                TimeoutPhase::IdleRead,
+                ErrorStage::Receive,
+                RetryReason::BodyRead,
+            ),
+            (
+                TimeoutPhase::Attempt,
+                ErrorStage::Receive,
+                RetryReason::BodyRead,
+            ),
+            (
+                TimeoutPhase::Attempt,
+                ErrorStage::Write,
+                RetryReason::Transport(TransportErrorKind::ReadReset),
+            ),
+            (
+                TimeoutPhase::Headers,
+                ErrorStage::Response,
+                RetryReason::Transport(TransportErrorKind::ReadReset),
+            ),
+            (
+                TimeoutPhase::Connect,
+                ErrorStage::Write,
+                RetryReason::Transport(TransportErrorKind::Connect),
+            ),
+            (
+                TimeoutPhase::Admission,
+                ErrorStage::Admission,
+                RetryReason::Application,
+            ),
+        ] {
+            let mut context = ErrorContext::default();
+            context.stage = Some(stage);
+            context.http_timeout_phase = Some(phase);
+            let error = NetError::from(ErrorKind::TimedOut).with_context(context);
+            check(
+                retry_reason_for_error(&error) == expected,
+                "SDK timeout crossed its retry evidence boundary",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn connect_timeout_marker_is_typed_and_retains_deadline() -> TestResult {
+        let deadline = tokio::time::Instant::now();
+        let error = NetError::with_source(
+            ErrorKind::TimedOut,
+            io::Error::other(ConnectTimedOut { deadline }),
+        );
+        check(
+            connect_timeout_deadline(&error) == Some(deadline),
+            "nested SDK connector marker was lost",
+        )?;
+        let untyped = NetError::with_source(
+            ErrorKind::TimedOut,
+            io::Error::other("HTTP connection budget expired"),
+        );
+        check(
+            connect_timeout_deadline(&untyped).is_none(),
+            "untyped error text acquired a Connect budget",
+        )
+    }
+
+    #[test]
     fn decoder_eof_without_http_transport_boundary_is_not_body_transfer() -> TestResult {
         let error = io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -542,6 +705,31 @@ mod tests {
         check(
             causes.transport && !causes.http_transfer(),
             "decoder EOF was promoted to HTTP transfer failure",
+        )
+    }
+
+    #[test]
+    fn response_boundary_only_promotes_http_transport_errors() -> TestResult {
+        let http_transport = Causes {
+            hyper: true,
+            transport: true,
+            ..Causes::default()
+        };
+        check(
+            is_response_transport_boundary(&http_transport, true),
+            "HTTP incomplete transport was not recognized at the response boundary",
+        )?;
+        check(
+            !is_response_transport_boundary(&http_transport, false),
+            "request-side mapping acquired response-boundary semantics",
+        )?;
+        let request_transport = Causes {
+            transport: true,
+            ..Causes::default()
+        };
+        check(
+            !is_response_transport_boundary(&request_transport, true),
+            "generic request transport error was promoted to Receive",
         )
     }
 

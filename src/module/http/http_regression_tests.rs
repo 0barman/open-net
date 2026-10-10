@@ -19,7 +19,7 @@ async fn automatic_id_skips_inflight_custom_id() -> TestResult {
         .ok_or_else(|| std::io::Error::other("missing first job"))?;
     let automatic = client.send(NoopRequest)?;
     check(
-        automatic != HttpRequestId(1),
+        automatic.id() != HttpRequestId(1),
         "automatic ID collided with custom ID",
     )
 }

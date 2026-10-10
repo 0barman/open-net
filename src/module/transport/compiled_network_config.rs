@@ -28,10 +28,9 @@ pub(crate) struct CompiledNetworkConfig {
 impl CompiledNetworkConfig {
     pub(crate) fn new(config: NetworkConfig) -> Result<Self, NetError> {
         let original = Arc::new(config.clone());
-        let mut roots = rustls::RootCertStore::empty();
-        if config.tls.root_mode == crate::api::network_config::RootCertificateMode::Append {
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
+        let mut roots = crate::module::tls::root_store(
+            config.tls.root_mode == crate::api::network_config::RootCertificateMode::Append,
+        );
         for root in config.tls.roots {
             roots
                 .add(root)
@@ -40,12 +39,11 @@ impl CompiledNetworkConfig {
         if roots.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidConfig));
         }
-        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| NetError::from(crate::error::ErrorKind::InvalidConfig))?
-        .with_root_certificates(roots);
+        let builder =
+            rustls::ClientConfig::builder_with_provider(crate::module::tls::local_provider())
+                .with_safe_default_protocol_versions()
+                .map_err(|_| NetError::from(crate::error::ErrorKind::InvalidConfig))?
+                .with_root_certificates(roots);
         let mut tls = match config.tls.identity {
             Some(identity) => builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(
                 identity.certified_key,

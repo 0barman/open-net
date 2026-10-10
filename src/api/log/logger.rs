@@ -33,9 +33,9 @@ impl Drop for LogSubscription {
 }
 
 /// Callback-only logging. The library does not print or persist log records.
-pub struct Logger;
+pub struct OpenNetLogger;
 
-impl Logger {
+impl OpenNetLogger {
     /// Registers an independent subscription with a queue of 256 records.
     ///
     /// Only explicitly listed origins are accepted, including for overflow reports.

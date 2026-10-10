@@ -2,19 +2,25 @@
 use super::client_slot::ClientSlot;
 #[cfg(feature = "http-client")]
 use super::http_client_slot::HttpClientSlot;
+#[cfg(feature = "net-status")]
 use super::net_status_clients::NetStatusClientSlot;
 use crate::common::CommonEngine;
 #[cfg(feature = "ws-client")]
 use crate::module::transport::compiled_network_config::CompiledNetworkConfig;
+#[cfg(feature = "net-status")]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "net-status")]
+use std::sync::Mutex;
 
 pub(crate) struct OpenNetInner {
     #[cfg(feature = "ws-client")]
     pub(super) network: Arc<CompiledNetworkConfig>,
     #[allow(dead_code)]
     pub(crate) common_engine: Arc<CommonEngine>,
+    #[cfg(feature = "net-status")]
     pub(crate) network_status: Arc<crate::module::net_status::inner::shared::SharedNetworkService>,
+    #[cfg(feature = "net-status")]
     pub(super) net_status_clients: Arc<Mutex<HashMap<String, NetStatusClientSlot>>>,
     #[cfg(feature = "ws-client")]
     pub(super) clients: Arc<Mutex<HashMap<String, ClientSlot>>>,

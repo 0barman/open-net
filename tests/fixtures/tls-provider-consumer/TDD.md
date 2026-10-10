@@ -43,3 +43,33 @@ cargo test --locked --offline --test ws_network_config_integration custom_ca_and
 ```sh
 cargo run --locked --offline --manifest-path open-net/tests/fixtures/tls-provider-consumer/Cargo.toml -- none legacy,open-net,http
 ```
+
+## 第二阶段：真实 SDK HTTP 与宿主策略（2026-10-10）
+
+上面的历史记录中，`http` 是外部 reqwest 客户端，只证明混合宿主中 reqwest 可用，不能据此声称覆盖了 SDK HTTP。本阶段保留 `http`，新增 `sdk-http`，通过公开的 `HttpClient::new` / `get` / `shutdown` 完成真实 HTTPS 请求。两者分别验证 HTTP 状态与 `ok` 响应体；服务端独立检查 ClientHello、协商的 TLS 版本与 ALPN，并读取 HTTP/1.1 请求后返回响应。
+
+此 fixture 是混合宿主兼容测试：外部 reqwest 有意开启 ring 和 http2，旧 tokio-tungstenite 0.28 与 SDK 自己的连接器并存。SDK 仅启用默认 WS 和 `http-client`，**没有**启用 `http-client-http2`。HTTP 服务器优先提供 h2；SDK 的 ClientHello 必须只提供 http/1.1，即使宿主将 reqwest/http2 合并启用。此依赖图不能作为纯 SDK 不引入 ring 的证据；下载隔离由独立的 feature-isolation 消费者验证。
+
+每个场景在新进程中运行，宿主在 runtime 创建之前安装 ring、AWS-LC、自定义 provider，或保留 None。自定义 provider 从 AWS-LC 移除 TLS 1.2 cipher suites，仅保留 TLS 1.3。每步完成后检查全局 provider：原先 None 必须仍是 None；原先 Some 必须保持相同的 Arc 指针。同时用实际 TLS 1.2 拒绝证明 SDK HTTP 使用自定义 provider 的限制，避免“仅检查 Arc 未变，但内部仍偷偷使用另一 provider”的假阳性。
+
+当前矩阵包含 5 项测试、110 个独立子进程：
+
+| 测试 | 进程数 | 证据 |
+| --- | ---: | --- |
+| 已初始化的宿主全部启动排列 | 72 | ring、AWS-LC、自定义 provider × 旧 WSS、SDK WSS、SDK HTTP、外部 reqwest 的 24 种排列；TLS 1.3 成功 |
+| 无宿主 provider 的 SDK/reqwest 排列 | 6 | SDK WSS、SDK HTTP、外部 reqwest 全部成功且全局仍为 None |
+| 原始歧义负对照 | 24 | 无宿主 provider；legacy 之前的步骤必须完成，legacy 必须以明确的 Rustls provider 歧义退出 |
+| 普通 provider 的 TLS 1.2 正对照 | 6 | None、ring、AWS-LC × HTTP/WS 两种顺序；两客户端均握手成功 |
+| 自定义 provider 的协议限制 | 2 | HTTP TLS 1.3 成功、HTTP TLS 1.2 返回 SDK Tls 错误且服务器证实版本/套件不兼容、WS TLS 1.2 仍成功；验证两种顺序 |
+
+每步有 5 秒 Tokio 超时，SDK HTTP 请求和 WS 握手各有 3 秒预算，子进程整轮有 25 秒预算；父进程独立在 30 秒后终止挂起的子进程，同时持续读取 stdout/stderr 防止管道堵塞。
+
+运行：
+
+```sh
+cargo test --locked --offline --manifest-path open-net/tests/fixtures/tls-provider-consumer/Cargo.toml --test cold_start -- --nocapture
+```
+
+上述矩阵不验证纯 SDK 下载数量、HTTP/2 正常协商、系统信任库、原生 Windows/Linux 或 TLS 性能；这些需要独立证据。最新工作树执行结果记录在第二阶段报告中，不能将本节的测试设计直接当作已通过结果。
+
+工作树验证（2026-10-10，macOS arm64，rustc/cargo 1.89.0）：上述命令退出 0，`5 passed; 0 failed; 0 ignored`，测试耗时 4.92 秒，110 个子进程均满足预期（86 个成功、24 个保留的歧义失败对照）。自定义 provider 的 HTTP TLS 1.2 拒绝在服务端记录为 `PeerIncompatible(Tls12NotOfferedOrEnabled)`；SDK 返回 `ErrorKind::Tls`。完整日志和逐场景结果见仓库 `reports/tls-provider-phase2/host-cold-start.log`、`host-summary.json`。首次编译暴露 fixture 导入路径错误，修正为公开的 `open_net::error::ErrorKind` 后完成上述验证，初始日志亦保留。

@@ -1,4 +1,6 @@
 use futures_util::StreamExt;
+use open_net::api::http::{HttpClient, HttpClientConfig, HttpTlsConfig};
+use open_net::error::ErrorKind;
 use open_net::network::{NetworkConfig, RootCertificateMode, TlsConfig};
 use open_net::ws::ReconnectPolicy;
 use open_net::OpenNet;
@@ -9,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::LazyConfigAcceptor;
 
 #[path = "../../../support/session.rs"]
 mod session;
@@ -19,6 +21,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 const CA: &[u8] = include_bytes!("../../network/ca.pem");
 const SERVER: &[u8] = include_bytes!("../../network/server.pem");
 const SERVER_KEY: &[u8] = include_bytes!("../../network/server-key.pem");
+const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Peer {
     address: std::net::SocketAddr,
@@ -27,7 +30,7 @@ struct Peer {
 
 impl Peer {
     async fn finish(mut self) -> TestResult {
-        tokio::time::timeout(Duration::from_secs(5), &mut self.task).await???;
+        tokio::time::timeout(STEP_TIMEOUT, &mut self.task).await???;
         Ok(())
     }
 }
@@ -38,22 +41,84 @@ impl Drop for Peer {
     }
 }
 
-async fn tls_peer(http: bool) -> TestResult<Peer> {
-    // The peer must not install the default that the consumer is testing.
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+/// A real loopback peer with an explicit, local provider. It checks ClientHello
+/// and the negotiated session; no client-side config inspection substitutes for
+/// handshake evidence. HTTP peers prefer h2, exposing accidental host-feature
+/// leakage into the SDK's HTTP/1.1-only policy.
+async fn tls_peer(
+    http: bool,
+    version: &'static rustls::SupportedProtocolVersion,
+    expect_provider_rejection: bool,
+) -> TestResult<Peer> {
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
-    .with_safe_default_protocol_versions()?
+    .with_protocol_versions(&[version])?
     .with_no_client_auth()
     .with_single_cert(
         CertificateDer::pem_slice_iter(SERVER).collect::<Result<Vec<_>, _>>()?,
         PrivateKeyDer::from_pem_slice(SERVER_KEY)?,
     )?;
+    if http {
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let task = tokio::spawn(async move {
         let (socket, _) = listener.accept().await?;
-        let mut stream = TlsAcceptor::from(Arc::new(config)).accept(socket).await?;
+        let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), socket).await?;
+        let offered: Vec<Vec<u8>> = start
+            .client_hello()
+            .alpn()
+            .into_iter()
+            .flatten()
+            .map(<[u8]>::to_vec)
+            .collect();
+        let expected_alpn: Vec<Vec<u8>> = if http {
+            vec![b"http/1.1".to_vec()]
+        } else {
+            Vec::new()
+        };
+        if offered != expected_alpn {
+            return Err(format!("unexpected ClientHello ALPN: {offered:?}").into());
+        }
+        let accepted = start.into_stream(Arc::new(config)).await;
+        if expect_provider_rejection {
+            let error = accepted
+                .err()
+                .ok_or("restricted HTTP provider accepted TLS 1.2")?;
+            let tls_error = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+            if !matches!(
+                tls_error,
+                Some(rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::NoCipherSuitesInCommon
+                        | rustls::PeerIncompatible::Tls12NotOffered
+                        | rustls::PeerIncompatible::Tls12NotOfferedOrEnabled
+                ))
+            ) {
+                return Err(
+                    format!("expected TLS 1.2 provider restriction, received {error:?}").into(),
+                );
+            }
+            println!("handshake-rejected:TLSv1_2:host-restriction:{tls_error:?}");
+            return Ok(());
+        }
+        let mut stream = accepted?;
+        let connection = stream.get_ref().1;
+        if connection.protocol_version() != Some(version.version) {
+            return Err("peer negotiated the wrong TLS protocol version".into());
+        }
+        let expected_negotiated = http.then_some(b"http/1.1".as_slice());
+        if connection.alpn_protocol() != expected_negotiated {
+            return Err("peer negotiated an unexpected ALPN protocol".into());
+        }
+        println!(
+            "handshake:{:?}:alpn={}",
+            version.version,
+            if http { "http/1.1" } else { "none" }
+        );
         if http {
             let mut headers = Vec::new();
             while !headers.ends_with(b"\r\n\r\n") {
@@ -61,6 +126,9 @@ async fn tls_peer(http: bool) -> TestResult<Peer> {
                     return Err("HTTP request headers exceeded fixture limit".into());
                 }
                 headers.push(stream.read_u8().await?);
+            }
+            if !headers.starts_with(b"GET /provider-probe HTTP/1.1\r\n") {
+                return Err(format!("unexpected HTTP request: {headers:?}").into());
             }
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
@@ -79,9 +147,9 @@ async fn tls_peer(http: bool) -> TestResult<Peer> {
     Ok(Peer { address, task })
 }
 
-/// Exercise the exact old connect_async default-connector branch before adding
-/// a fixture CA for the full handshake below. The peer deliberately stops after
-/// ClientHello, so an I/O error is expected, but a missing-provider panic is not.
+/// Exercise the old connect_async default-connector branch before adding the
+/// fixture CA for a full handshake. The peer stops after ClientHello: an I/O
+/// error is expected, but missing-provider ambiguity remains a genuine panic.
 async fn legacy_default_connector() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -106,12 +174,10 @@ async fn legacy_wss() -> TestResult {
     legacy_default_connector().await?;
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from_pem_slice(CA)?)?;
-    // Same process-default builder used by tokio-tungstenite 0.28's connector;
-    // only the root store differs, to permit a deterministic local TLS peer.
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let peer = tls_peer(false).await?;
+    let peer = tls_peer(false, &rustls::version::TLS13, false).await?;
     let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
         format!("wss://{}/", peer.address),
         None,
@@ -123,8 +189,8 @@ async fn legacy_wss() -> TestResult {
     peer.finish().await
 }
 
-async fn open_net_wss() -> TestResult {
-    let peer = tls_peer(false).await?;
+async fn open_net_wss(version: &'static rustls::SupportedProtocolVersion) -> TestResult {
+    let peer = tls_peer(false, version, false).await?;
     let config = NetworkConfig::default()
         .with_tls(TlsConfig::default().with_root_certificates(CA, RootCertificateMode::Replace)?);
     let engine = OpenNet::new_with_network_config(config)?;
@@ -144,22 +210,54 @@ async fn open_net_wss() -> TestResult {
     peer.finish().await
 }
 
-async fn https() -> TestResult {
-    let peer = tls_peer(true).await?;
+async fn sdk_https(
+    version: &'static rustls::SupportedProtocolVersion,
+    expect_provider_rejection: bool,
+) -> TestResult {
+    let peer = tls_peer(true, version, expect_provider_rejection).await?;
+    let client = HttpClient::new(
+        HttpClientConfig::new(format!("https://{}/", peer.address))?
+            .with_environment_proxy(false)
+            .with_timeout(Duration::from_secs(3))?
+            .with_tls(HttpTlsConfig::default().with_root_certificates(CA, true)?),
+        "sdk-provider-probe",
+    )?;
+    let response = client.get("/provider-probe").await;
+    client.shutdown().await?;
+    if expect_provider_rejection {
+        let error = response
+            .err()
+            .ok_or("SDK HTTP ignored host TLS 1.3 restriction")?;
+        if error.kind() != ErrorKind::Tls {
+            return Err(format!("expected SDK TLS error, received {error:?}").into());
+        }
+        println!("sdk-http-rejected:Tls");
+    } else {
+        let response = response?;
+        if response.status().as_u16() != 200 || response.body().as_ref() != b"ok" {
+            return Err("SDK HTTPS did not return the expected 200/ok response".into());
+        }
+        println!("sdk-http-response:200:ok");
+    }
+    peer.finish().await
+}
+
+async fn external_https() -> TestResult {
+    let peer = tls_peer(true, &rustls::version::TLS13, false).await?;
     let client = reqwest::Client::builder()
         .no_proxy()
         .http1_only()
         .add_root_certificate(reqwest::Certificate::from_pem(CA)?)
         .build()?;
     let body = client
-        .get(format!("https://{}/", peer.address))
+        .get(format!("https://{}/provider-probe", peer.address))
         .send()
         .await?
         .error_for_status()?
         .text()
         .await?;
     if body != "ok" {
-        return Err(format!("unexpected HTTPS body: {body:?}").into());
+        return Err(format!("unexpected external HTTPS body: {body:?}").into());
     }
     peer.finish().await
 }
@@ -167,12 +265,19 @@ async fn https() -> TestResult {
 async fn run(order: &str) -> TestResult {
     let original = rustls::crypto::CryptoProvider::get_default().cloned();
     for step in order.split(',') {
-        match step {
-            "legacy" => legacy_wss().await?,
-            "open-net" => open_net_wss().await?,
-            "http" => https().await?,
-            _ => return Err(format!("unknown operation: {step}").into()),
-        }
+        tokio::time::timeout(STEP_TIMEOUT, async {
+            match step {
+                "legacy" => legacy_wss().await,
+                "open-net" => open_net_wss(&rustls::version::TLS13).await,
+                "sdk-http" => sdk_https(&rustls::version::TLS13, false).await,
+                "http" => external_https().await,
+                "sdk-http-tls12" => sdk_https(&rustls::version::TLS12, false).await,
+                "sdk-http-reject-tls12" => sdk_https(&rustls::version::TLS12, true).await,
+                "sdk-ws-tls12" => open_net_wss(&rustls::version::TLS12).await,
+                _ => Err(format!("unknown operation: {step}").into()),
+            }
+        })
+        .await??;
         let unchanged = match (&original, rustls::crypto::CryptoProvider::get_default()) {
             (None, None) => true,
             (Some(before), Some(after)) => Arc::ptr_eq(before, after),
@@ -181,6 +286,7 @@ async fn run(order: &str) -> TestResult {
         if !unchanged {
             return Err(format!("{step} changed the process-default TLS provider").into());
         }
+        println!("provider-unchanged:{step}");
         println!("completed:{step}");
     }
     Ok(())
@@ -190,7 +296,7 @@ fn main() -> TestResult {
     let mut arguments = std::env::args().skip(1);
     let provider = arguments
         .next()
-        .ok_or("missing provider: ring/aws-lc/none")?;
+        .ok_or("missing provider: ring/aws-lc/custom/none")?;
     let order = arguments
         .next()
         .ok_or("missing comma-separated operation order")?;
@@ -198,12 +304,23 @@ fn main() -> TestResult {
         return Err("unexpected extra argument".into());
     }
     println!("requested-provider:{provider}");
-    // This is application initialization, before the runtime or any TLS client.
-    // A library must not choose a process-global provider for its consumer.
+    // Host initialization, before any runtime or TLS client. Filtering cipher
+    // suites supplies an observable restriction that distinguishes honoring the
+    // host's actual provider from merely preserving its global Arc pointer.
     let host_provider = match provider.as_str() {
         "ring" => Some(rustls::crypto::ring::default_provider()),
         "aws-lc" => Some(rustls::crypto::aws_lc_rs::default_provider()),
-        "none" => None, // Negative control: leave the legacy default ambiguous.
+        "custom" => {
+            let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+            provider
+                .cipher_suites
+                .retain(|suite| suite.tls13().is_some());
+            if provider.cipher_suites.is_empty() {
+                return Err("custom fixture provider has no TLS 1.3 cipher suites".into());
+            }
+            Some(provider)
+        }
+        "none" => None,
         _ => return Err(format!("unknown provider: {provider}").into()),
     };
     if let Some(host_provider) = host_provider {
@@ -214,5 +331,5 @@ fn main() -> TestResult {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async { tokio::time::timeout(Duration::from_secs(20), run(&order)).await? })
+    runtime.block_on(async { tokio::time::timeout(Duration::from_secs(25), run(&order)).await? })
 }

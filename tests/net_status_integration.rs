@@ -1,4 +1,6 @@
-//! Network monitoring is part of the base API, including with no default features.
+//! Network monitoring is available through `net-status`, including without protocol clients.
+
+#![cfg(feature = "net-status")]
 
 use open_net::error::ErrorKind;
 use open_net::net_status::{MonitorState, NetStatusClient, NetworkSnapshot};

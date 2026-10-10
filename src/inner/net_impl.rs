@@ -10,8 +10,11 @@ use crate::ws::{WebSocketClient, WebSocketClientConfig};
 use client_entry::ClientEntry;
 #[cfg(feature = "ws-client")]
 use client_slot::ClientSlot;
+#[cfg(feature = "net-status")]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "net-status")]
+use std::sync::Mutex;
 #[cfg(feature = "ws-client")]
 use std::thread::JoinHandle;
 #[cfg(feature = "ws-client")]
@@ -25,6 +28,7 @@ mod client_entry;
 mod client_slot;
 #[cfg(feature = "http-client")]
 mod http_client_slot;
+#[cfg(feature = "net-status")]
 mod net_status_clients;
 mod open_net_inner;
 #[cfg(test)]
@@ -50,13 +54,16 @@ impl OpenNetInner {
                 config.sync_queue_capacity,
                 config.runtime_worker_threads,
             )?);
+            #[cfg(feature = "net-status")]
             let network_status =
                 crate::module::net_status::inner::shared::SharedNetworkService::new(
                     common_engine.clone(),
                 )?;
             Ok(Self {
                 common_engine,
+                #[cfg(feature = "net-status")]
                 network_status,
+                #[cfg(feature = "net-status")]
                 net_status_clients: Arc::new(Mutex::new(HashMap::new())),
                 #[cfg(feature = "ws-client")]
                 network,
@@ -287,7 +294,7 @@ impl OpenNetInner {
                         });
                     match stored {
                         Ok(client) => {
-                            crate::log_s!(LogType::HTTP; "create_http_client", "thread_name|status", thread_name, "Ready");
+                            crate::log_r!(LogType::HTTP; "create_http_client", "thread_name|status", thread_name, "Ready");
                             Ok(client)
                         }
                         Err(error) => {
@@ -558,8 +565,11 @@ fn create_client_worker(
 
 impl Drop for OpenNetInner {
     fn drop(&mut self) {
-        self.network_status.request_close();
-        self.stop_net_status_clients();
+        #[cfg(feature = "net-status")]
+        {
+            self.network_status.request_close();
+            self.stop_net_status_clients();
+        }
         #[cfg(feature = "ws-client")]
         {
             crate::log_t!(LogType::WSC; "drop");
@@ -595,5 +605,5 @@ impl Drop for OpenNetInner {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "net-status"))]
 mod shared_network_tests;

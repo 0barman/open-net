@@ -1,6 +1,8 @@
 //! HTTP response and request identifier contracts.
 
 use crate::api::error::NetError;
+#[cfg(feature = "http-client-http2")]
+use crate::api::http::HttpResponseInfo;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
@@ -33,6 +35,8 @@ pub struct HttpResponse {
     pub attempts: u32,
     /// Identifier assigned to the originating request.
     pub request_id: HttpRequestId,
+    #[cfg(feature = "http-client-http2")]
+    info: HttpResponseInfo,
 }
 
 impl HttpResponse {
@@ -67,7 +71,40 @@ impl HttpResponse {
             body,
             attempts,
             request_id,
+            #[cfg(feature = "http-client-http2")]
+            info: HttpResponseInfo::default(),
         }
+    }
+
+    #[cfg(feature = "http-client-http2")]
+    pub(crate) fn with_info(mut self, info: HttpResponseInfo) -> Self {
+        self.info = info;
+        self
+    }
+
+    #[cfg(feature = "http-client-http2")]
+    /// Return the protocol and SDK-observable flow-control metadata.
+    pub fn info(&self) -> &HttpResponseInfo {
+        &self.info
+    }
+
+    #[cfg(feature = "http-client-http2")]
+    /// Return the protocol observed on the response.
+    pub fn protocol(&self) -> crate::api::http::HttpProtocol {
+        self.info.protocol
+    }
+
+    /// Construct a response returned directly by an HTTP middleware.
+    ///
+    /// A synthetic response has not reached the transport, so its attempt count is zero.
+    #[cfg(feature = "http-client-middleware")]
+    pub fn synthetic(
+        request_id: HttpRequestId,
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Self {
+        Self::new(status, headers, body, 0, request_id)
     }
 
     /// Report whether the status code is in the 2xx success range.

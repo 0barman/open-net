@@ -1,4 +1,6 @@
-use open_net::api::{self, config, error, log, net_status, network, subscription};
+use open_net::api::{self, config, error, log, subscription};
+#[cfg(feature = "net-status")]
+use open_net::api::{net_status, network};
 use std::convert::identity;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -33,13 +35,19 @@ fn core_api_types_match_compatible_imports() -> TestResult {
 }
 
 #[test]
-fn logging_and_network_monitor_api_types_match_compatible_imports() -> TestResult {
+fn logging_api_types_match_compatible_imports() -> TestResult {
     let _: fn(log::LogInfo) -> open_net::LogInfo = identity;
     let _: fn(log::LogLevel) -> open_net::LogLevel = identity;
     let _: fn(log::LogListener) -> open_net::LogListener = identity;
     let _: fn(log::LogSubscription) -> open_net::LogSubscription = identity;
     let _: fn(log::LogType) -> open_net::LogType = identity;
-    let _: fn(log::Logger) -> open_net::Logger = identity;
+    let _: fn(log::OpenNetLogger) -> open_net::OpenNetLogger = identity;
+    Ok(())
+}
+
+#[cfg(feature = "net-status")]
+#[test]
+fn network_monitor_api_types_match_compatible_imports() -> TestResult {
     let _: fn(net_status::IpStack) -> open_net::IpStack = identity;
     let _: fn(net_status::MonitorState) -> open_net::MonitorState = identity;
     let _: fn(net_status::NetStatusClient) -> open_net::NetStatusClient = identity;

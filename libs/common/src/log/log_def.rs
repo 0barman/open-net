@@ -1,10 +1,10 @@
 use crate::common::log::log_info::LogInfo;
 use crate::common::log::log_level::LogLevel;
-use crate::common::log::logger::Logger;
+use crate::common::log::logger::OpenNetLogger;
 use indexmap::IndexMap;
 use serde_json::Value;
 
-pub static LOG_PREFIX: &str = "ON";
+pub static LOG_PREFIX: &str = "O";
 pub static DESC: &str = "desc";
 
 pub(crate) use crate::api::log::LogType;
@@ -25,11 +25,11 @@ pub fn create_log_content(first_field: Option<&str>, values: Option<Vec<Value>>)
 pub(crate) fn format_tag(log_type: LogType, tag: &str, suffix: &str) -> String {
     let prefix = match log_type {
         LogType::None | LogType::Engine => LOG_PREFIX,
-        LogType::Database => "ON_DB",
-        LogType::WSS => "ON_WSS",
-        LogType::WSC => "ON_WSC",
-        LogType::Common => "ON_COMMON",
-        LogType::HTTP => "ON_HTTP",
+        LogType::Database => "O_DB",
+        LogType::WSS => "O_WSS",
+        LogType::WSC => "O_WSC",
+        LogType::Common => "O_COMMON",
+        LogType::HTTP => "O_HTTP",
     };
     format!("{prefix}-{tag}-{suffix}")
 }
@@ -54,7 +54,7 @@ pub fn on_log(
     values: Option<Vec<Value>>,
     suffix: &str,
 ) {
-    if !Logger::is_enabled(log_type) {
+    if !OpenNetLogger::is_enabled(log_type) {
         return;
     }
     crate::common::log::logger::dispatch(LogInfo {
@@ -80,7 +80,7 @@ macro_rules! location {
 macro_rules! internal_log {
     ($log_type:expr, $level:expr, $suffix:expr, $tag:expr, $first_field:expr $(, $value:expr)* $(,)?) => {{
         let log_type = $log_type;
-        if $crate::Logger::is_enabled(log_type) {
+        if $crate::OpenNetLogger::is_enabled(log_type) {
             let values = vec![$($crate::__serde_json::json!($value)),*];
             $crate::__log::on_log(
                 $crate::location!(), $level, log_type, $tag,
@@ -90,7 +90,7 @@ macro_rules! internal_log {
     }};
     ($log_type:expr, $level:expr, $suffix:expr, $tag:expr $(,)?) => {{
         let log_type = $log_type;
-        if $crate::Logger::is_enabled(log_type) {
+        if $crate::OpenNetLogger::is_enabled(log_type) {
             $crate::__log::on_log(
                 $crate::location!(), $level, log_type, $tag, None, None, $suffix,
             );

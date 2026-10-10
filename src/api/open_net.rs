@@ -6,6 +6,7 @@ use crate::api::open_net_config::OpenNetConfig;
 use crate::common::log::log_def::LogType;
 use crate::error::NetError;
 use crate::inner::net_impl::OpenNetInner;
+#[cfg(feature = "net-status")]
 use crate::net_status::NetStatusClient;
 #[cfg(feature = "ws-client")]
 use crate::ws::WebSocketClient;
@@ -193,6 +194,7 @@ impl OpenNet {
     }
 }
 
+#[cfg(feature = "net-status")]
 impl OpenNet {
     /// Export this engine's cached network state for an explicitly configured
     /// standalone HTTP client. Reading the context never starts monitoring.
@@ -203,7 +205,8 @@ impl OpenNet {
 
     /// Creates a network-status client; call `start().await` to begin monitoring.
     ///
-    /// Names are trimmed and must be unique within an engine. This feature is always available.
+    /// Names are trimmed and must be unique within an engine. Requires the
+    /// `net-status` feature, also enabled by `http-client` and `ws-client`.
     ///
     /// ```no_run
     /// use open_net::{NetError, OpenNet};

@@ -162,6 +162,15 @@ pub struct ErrorContext {
     pub request_id: Option<crate::ws::RequestId>,
     /// HTTP status associated with a protocol or upgrade failure.
     pub http_status: Option<http::StatusCode>,
+    #[cfg(feature = "http-client")]
+    /// HTTP request identifier associated with the failure, when available.
+    pub http_request_id: Option<crate::api::http::HttpRequestId>,
+    #[cfg(feature = "http-client")]
+    /// Expired HTTP budget, when the SDK classified a timeout.
+    pub http_timeout_phase: Option<crate::api::http::TimeoutPhase>,
+    #[cfg(feature = "http-client")]
+    /// HTTP attempt number starting at one; zero means no attempt has started.
+    pub http_attempt: Option<u32>,
     #[cfg(feature = "ws-client")]
     /// Handshake diagnostic captured for the failure, when available.
     pub diagnostic: Option<crate::ws::HandshakeDiagnostic>,
@@ -179,6 +188,11 @@ impl fmt::Debug for ErrorContext {
         output
             .field("stage", &self.stage)
             .field("http_status", &self.http_status);
+        #[cfg(feature = "http-client")]
+        output
+            .field("http_request_id", &self.http_request_id)
+            .field("http_timeout_phase", &self.http_timeout_phase)
+            .field("http_attempt", &self.http_attempt);
         #[cfg(feature = "ws-client")]
         output
             .field("client_id", &self.client_id)
@@ -247,8 +261,29 @@ impl NetError {
         self
     }
 
+    #[cfg(feature = "http-client")]
+    pub(crate) fn with_http_request_id(
+        mut self,
+        request_id: crate::api::http::HttpRequestId,
+    ) -> Self {
+        self.context.http_request_id = Some(request_id);
+        self
+    }
+
     pub(crate) fn config(field: impl Into<String>, reason: impl Into<String>) -> Self {
         ConfigError::new(field, reason).into()
+    }
+
+    #[cfg(feature = "http-client")]
+    pub(crate) fn with_http_attempt(mut self, attempt: u32) -> Self {
+        self.context.http_attempt = Some(attempt);
+        self
+    }
+
+    #[cfg(feature = "http-client")]
+    pub(crate) fn with_timeout_phase(mut self, phase: crate::api::http::TimeoutPhase) -> Self {
+        self.context.http_timeout_phase = Some(phase);
+        self
     }
 
     pub(crate) fn input(field: impl Into<String>, reason: impl Into<String>) -> Self {
@@ -272,6 +307,12 @@ impl NetError {
     /// Returns structured context captured while processing the failure.
     pub fn context(&self) -> &ErrorContext {
         &self.context
+    }
+
+    /// Returns the expired HTTP budget, or `None` for other failures.
+    #[cfg(feature = "http-client")]
+    pub fn timeout_phase(&self) -> Option<crate::api::http::TimeoutPhase> {
+        self.context.http_timeout_phase
     }
 
     /// Returns the HTTP status associated with the failure, if one was recorded.

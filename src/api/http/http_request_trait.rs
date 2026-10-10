@@ -1,3 +1,5 @@
+#[cfg(feature = "http-client-cookies")]
+use crate::api::http::cookies::CookieRequestContext;
 use crate::api::http::http_request_method::HttpRequestMethod;
 use crate::api::http::http_response::HttpResponseResult;
 use crate::api::http::retry::RetryPolicy;
@@ -8,13 +10,18 @@ use http::HeaderMap;
 /// Request object consumed by an HTTP client.
 ///
 /// Implementations own callback state and are moved to the callback lane after the final
-/// attempt.  `get_req_data` must return the same body for every attempt when retries are enabled.
+/// attempt. `get_req_data` must return the same body for every attempt when retries are enabled.
+///
+/// Requests may own application context as fields or capture it in their callbacks.
+/// The SDK only requires `Send + 'static`; request implementations may own
+/// `FnOnce + Send` callbacks that are not `Sync`, `Clone`, or `Debug`.
 #[async_trait]
 pub trait HttpRequestTrait: Send + 'static {
     /// Return the request target relative to the client's configured base URL.
     ///
-    /// The value is copied before it enters the worker. Absolute or cross-origin
-    /// targets are rejected by the client configuration's path validation.
+    /// The worker reads this value for each attempt. Absolute or cross-origin
+    /// targets fail validation after admission and are delivered through the
+    /// terminal callback; they are not returned as an admission rejection.
     fn get_path(&self) -> String;
 
     /// Return the HTTP method for this request.
@@ -55,10 +62,19 @@ pub trait HttpRequestTrait: Send + 'static {
         HeaderMap::new()
     }
 
+    /// Return SameSite context for this logical request.
+    #[cfg(feature = "http-client-cookies")]
+    fn cookie_context(&self) -> CookieRequestContext {
+        CookieRequestContext::default()
+    }
+
     /// Return the retry policy requested by this request.
     ///
     /// A policy with no retries allows the client default to remain in effect
     /// when using [`crate::api::http::HttpClient::send`]; explicit options can always override it.
+    /// `send` and `send_wait` evaluate this provider before admission, on the
+    /// caller's thread or submitting future. A provider panic unwinds there;
+    /// ownership recovery is guaranteed for returned errors, not for panics.
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::no_retry()
     }
@@ -70,11 +86,54 @@ pub trait HttpRequestTrait: Send + 'static {
 
     /// Consume this request with the final result.
     ///
-    /// The callback is invoked exactly once after the final attempt, whether
-    /// the operation succeeded, exhausted its retry budget, was cancelled, or
+    /// Once submission succeeds, the callback is invoked exactly once after the
+    /// final attempt, whether the operation succeeded, exhausted its retry budget, was cancelled, or
     /// failed before a response was available. It runs on the callback lane and
     /// receives ownership of the request object and response/error result.
+    /// Rejected submissions return the original request in `EnqueueError` and
+    /// do not invoke this callback. Abnormal worker termination and callback
+    /// panics are reported by the request handle's completion state.
     async fn deal_with_response(self: Box<Self>, result: HttpResponseResult);
+}
+
+// Forward all providers, including byte bodies and feature-gated metadata. The
+// consuming callback removes exactly one box layer, so nested boxes work too.
+#[async_trait]
+impl<T> HttpRequestTrait for Box<T>
+where
+    T: HttpRequestTrait + ?Sized,
+{
+    fn get_path(&self) -> String {
+        (**self).get_path()
+    }
+    fn get_method(&self) -> HttpRequestMethod {
+        (**self).get_method()
+    }
+    fn get_req_data(&self) -> String {
+        (**self).get_req_data()
+    }
+    fn get_req_body(&self) -> Bytes {
+        (**self).get_req_body()
+    }
+    fn has_req_body(&self) -> bool {
+        (**self).has_req_body()
+    }
+    fn headers(&self) -> HeaderMap {
+        (**self).headers()
+    }
+    #[cfg(feature = "http-client-cookies")]
+    fn cookie_context(&self) -> CookieRequestContext {
+        (**self).cookie_context()
+    }
+    fn retry_policy(&self) -> RetryPolicy {
+        (**self).retry_policy()
+    }
+    fn on_response_headers(&self, headers: &HeaderMap) {
+        (**self).on_response_headers(headers);
+    }
+    async fn deal_with_response(self: Box<Self>, result: HttpResponseResult) {
+        (*self).deal_with_response(result).await;
+    }
 }
 
 #[cfg(test)]

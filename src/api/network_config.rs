@@ -389,7 +389,7 @@ impl ClientIdentity {
         let certified_key = CertifiedKey::from_der(
             certificates,
             PrivateKeyDer::Pkcs8(key),
-            &rustls::crypto::aws_lc_rs::default_provider(),
+            &crate::module::tls::local_provider(),
         )
         .map_err(|_| {
             NetError::config(

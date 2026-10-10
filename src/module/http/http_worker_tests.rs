@@ -13,7 +13,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 fn failure(message: &str) -> NetError {
     NetError::with_source(ErrorKind::Internal, std::io::Error::other(message))
@@ -168,6 +169,7 @@ async fn callback_runs_on_dedicated_runtime_thread() -> Result<(), NetError> {
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
         }),
@@ -175,7 +177,7 @@ async fn callback_runs_on_dedicated_runtime_thread() -> Result<(), NetError> {
         request_id,
         control,
         registry: worker.registry(),
-        permit: worker.try_acquire_permit()?,
+        permit: Arc::new(worker.try_acquire_permit()?),
         operation_start: Instant::now(),
     })?;
     registration.commit();
@@ -217,6 +219,7 @@ async fn retry_budget_delivers_only_the_final_response() -> Result<(), NetError>
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
         }),
@@ -224,7 +227,7 @@ async fn retry_budget_delivers_only_the_final_response() -> Result<(), NetError>
         request_id,
         control,
         registry: worker.registry(),
-        permit: worker.try_acquire_permit()?,
+        permit: Arc::new(worker.try_acquire_permit()?),
         operation_start: Instant::now(),
     })?;
     registration.commit();
@@ -273,6 +276,7 @@ async fn retry_keeps_admission_permit_until_terminal_callback() -> Result<(), Ne
         .build()
         .map_err(|_| failure("quota policy was rejected"))?;
     worker.submit(SendJob {
+        completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
         }),
@@ -280,7 +284,7 @@ async fn retry_keeps_admission_permit_until_terminal_callback() -> Result<(), Ne
         request_id,
         control,
         registry: worker.registry(),
-        permit: worker.try_acquire_permit()?,
+        permit: Arc::new(worker.try_acquire_permit()?),
         operation_start: Instant::now(),
     })?;
     registration.commit();
@@ -358,6 +362,7 @@ async fn request_body_provider_is_materialized_once_per_attempt() -> Result<(), 
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        completion: None,
         request: Box::new(BodyCountingRequest {
             calls: Arc::clone(&calls),
             callback: callback_tx,
@@ -368,7 +373,7 @@ async fn request_body_provider_is_materialized_once_per_attempt() -> Result<(), 
         request_id,
         control,
         registry: worker.registry(),
-        permit: worker.try_acquire_permit()?,
+        permit: Arc::new(worker.try_acquire_permit()?),
         operation_start: Instant::now(),
     })?;
     registration.commit();
@@ -417,6 +422,7 @@ async fn non_replayable_body_stops_before_a_second_send() -> Result<(), NetError
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        completion: None,
         request: Box::new(BodyCountingRequest {
             calls: Arc::clone(&calls),
             callback: callback_tx,
@@ -428,7 +434,7 @@ async fn non_replayable_body_stops_before_a_second_send() -> Result<(), NetError
         request_id,
         control,
         registry: worker.registry(),
-        permit: worker.try_acquire_permit()?,
+        permit: Arc::new(worker.try_acquire_permit()?),
         operation_start: Instant::now(),
     })?;
     registration.commit();
@@ -476,6 +482,7 @@ async fn cancelled_request_emits_one_terminal_retry_event() -> Result<(), NetErr
     let control = registered.control;
     worker.cancel(request_id)?;
     worker.submit(SendJob {
+        completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
         }),
@@ -483,7 +490,7 @@ async fn cancelled_request_emits_one_terminal_retry_event() -> Result<(), NetErr
         request_id,
         control,
         registry: worker.registry(),
-        permit: worker.try_acquire_permit()?,
+        permit: Arc::new(worker.try_acquire_permit()?),
         operation_start: Instant::now(),
     })?;
     registration.commit();

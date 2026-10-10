@@ -5,7 +5,7 @@
 //! Requires `unshare`, `ip`, and permission to create user/network namespaces.
 //! Missing tools or permissions fail the test instead of silently skipping it.
 
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "net-status"))]
 
 use open_net::error::ErrorKind;
 use open_net::net_status::{

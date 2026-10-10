@@ -36,6 +36,11 @@ impl HttpRequestTrait for ResultRequest {
         self.request.headers.clone()
     }
 
+    #[cfg(feature = "http-client-cookies")]
+    fn cookie_context(&self) -> crate::api::http::CookieRequestContext {
+        self.request.cookie_context.clone()
+    }
+
     fn retry_policy(&self) -> crate::api::http::RetryPolicy {
         self.request.retry_policy.clone()
     }

@@ -1,7 +1,15 @@
+#[cfg(feature = "net-status")]
 #[path = "src/module/net_status/inner/platform/native/build_config.rs"]
 mod macos_config;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "net-status")]
+    build_network_monitor()?;
+    Ok(())
+}
+
+#[cfg(feature = "net-status")]
+fn build_network_monitor() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=SDKROOT");
     println!("cargo:rerun-if-env-changed=TOOLCHAINS");

@@ -7,6 +7,7 @@
 pub mod config;
 pub mod error;
 pub mod log;
+#[cfg(feature = "net-status")]
 pub mod net_status;
 pub mod network;
 pub mod subscription;
@@ -28,7 +29,8 @@ pub type Metadata = std::collections::BTreeMap<String, String>;
 
 pub use config::OpenNetConfig;
 pub use error::{BoxError, EnqueueError, NetError, Result};
-pub use log::{LogInfo, LogLevel, LogListener, LogSubscription, LogType, Logger};
+pub use log::{LogInfo, LogLevel, LogListener, LogSubscription, LogType, OpenNetLogger};
+#[cfg(feature = "net-status")]
 pub use net_status::{IpStack, MonitorState, NetStatusClient, NetworkSnapshot, NetworkStatus};
 pub use open_net::OpenNet;
 #[cfg(feature = "ws-client")]

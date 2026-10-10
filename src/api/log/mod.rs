@@ -10,4 +10,4 @@ pub use listener::LogListener;
 pub use log_info::LogInfo;
 pub use log_level::LogLevel;
 pub use log_type::LogType;
-pub use logger::{LogSubscription, Logger};
+pub use logger::{LogSubscription, OpenNetLogger};
