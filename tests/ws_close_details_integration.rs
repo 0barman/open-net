@@ -599,3 +599,6 @@ async fn invalid_wire_code_exposes_the_dependency_decoded_protocol_close() -> Te
     bounded(net.destroy_ws_client("close-details-decoded")).await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

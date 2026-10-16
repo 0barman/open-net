@@ -4,8 +4,11 @@ mod monitor_runtime;
 mod monitor_state;
 pub(crate) mod network_status_snapshot;
 mod platform;
+mod recoverable;
+pub(crate) mod refresh;
 mod refresh_trigger;
 
+mod coordinated_view;
 mod network_view;
 pub(crate) mod shared;
 

@@ -41,8 +41,11 @@ impl Sender {
     ///
     /// fn log_sender(session: &Session) {
     ///     let sender = session.sender();
-    ///     assert_eq!(sender.session_id(), session.id());
-    ///     println!("Sender session: {}", sender.session_id());
+    ///     println!(
+    ///         "Sender session: {}, owner session: {}",
+    ///         sender.session_id(),
+    ///         session.id(),
+    ///     );
     /// }
     /// ```
     pub fn session_id(&self) -> SessionId {
@@ -129,7 +132,7 @@ impl Sender {
     ///
     /// ```no_run
     /// use open_net::error::ReceiveError;
-    /// use open_net::network::{NetworkConfig, NetworkStatusPolicy};
+    /// use open_net::network::{NetworkConfig, NetworkStatusPolicy, TlsConfig};
     /// use open_net::subscription::{CallbackContext, Subscription};
     /// use open_net::ws::{
     ///     ConnectOptions, ConnectionEvent, ConnectionEventKind, ConnectionSnapshot, HeartbeatConfig,
@@ -137,12 +140,23 @@ impl Sender {
     ///     WebSocketClientConfig,
     /// };
     /// use open_net::{HeaderValue, OpenNet, OpenNetConfig};
+    /// use open_net::tls::CryptoProvider;
+    /// use std::sync::Arc;
     /// use std::thread;
     /// use std::time::Duration;
     ///
     /// # const WS_BASE_URL: &str = "wss://example.com/api/ws";
     /// # async fn example() -> open_net::Result<()> {
-    /// let net = OpenNet::new_with_config(OpenNetConfig::default().with_runtime_worker_threads(2))?;
+    /// let provider: Arc<CryptoProvider> =
+    ///     Arc::new(rustls_openssl::default_provider());
+    /// let network = NetworkConfig::default()
+    ///     .with_network_status_policy(NetworkStatusPolicy::Ignore)
+    ///     .with_tls(TlsConfig::default().with_crypto_provider(Arc::clone(&provider)));
+    /// let net = OpenNet::new_with_config(
+    ///     OpenNetConfig::default()
+    ///         .with_runtime_worker_threads(2)
+    ///         .with_network_config(network.clone()),
+    /// )?;
     /// let mut config = WebSocketClientConfig::default();
     /// config.queues.normal.max_items = 128;
     /// config.queues.urgent.max_items = 32;
@@ -155,11 +169,11 @@ impl Sender {
     /// config.heartbeat = Some(HeartbeatConfig {
     ///     interval: Duration::from_secs(20),
     ///     pong_timeout: Duration::from_secs(45),
+    ///     ..HeartbeatConfig::default()
     /// });
     /// config.close_timeout = Duration::from_secs(2);
     /// config.validate()?;
     ///
-    /// let network = NetworkConfig::default().with_network_status_policy(NetworkStatusPolicy::Ignore);
     /// // Explicitly override the client network configuration here; the default is direct access,
     /// // and wss uses the default trusted root certificates.
     /// // Other creation methods: net.create_ws_client(CLIENT_NAME).await?;
@@ -182,7 +196,7 @@ impl Sender {
     /// // A-thread_name: main, thread_id: ThreadId(1)
     /// println!(
     ///     "A-thread_name: {}, thread_id: {:?}",
-    ///     current_thread.name().unwrap_or("unnamed"),
+    ///     current_thread.name().map_or("unnamed", |name| name),
     ///     current_thread.id()
     /// );
     /// let mut session = client.connect(options).await?;
@@ -196,7 +210,7 @@ impl Sender {
     ///             println!(
     ///                 "State callback[{}]: {state:?}, thread_name: {}, thread_id: {:?}",
     ///                 context.id(),
-    ///                 current_thread.name().unwrap_or("unnamed"),
+    ///                 current_thread.name().map_or("unnamed", |name| name),
     ///                 current_thread.id()
     ///             );
     ///         }
@@ -214,7 +228,7 @@ impl Sender {
     ///                 // thread_name: open-net-ws-data-callback, thread_id: ThreadId(20)
     ///                 let current_thread = thread::current();
     ///                 println!("message_subscription->IncomingMessage: {:?}, thread_name: {}, thread_id: {:?}", message,
-    ///                          current_thread.name().unwrap_or("unnamed"),
+    ///                          current_thread.name().map_or("unnamed", |name| name),
     ///                          current_thread.id());
     ///             }
     ///             Err(error) => {
@@ -236,7 +250,7 @@ impl Sender {
     ///                 event.client_id,
     ///                 event.session_id,
     ///                 event.occurred_at,
-    ///                 current_thread.name().unwrap_or("unnamed"),
+    ///                 current_thread.name().map_or("unnamed", |name| name),
     ///                 current_thread.id());
     ///             // on_event records lifecycle events; observe immediate states such as network waits through on_state.
     ///             match event.kind {
@@ -327,7 +341,7 @@ impl Sender {
     ///             println!(
     ///                 "Task callback[{}]: {event:?}, thread_name: {}, thread_id: {:?}",
     ///                 context.id(),
-    ///                 current_thread.name().unwrap_or("unnamed"),
+    ///                 current_thread.name().map_or("unnamed", |name| name),
     ///                 current_thread.id()
     ///             );
     ///         }
@@ -781,7 +795,11 @@ impl MessageReceipt {
     ///
     /// async fn check_receipt_owner(sender: &Sender) -> Result<()> {
     ///     let receipt = sender.enqueue("status:ready").await?;
-    ///     assert_eq!(receipt.session_id(), sender.session_id());
+    ///     println!(
+    ///         "Receipt session: {}, sender session: {}",
+    ///         receipt.session_id(),
+    ///         sender.session_id(),
+    ///     );
     ///     receipt.written().await
     /// }
     /// ```
@@ -936,7 +954,7 @@ impl PreparedMessage {
     ///     let observer = prepared.receipt().clone();
     ///     println!("Operation ID before commit: {}", observer.id());
     ///     let committed = prepared.commit()?;
-    ///     assert_eq!(observer.id(), committed.id());
+    ///     println!("Operation ID after commit: {}", committed.id());
     ///     observer.written().await
     /// }
     /// ```

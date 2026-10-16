@@ -108,3 +108,6 @@ fn unsupported_architecture_is_rejected_with_or_without_explicit_target() -> io:
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

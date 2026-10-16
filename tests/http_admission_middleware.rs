@@ -992,3 +992,6 @@ async fn draining_after_middleware_abandons_terminal_waits_for_worker_cleanup() 
         "drain returned before the abandoned terminal released capacity",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

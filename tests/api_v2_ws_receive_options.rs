@@ -187,3 +187,6 @@ fn urgent_task_reserve_is_inside_total_and_leaves_normal_capacity() -> TestResul
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

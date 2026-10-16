@@ -238,3 +238,6 @@ fn forbidden_common_or_request_headers_are_still_rejected_before_merging() {
         assert_eq!(snapshot(&request), request_before);
     }
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

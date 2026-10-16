@@ -54,3 +54,40 @@ async fn pool_reuses_worker_outside_network_runtime_in_submission_order() -> Tes
     check!(pool.ensure_ready().is_err())?;
     Ok(())
 }
+
+#[tokio::test]
+async fn engine_retirement_waits_for_closed_data_pool_with_retained_clones() -> TestResult {
+    use crate::common::retirement::{ExecutionScope, ThreadRegistry};
+    let threads = Arc::new(ThreadRegistry::new());
+    let pool = Arc::new(DataCallbackPool::new_with_threads(1, threads.clone()));
+    let retained = pool.clone();
+    let (entered, started) = oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let callback = pool.dispatch(Box::new(move || {
+        let _ = entered.send(ExecutionScope::is_current());
+        let _ = released.recv_timeout(Duration::from_secs(5));
+    }))?;
+    let mut callback = Box::pin(callback);
+    check!(futures::poll!(&mut callback).is_pending())?;
+    check!(fixture::bounded(started).await??)?;
+    drop(callback);
+    pool.close();
+    check!(retained.ensure_ready().is_err())?;
+    let (joining, joining_started) = std::sync::mpsc::channel();
+    let (done, finished) = std::sync::mpsc::channel();
+    let cleanup = std::thread::spawn(move || {
+        let _ = joining.send(());
+        let _ = done.send(threads.seal_and_join());
+    });
+    joining_started.recv_timeout(Duration::from_secs(5))?;
+    check!(matches!(
+        finished.recv_timeout(Duration::from_millis(30)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ))?;
+    release.send(())?;
+    check!(finished.recv_timeout(Duration::from_secs(5))?.is_ok())?;
+    cleanup
+        .join()
+        .map_err(|_| test_error("data callback cleanup thread panicked"))?;
+    Ok(())
+}

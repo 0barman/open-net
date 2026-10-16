@@ -509,3 +509,6 @@ async fn exercise_network(network: IsolatedNetwork) -> TestResult {
     .await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

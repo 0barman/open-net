@@ -1,11 +1,23 @@
 use std::fmt;
 
 /// Current host-level network reachability reported by the monitor.
+///
+/// Evidence differs by platform: Windows uses Network List Manager's Internet
+/// connectivity flags; macOS uses netwatch's default-route and IP-capability
+/// facts; Linux checks operational interfaces and default routes. These are
+/// host observations, not probes of a particular server, DNS service, or URL.
+/// Always handle errors from the actual network operation.
+///
+/// An absent `NetworkSnapshot::reachability` means no current observation, not
+/// `Unavailable`. `Stopped`, `Starting`, `Failed`, and `Closed` describe the
+/// monitor's lifecycle and must not be converted into a network disconnection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkStatus {
-    /// Network is unavailable.
+    /// The platform observation does not establish host network availability.
+    /// This does not imply that every local or remote endpoint is unreachable.
     Unavailable,
-    /// Network is available.
+    /// The platform observation indicates host network availability.
+    /// A request can still fail because of DNS, TLS, a firewall, or the server.
     Available,
 }
 

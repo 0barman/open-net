@@ -18,6 +18,29 @@ use std::str::Utf8Error;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HttpRequestId(pub u64);
 
+/// Status and headers received before a buffered response body failed to complete.
+///
+/// This metadata does not make the request successful. Inspect the accompanying
+/// [`NetError`] for the original classification, source and timeout phase. Header
+/// values may be sensitive and are intentionally omitted from `Debug` output.
+#[derive(Clone)]
+pub struct HttpResponseHead {
+    /// Response status code returned by the peer.
+    pub status: StatusCode,
+    /// Response headers, including values supplied by the peer.
+    pub headers: HeaderMap,
+}
+
+impl fmt::Debug for HttpResponseHead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpResponseHead")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
+}
+
 /// A fully buffered HTTP response delivered to a request callback.
 ///
 /// The body is retained as owned bytes and is intentionally omitted from
@@ -166,7 +189,8 @@ impl fmt::Debug for HttpResponse {
 /// `Ok` contains a fully buffered response. `Err` contains a transport,
 /// configuration, cancellation, or retry-exhaustion error; an HTTP status that
 /// is merely unsuccessful is still represented by `Ok` until the caller applies
-/// [`HttpResponse::check_status`].
+/// [`HttpResponse::check_status`]. A buffered body failure retains the received
+/// status and headers in [`NetError::http_response_head`]; the result stays `Err`.
 pub type HttpResponseResult = Result<HttpResponse, NetError>;
 
 #[cfg(test)]

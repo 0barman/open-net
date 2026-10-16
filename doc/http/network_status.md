@@ -12,8 +12,24 @@ Add these dependencies, replacing the local library path.
 ```toml
 [dependencies]
 open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 The examples below do not send HTTP requests and need no server. `cargo run`
 executes them; network observation examples use the host platform's monitor.
@@ -79,6 +95,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let engine = OpenNet::new()?;
     let client = HttpClient::new_with_network_status(
         HttpClientConfig::new("http://127.0.0.1:8080")?,
@@ -134,6 +153,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let engine = OpenNet::new()?;
     let client = HttpClient::new_with_network_status(
         HttpClientConfig::new("http://127.0.0.1:8080")?,
@@ -190,7 +212,7 @@ Create an engine, bind the standalone HTTP client to its context, observe state,
 
 ### Errors and behavior
 
-Callbacks execute asynchronously on the shared callback pool. Keep the returned handle alive. Fn permits repeated calls; Send + Sync allows worker use; 'static requires captures without short-lived borrows. HTTP shutdown ends observation without waiting for a running network callback. Subscription::close() externally waits for its retirement and reports callback panic/dispatch errors.
+Callbacks execute asynchronously on the shared callback pool. Keep the returned handle alive. Fn permits repeated calls; Send + Sync allows worker use; 'static requires captures without short-lived borrows. HTTP shutdown ends observation without waiting for a running network callback. Subscription::close() externally waits for its retirement and reports callback panic/dispatch errors. Polling close inside any synchronous subscription callback first unsubscribes, then returns InvalidInput; use CallbackContext::unsubscribe there and await close externally.
 
 ### Example
 
@@ -200,6 +222,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let engine = OpenNet::new()?;
     let client = HttpClient::new_with_network_status(
         HttpClientConfig::new("http://127.0.0.1:8080")?,
@@ -305,7 +330,7 @@ are publicly exported through `open_net::subscription`. StateReceiver<T> require
 | `Subscription::id(&self) -> SubscriptionId` | No parameters; controlled registration ID. |
 | `is_active(&self) -> bool` | Whether new deliveries are accepted. |
 | `unsubscribe(&self) -> bool` | Idempotent synchronous unsubscribe; does not wait for an executing callback. |
-| `async close(self) -> Result<(), NetError>` | Consumes the handle, unsubscribes and awaits callback retirement. Preserves panic/dispatch error. Detached application tasks are outside this boundary. |
+| `async close(self) -> Result<(), NetError>` | Consumes the handle and unsubscribes. Outside subscription callbacks, awaits retirement and preserves panic/dispatch error. Inside any synchronous subscription callback, returns InvalidInput after unsubscribing. Detached application tasks are outside this boundary. |
 | `CallbackContext::id(&self) -> SubscriptionId` | Calling registration's ID. |
 | `unsubscribe(&self) -> bool` | May be called inside callback; false if already detached/dropped. Does not await the callback. |
 | `SubscriptionId::as_u64(self) -> u64` | Numeric registration ID. |
@@ -314,7 +339,14 @@ A StateReceiver also implements Stream with `Item = Result<T, NetError>`.
 Dropping a receiver or Subscription unsubscribes immediately. Retaining a
 CallbackContext alone does not retain the subscription because its control
 reference is weak. To stop from inside a callback use context.unsubscribe();
-await Subscription::close() from outside that callback, not from itself.
+await Subscription::close() from outside all synchronous subscription callbacks.
+This includes closing a different or already idle subscription: the callback
+context check runs on every poll and returns `InvalidInput` with field
+`subscription.close` and stage `Dispatch`. That error does not confirm retirement.
+A close future created in a callback can be awaited externally after the callback
+returns. Cancelling a close wait does not reactivate delivery or interrupt a
+callback already running. Do not indirectly wait for that callback through another
+thread either. See [shared lifecycle rules](../lifecycle.md).
 State observation coalesces changes, so slow receivers can miss intermediate values.
 
 The next example converts the receiver to a callback without losing its
@@ -326,6 +358,9 @@ use open_net::api::http::HttpClientConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let engine = OpenNet::new()?;
     let client = engine.create_http_client_with_config(
         "observations", HttpClientConfig::new("http://127.0.0.1:8080")?,

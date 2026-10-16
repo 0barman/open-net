@@ -115,3 +115,46 @@ fn invoke_from_engine_post_uses_the_existing_sync_queue_without_nested_runtime_f
     check_observation(receiver.recv_timeout(WAIT)??, (engine_id, 6))?;
     Ok(())
 }
+
+#[test]
+fn explicit_shutdown_waits_for_a_foreign_runtime_bridge_thread() -> TestResult {
+    let engine = engine()?;
+    let (started, entry) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let bridged_engine = Arc::clone(&engine);
+    let caller = std::thread::spawn(move || -> Result<(), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async move {
+            bridged_engine
+                .run_blocking_on_engine_rt(move || {
+                    let _ = started.send(());
+                    let _ = gate.recv_timeout(WAIT);
+                })
+                .map_err(|error| format!("bridge failed: {error:?}"))
+        })
+    });
+    entry.recv_timeout(WAIT)?;
+    let (finished, completion) = mpsc::channel();
+    let retiring = Arc::clone(&engine);
+    let coordinator = std::thread::spawn(move || {
+        let _ = finished.send(retiring.shutdown_blocking());
+    });
+    assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+    release.send(())?;
+    completion.recv_timeout(WAIT)?.map_err(common_error)?;
+    caller
+        .join()
+        .map_err(|_| test_error("foreign runtime caller panicked"))??;
+    coordinator
+        .join()
+        .map_err(|_| test_error("bridge coordinator panicked"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    assert_eq!(
+        runtime.block_on(async { engine.run_blocking_on_engine_rt(|| ()) }),
+        Err(CommonError::RuntimeError)
+    );
+    Ok(())
+}

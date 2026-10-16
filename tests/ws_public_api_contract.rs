@@ -462,6 +462,7 @@ fn complete_configuration_literals_and_root_exports_type_check() -> TestResult {
         heartbeat: Some(open_net::ws::HeartbeatConfig {
             interval: Duration::from_secs(20),
             pong_timeout: Duration::from_secs(45),
+            ..Default::default()
         }),
     };
     // Type-check the single observed connection contract without network work.
@@ -476,3 +477,24 @@ fn complete_configuration_literals_and_root_exports_type_check() -> TestResult {
     let _ = (config, compile_session);
     Ok(())
 }
+
+#[test]
+fn heartbeat_retry_configuration_is_public_and_fallible() -> TestResult {
+    let retry = open_net::ws::HeartbeatRetryConfig {
+        pong_recovery_attempts: 2,
+        pong_retry_interval: Duration::from_millis(1500),
+        ping_write_retries: 1,
+        ping_write_retry_interval: Duration::from_millis(250),
+    };
+    retry.validate()?;
+    let heartbeat = open_net::ws::HeartbeatConfig {
+        interval: Duration::from_secs(20),
+        pong_timeout: Duration::from_secs(45),
+        retry,
+    };
+    heartbeat.validate()?;
+    Ok(())
+}
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

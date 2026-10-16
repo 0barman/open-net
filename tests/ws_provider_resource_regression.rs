@@ -696,3 +696,6 @@ async fn shutdown_is_bounded_while_provider_is_blocked() -> TestResult {
 async fn destroy_is_bounded_while_provider_is_blocked() -> TestResult {
     shutdown_scenario(true).await
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

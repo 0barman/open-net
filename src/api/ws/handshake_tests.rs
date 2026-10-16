@@ -1,7 +1,7 @@
 use super::*;
 use crate::module::ws_client::test_support::{check, check_eq, TestResult};
 use crate::ws::{AttemptId, ClientId, CycleId, SessionId};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -394,6 +394,80 @@ async fn cancelled_blocking_calls_hold_quota_through_capture_and_unreceived_sour
         drop(permit);
         check_eq!(slots.available_permits(), 1)?;
     }
+    Ok(())
+}
+
+#[test]
+fn engine_retirement_tracks_cancelled_blocking_provider_until_real_exit() -> TestResult {
+    use crate::common::retirement::{ExecutionScope, ThreadRegistry};
+    let threads = Arc::new(ThreadRegistry::new());
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let provider = HandshakeProvider::blocking(move |_| {
+        entered.send(ExecutionScope::is_current())?;
+        released
+            .lock()
+            .map_err(|_| std::io::Error::other("test release lock poisoned"))?
+            .recv_timeout(DEADLINE)?;
+        Ok(HandshakeHeaders::new(HeaderMap::new()))
+    });
+    let mut pending = Box::pin(provider.provide_with_threads(
+        attempt()?,
+        Arc::new(Semaphore::new(1)),
+        threads.clone(),
+    ));
+    futures::executor::block_on(async { check!(futures::poll!(&mut pending).is_pending()) })?;
+    check!(started.recv_timeout(DEADLINE)?)?;
+    drop(pending);
+    let (joining, joining_started) = std::sync::mpsc::channel();
+    let (done, finished) = std::sync::mpsc::channel();
+    let cleanup = std::thread::spawn(move || {
+        let _ = joining.send(());
+        let _ = done.send(threads.seal_and_join());
+    });
+    joining_started.recv_timeout(DEADLINE)?;
+    check!(matches!(
+        finished.recv_timeout(Duration::from_millis(30)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ))?;
+    release.send(())?;
+    check!(finished.recv_timeout(DEADLINE)?.is_ok())?;
+    cleanup
+        .join()
+        .map_err(|_| "provider cleanup thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn async_provider_constructor_poll_and_drop_enter_execution_scope() -> TestResult {
+    use crate::common::retirement::ExecutionScope;
+    struct ScopedDrop(Arc<AtomicBool>);
+    impl Drop for ScopedDrop {
+        fn drop(&mut self) {
+            self.0.store(ExecutionScope::is_current(), Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let dropped_in_provider = dropped.clone();
+    let constructed = Arc::new(AtomicBool::new(false));
+    let constructed_in_provider = constructed.clone();
+    let provider = HandshakeProvider::new(move |_| {
+        constructed_in_provider.store(ExecutionScope::is_current(), Ordering::SeqCst);
+        let on_drop = ScopedDrop(dropped_in_provider.clone());
+        async move {
+            let _on_drop = on_drop;
+            check!(ExecutionScope::is_current())?;
+            std::future::pending::<ProviderOutput>().await
+        }
+    });
+    let mut pending = Box::pin(provider.provide(attempt()?, Arc::new(Semaphore::new(1))));
+    check!(futures::poll!(&mut pending).is_pending())?;
+    check!(constructed.load(Ordering::SeqCst))?;
+    check!(!ExecutionScope::is_current())?;
+    drop(pending);
+    check!(dropped.load(Ordering::SeqCst))?;
+    check!(!ExecutionScope::is_current())?;
     Ok(())
 }
 

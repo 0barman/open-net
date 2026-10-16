@@ -36,8 +36,8 @@ use crate::module::ws_client::ws_write::{fail_requests, run_write_loop};
 use crate::ws::TerminationReason;
 use crate::ws::{ConnectionId, TaskEndCause};
 use crate::ws::{IoEndKind, PeerClose, RetryDecision};
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use socket2::{SockRef, TcpKeepalive};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -110,6 +110,7 @@ impl WSClientWorker {
     ///
     /// - `ready_tx`：向客户端创建流程报告工作线程是否完成运行时初始化的同步通道。
     pub(crate) fn run(self, ready_tx: std::sync::mpsc::Sender<Result<(), NetError>>) {
+        let _scope = crate::common::retirement::ExecutionScope::enter();
         crate::log_t!(LogType::WSC; "run", "generation", self.generation);
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -279,6 +280,7 @@ impl WSClientWorker {
         self.drain_data_callbacks_until(terminal_response_deadline)
             .await;
         self.clear_listeners();
+        self.task_observers.close_executor();
         if let Some(lease) = self.network_lease.take() {
             if let Err(error) = lease.release().wait().await {
                 crate::log_e!(LogType::WSC; "network_monitor_release", "error", format!("{error:?}"));
@@ -1047,6 +1049,7 @@ impl WSClientWorker {
         let client_config = self.config.clone();
         let network = Arc::clone(&self.network);
         let provider_slots = Arc::clone(&self.context_provider_slots);
+        let resource_threads = Arc::clone(&self.resource_threads);
         self.connect_handle = Some(spawn(async move {
             context_connect::ContextConnectTask {
                 target,
@@ -1054,6 +1057,7 @@ impl WSClientWorker {
                 client_config,
                 network,
                 provider_slots,
+                resource_threads,
                 generation,
                 cancel,
                 network_available,

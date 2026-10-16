@@ -16,3 +16,6 @@ fn connection_receiver_names_expose_the_native_stream_and_fallible_receive_contr
         ConnectionJournal::try_recv;
     let _unsubscribe: fn(&ConnectionJournal) -> bool = ConnectionJournal::unsubscribe;
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

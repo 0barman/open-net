@@ -133,6 +133,10 @@ pub(crate) struct InnerNetStatusClient {
     lifecycle: Arc<Mutex<Lifecycle>>,
     // 统一快照源；公开订阅复用引擎回调池，私有 watch 维持 WS 的网络门控时序。
     observations: NetworkStatusSource,
+    #[cfg(any(target_os = "windows", test))]
+    windows_sampler: Arc<super::refresh::WindowsSampler>,
+    #[cfg(any(target_os = "windows", test))]
+    windows_reachability_sampler: Arc<super::refresh::WindowsSampler>,
     // 测试专用的安全初始化工厂，用于精确控制失败与并发时机，不改变生产构建。
     #[cfg(test)]
     monitor_factory: Mutex<Option<initialization_tests::MonitorFactory>>,
@@ -144,11 +148,19 @@ impl InnerNetStatusClient {
     // 创建未启动的客户端，持有共享引擎并将内部观测初始化为未知。
     pub(crate) fn new(engine: Arc<CommonEngine>) -> Result<Self, NetError> {
         let executor = Arc::new(CommonCallbackExecutor::new(&engine));
-        let observations = NetworkStatusSource::new(executor, 1024)?;
+        let observations =
+            NetworkStatusSource::new(executor, 1024)?.with_retirement(engine.retirement_work());
+        #[cfg(any(target_os = "windows", test))]
+        let (windows_sampler, windows_reachability_sampler) =
+            super::refresh::WindowsSampler::pair(engine.resource_threads());
         Ok(Self {
             engine,
             lifecycle: Arc::new(Mutex::new(Lifecycle::default())),
             observations,
+            #[cfg(any(target_os = "windows", test))]
+            windows_sampler,
+            #[cfg(any(target_os = "windows", test))]
+            windows_reachability_sampler,
             #[cfg(test)]
             monitor_factory: Mutex::new(None),
             #[cfg(test)]
@@ -166,6 +178,20 @@ impl InnerNetStatusClient {
 
     pub(crate) fn subscribe_facts(&self) -> watch::Receiver<NetworkSnapshot> {
         self.observations.subscribe_facts()
+    }
+
+    pub(super) fn observation_source(&self) -> NetworkStatusSource {
+        self.observations.clone()
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(super) fn windows_sampler(&self) -> Arc<super::refresh::WindowsSampler> {
+        self.windows_sampler.clone()
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(super) fn windows_reachability_sampler(&self) -> Arc<super::refresh::WindowsSampler> {
+        self.windows_reachability_sampler.clone()
     }
 
     pub(crate) fn subscribe_failure(&self) -> watch::Receiver<Option<NetError>> {
@@ -371,12 +397,15 @@ impl InnerNetStatusClient {
         // dedicated runtime because netwatch detaches nested platform tasks and
         // exposes no join API. Dropping that runtime on its ordinary thread
         // drains async tasks and blocking work before the completion guard runs.
+        #[cfg(target_os = "windows")]
+        let windows_sampler = self.windows_sampler.clone();
+        #[cfg(target_os = "windows")]
+        let windows_reachability_sampler = self.windows_reachability_sampler.clone();
+        let threads = self.engine.resource_threads();
         let task = async move {
             let (submission_alive, submission_cancelled) = oneshot::channel::<()>();
             let (thread_finished, thread_wait) = oneshot::channel();
-            let spawned = std::thread::Builder::new()
-                .name("open-net-network-monitor".to_owned())
-                .spawn(move || {
+            let spawned = threads.spawn("open-net-network-monitor", move || {
                     // Declared before runtime: unwinding also destroys runtime
                     // resources before publishing this generation's completion.
                     let mut completion = completion;
@@ -401,6 +430,10 @@ impl InnerNetStatusClient {
                                 shared_state,
                                 stop_receiver,
                                 initial_sender,
+                                #[cfg(target_os = "windows")]
+                                windows_sampler,
+                                #[cfg(target_os = "windows")]
+                                windows_reachability_sampler,
                                 #[cfg(test)]
                                 factory,
                             ) => result,
@@ -438,6 +471,13 @@ impl InnerNetStatusClient {
         &self,
         permanent: bool,
     ) -> (Vec<watch::Receiver<bool>>, Option<NetError>) {
+        #[cfg(any(target_os = "windows", test))]
+        if permanent {
+            // Explicit engine shutdown must release the sampling lanes even
+            // while applications retain clients or read-only contexts.
+            self.windows_sampler.close();
+            self.windows_reachability_sampler.close();
+        }
         let mut error = None;
         let (finished, retired, publication) = {
             let mut lifecycle = match self.lifecycle.lock() {
@@ -536,7 +576,7 @@ impl InnerNetStatusClient {
     }
 
     // 按默认路由与 IP 能力推导可达性：同时具备默认路由及至少一种 IP 能力时为 Available。
-    #[cfg(any(not(target_os = "linux"), test))]
+    #[cfg(any(not(any(target_os = "linux", target_os = "windows")), test))]
     fn reachability_from_flags(
         has_default_route: bool,
         have_v4: bool,
@@ -550,7 +590,7 @@ impl InnerNetStatusClient {
     }
 
     // 从 netwatch 接口快照提取默认路由与 IPv4/IPv6 标志，转换为本库的可达性枚举。
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     fn reachability_from_state(state: &netwatch::netmon::State) -> NetworkStatus {
         Self::reachability_from_flags(
             state.default_route_interface.is_some(),
@@ -567,20 +607,10 @@ impl InnerNetStatusClient {
         IpStack::from_flags(state.have_v4, state.have_v6)
     }
 
-    // 获取当前可达性；Windows 优先使用系统连接状态，查询无结果或其他平台则使用 netwatch 快照。
-    #[cfg(not(target_os = "linux"))]
-    fn current_reachability(state: &netwatch::netmon::State) -> NetworkStatus {
-        #[cfg(target_os = "windows")]
-        if let Some(reachability) = Self::windows_network_reachability() {
-            return reachability;
-        }
-
-        Self::reachability_from_state(state)
-    }
-
     // Linux additionally checks operational links and IPv6 on-link defaults.
     // Cancel slow platform reads on stop; the read-only worker cannot publish
     // into this or a later generation. Other platforms retain their exact query.
+    #[cfg(not(target_os = "windows"))]
     async fn reachability_or_stop(
         snapshot: &netwatch::netmon::State,
         _stop_receiver: &mut oneshot::Receiver<()>,
@@ -595,20 +625,18 @@ impl InnerNetStatusClient {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Ok(Some(Self::current_reachability(snapshot)))
+            Ok(Some(Self::reachability_from_state(snapshot)))
         }
     }
 
     // One authoritative snapshot contains reachability and IP capability. Public wakeups,
     // user captures and callback scheduling are all released outside the monitor lock.
+    #[cfg(any(not(target_os = "windows"), test))]
     fn update_state_inner(
         state: &Arc<Mutex<MonitorState>>,
         reachability: NetworkStatus,
         ip_stack: IpStack,
     ) -> Result<(), NetError> {
-        #[cfg(target_os = "windows")]
-        let network_name = Self::query_current_network();
-        #[cfg(not(target_os = "windows"))]
         let network_name = None;
         let publication = {
             let guard = state.lock().map_err(NetError::from_poison)?;
@@ -644,6 +672,10 @@ impl InnerNetStatusClient {
         state: Arc<Mutex<MonitorState>>,
         mut stop_receiver: oneshot::Receiver<()>,
         initial_state: watch::Sender<MonitorInitialization>,
+        #[cfg(target_os = "windows")] windows_sampler: Arc<super::refresh::WindowsSampler>,
+        #[cfg(target_os = "windows")] windows_reachability_sampler: Arc<
+            super::refresh::WindowsSampler,
+        >,
         #[cfg(test)] factory: Option<initialization_tests::MonitorFactory>,
     ) -> Result<(), NetError> {
         let monitor = tokio::select! {
@@ -665,14 +697,16 @@ impl InnerNetStatusClient {
         let mut interface_state = monitor.interface_state();
 
         let initial = interface_state.get();
-        let Some(current) = Self::reachability_or_stop(&initial, &mut stop_receiver).await? else {
+        if !Self::observe_or_stop(
+            &state,
+            &initial,
+            &mut stop_receiver,
+            #[cfg(target_os = "windows")]
+            &windows_reachability_sampler,
+        )
+        .await?
+        {
             return Ok(());
-        };
-        let ip_stack = Self::ip_stack_from_state(&initial);
-        // If the initial state update fails (lock poisoned), end the task.
-        if let Err(error) = Self::update_state_inner(&state, current, ip_stack) {
-            crate::log_e!(LogType::Engine; "network_status_initial_observation", "error", crate::common::log::summary::error(&error));
-            return Err(error);
         }
         initial_state.send_replace(MonitorInitialization::Ready);
 
@@ -686,25 +720,39 @@ impl InnerNetStatusClient {
         let mut refresh_interval = time::interval(Duration::from_secs(2));
         refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut stop_receiver => break,
-                update = interface_state.updated() => {
-                    match update {
-                        Ok(new_state) => {
-                            let Some(reachability) = Self::reachability_or_stop(&new_state, &mut stop_receiver).await? else {
-                                break;
-                            };
-                            let ip_stack = Self::ip_stack_from_state(&new_state);
-                            // Exit the monitor loop if the lock is poisoned.
-                            Self::update_state_inner(&state, reachability, ip_stack)?;
+        let observations = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut stop_receiver => break,
+                    update = interface_state.updated() => {
+                        match update {
+                            Ok(new_state) => {
+                                if !Self::resample_or_stop(&state, &new_state, &mut stop_receiver,
+                                    #[cfg(target_os = "windows")] &windows_reachability_sampler,
+                                ).await? {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
-                native_changed = platform_monitor.changed() => {
-                    if native_changed {
+                    native_changed = platform_monitor.changed() => {
+                        if native_changed {
+                            match request_refresh_or_stop(
+                                &mut stop_receiver,
+                                || monitor.network_change(),
+                            ).await {
+                                RefreshWorkOutcome::Stopped => break,
+                                RefreshWorkOutcome::Requested | RefreshWorkOutcome::RequestFailed => {}
+                            }
+                        }
+                    }
+                    _ = refresh_interval.tick() => {
+                        // netwatch 0.18 does not subscribe to Linux link changes.
+                        // Re-sample instead of only re-reading its cached state;
+                        // the request is asynchronous and updates arrive above.
+                        #[cfg(target_os = "linux")]
                         match request_refresh_or_stop(
                             &mut stop_receiver,
                             || monitor.network_change(),
@@ -712,29 +760,31 @@ impl InnerNetStatusClient {
                             RefreshWorkOutcome::Stopped => break,
                             RefreshWorkOutcome::Requested | RefreshWorkOutcome::RequestFailed => {}
                         }
+                        let snapshot = interface_state.get();
+                        if !Self::resample_or_stop(&state, &snapshot, &mut stop_receiver,
+                            #[cfg(target_os = "windows")] &windows_reachability_sampler,
+                        ).await? {
+                            break;
+                        }
                     }
-                }
-                _ = refresh_interval.tick() => {
-                    // netwatch 0.18 does not subscribe to Linux link changes.
-                    // Re-sample instead of only re-reading its cached state;
-                    // the request is asynchronous and updates arrive above.
-                    #[cfg(target_os = "linux")]
-                    match request_refresh_or_stop(
-                        &mut stop_receiver,
-                        || monitor.network_change(),
-                    ).await {
-                        RefreshWorkOutcome::Stopped => break,
-                        RefreshWorkOutcome::Requested | RefreshWorkOutcome::RequestFailed => {}
-                    }
-                    let snapshot = interface_state.get();
-                    let Some(reachability) = Self::reachability_or_stop(&snapshot, &mut stop_receiver).await? else {
-                        break;
-                    };
-                    let ip_stack = Self::ip_stack_from_state(&snapshot);
-                    Self::update_state_inner(&state, reachability, ip_stack)?;
                 }
             }
+
+            Ok::<(), NetError>(())
+        };
+        #[cfg(target_os = "windows")]
+        {
+            // Both futures belong to this monitor generation. Stop/drop of the
+            // main loop drops the name future and its Cancellation guard; native
+            // work has no publisher and cannot commit a late result.
+            tokio::select! {
+                biased;
+                result = observations => result?,
+                result = Self::monitor_windows_names(&state, &windows_sampler) => result?,
+            }
         }
+        #[cfg(not(target_os = "windows"))]
+        observations.await?;
 
         // On macOS the native source waits for cancellation completion and
         // drains the serial callback queue before releasing the
@@ -761,165 +811,231 @@ impl InnerNetStatusClient {
         })
     }
 
-    // ------------------------------------------------------------------
-    // Windows network reachability (based on the NetworkListManager COM API)
-    // ------------------------------------------------------------------
+    // Background reachability and explicit reachability queries share a bounded
+    // lane; name queries use another lane and a separate commit watermark.
+    // Native work never owns the commit capability and cannot publish after stop.
+    async fn observe_or_stop(
+        state: &Arc<Mutex<MonitorState>>,
+        snapshot: &netwatch::netmon::State,
+        stop: &mut oneshot::Receiver<()>,
+        #[cfg(target_os = "windows")] sampler: &super::refresh::WindowsSampler,
+    ) -> Result<bool, NetError> {
+        Self::observe_with_policy(
+            state,
+            snapshot,
+            stop,
+            false,
+            #[cfg(target_os = "windows")]
+            sampler,
+        )
+        .await
+    }
 
-    #[cfg(target_os = "windows")]
-    // 将 Windows 连接标志转为可达性，只认可 IPv4 或 IPv6 的 INTERNET 位。
-    fn reachability_from_windows_connectivity(
-        connectivity: windows::Win32::Networking::NetworkListManager::NLM_CONNECTIVITY,
-    ) -> NetworkStatus {
-        use windows::Win32::Networking::NetworkListManager::{
-            NLM_CONNECTIVITY_IPV4_INTERNET, NLM_CONNECTIVITY_IPV6_INTERNET,
-        };
+    // An initialized monitor can retry a saturated or slow sampling worker.
+    // Initial observation still has to succeed before start reports Running.
+    async fn resample_or_stop(
+        state: &Arc<Mutex<MonitorState>>,
+        snapshot: &netwatch::netmon::State,
+        stop: &mut oneshot::Receiver<()>,
+        #[cfg(target_os = "windows")] sampler: &super::refresh::WindowsSampler,
+    ) -> Result<bool, NetError> {
+        Self::observe_with_policy(
+            state,
+            snapshot,
+            stop,
+            true,
+            #[cfg(target_os = "windows")]
+            sampler,
+        )
+        .await
+    }
 
-        if connectivity.0 & NLM_CONNECTIVITY_IPV4_INTERNET.0 != 0
-            || connectivity.0 & NLM_CONNECTIVITY_IPV6_INTERNET.0 != 0
+    async fn observe_with_policy(
+        state: &Arc<Mutex<MonitorState>>,
+        snapshot: &netwatch::netmon::State,
+        stop: &mut oneshot::Receiver<()>,
+        _retry_transient: bool,
+        #[cfg(target_os = "windows")] sampler: &super::refresh::WindowsSampler,
+    ) -> Result<bool, NetError> {
+        #[cfg(not(target_os = "windows"))]
         {
-            NetworkStatus::Available
-        } else {
-            NetworkStatus::Unavailable
+            let Some(reachability) = Self::reachability_or_stop(snapshot, stop).await? else {
+                return Ok(false);
+            };
+            Self::update_state_inner(state, reachability, Self::ip_stack_from_state(snapshot))?;
         }
-    }
-
-    #[cfg(target_os = "windows")]
-    // 同步查询 Windows NetworkListManager 的连接状态，系统调用失败返回 None 以便上层回退。
-    // 仅当本次成功初始化 COM 时进行配对反初始化，不释放其他调用方已有的 COM 初始化计数。
-    fn windows_network_reachability() -> Option<NetworkStatus> {
-        use windows::Win32::{
-            Networking::NetworkListManager::{INetworkListManager, NetworkListManager},
-            System::Com::{
-                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
-            },
-        };
-
-        unsafe {
-            let com_initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-            let reachability = (|| {
-                let manager: INetworkListManager =
-                    CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL).ok()?;
-                let connectivity = manager.GetConnectivity().ok()?;
-                Some(Self::reachability_from_windows_connectivity(connectivity))
-            })();
-
-            if com_initialized {
-                CoUninitialize();
+        #[cfg(target_os = "windows")]
+        {
+            let cancel = super::refresh::Cancellation::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let sampled = tokio::select! {
+                biased;
+                _ = &mut *stop => return Ok(false),
+                result = Self::complete_windows_sample(async {
+                    tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        sampler.sample_background(deadline, cancel.flag.clone()),
+                    ).await.map_err(|_| NetError::from(crate::error::ErrorKind::TimedOut))?
+                }, _retry_transient) => result?,
+            };
+            let Some(sampled) = sampled else {
+                // No observation was collected or committed. The existing
+                // Running snapshot and its timestamp remain unchanged.
+                return Ok(true);
+            };
+            let (keep_running, publication) = Self::prepare_windows_sample(
+                state,
+                &cancel,
+                deadline,
+                _retry_transient,
+                sampled,
+                Self::ip_stack_from_state(snapshot),
+            )?;
+            if !keep_running {
+                return Ok(false);
             }
-
-            reachability
+            if let Some(publication) = publication {
+                publication.dispatch()?;
+            }
         }
+        Ok(true)
     }
 
-    // ------------------------------------------------------------------
-    // Windows connected-network name (Wi-Fi SSID + NetworkListManager)
-    // ------------------------------------------------------------------
-
-    /// Resolve the name of the currently connected network on Windows.
-    ///
-    /// Prefers the active Wi-Fi SSID; if that is unavailable, falls back to the
-    /// `NetworkListManager` connected-network name. Returns `None` when no
-    /// connected network can be resolved.
-    #[cfg(target_os = "windows")]
-    // 优先解析活动 Wi-Fi 的 SSID，无结果再查询首个已连接 Windows 网络的名称。
-    fn query_current_network() -> Option<String> {
-        Self::query_wifi_network().or_else(Self::query_windows_connected_network)
+    #[cfg(any(target_os = "windows", test))]
+    async fn complete_windows_sample<T>(
+        sample: impl std::future::Future<Output = Result<T, NetError>>,
+        retry_transient: bool,
+    ) -> Result<Option<T>, NetError> {
+        Self::classify_windows_sample(sample.await, retry_transient)
     }
 
-    /// Query the active Wi-Fi SSID via `netsh wlan show interfaces`.
-    #[cfg(target_os = "windows")]
-    // 无可见控制台地执行 netsh 并解析 Wi-Fi 名称；命令启动失败、退出失败或无 SSID 时返回 None。
-    fn query_wifi_network() -> Option<String> {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
-
-        /// Avoid spawning a visible console window for the `netsh` child process.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let output = Command::new("netsh")
-            .args(["wlan", "show", "interfaces"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
+    #[cfg(any(target_os = "windows", test))]
+    fn prepare_windows_sample(
+        state: &Arc<Mutex<MonitorState>>,
+        cancel: &super::refresh::Cancellation,
+        deadline: std::time::Instant,
+        retry_transient: bool,
+        sampled: super::refresh::CompletedSample,
+        ip_stack: IpStack,
+    ) -> Result<(bool, Option<NetworkPublication>), NetError> {
+        let monitor = state.lock().map_err(NetError::from_poison)?;
+        if !monitor.active.load(Ordering::Acquire) {
+            return Ok((false, None));
         }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Self::parse_netsh_wifi_ssid(&stdout)
+        // Waiting for the monitor lock is part of the sample's deadline. An
+        // established monitor retries an expired sample without committing it.
+        if Self::classify_windows_sample(cancel.check(deadline), retry_transient)?.is_none() {
+            return Ok((true, None));
+        }
+        let publication = match &monitor.observation {
+            Some(publisher) => publisher.prepare_sampled_observation(
+                sampled.id,
+                sampled.observation.reachability,
+                Some(ip_stack),
+                if matches!(
+                    sampled.observation.name_source,
+                    crate::net_status::NetworkNameSource::CachedObservation
+                ) {
+                    super::network_status_snapshot::NetworkNameUpdate::Preserve
+                } else {
+                    sampled.observation.network_name.into()
+                },
+                sampled.sampled_at,
+                || {
+                    Self::classify_windows_sample(cancel.check(deadline), retry_transient)
+                        .map(|sample| sample.is_some())
+                },
+            )?,
+            None => None,
+        };
+        Ok((true, publication))
     }
 
-    /// Extract the `SSID` value from `netsh wlan show interfaces` output,
-    /// ignoring the `BSSID` line and any empty value.
-    #[cfg(target_os = "windows")]
-    // 从 netsh 文本中提取首个非空 SSID 值，忽略 BSSID 等其他键，找不到时返回 None。
-    fn parse_netsh_wifi_ssid(output: &str) -> Option<String> {
-        output.lines().find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            let key = key.trim();
-            if key.eq_ignore_ascii_case("SSID") && !key.eq_ignore_ascii_case("BSSID") {
-                let name = value.trim();
-                if !name.is_empty() {
-                    return Some(name.to_string());
+    #[cfg(any(target_os = "windows", test))]
+    async fn monitor_windows_names(
+        state: &Arc<Mutex<MonitorState>>,
+        sampler: &super::refresh::WindowsSampler,
+    ) -> Result<(), NetError> {
+        let mut interval = time::interval(Duration::from_secs(2));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if !state
+                .lock()
+                .map_err(NetError::from_poison)?
+                .active
+                .load(Ordering::Acquire)
+            {
+                return Ok(());
+            }
+            let cancel = super::refresh::Cancellation::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let result = time::timeout_at(
+                time::Instant::from_std(deadline),
+                sampler.sample_background(deadline, cancel.flag.clone()),
+            )
+            .await;
+            let sampled = match result {
+                Ok(Ok(sampled)) => sampled,
+                Ok(Err(error)) => {
+                    // A name-query fault does not invalidate successful Internet
+                    // reachability; retain the last name and retry next period.
+                    crate::log_e!(LogType::Engine; "network_status_name_query", "error", crate::common::log::summary::error(&error));
+                    continue;
                 }
+                Err(_) => continue,
+            };
+            let publication = {
+                let monitor = state.lock().map_err(NetError::from_poison)?;
+                if !monitor.active.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match &monitor.observation {
+                    Some(publisher) => publisher.prepare_sampled_name_observation(
+                        sampled.id,
+                        sampled.observation.network_name,
+                        sampled.sampled_at,
+                        || match cancel.check(deadline) {
+                            Ok(()) => Ok(true),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    crate::error::ErrorKind::TimedOut
+                                        | crate::error::ErrorKind::Cancelled
+                                ) =>
+                            {
+                                Ok(false)
+                            }
+                            Err(error) => Err(error),
+                        },
+                    )?,
+                    None => None,
+                }
+            };
+            if let Some(publication) = publication {
+                publication.dispatch()?;
             }
-            None
-        })
+        }
     }
 
-    /// Query the first connected network's name via the `NetworkListManager`
-    /// COM API. COM is uninitialized on every exit path via an RAII guard, even
-    /// on early returns.
-    #[cfg(target_os = "windows")]
-    // 通过 COM 获取首个已连接网络的非空名称；查询失败返回 None，并由守卫配对释放本次 COM 初始化。
-    fn query_windows_connected_network() -> Option<String> {
-        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-        use windows::Win32::Networking::NetworkListManager::{
-            INetworkListManager, NetworkListManager, NLM_ENUM_NETWORK_CONNECTED,
-        };
-        use windows::Win32::System::Com::{
-            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
-        };
-
-        // 当前线程 COM 初始化的局部释放守卫，覆盖查询中所有提前返回路径。
-        struct CoUninit(bool); // 唯一字段：本次调用是否成功初始化 COM，决定析构时是否需要反初始化。
-        impl Drop for CoUninit {
-            // 仅释放本次成功取得的 COM 初始化引用，保留其他线程模型或调用者已有的初始化状态。
-            fn drop(&mut self) {
-                if self.0 {
-                    unsafe { CoUninitialize() };
-                }
+    #[cfg(any(target_os = "windows", test))]
+    fn classify_windows_sample<T>(
+        sample: Result<T, NetError>,
+        retry_transient: bool,
+    ) -> Result<Option<T>, NetError> {
+        match sample {
+            Err(error)
+                if retry_transient
+                    && matches!(
+                        error.kind(),
+                        crate::error::ErrorKind::QueueFull
+                            | crate::error::ErrorKind::TimedOut
+                            | crate::error::ErrorKind::ResourceExhausted
+                    ) =>
+            {
+                Ok(None)
             }
-        }
-
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let should_uninit = hr.is_ok();
-        // `RPC_E_CHANGED_MODE` means COM is already initialized with a different
-        // model on this thread; the existing apartment is reused and must not be
-        // uninitialized here. Any other failure is fatal to this query.
-        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
-            return None;
-        }
-        let _co_guard = CoUninit(should_uninit);
-
-        unsafe {
-            let nlm: INetworkListManager =
-                CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL).ok()?;
-            let networks = nlm.GetNetworks(NLM_ENUM_NETWORK_CONNECTED).ok()?;
-            let mut fetched = 0;
-            let mut items = [None];
-            networks.Next(&mut items, Some(&mut fetched)).ok()?;
-            if fetched == 0 {
-                return None;
-            }
-
-            let name = items[0].as_ref()?.GetName().ok()?.to_string();
-            if name.trim().is_empty() {
-                return None;
-            }
-
-            Some(name)
+            result => result.map(Some),
         }
     }
 }
@@ -934,3 +1050,11 @@ impl Drop for InnerNetStatusClient {
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "resample_tests.rs"]
+mod resample_tests;
+
+#[cfg(test)]
+#[path = "background_name_tests.rs"]
+mod background_name_tests;

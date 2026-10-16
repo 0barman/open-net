@@ -207,6 +207,56 @@ fn grouped_defaults_preserve_existing_budgets_and_validate() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn heartbeat_retry_defaults_are_disabled_and_enabled_policy_validates() -> TestResult {
+    let defaults = HeartbeatRetryConfig::default();
+    if defaults.pong_recovery_attempts != 0 || defaults.ping_write_retries != 0 {
+        return Err("heartbeat retry defaults unexpectedly enabled".into());
+    }
+    defaults.validate()?;
+
+    let enabled = HeartbeatRetryConfig {
+        pong_recovery_attempts: 10,
+        pong_retry_interval: Duration::from_millis(100),
+        ping_write_retries: 2,
+        ping_write_retry_interval: Duration::from_millis(25),
+    };
+    enabled.validate()?;
+    Ok(())
+}
+
+#[test]
+fn heartbeat_retry_validation_rejects_busy_or_unbounded_policies() -> TestResult {
+    let zero_interval = HeartbeatRetryConfig {
+        pong_recovery_attempts: 1,
+        pong_retry_interval: Duration::ZERO,
+        ..HeartbeatRetryConfig::default()
+    };
+    invalid(
+        zero_interval.validate(),
+        "heartbeat.retry.pong_retry_interval",
+    )?;
+
+    let too_many = HeartbeatRetryConfig {
+        pong_recovery_attempts: 11,
+        ..HeartbeatRetryConfig::default()
+    };
+    invalid(
+        too_many.validate(),
+        "heartbeat.retry.pong_recovery_attempts",
+    )?;
+
+    let too_many_write_retries = HeartbeatRetryConfig {
+        ping_write_retries: 1025,
+        ..HeartbeatRetryConfig::default()
+    };
+    invalid(
+        too_many_write_retries.validate(),
+        "heartbeat.retry.ping_write_retries",
+    )?;
+    Ok(())
+}
+
 type Edit = fn(&mut WebSocketClientConfig);
 #[test]
 fn every_nested_zero_capacity_reports_its_own_field() -> TestResult {
@@ -459,6 +509,7 @@ fn disabled_heartbeat_and_pong_deadline_not_exceeding_interval_are_valid() -> Te
         config.heartbeat = Some(HeartbeatConfig {
             interval: Duration::from_secs(60),
             pong_timeout,
+            ..HeartbeatConfig::default()
         });
         config.validate()?;
     }

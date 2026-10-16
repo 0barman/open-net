@@ -5,7 +5,23 @@ Required feature: `http-client`. This guide describes the checked-out source. In
 ```toml
 [dependencies]
 open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 Adjust the local path to your checkout. All types below are in `open_net::api::http`; `Duration` is `std::time::Duration`. Configuration builders consume and return ownership of the configuration. Fallible setters consume the original configuration even on `Err(NetError)`; the error does not return it. Clone first if a previous configuration must remain available. `?` returns early on failure. Create a new client to apply changed settings; changing a retained configuration does not reconfigure a running client. `Clone` copies ordinary settings and shares explicitly installed `Arc` providers.
 
@@ -49,7 +65,7 @@ Public fields and initial values:
 | `response_queue_capacity` | `usize` | 128; same range. |
 | `callback_queue_capacity` | `usize` | 128; same range. |
 | `default_retry_policy` | `RetryPolicy` | `RetryPolicy::no_retry()`. |
-| `tls` | `HttpTlsConfig` | Built-in WebPKI roots, no custom roots or client identity. |
+| `tls` | `HttpTlsConfig` | Built-in WebPKI roots, no custom roots, client identity or explicit cryptographic provider. |
 | `proxy` | `Option<HttpProxyConfig>` | `None`. |
 | `environment_proxy` | `bool` | `false`. |
 
@@ -65,7 +81,13 @@ None.
 
 ### Errors and behavior
 
-Invalid configuration returns `InvalidConfig`; inspect `error.config_error()` and its `field()`. A directly mutated public field is checked again at installation. Certificate parsing is performed by the TLS configuration methods; transport initialization performs additional TLS setup.
+Invalid configuration returns `InvalidConfig`; inspect `error.config_error()` and
+its `field()`. A directly mutated public field is checked again at installation.
+TLS setters parse bounded PEM material. Client construction resolves the
+cryptographic provider and checks the identity's private key and certificate
+match; `HttpClientConfig::validate()` does not perform those connector checks.
+A missing provider returns `InvalidConfig` for `tls.provider` at client creation.
+See [TLS providers](../tls.md) and [TLS identity setup](tls_and_proxy.md).
 
 Relative request paths are resolved using URL joining. For base `https://example.com/api/`, `users` becomes `/api/users`; `/users` becomes `/users`. A base without a trailing slash treats its last component as a file. `..` may traverse the base path while remaining on the same origin. The client trims outer whitespace and rejects empty paths, absolute URLs, `//`, backslashes, fragments, control characters and origin changes. These rules apply to the initial request target; redirects can cross origins. See [authentication](authentication.md) and [cookies](cookies.md) for provider-aware redirects.
 

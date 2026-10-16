@@ -1,3 +1,31 @@
+# OpenSSL provider 消费者契约（2026-10-11）
+
+本次迁移保留 rustls，以 `rustls-openssl` 0.4.2 提供密码算法。消费者的 reqwest 使用 `rustls-tls-manual-roots-no-provider`；不再通过宿主依赖引入 AWS-LC 或 ring。旧 tokio-tungstenite 0.28 仍用于验证依赖共存及缺失进程 provider 的负对照。
+
+SDK 的选择顺序为每客户端显式 provider、宿主进程 provider；均未配置时返回类型化 InvalidConfig。SDK 不内置、安装或替换进程 provider。HTTP 与 WS 使用相同规则。
+
+当前矩阵保留 5 项测试，共 84 个独立子进程：
+
+| 测试 | 进程数 | 证据 |
+| --- | ---: | --- |
+| 已初始化宿主的所有启动排列 | 48 | OpenSSL、自定义 TLS 1.3 provider × 旧 WSS、SDK WSS、SDK HTTP、外部 HTTP 的 24 种排列 |
+| 无宿主 provider 的 SDK 排列 | 6 | 缺失 provider 返回 InvalidConfig，显式注入 OpenSSL 的 HTTP/WS 完成握手，全局仍为 None |
+| 旧连接器缺失 provider 负对照 | 24 | SDK 不污染全局；旧默认连接器仍明确报告缺少 provider |
+| TLS 1.2 正对照 | 4 | None 下显式注入、OpenSSL 全局注入 × HTTP/WS 两种顺序 |
+| 全局限制与显式覆盖 | 2 | HTTP/WS 均服从全局 TLS 1.3 限制，返回 Tls 错误；两者的显式 OpenSSL provider 均恢复 TLS 1.2 握手 |
+
+每一步检查全局 Arc 指针不变；服务器检查 ClientHello、协商版本及 ALPN。HTTP 服务器优先提供 h2，SDK 仅开启基础 HTTP，必须维持 HTTP/1.1。超时及进程回收边界沿用下方历史记录。
+
+运行：
+
+```sh
+cargo test --locked --offline --manifest-path open-net/tests/fixtures/tls-provider-consumer/Cargo.toml --test cold_start -- --nocapture
+```
+
+本轮执行（2026-10-11，macOS arm64）：上述命令退出 0，5 passed、0 failed，84 个隔离子进程完成预期检查，测试耗时 3.02 秒。未据此宣称 Windows/Linux 已验证。下方为旧实现的历史证据，旧 AWS-LC/ring 策略和通过结果不代表当前实现。
+
+---
+
 # ON-04 测试记录
 
 2026-09-18，macOS arm64，rustc/cargo 1.89.0。fixture 使用独立锁文件；未修改 open-net 的 Cargo feature 或运行时代码。

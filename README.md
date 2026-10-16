@@ -16,19 +16,19 @@ constructed independently with `HttpClient::new`.
 | Windows | Native desktop applications |
 | Ubuntu | Linux kernel 5.0 or later |
 
-This table states the project's support scope. It does not claim that this
-documentation change has tested every operating system or the minimum Linux
-kernel. Linux 5.0 is a kernel version, not an Ubuntu release number.
-
 ## Cargo Features
 
 | Capability | Minimum feature | Automatically enables / additional requirements |
 | --- | --- | --- |
 | Engine, basic configuration, logging, errors, shared subscription types | None | Available with `default-features = false` |
-| Network monitoring, snapshots, IPv4/IPv6 capability, subscriptions | `net-status` | Create a named `NetStatusClient` through `OpenNet` |
-| Preferred LAN IPv4 discovery | `net-status` | `open_net::network::preferred_lan_ipv4()` |
-| WebSocket client | `ws-client` | Default; enables `net-status` |
+| Network monitoring, snapshots, IPv4/IPv6 capability, state subscriptions and ordered events | `net-status` | Create a named `NetStatusClient` through `OpenNet` |
+| Recoverable event callbacks | `net-status` | Stable subscription identity; queue overflow reconciles to a new atomic baseline |
+| On-demand network observation | `net-status` | Windows; async and blocking refresh of reachability and network name, with cached IP-stack capability |
+| LAN IPv4 candidates and evidence-based recommendation | `net-status` | `network::lan_ipv4_snapshot()` or `NetStatusClient::query_lan_ipv4()`; fresh synchronous OS query |
+| Subnet-based LAN IPv4 selection | `net-status` | `network::preferred_lan_ipv4()` ranks candidates by subnet priority |
+| WebSocket client | `ws-client` | Default; enables `net-status`; select a TLS provider separately |
 | HTTP/HTTPS, GET/POST, custom methods, headers, byte request bodies | `http-client` | Enables `net-status`; import from `open_net::api::http` |
+| Lazy named HTTP clients and shared shutdown | `http-client` | `OpenNet::managed_http`; fixed configuration with SDK-owned initialization and cleanup |
 | Buffered responses, text/JSON parsing, explicit HTTP status checks | `http-client` | JSON response parsing does not require codecs |
 | Streaming response bytes and raw SSE bytes | `http-client` | No SSE event parser is included |
 | Custom request traits, callback submission, completion handles | `http-client` | No extra feature |
@@ -47,13 +47,46 @@ HTTP-only dependency, use `default-features = false, features = ["http-client"]`
 For network monitoring alone, use
 `default-features = false, features = ["net-status"]`.
 
+`ws-client` and `http-client` use rustls without bundling or selecting a
+cryptographic provider. Supply a compatible rustls 0.23 `CryptoProvider`
+explicitly or install one in the host application before client creation.
+A missing provider returns `InvalidConfig` for `tls.provider`
+when the client is built, including clients intended for plain HTTP or WS.
+With `ws-client` enabled, `OpenNet` also compiles its default WebSocket connector
+during engine construction, so supply the engine's provider before that step.
+See [TLS providers](doc/tls.md) for complete examples and provider-specific build
+requirements. open-net does not enable AWS-LC or ring, or depend on OpenSSL in
+production. There are no built-in provider features.
+
 Cargo features are additive: another dependency can enable a feature even when
-one declaration disables defaults. This library has no features named `http`,
+one declaration disables defaults, including rustls's AWS-LC or ring features.
+This library has no features named `http`,
 `json`, `sse`, `retry`, or `tls`.
+
+## Using this library from your application
+
+Start with Rust 1.89 or later and create a consumer with `cargo new my-app`.
+From the consumer's directory, add the dependency with Cargo and select the
+features your application needs. For an HTTP-only application:
+
+```sh
+cargo add open-net --no-default-features --features http-client
+```
+
+The guides use a local `path` dependency for building from source. Point it at
+the `open-net` directory containing this package's `Cargo.toml`. For a dependency
+added from crates.io, keep Cargo's dependency entry and apply the guide's feature
+selection. Add the example's application dependencies (such as Tokio and a TLS
+provider) to your consumer too; the library's test dependencies are not
+automatically available to your application.
 
 ## Integration Guides
 
+- [Engine and client lifecycle](doc/lifecycle.md)
+- [Logging, subscriptions and drop statistics](doc/log/README.md)
 - [NetStatusClient](doc/net_status/README.md)
+- [LAN IPv4 candidates and selection](doc/lan_ipv4.md)
+- [TLS providers, OpenSSL setup and custom cryptography](doc/tls.md)
 - [HttpClient: installation and first request](doc/http/README.md)
   - [Requests and responses](doc/http/requests_and_responses.md)
   - [Callback requests](doc/http/callback_requests.md)
@@ -71,3 +104,16 @@ one declaration disables defaults. This library has no features named `http`,
   - [HTTP/2](doc/http/http2.md)
 - [WebSocketClient](doc/websocket/README.md)
 - [Third-Party Dependencies](doc/third_party/README.md)
+
+## Engine shutdown
+
+Use `OpenNet::begin_shutdown()` to request permanent shutdown synchronously,
+including from SDK callbacks. Await `OpenNet::shutdown()` from an external
+control flow to confirm that the engine's owned workers, registered clients,
+monitoring and callbacks/providers have retired. Cancelling or timing out the
+wait leaves cleanup running. No caller Tokio runtime is required for this wait.
+
+Standalone HTTP workers, other engines, process-wide log subscriptions and
+application-created tasks have separate owners. Drop initiates cleanup but does
+not confirm completion. See [engine and client lifecycle](doc/lifecycle.md) for
+a comparison of shutdown APIs, callback restrictions and complete examples.

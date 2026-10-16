@@ -50,15 +50,14 @@ async fn tls_peer(
     version: &'static rustls::SupportedProtocolVersion,
     expect_provider_rejection: bool,
 ) -> TestResult<Peer> {
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[version])?
-    .with_no_client_auth()
-    .with_single_cert(
-        CertificateDer::pem_slice_iter(SERVER).collect::<Result<Vec<_>, _>>()?,
-        PrivateKeyDer::from_pem_slice(SERVER_KEY)?,
-    )?;
+    let mut config =
+        rustls::ServerConfig::builder_with_provider(Arc::new(rustls_openssl::default_provider()))
+            .with_protocol_versions(&[version])?
+            .with_no_client_auth()
+            .with_single_cert(
+                CertificateDer::pem_slice_iter(SERVER).collect::<Result<Vec<_>, _>>()?,
+                PrivateKeyDer::from_pem_slice(SERVER_KEY)?,
+            )?;
     if http {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     }
@@ -86,7 +85,7 @@ async fn tls_peer(
         if expect_provider_rejection {
             let error = accepted
                 .err()
-                .ok_or("restricted HTTP provider accepted TLS 1.2")?;
+                .ok_or("restricted provider accepted TLS 1.2")?;
             let tls_error = error
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<rustls::Error>());
@@ -189,10 +188,17 @@ async fn legacy_wss() -> TestResult {
     peer.finish().await
 }
 
-async fn open_net_wss(version: &'static rustls::SupportedProtocolVersion) -> TestResult {
-    let peer = tls_peer(false, version, false).await?;
-    let config = NetworkConfig::default()
-        .with_tls(TlsConfig::default().with_root_certificates(CA, RootCertificateMode::Replace)?);
+async fn open_net_wss(
+    version: &'static rustls::SupportedProtocolVersion,
+    expect_provider_rejection: bool,
+    explicit_provider: bool,
+) -> TestResult {
+    let peer = tls_peer(false, version, expect_provider_rejection).await?;
+    let mut tls = TlsConfig::default().with_root_certificates(CA, RootCertificateMode::Replace)?;
+    if explicit_provider {
+        tls = tls.with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    }
+    let config = NetworkConfig::default().with_tls(tls);
     let engine = OpenNet::new_with_network_config(config)?;
     let client = engine.create_ws_client("mixed-provider-consumer").await?;
     let connected = session::SessionGuard::establish(&client, {
@@ -206,20 +212,36 @@ async fn open_net_wss(version: &'static rustls::SupportedProtocolVersion) -> Tes
     .await;
     client.shutdown().await?;
     engine.destroy_ws_client("mixed-provider-consumer").await?;
-    connected?.finish().await?;
+    if expect_provider_rejection {
+        let error = match connected {
+            Ok(_) => return Err("SDK WS ignored host TLS 1.3 restriction".into()),
+            Err(error) => error,
+        };
+        if error.kind() != ErrorKind::Tls {
+            return Err(format!("expected SDK TLS error, received {error:?}").into());
+        }
+        println!("sdk-ws-rejected:Tls");
+    } else {
+        connected?.finish().await?;
+    }
     peer.finish().await
 }
 
 async fn sdk_https(
     version: &'static rustls::SupportedProtocolVersion,
     expect_provider_rejection: bool,
+    explicit_provider: bool,
 ) -> TestResult {
     let peer = tls_peer(true, version, expect_provider_rejection).await?;
+    let mut tls = HttpTlsConfig::default().with_root_certificates(CA, true)?;
+    if explicit_provider {
+        tls = tls.with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    }
     let client = HttpClient::new(
         HttpClientConfig::new(format!("https://{}/", peer.address))?
             .with_environment_proxy(false)
             .with_timeout(Duration::from_secs(3))?
-            .with_tls(HttpTlsConfig::default().with_root_certificates(CA, true)?),
+            .with_tls(tls),
         "sdk-provider-probe",
     )?;
     let response = client.get("/provider-probe").await;
@@ -244,10 +266,20 @@ async fn sdk_https(
 
 async fn external_https() -> TestResult {
     let peer = tls_peer(true, &rustls::version::TLS13, false).await?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from_pem_slice(CA)?)?;
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls_openssl::default_provider()));
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let client = reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
         .no_proxy()
         .http1_only()
-        .add_root_certificate(reqwest::Certificate::from_pem(CA)?)
         .build()?;
     let body = client
         .get(format!("https://{}/provider-probe", peer.address))
@@ -262,18 +294,38 @@ async fn external_https() -> TestResult {
     peer.finish().await
 }
 
+fn missing_sdk_provider() -> TestResult {
+    if !matches!(OpenNet::new(), Err(error) if error.kind() == ErrorKind::InvalidConfig) {
+        return Err("SDK WS did not return typed missing-provider configuration error".into());
+    }
+    if !matches!(HttpClient::new(HttpClientConfig::new("https://localhost")?, "missing-provider"),
+        Err(error) if error.kind() == ErrorKind::InvalidConfig)
+    {
+        return Err("SDK HTTP did not return typed missing-provider configuration error".into());
+    }
+    println!("sdk-ws-missing-provider:InvalidConfig");
+    println!("sdk-http-missing-provider:InvalidConfig");
+    Ok(())
+}
+
 async fn run(order: &str) -> TestResult {
     let original = rustls::crypto::CryptoProvider::get_default().cloned();
     for step in order.split(',') {
         tokio::time::timeout(STEP_TIMEOUT, async {
             match step {
                 "legacy" => legacy_wss().await,
-                "open-net" => open_net_wss(&rustls::version::TLS13).await,
-                "sdk-http" => sdk_https(&rustls::version::TLS13, false).await,
+                "missing-provider" => missing_sdk_provider(),
+                "sdk-ws-explicit-tls13" => open_net_wss(&rustls::version::TLS13, false, true).await,
+                "sdk-http-explicit-tls13" => sdk_https(&rustls::version::TLS13, false, true).await,
+                "open-net" => open_net_wss(&rustls::version::TLS13, false, false).await,
+                "sdk-http" => sdk_https(&rustls::version::TLS13, false, false).await,
                 "http" => external_https().await,
-                "sdk-http-tls12" => sdk_https(&rustls::version::TLS12, false).await,
-                "sdk-http-reject-tls12" => sdk_https(&rustls::version::TLS12, true).await,
-                "sdk-ws-tls12" => open_net_wss(&rustls::version::TLS12).await,
+                "sdk-http-tls12" => sdk_https(&rustls::version::TLS12, false, false).await,
+                "sdk-http-reject-tls12" => sdk_https(&rustls::version::TLS12, true, false).await,
+                "sdk-ws-tls12" => open_net_wss(&rustls::version::TLS12, false, false).await,
+                "sdk-ws-reject-tls12" => open_net_wss(&rustls::version::TLS12, true, false).await,
+                "sdk-http-explicit-tls12" => sdk_https(&rustls::version::TLS12, false, true).await,
+                "sdk-ws-explicit-tls12" => open_net_wss(&rustls::version::TLS12, false, true).await,
                 _ => Err(format!("unknown operation: {step}").into()),
             }
         })
@@ -296,7 +348,7 @@ fn main() -> TestResult {
     let mut arguments = std::env::args().skip(1);
     let provider = arguments
         .next()
-        .ok_or("missing provider: ring/aws-lc/custom/none")?;
+        .ok_or("missing provider: openssl/custom/none")?;
     let order = arguments
         .next()
         .ok_or("missing comma-separated operation order")?;
@@ -308,10 +360,9 @@ fn main() -> TestResult {
     // suites supplies an observable restriction that distinguishes honoring the
     // host's actual provider from merely preserving its global Arc pointer.
     let host_provider = match provider.as_str() {
-        "ring" => Some(rustls::crypto::ring::default_provider()),
-        "aws-lc" => Some(rustls::crypto::aws_lc_rs::default_provider()),
+        "openssl" => Some(rustls_openssl::default_provider()),
         "custom" => {
-            let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+            let mut provider = rustls_openssl::default_provider();
             provider
                 .cipher_suites
                 .retain(|suite| suite.tls13().is_some());

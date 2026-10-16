@@ -630,3 +630,6 @@ async fn owned_task_event_retains_source_payload_after_shutdown_until_applicatio
     bounded(released).await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

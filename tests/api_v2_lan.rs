@@ -11,3 +11,6 @@ fn lan_query_exposes_fallible_result_without_a_client() -> Result<(), Box<dyn st
     let _outcome = query();
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

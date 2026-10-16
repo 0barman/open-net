@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 pub(crate) struct OpenNetInner {
+    pub(super) shutdown: Option<super::engine_shutdown::EngineShutdown>,
     #[cfg(feature = "ws-client")]
     pub(super) network: Arc<CompiledNetworkConfig>,
     #[allow(dead_code)]
@@ -24,6 +25,8 @@ pub(crate) struct OpenNetInner {
     pub(super) net_status_clients: Arc<Mutex<HashMap<String, NetStatusClientSlot>>>,
     #[cfg(feature = "ws-client")]
     pub(super) clients: Arc<Mutex<HashMap<String, ClientSlot>>>,
+    #[cfg(feature = "ws-client")]
+    pub(super) clients_changed: Arc<tokio::sync::Notify>,
     #[cfg(feature = "http-client")]
     pub(super) http_clients: Arc<Mutex<HashMap<String, HttpClientSlot>>>,
 }

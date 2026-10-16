@@ -524,3 +524,6 @@ async fn dropped_stream_opening_cleans_before_completed_observer() -> TestResult
     client.shutdown().await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

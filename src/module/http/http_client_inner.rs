@@ -6,6 +6,8 @@ use crate::api::http::HttpClient;
 mod admission;
 #[path = "request_completion.rs"]
 mod request_completion;
+#[path = "worker_shutdown.rs"]
+mod worker_shutdown;
 use crate::module::http::http_failure::{
     map_body_error, map_reqwest_error, map_response_error, retry_reason_for_error,
 };
@@ -16,6 +18,7 @@ use crate::net_status::{NetworkSnapshot, NetworkStatusContext};
 use crate::subscription::StateReceiver;
 use admission::Admission;
 pub(crate) use request_completion::CompletionLease;
+use worker_shutdown::{WorkerJoin, WorkerShutdown};
 #[path = "http_stream_body.rs"]
 mod stream_body;
 #[cfg(feature = "http-client-auth")]
@@ -28,9 +31,9 @@ use crate::api::http::TimeoutPhase;
 use crate::api::http::{HttpCall, HttpMiddleware, HttpMiddlewareResponse, HttpResponseMode, Next};
 use crate::api::http::{
     HttpCancelOutcome, HttpClientConfig, HttpCompletion, HttpRequest, HttpRequestHandle,
-    HttpRequestId, HttpRequestOptions, HttpRequestTrait, HttpResponse, HttpResponseResult,
-    HttpResponseSummary, HttpStreamResponse, RetryEvent, RetryObserverHandle, RetryReason,
-    RetryReport,
+    HttpRequestId, HttpRequestOptions, HttpRequestTrait, HttpResponse, HttpResponseHead,
+    HttpResponseResult, HttpResponseSummary, HttpStreamResponse, RetryEvent, RetryObserverHandle,
+    RetryReason, RetryReport,
 };
 #[cfg(feature = "http-client-http2")]
 use crate::api::http::{HttpResponseInfo, HttpVersionPolicy};
@@ -44,7 +47,7 @@ use std::error::Error as StdError;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 use stream_body::{FusedHttpBody, StreamBudget, StreamOwner, StreamSupervisor};
 use tokio::sync::oneshot;
@@ -85,7 +88,15 @@ pub(crate) fn create_http_client(
     config: HttpClientConfig,
     context: NetworkStatusContext,
 ) -> Result<HttpClient, NetError> {
-    HttpClient::new_with_network_status(config, thread_name, context)
+    let threads = context.common_engine()?.resource_threads();
+    Ok(HttpClient {
+        inner: HttpClientInner::new_with_thread_registry(
+            thread_name,
+            config,
+            Some(context),
+            Some(threads),
+        )?,
+    })
 }
 
 pub(crate) struct SendJob {
@@ -121,18 +132,12 @@ pub(crate) struct HttpClientInner {
     shutdown_sent: Arc<AtomicBool>,
     admission_gate: Mutex<()>,
     shutdown_notify: Arc<Notify>,
-    shutdown_state: Arc<ShutdownState>,
+    shutdown_state: Arc<WorkerShutdown>,
     client: Client,
     config: Arc<HttpClientConfig>,
     registry: Arc<RequestRegistry>,
     in_flight: Arc<Semaphore>,
     network_observation: Option<Arc<HttpNetworkObservation>>,
-}
-
-struct ShutdownState {
-    joins: Mutex<Option<Vec<JoinHandle<()>>>>,
-    result: Mutex<Option<Result<(), NetError>>>,
-    notify: Notify,
 }
 
 struct RetryObserverLifecycle {
@@ -653,6 +658,15 @@ impl HttpClientInner {
         config: HttpClientConfig,
         context: Option<NetworkStatusContext>,
     ) -> Result<Arc<Self>, NetError> {
+        Self::new_with_thread_registry(thread_name, config, context, None)
+    }
+
+    fn new_with_thread_registry(
+        thread_name: String,
+        config: HttpClientConfig,
+        context: Option<NetworkStatusContext>,
+        threads: Option<Arc<crate::common::retirement::ThreadRegistry>>,
+    ) -> Result<Arc<Self>, NetError> {
         config.validate()?;
         let client = build_client(&config)?;
         let network_observation = context.map(HttpNetworkObservation::new).transpose()?;
@@ -668,9 +682,10 @@ impl HttpClientInner {
         let receive_name = format!("{thread_name}-recv");
         let send_name = thread_name;
 
-        let (callback_thread, callback_ready) = spawn_runtime(callback_name, move || {
-            Box::pin(async move { callback_loop(callback_rx).await })
-        })?;
+        let (callback_thread, callback_ready) =
+            spawn_runtime(callback_name, threads.as_ref(), move || {
+                Box::pin(async move { callback_loop(callback_rx).await })
+            })?;
         if let Err(error) = wait_ready(callback_ready) {
             drop(callback_tx);
             let _ = callback_thread.join();
@@ -678,18 +693,19 @@ impl HttpClientInner {
         }
 
         let callback_tx_for_receive = callback_tx.clone();
-        let (receive_thread, receive_ready) = match spawn_runtime(receive_name, move || {
-            Box::pin(async move {
-                receive_loop(response_rx, callback_tx_for_receive).await;
-            })
-        }) {
-            Ok(value) => value,
-            Err(error) => {
-                drop(callback_tx);
-                let _ = callback_thread.join();
-                return Err(error);
-            }
-        };
+        let (receive_thread, receive_ready) =
+            match spawn_runtime(receive_name, threads.as_ref(), move || {
+                Box::pin(async move {
+                    receive_loop(response_rx, callback_tx_for_receive).await;
+                })
+            }) {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(callback_tx);
+                    let _ = callback_thread.join();
+                    return Err(error);
+                }
+            };
         if let Err(error) = wait_ready(receive_ready) {
             drop(callback_tx);
             drop(response_tx);
@@ -703,29 +719,30 @@ impl HttpClientInner {
         let send_shutdown_notify = Arc::clone(&shutdown_notify);
         let shutdown_sent = Arc::new(AtomicBool::new(false));
         let send_shutdown_sent = Arc::clone(&shutdown_sent);
-        let (send_thread, send_ready) = match spawn_runtime(send_name, move || {
-            Box::pin(async move {
-                send_loop(
-                    request_rx,
-                    supervisor_rx,
-                    response_tx,
-                    send_client,
-                    send_config,
-                    send_shutdown_notify,
-                    send_shutdown_sent,
-                )
-                .await;
-            })
-        }) {
-            Ok(value) => value,
-            Err(error) => {
-                drop(request_tx);
-                drop(callback_tx);
-                let _ = receive_thread.join();
-                let _ = callback_thread.join();
-                return Err(error);
-            }
-        };
+        let (send_thread, send_ready) =
+            match spawn_runtime(send_name, threads.as_ref(), move || {
+                Box::pin(async move {
+                    send_loop(
+                        request_rx,
+                        supervisor_rx,
+                        response_tx,
+                        send_client,
+                        send_config,
+                        send_shutdown_notify,
+                        send_shutdown_sent,
+                    )
+                    .await;
+                })
+            }) {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(request_tx);
+                    drop(callback_tx);
+                    let _ = receive_thread.join();
+                    let _ = callback_thread.join();
+                    return Err(error);
+                }
+            };
         if let Err(error) = wait_ready(send_ready) {
             drop(request_tx);
             drop(callback_tx);
@@ -741,11 +758,10 @@ impl HttpClientInner {
             shutdown_sent,
             admission_gate: Mutex::new(()),
             shutdown_notify,
-            shutdown_state: Arc::new(ShutdownState {
-                joins: Mutex::new(Some(vec![send_thread, receive_thread, callback_thread])),
-                result: Mutex::new(None),
-                notify: Notify::new(),
-            }),
+            shutdown_state: Arc::new(WorkerShutdown::from_joins(
+                vec![send_thread, receive_thread, callback_thread],
+                threads,
+            )),
             client,
             config,
             registry: Arc::new(RequestRegistry::new()),
@@ -1395,6 +1411,16 @@ impl HttpClientInner {
         }
     }
 
+    /// Read the permanent admission closure shared by every raw client clone.
+    pub(crate) fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_sent.load(Ordering::Acquire)
+    }
+
+    /// Report actual worker retirement, independently of cleanup launch errors.
+    pub(crate) fn workers_joined(&self) -> bool {
+        self.shutdown_state.workers_joined()
+    }
+
     /// Close admission under the same gate as queue publication, independently of capacity.
     pub(crate) fn request_shutdown(&self) {
         let _admission = match self.admission_gate.lock() {
@@ -1427,57 +1453,8 @@ impl HttpClientInner {
     }
 
     async fn join_workers(&self) -> Result<(), NetError> {
-        let joins = self.shutdown_state.joins.lock().map_or_else(
-            |poisoned| poisoned.into_inner().take(),
-            |mut joins| joins.take(),
-        );
-        if let Some(joins) = joins {
-            let state = Arc::clone(&self.shutdown_state);
-            let joined = tokio::task::spawn_blocking(move || {
-                let mut first_error = None;
-                for join in joins {
-                    if join.join().is_err() && first_error.is_none() {
-                        first_error =
-                            Some(NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Close));
-                    }
-                }
-                let result = first_error.map_or(Ok(()), Err);
-                publish_shutdown_result(&state, &result);
-                result
-            })
-            .await;
-            return match joined {
-                Ok(result) => result,
-                Err(_) => {
-                    let result =
-                        Err(NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Close));
-                    publish_shutdown_result(&self.shutdown_state, &result);
-                    result
-                }
-            };
-        }
-        loop {
-            if let Some(result) = self
-                .shutdown_state
-                .result
-                .lock()
-                .map_err(NetError::from_poison)?
-                .clone()
-            {
-                return result;
-            }
-            let notified = self.shutdown_state.notify.notified();
-            if let Some(result) = self
-                .shutdown_state
-                .result
-                .lock()
-                .map_err(NetError::from_poison)?
-                .clone()
-            {
-                return result;
-            }
-            notified.await;
-        }
+        self.shutdown_state.start()?;
+        self.shutdown_state.wait().await
     }
 }
 
@@ -1548,14 +1525,6 @@ fn middleware_mode_error(
         .with_http_request_id(request_id)
 }
 
-fn publish_shutdown_result(state: &ShutdownState, result: &Result<(), NetError>) {
-    match state.result.lock() {
-        Ok(mut stored) => *stored = Some(result.clone()),
-        Err(poisoned) => *poisoned.into_inner() = Some(result.clone()),
-    }
-    state.notify.notify_waiters();
-}
-
 impl Drop for HttpClientInner {
     fn drop(&mut self) {
         self.request_shutdown();
@@ -1567,51 +1536,11 @@ impl Drop for HttpClientInner {
                 format!("request_cancellation_failed:{:?}", error.kind())
             );
         }
-        let joins = match self.shutdown_state.joins.lock() {
-            Ok(mut joins) => joins.take(),
-            Err(poisoned) => {
-                crate::log_e!(
-                    crate::LogType::HTTP;
-                    "drop",
-                    "error",
-                    "worker_join_registry_poisoned"
-                );
-                poisoned.into_inner().take()
-            }
-        };
-        let Some(joins) = joins else {
-            return;
-        };
-        let cleanup = Arc::new(Mutex::new(Some(joins)));
-        let thread_cleanup = Arc::clone(&cleanup);
-        let spawned = thread::Builder::new()
-            .name("open-net-http-destroy-cleanup".to_owned())
-            .spawn(move || {
-                if let Some(joins) = thread_cleanup
-                    .lock()
-                    .ok()
-                    .and_then(|mut pending| pending.take())
-                {
-                    join_worker_threads(joins);
-                }
-            });
-        if spawned.is_err() {
-            if let Some(joins) = cleanup.lock().ok().and_then(|mut pending| pending.take()) {
-                join_worker_threads(joins);
-            }
-        }
-    }
-}
-
-fn join_worker_threads(joins: Vec<JoinHandle<()>>) {
-    for join in joins {
-        if join.join().is_err() {
-            crate::log_e!(
-                crate::LogType::HTTP;
-                "worker_cleanup",
-                "error",
-                "worker_thread_failed"
-            );
+        if self.shutdown_state.start().is_err() {
+            // Preserve the final-owner fallback: there is no caller left to
+            // retry an OS thread-creation failure. Async shutdown never blocks
+            // its caller here, and an accepted cleanup owns its own state.
+            self.shutdown_state.join_workers();
         }
     }
 }
@@ -1625,10 +1554,7 @@ fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
         default_headers
     };
     let builder = Client::builder()
-        .use_preconfigured_tls(config.tls.compile(
-            crate::module::tls::http_provider(),
-            config.tls_alpn_protocols(),
-        )?)
+        .use_preconfigured_tls(config.tls.compile(config.tls_alpn_protocols())?)
         .tcp_keepalive(config.tcp_keepalive)
         .default_headers(default_headers);
     #[cfg(not(feature = "http-client-http2"))]
@@ -1675,40 +1601,46 @@ fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
         .map_err(|error| map_reqwest_error(error, ErrorStage::Configuration))
 }
 
-type RuntimeReady = (
-    JoinHandle<()>,
-    std::sync::mpsc::Receiver<Result<(), NetError>>,
-);
+type RuntimeReady = (WorkerJoin, std::sync::mpsc::Receiver<Result<(), NetError>>);
 
-fn spawn_runtime<F>(name: String, task: F) -> Result<RuntimeReady, NetError>
+fn spawn_runtime<F>(
+    name: String,
+    threads: Option<&Arc<crate::common::retirement::ThreadRegistry>>,
+    task: F,
+) -> Result<RuntimeReady, NetError>
 where
     F: FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + 'static,
 {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let thread = thread::Builder::new()
-        .name(name)
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            match runtime {
-                Ok(runtime) => {
-                    let _ = ready_tx.send(Ok(()));
-                    runtime.block_on(task());
-                }
-                Err(error) => {
-                    let _ = ready_tx.send(Err(NetError::with_source(
-                        ErrorKind::RuntimeUnavailable,
-                        error,
-                    )
-                    .with_stage(ErrorStage::Runtime)));
-                }
+    let run = move || {
+        let _scope = crate::common::retirement::ExecutionScope::enter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        match runtime {
+            Ok(runtime) => {
+                let _ = ready_tx.send(Ok(()));
+                runtime.block_on(task());
             }
-        })
-        .map_err(|error| {
-            NetError::with_source(ErrorKind::RuntimeUnavailable, error)
-                .with_stage(ErrorStage::Runtime)
-        })?;
+            Err(error) => {
+                let _ = ready_tx.send(Err(NetError::with_source(
+                    ErrorKind::RuntimeUnavailable,
+                    error,
+                )
+                .with_stage(ErrorStage::Runtime)));
+            }
+        }
+    };
+    let thread = match threads {
+        Some(threads) => threads.spawn_tracked(name, run).map(WorkerJoin::Tracked),
+        None => thread::Builder::new()
+            .name(name)
+            .spawn(run)
+            .map(WorkerJoin::Owned),
+    }
+    .map_err(|error| {
+        NetError::with_source(ErrorKind::RuntimeUnavailable, error).with_stage(ErrorStage::Runtime)
+    })?;
     Ok((thread, ready_rx))
 }
 
@@ -1838,7 +1770,7 @@ async fn run_request(
     config: &HttpClientConfig,
     initial_attempt: u32,
 ) -> HttpResponseResult {
-    let method: Method = job.request.get_method().into();
+    let method: Method = job.request.get_method().try_into()?;
     #[cfg(feature = "http-client-cookies")]
     let cookie_context = job.request.cookie_context();
     let replayable = job.options.replayable_body;
@@ -2314,7 +2246,19 @@ fn arbitrate_result<T>(
     if candidate.is_some_and(|(deadline, phase)| budget.candidate_wins(deadline, phase)) {
         return result;
     }
-    check_budget(budget, control, stage)?;
+    if let Err(error) = check_budget(budget, control, stage) {
+        // A deadline can expire between reading the body and final arbitration.
+        // Preserve this attempt's received head without changing the winning
+        // error or attaching metadata to explicit cancellation.
+        return Err(
+            match result.as_ref().err().and_then(NetError::http_response_head) {
+                Some(head) if error.kind() != ErrorKind::Cancelled => {
+                    error.with_http_response_head(head.clone())
+                }
+                _ => error,
+            },
+        );
+    }
     result
 }
 
@@ -2385,36 +2329,47 @@ async fn read_response(
     let headers = response.headers().clone();
     #[cfg(feature = "http-client-http2")]
     let response_version = response.version();
-    let mut stream = response.bytes_stream();
-    let mut body = BytesMut::new();
-    let mut body_chunks = 0_u64;
-    let mut read_budget =
-        budget.with_phase(Instant::now(), idle_timeout, TimeoutPhase::IdleRead)?;
-    loop {
-        let next = run_budget(read_budget, &control, ErrorStage::Receive, async {
-            stream.next().await.transpose().map_err(map_body_error)
-        })
-        .await?;
-        let Some(chunk) = next else {
-            break;
-        };
-        if !chunk.is_empty() {
-            read_budget =
-                budget.with_phase(Instant::now(), idle_timeout, TimeoutPhase::IdleRead)?;
+    let result = async {
+        let mut stream = response.bytes_stream();
+        let mut body = BytesMut::new();
+        let mut body_chunks = 0_u64;
+        let mut read_budget =
+            budget.with_phase(Instant::now(), idle_timeout, TimeoutPhase::IdleRead)?;
+        loop {
+            let next = run_budget(read_budget, &control, ErrorStage::Receive, async {
+                stream.next().await.transpose().map_err(map_body_error)
+            })
+            .await?;
+            let Some(chunk) = next else {
+                break;
+            };
+            if !chunk.is_empty() {
+                read_budget =
+                    budget.with_phase(Instant::now(), idle_timeout, TimeoutPhase::IdleRead)?;
+            }
+            if body.len().saturating_add(chunk.len()) > max_response_bytes {
+                return Err(NetError::from(ErrorKind::ItemTooLarge).with_stage(ErrorStage::Receive));
+            }
+            body_chunks = body_chunks.saturating_add(1);
+            body.extend_from_slice(&chunk);
         }
-        if body.len().saturating_add(chunk.len()) > max_response_bytes {
-            return Err(NetError::from(ErrorKind::ItemTooLarge).with_stage(ErrorStage::Receive));
-        }
-        body_chunks = body_chunks.saturating_add(1);
-        body.extend_from_slice(&chunk);
+        Ok((body, body_chunks))
     }
+    .await;
+    let (body, _body_chunks) = match result {
+        Ok(body) => body,
+        Err(error) if error.kind() == ErrorKind::Cancelled => return Err(error),
+        Err(error) => {
+            return Err(error.with_http_response_head(HttpResponseHead { status, headers }));
+        }
+    };
     let response = HttpResponse::new(status, headers, body.freeze(), attempts, request_id);
     #[cfg(feature = "http-client-http2")]
     let response = {
         let mut info = HttpResponseInfo::from_response(response_version, http2);
         if let Some(mut flow) = info.flow_control {
             flow.body_bytes_delivered = response.body.len() as u64;
-            flow.body_chunks_delivered = body_chunks;
+            flow.body_chunks_delivered = _body_chunks;
             info.flow_control = Some(flow);
         }
         response.with_info(info)
@@ -2527,6 +2482,80 @@ async fn run_callback(job: CallbackJob) {
 mod tests {
     use super::*;
     use crate::api::http::HttpRequestMethod;
+
+    #[tokio::test(start_paused = true)]
+    async fn final_deadline_arbitration_retains_this_attempts_body_failure_head(
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        let control = CancellationSignal::new();
+        let budget = StreamBudget::total(Instant::now(), Some(Duration::from_secs(1)))?;
+        let error = NetError::from(ErrorKind::Io)
+            .with_stage(ErrorStage::Receive)
+            .with_http_response_head(HttpResponseHead {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: http::HeaderMap::new(),
+            });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result: HttpResponseResult =
+            arbitrate_result(budget, &control, ErrorStage::Receive, Err(error.clone()));
+        let expired = result.err().ok_or("expired body became successful")?;
+        check(
+            expired.kind() == ErrorKind::DeadlineExceeded
+                && expired.timeout_phase() == Some(TimeoutPhase::Total)
+                && expired.http_response_head().map(|head| head.status)
+                    == Some(http::StatusCode::UNAUTHORIZED),
+            "final timeout arbitration lost received head or timeout context",
+        )?;
+        control.request_cancel();
+        let result: HttpResponseResult =
+            arbitrate_result(budget, &control, ErrorStage::Receive, Err(error));
+        let cancelled = result.err().ok_or("cancelled body became successful")?;
+        check(
+            cancelled.kind() == ErrorKind::Cancelled && cancelled.http_response_head().is_none(),
+            "cancellation was misrepresented as a buffered body failure",
+        )
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_body_poll_does_not_become_a_response_read_failure(
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        let (entered, body_polled) = oneshot::channel();
+        let stream = futures_util::stream::once(async move {
+            let _ = entered.send(());
+            std::future::pending::<Result<bytes::Bytes, std::io::Error>>().await
+        });
+        let response = http::Response::builder()
+            .status(http::StatusCode::UNAUTHORIZED)
+            .body(reqwest::Body::wrap_stream(stream))?;
+        let control = Arc::new(CancellationSignal::new());
+        #[cfg(feature = "http-client-http2")]
+        let config = HttpClientConfig::new("http://localhost")?;
+        let reading = read_response(
+            response.into(),
+            1,
+            HttpRequestId(1),
+            1024,
+            Arc::clone(&control),
+            #[cfg(feature = "http-client-http2")]
+            config.http2(),
+            StreamBudget::default(),
+            None,
+        );
+        let cancelling = async {
+            body_polled.await?;
+            control.request_cancel();
+            Ok::<(), oneshot::error::RecvError>(())
+        };
+        let (result, cancelled) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(reading, cancelling)
+        })
+        .await?;
+        cancelled?;
+        let error = result.err().ok_or("cancelled body became successful")?;
+        check(
+            error.kind() == ErrorKind::Cancelled && error.http_response_head().is_none(),
+            "cancellation after body polling was misrepresented as a body failure",
+        )
+    }
 
     struct CountingRequest(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -2728,7 +2757,11 @@ mod tests {
             .with_stage(ErrorStage::Receive)
             .with_timeout_phase(TimeoutPhase::Total)
             .with_http_request_id(handle.id())
-            .with_http_attempt(2);
+            .with_http_attempt(2)
+            .with_http_response_head(HttpResponseHead {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: http::HeaderMap::new(),
+            });
         check(
             handle.cancel() == HttpCancelOutcome::Requested,
             "cancellation was not registered",
@@ -2750,7 +2783,11 @@ mod tests {
                 && completed.timeout_phase() == delivered.timeout_phase()
                 && completed.context().stage == delivered.context().stage
                 && completed.context().http_request_id == delivered.context().http_request_id
-                && completed.context().http_attempt == delivered.context().http_attempt,
+                && completed.context().http_attempt == delivered.context().http_attempt
+                && completed.http_response_head().map(|head| head.status)
+                    == Some(http::StatusCode::UNAUTHORIZED)
+                && delivered.http_response_head().map(|head| head.status)
+                    == Some(http::StatusCode::UNAUTHORIZED),
             "callback cancellation overwrote timeout or completion disagreed with handler",
         )?;
         completion.callback?;
@@ -3119,11 +3156,7 @@ mod tests {
                 shutdown_sent: Arc::new(AtomicBool::new(false)),
                 admission_gate: Mutex::new(()),
                 shutdown_notify: Arc::new(Notify::new()),
-                shutdown_state: Arc::new(ShutdownState {
-                    joins: Mutex::new(None),
-                    result: Mutex::new(Some(Ok(()))),
-                    notify: Notify::new(),
-                }),
+                shutdown_state: Arc::new(WorkerShutdown::new(Vec::new())),
                 client: build_client(&config)?,
                 config,
                 registry: Arc::new(RequestRegistry::new()),

@@ -1,12 +1,19 @@
-//! Run against a WebSocket echo server: cargo run --example v2_messages -- ws://host/echo
-use open_net::{BoxError, OpenNet};
+//! Run against a WebSocket echo server: cargo run --example examples_messages -- ws://host/echo
+use open_net::{
+    network::{NetworkConfig, TlsConfig},
+    BoxError, OpenNet,
+};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let url = std::env::args()
         .nth(1)
         .ok_or("provide a WebSocket echo URL")?;
-    let net = OpenNet::new()?;
+    // The application selects cryptography; open-net supplies no default provider.
+    let tls =
+        TlsConfig::default().with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    let net = OpenNet::new_with_network_config(NetworkConfig::default().with_tls(tls))?;
     let client = net.create_ws_client("echo").await?;
     let mut session = client.connect(url).await?;
     let mut messages = session.take_messages().ok_or("initial inbox missing")?;

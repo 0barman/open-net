@@ -270,6 +270,7 @@ async fn run_scope_backpressure(revoke_while_blocked: bool) -> TestResult {
             config.heartbeat = Some(open_net::ws::HeartbeatConfig {
                 interval: Duration::from_secs(3600),
                 pong_timeout: Duration::from_secs(7200),
+                ..Default::default()
             });
             config
         }),
@@ -587,3 +588,6 @@ async fn same_scope_prepared_request_survives_automatic_reconnect_without_new_id
     .await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

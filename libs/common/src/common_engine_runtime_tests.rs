@@ -41,6 +41,7 @@ async fn last_common_runtime_owner_can_drop_in_async_context() -> TestResult {
         async_tx,
         sync_tx,
         rt,
+        ..
     } = engine;
     drop(cb_pool);
     drop(async_tx);
@@ -117,6 +118,7 @@ async fn async_runtime_drop_returns_before_running_blocking_task_finishes() -> T
         async_tx,
         sync_tx,
         rt,
+        ..
     } = engine;
     drop(cb_pool);
     drop(async_tx);
@@ -161,6 +163,7 @@ async fn ordinary_thread_runtime_drop_waits_for_running_blocking_task() -> TestR
         async_tx,
         sync_tx,
         rt,
+        ..
     } = engine;
     drop(cb_pool);
     drop(async_tx);
@@ -198,5 +201,110 @@ async fn ordinary_thread_runtime_drop_waits_for_running_blocking_task() -> TestR
             "ordinary thread drop stopped waiting for blocking work",
         ));
     }
+    Ok(())
+}
+
+#[test]
+fn explicit_shutdown_joins_callbacks_and_blocking_tasks_with_live_handles() -> TestResult {
+    let engine = Arc::new(
+        CommonEngine::new(4, 4).map_err(|error| test_error(format!("create engine: {error:?}")))?,
+    );
+    let retained_pool = engine.cb_pool.clone();
+    let (callback_started, callback_entry) = std::sync::mpsc::channel();
+    let (callback_release, callback_gate) = std::sync::mpsc::channel();
+    retained_pool
+        .execute(move || {
+            let _ = callback_started.send(());
+            let _ = callback_gate.recv_timeout(WAIT);
+        })
+        .map_err(|error| test_error(format!("submit callback: {error:?}")))?;
+    callback_entry.recv_timeout(WAIT)?;
+    let (blocking_started, blocking_entry) = std::sync::mpsc::channel();
+    let (blocking_release, blocking_gate) = std::sync::mpsc::channel();
+    engine.runtime_handle().spawn_blocking(move || {
+        let _ = blocking_started.send(());
+        let _ = blocking_gate.recv_timeout(WAIT);
+    });
+    blocking_entry.recv_timeout(WAIT)?;
+    let (finished, completion) = std::sync::mpsc::channel();
+    let closing = Arc::clone(&engine);
+    let coordinator = std::thread::spawn(move || {
+        let _ = finished.send(closing.shutdown_blocking());
+    });
+    assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+    callback_release.send(())?;
+    assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+    blocking_release.send(())?;
+    assert_eq!(completion.recv_timeout(WAIT)?, Ok(()));
+    coordinator
+        .join()
+        .map_err(|_| test_error("shutdown coordinator panicked"))?;
+    assert_eq!(
+        retained_pool.ensure_ready(),
+        Err(super::CommonError::PostError)
+    );
+    assert_eq!(engine.shutdown_blocking(), Ok(()));
+    Ok(())
+}
+
+#[test]
+fn management_drain_finishes_accepted_work_and_keeps_runtime_available() -> TestResult {
+    let engine =
+        CommonEngine::new(4, 4).map_err(|error| test_error(format!("create engine: {error:?}")))?;
+    let (sent, received) = std::sync::mpsc::channel();
+    for index in 0..4 {
+        let sent = sent.clone();
+        engine.post(async move {
+            let _ = sent.send(index);
+        });
+    }
+    assert_eq!(engine.drain_management(), Ok(()));
+    for index in 0..4 {
+        assert_eq!(received.recv_timeout(WAIT)?, index);
+    }
+    let (sent, received) = std::sync::mpsc::channel();
+    engine.runtime_handle().spawn(async move {
+        let _ = sent.send(());
+    });
+    received.recv_timeout(WAIT)?;
+    assert_eq!(engine.invoke(async {}), Err(super::CommonError::PostError));
+    assert_eq!(engine.shutdown_blocking(), Ok(()));
+    Ok(())
+}
+
+#[test]
+fn shutdown_keeps_callback_pool_open_until_deferred_retirement_dispatch_finishes() -> TestResult {
+    let engine = Arc::new(
+        CommonEngine::new(4, 4).map_err(|error| test_error(format!("create engine: {error:?}")))?,
+    );
+    let lease = engine.retirement_work().register();
+    let pool = engine.cb_pool.clone();
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let (callback, callback_received) = std::sync::mpsc::channel();
+    let (submitted, submission) = std::sync::mpsc::channel();
+    engine.runtime_handle().spawn_blocking(move || {
+        let _lease = lease;
+        let _ = entered.send(());
+        let _ = gate.recv_timeout(WAIT);
+        let result = pool.execute(move || {
+            let _ = callback.send(());
+        });
+        let _ = submitted.send(result);
+    });
+    entry.recv_timeout(WAIT)?;
+    let (finished, completion) = std::sync::mpsc::channel();
+    let retiring = Arc::clone(&engine);
+    let coordinator = std::thread::spawn(move || {
+        let _ = finished.send(retiring.shutdown_blocking());
+    });
+    assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+    release.send(())?;
+    assert_eq!(submission.recv_timeout(WAIT)?, Ok(()));
+    assert_eq!(completion.recv_timeout(WAIT)?, Ok(()));
+    callback_received.recv_timeout(WAIT)?;
+    coordinator
+        .join()
+        .map_err(|_| test_error("retirement dispatch coordinator panicked"))?;
     Ok(())
 }

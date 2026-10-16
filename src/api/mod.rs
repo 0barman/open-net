@@ -11,6 +11,8 @@ pub mod log;
 pub mod net_status;
 pub mod network;
 pub mod subscription;
+#[cfg(any(feature = "ws-client", feature = "http-client"))]
+pub mod tls;
 #[cfg(feature = "ws-client")]
 pub mod ws;
 
@@ -29,9 +31,16 @@ pub type Metadata = std::collections::BTreeMap<String, String>;
 
 pub use config::OpenNetConfig;
 pub use error::{BoxError, EnqueueError, NetError, Result};
-pub use log::{LogInfo, LogLevel, LogListener, LogSubscription, LogType, OpenNetLogger};
+pub use log::{
+    LogDropStats, LogInfo, LogLevel, LogListener, LogSubscription, LogSubscriptionOptions, LogType,
+    OpenNetLogger, SharedLogListener,
+};
 #[cfg(feature = "net-status")]
-pub use net_status::{IpStack, MonitorState, NetStatusClient, NetworkSnapshot, NetworkStatus};
+pub use net_status::{
+    IpStack, MonitorState, NetStatusClient, NetworkEvent, NetworkEventKind, NetworkEventOptions,
+    NetworkIpStackSource, NetworkNameSource, NetworkObservation, NetworkRefreshResult,
+    NetworkSnapshot, NetworkStatus,
+};
 pub use open_net::OpenNet;
 #[cfg(feature = "ws-client")]
 pub use ws::WebSocketClient;

@@ -6,6 +6,8 @@ use tokio::sync::Semaphore;
 // These executors create a fixed set of workers. The data executor instead
 // grows lazily and is bounded by its existing semaphore budget.
 const MAX_FIXED_CALLBACK_WORKERS: usize = 256;
+const MAX_HEARTBEAT_PONG_RECOVERY_ATTEMPTS: usize = 10;
+const MAX_HEARTBEAT_PING_WRITE_RETRIES: usize = 1024;
 
 /// Shared resource limits, transport parameters, and heartbeat configuration for WebSocket clients.
 #[derive(Clone, Debug)]
@@ -493,6 +495,9 @@ pub struct HeartbeatConfig {
     pub interval: Duration,
     /// The time limit for waiting for matching payload Pong after Ping is successfully written. The default is 45 seconds.
     pub pong_timeout: Duration,
+    /// Bounded recovery and safe Ping-write retry policy. The default keeps the
+    /// existing fail-fast behavior by disabling both retry paths.
+    pub retry: HeartbeatRetryConfig,
 }
 
 impl Default for HeartbeatConfig {
@@ -500,6 +505,7 @@ impl Default for HeartbeatConfig {
         Self {
             interval: Duration::from_secs(20),
             pong_timeout: Duration::from_secs(45),
+            retry: HeartbeatRetryConfig::default(),
         }
     }
 }
@@ -508,7 +514,80 @@ impl HeartbeatConfig {
     /// Validates heartbeat intervals and Pong deadlines.
     pub fn validate(&self) -> Result<()> {
         deadline(self.interval, "heartbeat.interval", false)?;
-        deadline(self.pong_timeout, "heartbeat.pong_timeout", false)
+        deadline(self.pong_timeout, "heartbeat.pong_timeout", false)?;
+        self.retry.validate()
+    }
+}
+
+/// Bounded recovery policy for WebSocket control-layer heartbeats.
+///
+/// `pong_recovery_attempts` counts the additional Ping probes after the
+/// normal probe's Pong deadline expires and is limited to ten. `ping_write_retries`
+/// counts only additional safe write attempts after the initial normal-heartbeat write.
+/// A write timeout or an error with unknown delivery is never retried on the
+/// same sink; the physical connection is retired instead.
+#[derive(Clone, Debug)]
+pub struct HeartbeatRetryConfig {
+    /// Number of additional fast Ping probes after a Pong timeout.
+    pub pong_recovery_attempts: usize,
+    /// Maximum wait for a matching Pong for each recovery probe and the delay
+    /// before the next probe.
+    pub pong_retry_interval: Duration,
+    /// Number of additional normal-heartbeat Ping write attempts.
+    pub ping_write_retries: usize,
+    /// Delay between safe normal-heartbeat Ping write attempts.
+    pub ping_write_retry_interval: Duration,
+}
+
+impl Default for HeartbeatRetryConfig {
+    fn default() -> Self {
+        Self {
+            pong_recovery_attempts: 0,
+            pong_retry_interval: Duration::from_millis(1500),
+            ping_write_retries: 0,
+            ping_write_retry_interval: Duration::from_millis(1500),
+        }
+    }
+}
+
+impl HeartbeatRetryConfig {
+    /// Validates retry counts and enabled retry delays without permitting a
+    /// busy loop or an unrepresentable monotonic deadline.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_attempts(
+            self.pong_recovery_attempts,
+            self.pong_retry_interval,
+            "heartbeat.retry.pong_recovery_attempts",
+            "heartbeat.retry.pong_retry_interval",
+            MAX_HEARTBEAT_PONG_RECOVERY_ATTEMPTS,
+        )?;
+        self.validate_attempts(
+            self.ping_write_retries,
+            self.ping_write_retry_interval,
+            "heartbeat.retry.ping_write_retries",
+            "heartbeat.retry.ping_write_retry_interval",
+            MAX_HEARTBEAT_PING_WRITE_RETRIES,
+        )
+    }
+
+    fn validate_attempts(
+        &self,
+        attempts: usize,
+        interval: Duration,
+        attempts_field: &str,
+        interval_field: &str,
+        maximum: usize,
+    ) -> Result<()> {
+        if attempts == 0 {
+            return Ok(());
+        }
+        if attempts > maximum {
+            return Err(NetError::config(
+                attempts_field,
+                format!("must not exceed {maximum}"),
+            ));
+        }
+        deadline(interval, interval_field, false)
     }
 }
 

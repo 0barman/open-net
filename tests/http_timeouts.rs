@@ -211,3 +211,6 @@ async fn disabling_attempt_overrides_both_legacy_limits_and_shutdown_reaps_unpol
     )?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

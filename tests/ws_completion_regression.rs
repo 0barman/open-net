@@ -80,3 +80,6 @@ async fn all_close_entries_allow_immediate_recreation_after_real_socket_cleanup(
     drop(peer);
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -463,3 +463,6 @@ async fn protocol_managed_headers_fail_at_request_build_before_network() -> Test
     bounded(net.destroy_ws_client("managed-handshake-headers")).await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -5,8 +5,24 @@ Required feature: `http-client-middleware` (includes `http-client`). Middleware 
 ```toml
 [dependencies]
 open-net = { path = "../open-net", default-features = false, features = ["http-client-middleware"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 Adjust the local path to your checkout. All middleware types are exported from `open_net::api::http`. Use `open_net::async_trait` for trait implementations. `.await` waits without blocking an asynchronous worker; a middleware must avoid blocking work because the request's cancellation and total timeout depend on the future making progress.
 
@@ -107,6 +123,9 @@ impl HttpMiddleware for OfflineResponse {
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let config = HttpClientConfig::new("https://example.com/")?
         .with_middleware(Trace)
         .with_middleware_arc(Arc::new(OfflineResponse));
@@ -248,6 +267,9 @@ impl HttpMiddleware for OfflineResponse {
 }
 #[tokio::main]
 async fn main() -> Result<(), NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let config = HttpClientConfig::new("http://127.0.0.1:8080")?
         .with_middleware(Trace).with_middleware(OfflineResponse);
     let client = HttpClient::new(config, "middleware-stream-example")?;

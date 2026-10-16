@@ -1,3 +1,4 @@
+use crate::common::retirement::ThreadRegistry;
 use crate::error::{ErrorKind, NetError};
 use crate::module::net_status::inner::network_status_snapshot::NetworkStatusSnapshot;
 use crate::module::net_status::inner::shared::NetworkLease;
@@ -82,6 +83,7 @@ pub(crate) struct WSClientInner {
 }
 
 impl WSClientInner {
+    #[cfg(test)]
     pub(crate) fn new_with_network(
         config: WebSocketClientConfig,
         network: Arc<CompiledNetworkConfig>,
@@ -89,6 +91,23 @@ impl WSClientInner {
             NetworkLease,
             tokio::sync::watch::Receiver<NetworkStatusSnapshot>,
         )>,
+    ) -> Result<(Arc<Self>, WSClientWorker), NetError> {
+        Self::new_with_network_and_threads(
+            config,
+            network,
+            network_observation,
+            Arc::new(ThreadRegistry::new()),
+        )
+    }
+
+    pub(crate) fn new_with_network_and_threads(
+        config: WebSocketClientConfig,
+        network: Arc<CompiledNetworkConfig>,
+        network_observation: Option<(
+            NetworkLease,
+            tokio::sync::watch::Receiver<NetworkStatusSnapshot>,
+        )>,
+        resource_threads: Arc<ThreadRegistry>,
     ) -> Result<(Arc<Self>, WSClientWorker), NetError> {
         config.validate()?;
         let queue = PriorityWriteQueue::new(
@@ -103,20 +122,25 @@ impl WSClientInner {
         let (io_event_tx, io_event_rx) = mpsc::channel(config.queues.io_events);
         let (data_callback_tx, data_callback_rx) =
             mpsc::channel(config.dispatch.incoming.max_items);
-        let data_callback_pool = Arc::new(DataCallbackPool::new(
+        let data_callback_pool = Arc::new(DataCallbackPool::new_with_threads(
             config.dispatch.message_callback_workers,
+            resource_threads.clone(),
         ));
         let state = Arc::new(RwLock::new(ConnectionStatus::Idle));
-        let listeners = Arc::new(ListenerStore::new(&config)?);
+        let listeners = Arc::new(ListenerStore::new_with_threads(
+            &config,
+            resource_threads.clone(),
+        )?);
         let shutdown = CancellationToken::new();
         let shutdown_reason = Arc::new(ShutdownReason::default());
         let shutdown_complete = CancellationToken::new();
         let network_available = Arc::new(Notify::new());
         let instance_id = ClientId::allocate(&NEXT_CLIENT_INSTANCE_ID)?;
-        let task_executor = ListenerExecutor::new(
+        let task_executor = ListenerExecutor::new_with_threads(
             &format!("open-net-task-events-{instance_id}"),
             config.dispatch.task_callback_workers,
             config.dispatch.task_subscriptions,
+            resource_threads.clone(),
         )?;
         let task_observers = NativeTaskObserver::new(task_executor, &config.dispatch)?;
         let message_resources = MessageResources::new(&config.dispatch)?;
@@ -153,6 +177,7 @@ impl WSClientInner {
             network_available: Arc::clone(&network_available),
         });
         let worker = WSClientWorker {
+            resource_threads,
             network_lease,
             network_status,
             network_loss_epoch,

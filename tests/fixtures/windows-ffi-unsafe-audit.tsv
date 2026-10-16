@@ -1,0 +1,15 @@
+# Reviewed native Windows FFI boundary; separate from historical panic allowances.
+# COM initialization, interfaces and BSTRs stay on one worker apartment.
+# Enumeration outputs and pipe handles remain live and exclusively borrowed.
+# Each unsafe operation is justified by its adjacent SAFETY comment.
+# The complete token fingerprint detects body changes; only exact unsafe rows
+# below are allowed. Panic/unwrap operations are never exempted.
+fingerprint	src/module/net_status/inner/platform/windows.rs	bc4762a6584f13f2
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoUninitialize() };
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }.map_err(monitor_io)?;
+1	src/module/net_status/inner/platform/windows.rs	unsafe	let connectivity = unsafe { manager.GetConnectivity() }.map_err(monitor_io)?;
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { manager.GetNetworks(NLM_ENUM_NETWORK_CONNECTED) }.map_err(monitor_io)?;
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { networks.Next(&mut items, Some(&mut fetched)) }.map_err(monitor_io)?;
+1	src/module/net_status/inner/platform/windows.rs	unsafe	let name = unsafe { network.GetName() }
+1	src/module/net_status/inner/platform/windows.rs	unsafe	let peeked = unsafe {

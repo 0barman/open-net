@@ -244,6 +244,76 @@ async fn finished(handle: &HttpRequestHandle) -> TestResult<HttpCompletion> {
     Ok(tokio::time::timeout(WATCHDOG, handle.finished()).await?)
 }
 
+#[tokio::test]
+async fn invalid_extension_methods_finish_once_without_dispatch_and_release_capacity() -> TestResult
+{
+    let mut peer = Peer::new().await?;
+    let client = peer.client(1)?;
+    // Reusing the single permit and ID verifies both are released even when no
+    // transport attempt starts. Invalid input must never become a different method.
+    let request_id = HttpRequestId(981);
+    for token in ["", "BAD METHOD", "GET\r\nsecret", "GÉT", "GET/", "GET\0"] {
+        let counts = Arc::new(Counts::default());
+        let mut request = Probe::new(&counts);
+        request.method = HttpRequestMethod::Extension(token.to_owned());
+        let (callback_tx, callback_rx) = oneshot::channel();
+        request.callback = Some(Box::new(move |_, result| {
+            let _ = callback_tx.send(result);
+        }));
+        let handle = client
+            .send_with_options(
+                request,
+                HttpRequestOptions::new().with_request_id(request_id),
+            )
+            .map_err(|error| error.into_error())?;
+        let completion = finished(&handle).await?;
+        completion.callback?;
+        let callback_result = tokio::time::timeout(WATCHDOG, callback_rx).await??;
+        for error in [
+            completion
+                .response
+                .expect_err("completion rejects invalid method"),
+            callback_result.expect_err("callback receives invalid method error"),
+        ] {
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert_eq!(error.context().stage, Some(ErrorStage::RequestBuild));
+            assert_eq!(error.context().http_request_id, Some(request_id));
+            assert_eq!(error.context().http_attempt, Some(0));
+            let detail = error.config_error().expect("method error details");
+            assert_eq!(detail.field(), "method");
+            assert_eq!(detail.reason(), "invalid HTTP method token");
+            assert!(!format!("{error} {error:?}").contains("secret"));
+        }
+        assert_eq!(counts.callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.paths.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.hooks.load(Ordering::SeqCst), 0);
+        assert!(peer.requests.try_recv().is_err());
+    }
+
+    // The same worker must still transmit valid extension methods verbatim.
+    let counts = Arc::new(Counts::default());
+    let mut request = Probe::new(&counts);
+    request.method = HttpRequestMethod::Extension("CuStOm".to_owned());
+    let handle = client
+        .send_with_options(
+            request,
+            HttpRequestOptions::new().with_request_id(request_id),
+        )
+        .map_err(|error| error.into_error())?;
+    let observed = peer.next().await?;
+    assert!(observed.headers.starts_with("CuStOm /owned HTTP/1.1\r\n"));
+    observed.respond(200);
+    let completion = finished(&handle).await?;
+    assert_eq!(completion.response?.status, StatusCode::OK);
+    completion.callback?;
+    assert_eq!(counts.callbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.drops.load(Ordering::SeqCst), 1);
+    client.shutdown_graceful().await?;
+    assert!(peer.requests.try_recv().is_err());
+    Ok(())
+}
+
 fn assert_returned<C>(request: &Probe<C>, identity: *const Cell<usize>, counts: &Counts) {
     assert_eq!(request.identity(), identity);
     assert_eq!(request.identity.get(), 37);
@@ -623,7 +693,7 @@ async fn dropping_handle_does_not_cancel_and_acceptance_error_runs_callback_once
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_racing_commit_has_exactly_one_owner() -> TestResult {
     for _ in 0..24 {
-        let peer = Peer::new().await?;
+        let mut peer = Peer::new().await?;
         let client = peer.client(1)?;
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let closing_client = client.clone();
@@ -638,8 +708,12 @@ async fn shutdown_racing_commit_has_exactly_one_owner() -> TestResult {
         barrier.wait().await;
         match client.send_wait(request).await {
             Ok(handle) => {
+                // Closing admission preserves an already accepted request.
+                // Let it finish instead of waiting for an unsent response.
+                peer.next().await?.respond(200);
                 let completion = finished(&handle).await?;
                 completion.callback?;
+                assert_eq!(completion.response?.status, StatusCode::OK);
                 assert_eq!(counts.callbacks.load(Ordering::SeqCst), 1);
                 assert_eq!(counts.drops.load(Ordering::SeqCst), 1);
             }
@@ -826,3 +900,6 @@ async fn fast_completion_is_replayable_for_multiple_waiters() -> TestResult {
     client.shutdown_graceful().await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

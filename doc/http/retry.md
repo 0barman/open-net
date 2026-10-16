@@ -1,19 +1,31 @@
 # Retries
 
 Required features: `http-client`. Retry support has no additional feature.
-Use the following dependencies for every complete program on this page, adjusting
-the source path to your checkout:
+Create a project with `cargo new retry-example` and add the following
+dependencies to its `Cargo.toml`, adjusting the source path to your checkout.
+Every complete program on this page uses these dependencies:
 
 ```toml
-[package]
-name = "retry-example"
-version = "0.1.0"
-edition = "2021"
-
 [dependencies]
 open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 See [timeouts](timeouts_and_admission.md) for deadline inheritance and
 [callback requests](callback_requests.md) for submitting custom request traits.
@@ -112,6 +124,13 @@ cancellation and applicable deadlines terminate that operation. A stream is
 never replayed after it has been returned to the caller. Application predicates
 only run on fully buffered responses.
 
+For a final buffered-body failure, `NetError::http_response_head()` may retain
+that attempt's status and headers while the original failure classification,
+source and timeout phase remain authoritative. A later retry never reuses an
+earlier attempt's head, and explicit cancellation carries no head. Do not treat
+retained status as a successful result or as automatic permission to replay a
+request. See [response-head diagnostics](requests_and_responses.md#neterrorhttp_response_head).
+
 ### Example
 
 Start a server at `127.0.0.1:8080` serving `/status`. A transient response such as
@@ -124,6 +143,9 @@ use open_net::api::http::{Backoff, HttpClient, HttpClientConfig, HttpRequest, Re
 use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let policy = RetryPolicy::builder()
         .max_attempts(3)
         .backoff(Backoff::exponential(Duration::from_millis(100), Duration::from_secs(1)))

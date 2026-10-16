@@ -103,3 +103,6 @@ fn native_path_monitor_failure_and_lifetime_suite() -> io::Result<()> {
         "native path monitor failure and lifetime tests",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

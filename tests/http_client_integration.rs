@@ -1116,3 +1116,6 @@ async fn http_and_websocket_registries_allow_the_same_name() -> TestResult {
     http.shutdown().await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

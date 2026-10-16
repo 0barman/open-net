@@ -1,38 +1,51 @@
 use crate::common::log::log_info::LogInfo;
 use crate::common::log::log_level::LogLevel;
 use crate::common::log::logger::OpenNetLogger;
-use indexmap::IndexMap;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
+use std::collections::{hash_map::Entry, HashMap};
 
-pub static LOG_PREFIX: &str = "O";
 pub static DESC: &str = "desc";
 
 pub(crate) use crate::api::log::LogType;
 
+struct LogFields<'a>(Vec<(&'a str, Value)>);
+
+impl Serialize for LogFields<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (field, value) in &self.0 {
+            map.serialize_entry(field, value)?;
+        }
+        map.end()
+    }
+}
+
 /// Builds JSON content from pipe-separated field names and serializable values.
+/// Repeated names keep their first position and use their last paired value.
 /// Logging internals deliberately do not emit logs through their own pipeline.
 pub fn create_log_content(first_field: Option<&str>, values: Option<Vec<Value>>) -> String {
     let Some(first_field) = first_field else {
         return "{}".to_string();
     };
-    let map: IndexMap<_, _> = first_field
-        .split('|')
-        .zip(values.unwrap_or_default())
-        .collect();
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    let mut fields: Vec<(&str, Value)> = Vec::new();
+    let mut positions: HashMap<&str, usize> = HashMap::new();
+    for (field, value) in first_field.split('|').zip(values.unwrap_or_default()) {
+        match positions.entry(field) {
+            Entry::Occupied(position) => fields[*position.get()].1 = value,
+            Entry::Vacant(position) => {
+                position.insert(fields.len());
+                fields.push((field, value));
+            }
+        }
+    }
+    serde_json::to_string(&LogFields(fields)).unwrap_or_else(|_| "{}".to_string())
 }
 
-pub(crate) fn format_tag(log_type: LogType, tag: &str, suffix: &str) -> String {
-    let prefix = match log_type {
-        LogType::None | LogType::Engine => LOG_PREFIX,
-        LogType::Database => "O_DB",
-        LogType::WSS => "O_WSS",
-        LogType::WSC => "O_WSC",
-        LogType::Common => "O_COMMON",
-        LogType::HTTP => "O_HTTP",
-    };
-    format!("{prefix}-{tag}-{suffix}")
-}
+#[cfg(test)]
+#[path = "log_content_tests.rs"]
+mod log_content_tests;
 
 pub(crate) fn timestamp_millis() -> i64 {
     std::time::SystemTime::now()
@@ -44,7 +57,6 @@ pub(crate) fn timestamp_millis() -> i64 {
 
 /// Queues a structured record for matching subscriptions without writing stdout,
 /// files, or a database. User callbacks execute on their subscription's thread.
-#[allow(clippy::too_many_arguments)]
 pub fn on_log(
     location: String,
     level: LogLevel,
@@ -52,16 +64,15 @@ pub fn on_log(
     tag: &str,
     first_field: Option<&str>,
     values: Option<Vec<Value>>,
-    suffix: &str,
 ) {
-    if !OpenNetLogger::is_enabled(log_type) {
+    if !OpenNetLogger::is_enabled_for(log_type, level) {
         return;
     }
     crate::common::log::logger::dispatch(LogInfo {
         log_type,
         location,
         level,
-        tag: format_tag(log_type, tag, suffix),
+        tag: tag.to_owned(),
         content: create_log_content(first_field, values),
         create_time: timestamp_millis(),
     });
@@ -78,71 +89,77 @@ macro_rules! location {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! internal_log {
-    ($log_type:expr, $level:expr, $suffix:expr, $tag:expr, $first_field:expr $(, $value:expr)* $(,)?) => {{
+    ($log_type:expr, $level:expr, $tag:expr, $first_field:expr $(, $value:expr)* $(,)?) => {{
         let log_type = $log_type;
         if $crate::OpenNetLogger::is_enabled(log_type) {
-            let values = vec![$($crate::__serde_json::json!($value)),*];
-            $crate::__log::on_log(
-                $crate::location!(), $level, log_type, $tag,
-                Some($first_field), Some(values), $suffix,
-            );
+            let level = $level;
+            if $crate::OpenNetLogger::is_enabled_for(log_type, level) {
+                let values = vec![$($crate::__serde_json::json!($value)),*];
+                $crate::__log::on_log(
+                    $crate::location!(), level, log_type, $tag,
+                    Some($first_field), Some(values),
+                );
+            }
         }
     }};
-    ($log_type:expr, $level:expr, $suffix:expr, $tag:expr $(,)?) => {{
+    ($log_type:expr, $level:expr, $tag:expr $(,)?) => {{
         let log_type = $log_type;
         if $crate::OpenNetLogger::is_enabled(log_type) {
-            $crate::__log::on_log(
-                $crate::location!(), $level, log_type, $tag, None, None, $suffix,
-            );
+            let level = $level;
+            if $crate::OpenNetLogger::is_enabled_for(log_type, level) {
+                $crate::__log::on_log(
+                    $crate::location!(), level, log_type, $tag, None, None,
+                );
+            }
         }
     }};
 }
 
-/// Emits a T record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
+/// Emits an Info record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
 /// The legacy form without a type uses `LogType::Engine`.
 #[macro_export]
 macro_rules! log_t {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::LogLevel::Info, "T", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Info, $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Info, "T", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Info, $($arg),+)
     };
 }
 
-/// Emits a R record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
+/// Emits a Debug record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
 /// The legacy form without a type uses `LogType::Engine`.
 #[macro_export]
 macro_rules! log_r {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::LogLevel::Debug, "R", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Debug, $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Debug, "R", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Debug, $($arg),+)
     };
 }
 
-/// Emits a S record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
+/// Emits a Debug record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
 /// The legacy form without a type uses `LogType::Engine`.
 #[macro_export]
 macro_rules! log_s {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::LogLevel::Debug, "S", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Debug, $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Debug, "S", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Debug, $($arg),+)
     };
 }
 
-/// Emits a E record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
+/// Emits an Error record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
 /// The legacy form without a type uses `LogType::Engine`.
 #[macro_export]
 macro_rules! log_e {
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($log_type, $crate::LogLevel::Error, "E", $($arg),+)
+        $crate::internal_log!($log_type, $crate::LogLevel::Error, $($arg),+)
     };
     ($($arg:expr),+ $(,)?) => {
-        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Error, "E", $($arg),+)
+        $crate::internal_log!($crate::LogType::Engine, $crate::LogLevel::Error, $($arg),+)
     };
 }
 

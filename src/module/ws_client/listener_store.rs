@@ -21,20 +21,33 @@ pub(crate) struct ConnectionObservers {
 }
 
 impl ListenerStore {
+    #[cfg(test)]
     pub(crate) fn new(config: &WebSocketClientConfig) -> Result<Self, NetError> {
+        Self::new_with_threads(
+            config,
+            Arc::new(crate::common::retirement::ThreadRegistry::new()),
+        )
+    }
+
+    pub(crate) fn new_with_threads(
+        config: &WebSocketClientConfig,
+        threads: Arc<crate::common::retirement::ThreadRegistry>,
+    ) -> Result<Self, NetError> {
         config.dispatch.validate()?;
         Ok(Self {
             state_quota: Arc::new(Semaphore::new(config.dispatch.state_subscriptions)),
-            state_executor: ListenerExecutor::new(
+            state_executor: ListenerExecutor::new_with_threads(
                 "open-net-ws-status",
                 config.dispatch.state_callback_workers,
                 config.dispatch.state_subscriptions,
+                threads.clone(),
             )?,
             event_quota: Arc::new(Semaphore::new(config.dispatch.event_subscriptions)),
-            event_executor: ListenerExecutor::new(
+            event_executor: ListenerExecutor::new_with_threads(
                 "open-net-ws-events",
                 config.dispatch.event_callback_workers,
                 config.dispatch.event_subscriptions,
+                threads,
             )?,
         })
     }

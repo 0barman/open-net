@@ -365,3 +365,6 @@ async fn id_only_wire_reply_cannot_prove_which_same_connection_registration_sent
     net.destroy_ws_client("identity-ambiguity").await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

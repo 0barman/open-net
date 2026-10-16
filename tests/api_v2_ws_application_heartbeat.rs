@@ -125,3 +125,6 @@ async fn application_heartbeat_sends_payload_matches_response_and_stops() -> Tes
         .await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

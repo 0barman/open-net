@@ -8,10 +8,21 @@ use std::{fmt, sync::Arc};
 /// # Example
 ///
 /// ```no_run
-/// use open_net::{ws::WebSocketClient, OpenNet, Result};
+/// use open_net::{
+///     network::{NetworkConfig, TlsConfig},
+///     tls::CryptoProvider,
+///     ws::WebSocketClient,
+///     OpenNet, Result,
+/// };
+/// use std::sync::Arc;
 ///
 /// # async fn example() -> Result<()> {
-/// let net = OpenNet::new()?;
+/// // Choose and add a rustls 0.23 provider in the application crate.
+/// let provider: Arc<CryptoProvider> =
+///     Arc::new(rustls_openssl::default_provider());
+/// let network = NetworkConfig::default()
+///     .with_tls(TlsConfig::default().with_crypto_provider(provider));
+/// let net = OpenNet::new_with_network_config(network)?;
 /// let client: WebSocketClient = net.create_ws_client("market-feed").await?;
 /// println!("Client id: {}", client.id());
 /// client.shutdown().await?;
@@ -48,10 +59,10 @@ impl WebSocketClient {
     ///
     /// fn log_client(client: &WebSocketClient) {
     ///     let worker_client = client.clone();
-    ///     assert_eq!(client.id(), worker_client.id());
     ///     println!(
-    ///         "Preparing to process business messages from client {}",
-    ///         client.id()
+    ///         "Preparing to process business messages from clients {} and {}",
+    ///         client.id(),
+    ///         worker_client.id(),
     ///     );
     /// }
     /// ```
@@ -162,11 +173,22 @@ impl WebSocketClient {
     /// # Example
     ///
     /// ```no_run
-    /// use open_net::{ws::ConnectOptions, OpenNet, Result};
+    /// use open_net::{
+    ///     network::{NetworkConfig, TlsConfig},
+    ///     tls::CryptoProvider,
+    ///     ws::ConnectOptions,
+    ///     OpenNet, Result,
+    /// };
+    /// use std::sync::Arc;
     /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<()> {
-    /// let net = OpenNet::new()?;
+    /// let provider: Arc<CryptoProvider> =
+    ///     Arc::new(rustls_openssl::default_provider());
+    /// let net = OpenNet::new_with_network_config(
+    ///     NetworkConfig::default()
+    ///         .with_tls(TlsConfig::default().with_crypto_provider(provider)),
+    /// )?;
     /// let client = net.create_ws_client("market-feed").await?;
     /// let mut options = ConnectOptions::new("wss://example.com/stream");
     /// options.connect_timeout = Some(Duration::from_secs(15));
@@ -246,7 +268,9 @@ impl WebSocketClient {
     ///         Some(JournalOptions::default()),
     ///     ).await?;
     ///
-    ///     let journal = session.take_journal().expect("Connection log is enabled when created");
+    ///     let journal = session.take_journal().ok_or_else(|| {
+    ///         open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig)
+    ///     })?;
     ///     // The callback continues to consume logs; keep the subscription handle alive to avoid log accumulation while waiting for a connection.
     ///     let _journal_subscription = journal.into_callback(|_, event| {
     ///         match event {
@@ -339,7 +363,7 @@ impl WebSocketClient {
     ///     let worker_client = client.clone();
     ///     // Complete the business sending and response waiting that need to be reserved before calling.
     ///     client.shutdown().await?;
-    ///     assert!(worker_client.is_shutdown());
+    ///     println!("Worker shutdown requested: {}", worker_client.is_shutdown());
     ///
     ///     // Multiple components can also be cleaned separately; here they will be returned successfully.
     ///     worker_client.shutdown().await?;

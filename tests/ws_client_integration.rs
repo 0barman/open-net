@@ -817,6 +817,7 @@ async fn pong_reaches_raw_peer_while_fragmented_binary_is_still_in_flight() -> T
             config.heartbeat = Some(open_net::ws::HeartbeatConfig {
                 interval: Duration::from_secs(60),
                 pong_timeout: Duration::from_secs(120),
+                ..Default::default()
             });
             config
         })
@@ -932,3 +933,6 @@ async fn blocked_data_callback_does_not_prevent_client_shutdown() -> TestResult 
     _release.0.release();
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

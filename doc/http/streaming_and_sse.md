@@ -11,9 +11,25 @@ Replace `/path/to/open-net` with the library directory containing Cargo.toml.
 ```toml
 [dependencies]
 open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 futures-util = "0.3"
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 Each Rust block is an independent `src/main.rs`; `cargo check` compiles it.
 Sending examples need a server at `http://127.0.0.1:8080` with the stated route.
@@ -96,6 +112,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HttpStatusPolicy, HttpRe
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "stream-example",
     )?;
@@ -161,6 +180,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HttpStatusPolicy, Header
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "stream-example",
     )?;

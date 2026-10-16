@@ -454,3 +454,6 @@ fn websocket_invalid_url_components_keep_the_request_build_origin() -> TestResul
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

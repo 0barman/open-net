@@ -442,3 +442,6 @@ async fn last_engine_owner_drop_terminates_a_retained_client_with_engine_dropped
     )?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

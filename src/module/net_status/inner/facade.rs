@@ -3,12 +3,18 @@ use std::sync::{Arc, Mutex};
 
 use crate::common::CommonEngine;
 use crate::error::{ErrorKind, NetError};
-use crate::net_status::{MonitorState, NetworkSnapshot};
+use crate::net_status::{
+    IpStack, MonitorState, NetworkEvent, NetworkEventOptions, NetworkObservation, NetworkSnapshot,
+    NetworkStatus,
+};
 use crate::subscription::common_executor::CommonCallbackExecutor;
-use crate::subscription::{StatePublication, StatePublisher, StateReceiver, StateSource};
+use crate::subscription::{
+    CallbackContext, EventReceiver, StateReceiver, StateSource, Subscription,
+};
 use tokio::sync::{oneshot, watch, Notify};
 
-use super::network_view::NetworkView;
+use super::coordinated_view::ViewPublication;
+use super::network_status_snapshot::{NetworkRefreshTarget, NetworkViewHandle};
 use super::shared::{CleanupTicket, NetworkLease, NetworkStatusContext};
 
 struct StartCycle {
@@ -46,7 +52,7 @@ impl StartCycle {
     }
 }
 struct LocalState {
-    view: NetworkView,
+    closed: bool,
     lease: Option<NetworkLease>,
     tickets: Vec<CleanupTicket>,
     cycle: Arc<StartCycle>,
@@ -57,7 +63,7 @@ pub(crate) struct NetworkObservationOwner {
     context: NetworkStatusContext,
     engine: Arc<CommonEngine>,
     local: Mutex<LocalState>,
-    publisher: StatePublisher<NetworkSnapshot>,
+    view: NetworkViewHandle,
     source: StateSource<NetworkSnapshot>,
     bridge_stop: Mutex<Option<oneshot::Sender<()>>>,
     bridge_finished: watch::Receiver<bool>,
@@ -92,26 +98,28 @@ impl NetworkObservationOwner {
             return Err(NetError::from(ErrorKind::Closed));
         }
         let engine = context.common_engine()?;
-        let view = NetworkView::new();
-        let (publisher, source) = StateSource::new(
-            view.snapshot.clone(),
+        // Register before exposing the view to a concurrent terminal commit.
+        // Even an unpolled bridge owns this lease until its future is dropped.
+        let bridge_work = engine.retirement_work().register();
+        let view = context.observation_source()?.new_view(
             Arc::new(CommonCallbackExecutor::new(&engine)),
-            1024,
+            Some(engine.clone()),
         )?;
+        let source = view.source()?;
         let (bridge_stop, mut bridge_stopped) = oneshot::channel();
         let (finished, bridge_finished) = watch::channel(false);
         let completion = BridgeCompletion(finished);
         let owner = Arc::new(Self {
             context,
             engine,
-            publisher,
+            view,
             source,
             bridge_stop: Mutex::new(Some(bridge_stop)),
             bridge_finished,
             #[cfg(test)]
             bridge_pause: Mutex::new(bridge_pause),
             local: Mutex::new(LocalState {
-                view,
+                closed: false,
                 lease: None,
                 tickets: Vec::new(),
                 cycle: Arc::new(StartCycle::new()),
@@ -122,6 +130,7 @@ impl NetworkObservationOwner {
         let mut failures = owner.context.subscribe_failure();
         let weak = Arc::downgrade(&owner);
         owner.engine.runtime_handle().spawn(async move {
+            let _work = bridge_work;
             let _completion = completion;
             loop {
                 let snapshot = facts.borrow_and_update().clone();
@@ -180,51 +189,35 @@ impl NetworkObservationOwner {
         });
         Ok(owner)
     }
-    // Returns deferred notifications; no user code runs on the lifecycle stack.
-    fn prepare(&self, local: &LocalState) -> StatePublication<NetworkSnapshot> {
-        let snapshot = Arc::new(local.view.snapshot.clone());
-        if local.view.closed() {
-            self.publisher.prepare_finish_arc(snapshot)
-        } else {
-            self.publisher.prepare_arc(snapshot)
-        }
-    }
-    fn dispatch(
-        &self,
-        publication: Option<StatePublication<NetworkSnapshot>>,
-        wake: Option<Arc<Notify>>,
-    ) {
+    fn dispatch(&self, publication: Option<ViewPublication>, wake: Option<Arc<Notify>>) {
+        let publication = publication.filter(|publication| !publication.is_empty());
         if publication.is_none() && wake.is_none() {
             return;
         }
         let engine = self.engine.clone();
+        let work = engine.retirement_work().register();
         self.engine.runtime_handle().spawn_blocking(move || {
+            let _work = work;
             let _engine = engine;
             if let Some(wake) = wake {
                 wake.notify_waiters();
             }
             if let Some(publication) = publication {
-                if let Err(error) = publication.dispatch() {
-                    log_error("network_view_publish", &error);
-                }
+                publication.dispatch();
             }
         });
     }
     fn accept(&self, snapshot: NetworkSnapshot, refresh: bool) -> Result<(), NetError> {
         if matches!(snapshot.state, MonitorState::Closed) {
             self.request_close();
-            return Ok(());
+        } else if refresh {
+            let publication = self.view.refresh_latest()?;
+            self.dispatch(Some(publication), None);
+        } else {
+            self.view.current()?;
         }
-        let publication = {
-            let mut local = self.local.lock().map_err(NetError::from_poison)?;
-            let changed = if refresh {
-                local.view.refresh(snapshot)?
-            } else {
-                local.view.import(snapshot, false)?
-            };
-            changed.then(|| self.prepare(&local))
-        };
-        self.dispatch(publication, None);
+        // Facts are already projected atomically by the source. This bridge is
+        // only responsible for retiring leases/start waiters on source failure.
         Ok(())
     }
     pub(crate) fn activate(self: &Arc<Self>) -> Result<(), NetError> {
@@ -235,26 +228,28 @@ impl NetworkObservationOwner {
         ensure_started: bool,
     ) -> Result<Option<(Arc<StartCycle>, NetworkLease, u64)>, NetError> {
         let mut publication = None;
-        let result = {
+        let mut rollback = None;
+        let result = (|| {
             let mut local = self.local.lock().map_err(NetError::from_poison)?;
             if let Some(error) = &local.failure {
                 return Err(error.clone());
             }
-            if local.view.closed() || self.context.is_closed() {
+            if local.closed || self.view.current()?.closed() || self.context.is_closed() {
                 return Err(NetError::from(ErrorKind::Closed));
             }
             local.tickets.retain(|ticket| !ticket.is_finished());
             let new_lease = local.lease.is_none();
             if new_lease {
-                let snapshot = self.context.snapshot()?;
                 let lease = self.context.acquire()?;
-                if let Err(error) = local.view.activate(snapshot) {
-                    local.tickets.push(lease.release());
-                    return Err(error);
+                match self.view.activate() {
+                    Ok((_, prepared)) => publication = Some(prepared),
+                    Err(error) => {
+                        local.tickets.push(lease.release());
+                        return Err(error);
+                    }
                 }
                 local.cycle = Arc::new(StartCycle::new());
                 local.lease = Some(lease);
-                publication = Some(self.prepare(&local));
             }
             let result = match &local.lease {
                 Some(lease) if ensure_started => lease.ensure_started(),
@@ -265,7 +260,7 @@ impl NetworkObservationOwner {
                 if let Some(lease) = local.lease.take() {
                     local.tickets.push(lease.release());
                 }
-                local.view.stop(false)?;
+                rollback = Some(self.view.retire(false, None)?);
             }
             let captured = if !ensure_started && result.is_ok() {
                 Some((
@@ -274,14 +269,18 @@ impl NetworkObservationOwner {
                         .lease
                         .clone()
                         .ok_or_else(|| NetError::from(ErrorKind::Internal))?,
-                    local.view.generation,
+                    self.view.current()?.generation,
                 ))
             } else {
                 None
             };
             result.map(|()| captured)
-        };
+        })();
         self.dispatch(publication, None);
+        self.dispatch(rollback, None);
+        if let Err(error) = self.view.current() {
+            self.fail_source(error);
+        }
         result
     }
     pub(crate) async fn start(self: &Arc<Self>) -> Result<NetworkSnapshot, NetError> {
@@ -295,93 +294,54 @@ impl NetworkObservationOwner {
             stopped = cycle.wait() => return stopped,
             initialized = lease.wait_started() => initialized,
         };
-        let (result, publication) = {
-            let mut local = self.local.lock().map_err(NetError::from_poison)?;
-            if let Some(outcome) = cycle.result()? {
-                return outcome;
-            }
-            if local.view.closed() {
-                return Err(NetError::from(ErrorKind::Closed));
-            }
-            if local.view.generation != generation || !local.view.active {
-                return Err(NetError::from(ErrorKind::Internal));
-            }
-            match result {
-                Ok(snapshot) => {
-                    let changed = local.view.import(snapshot, false)?;
-                    (
-                        Ok(local.view.snapshot.clone()),
-                        changed.then(|| self.prepare(&local)),
-                    )
-                }
-                Err(error) => (Err(error), None),
-            }
-        };
-        self.dispatch(publication, None);
-        result
+        let _local = self.local.lock().map_err(NetError::from_poison)?;
+        if let Some(outcome) = cycle.result()? {
+            return outcome;
+        }
+        let view = self.view.current()?;
+        if view.closed() {
+            return Err(NetError::from(ErrorKind::Closed));
+        }
+        if view.generation != generation || !view.active {
+            return Err(NetError::from(ErrorKind::Internal));
+        }
+        match result {
+            Ok(_) => Ok(view.snapshot),
+            Err(error) => Err(error),
+        }
     }
     fn retire(&self, permanent: bool, source_error: Option<NetError>) -> Result<(), NetError> {
+        // The local bridge can be stopped before the deferred start-waiter
+        // wake is submitted below. Keep its successor work registered across
+        // that handoff, including when the source already closed this view.
+        let _work = self.engine.retirement_work().register();
         let (publication, wake, result, closed) = {
             let mut local = match self.local.lock() {
                 Ok(local) => local,
-                Err(poisoned) => {
-                    log_error(
-                        "network_view_retire_poison_recovered",
-                        &NetError::from(ErrorKind::Internal),
-                    );
-                    poisoned.into_inner()
-                }
+                Err(poisoned) => poisoned.into_inner(),
             };
-            let was_closed = local.view.closed();
-            let stopped = local.view.stop(permanent);
-            // A local Closed commit is terminal for this view. A late source
-            // error must not overwrite its readable terminal snapshot or a
-            // previously recorded infrastructure error.
-            let failure = if was_closed {
-                None
-            } else {
-                source_error.or_else(|| stopped.as_ref().err().cloned())
-            };
-            let changed = match &stopped {
-                Ok(changed) => *changed,
-                Err(_) => true,
-            };
-            // Exhausted local versions are an infrastructure error, never a
-            // reason to retain demand or leave a seemingly Running view behind.
-            if let Some(error) = &failure {
-                local.failure = Some(error.clone());
-                local.view.active = false;
-                local.view.snapshot.state = MonitorState::Closed;
-                local.view.snapshot.reachability = None;
-                local.view.snapshot.ip_stack = None;
-                local.view.snapshot.network_name = None;
-                local.view.snapshot.observed_at = None;
+            let was_closed = local.closed;
+            let publication = self.view.retire(permanent, source_error)?;
+            let current = self.view.current();
+            let closed = current.as_ref().map_or(true, |view| view.closed());
+            if let Err(error) = &current {
+                local.failure.get_or_insert_with(|| error.clone());
             }
             if let Some(lease) = local.lease.take() {
                 local.tickets.push(lease.release());
             }
-            let notify = !was_closed && (changed || failure.is_some());
-            let wake = if notify {
-                let outcome = if let Some(error) = &failure {
-                    Err(error.clone())
-                } else if permanent {
-                    Err(NetError::from(ErrorKind::Closed))
-                } else {
-                    Ok(local.view.snapshot.clone())
+            let wake = if !was_closed {
+                let outcome = match &current {
+                    Err(error) => Err(error.clone()),
+                    Ok(view) if view.closed() => Err(NetError::from(ErrorKind::Closed)),
+                    Ok(view) => Ok(view.snapshot.clone()),
                 };
                 Some(local.cycle.complete(outcome)?)
             } else {
                 None
             };
-            let publication = if notify {
-                Some(match failure {
-                    Some(error) => self.publisher.prepare_failure(error),
-                    None => self.prepare(&local),
-                })
-            } else {
-                None
-            };
-            (publication, wake, stopped.map(|_| ()), local.view.closed())
+            local.closed = closed;
+            (Some(publication), wake, current.map(|_| ()), closed)
         };
         if closed {
             self.stop_bridge();
@@ -421,7 +381,7 @@ impl NetworkObservationOwner {
     pub(crate) async fn wait_cleanup(&self) -> Result<(), NetError> {
         let (tickets, closed) = {
             let local = self.local.lock().map_err(NetError::from_poison)?;
-            (local.tickets.clone(), local.view.closed())
+            (local.tickets.clone(), local.closed)
         };
         let mut failure = None;
         for ticket in tickets {
@@ -444,37 +404,111 @@ impl NetworkObservationOwner {
         }
         failure.map_or(Ok(()), Err)
     }
+    /// Read-only queries do not acquire a monitoring lease or require Running.
+    /// Release these short locks before any OS call; admitted queries may finish
+    /// after close and are deliberately outside the monitor cleanup barrier.
+    pub(crate) fn admit_lan_query(&self) -> Result<(), NetError> {
+        let local = self.local.lock().map_err(NetError::from_poison)?;
+        if local.closed || self.context.is_closed() {
+            return Err(ErrorKind::Closed.into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn snapshot(&self) -> Result<NetworkSnapshot, NetError> {
         if self.context.is_closed() {
             self.request_close();
         }
-        let local = self.local.lock().map_err(NetError::from_poison)?;
-        if let Some(error) = &local.failure {
-            return Err(error.clone());
-        }
-        Ok(local.view.snapshot.clone())
+        Ok(self.view.current()?.snapshot)
     }
     pub(crate) fn snapshot_latest(&self) -> Result<NetworkSnapshot, NetError> {
-        {
-            let local = self.local.lock().map_err(NetError::from_poison)?;
-            if local.view.closed() {
-                if let Some(error) = &local.failure {
-                    return Err(error.clone());
-                }
-                return Ok(local.view.snapshot.clone());
-            }
+        if self.context.is_closed() {
+            self.request_close();
         }
-        match self
-            .context
-            .snapshot()
-            .and_then(|snapshot| self.accept(snapshot, true))
-        {
-            Ok(()) => self.snapshot(),
+        let publication = match self.view.refresh_latest() {
+            Ok(publication) => publication,
             Err(error) => {
                 self.fail_source(error.clone());
-                Err(error)
+                return Err(error);
             }
+        };
+        self.dispatch(Some(publication), None);
+        let snapshot = self.snapshot();
+        if let Err(error) = &snapshot {
+            self.fail_source(error.clone());
         }
+        snapshot
+    }
+    pub(super) fn context(&self) -> &NetworkStatusContext {
+        &self.context
+    }
+    pub(crate) fn subscribe_events(
+        &self,
+        options: NetworkEventOptions,
+    ) -> Result<EventReceiver<NetworkEvent>, NetError> {
+        if self.context.is_closed() {
+            self.request_close();
+        }
+        self.view.subscribe_events(options)
+    }
+    pub(crate) fn on_recoverable_event<F>(
+        self: &Arc<Self>,
+        options: NetworkEventOptions,
+        callback: F,
+    ) -> Result<Subscription, NetError>
+    where
+        F: Fn(CallbackContext, Result<NetworkObservation, NetError>) + Send + Sync + 'static,
+    {
+        // Admission follows registration: if engine closure has already
+        // reached its work barrier, the closed context rejects this observer.
+        let retirement = self.engine.retirement_work().register();
+        if self.context.is_closed() {
+            return Err(ErrorKind::Closed.into());
+        }
+        let receiver = self.subscribe_events(options)?;
+        let view = self.view.clone();
+        super::recoverable::subscribe(
+            receiver,
+            Arc::new(move || view.subscribe_events(options)),
+            Arc::new(CommonCallbackExecutor::new(&self.engine)),
+            self.engine.runtime_handle(),
+            Some(retirement),
+            callback,
+        )
+    }
+    pub(crate) fn refresh_target(&self) -> Result<NetworkRefreshTarget, NetError> {
+        self.view.refresh_target()
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_refresh(
+        &self,
+        target: NetworkRefreshTarget,
+        sample_id: u64,
+        reachability: NetworkStatus,
+        ip_stack: Option<IpStack>,
+        network_name: impl Into<super::network_status_snapshot::NetworkNameUpdate>,
+        observed_at: std::time::SystemTime,
+        validate: impl FnOnce() -> Result<(), NetError>,
+    ) -> Result<NetworkSnapshot, NetError> {
+        let (snapshot, publication) = self.view.commit_refresh(
+            target,
+            sample_id,
+            reachability,
+            ip_stack,
+            network_name,
+            observed_at,
+            validate,
+        )?;
+        let result = publication.result();
+        let engine = self.engine.clone();
+        self.engine.runtime_handle().spawn_blocking(move || {
+            let _engine = engine;
+            if let Err(error) = publication.dispatch() {
+                log_error("network_refresh_publish", &error);
+            }
+        });
+        result?;
+        snapshot
     }
     /// Named monitors preserve their historical ability to observe a cached
     /// terminal snapshot. HTTP registration uses the stricter active-only entry.
@@ -489,17 +523,21 @@ impl NetworkObservationOwner {
         if let Some(error) = &local.failure {
             return Err(error.clone());
         }
-        if local.view.closed() || self.context.is_closed() {
+        if local.closed || self.view.current()?.closed() || self.context.is_closed() {
             return Err(NetError::from(ErrorKind::Closed));
         }
         self.source.subscribe_committed()
     }
 
     #[cfg(test)]
+    pub(crate) fn activate_view_for_test(&self) -> Result<NetworkSnapshot, NetError> {
+        let (_, publication) = self.view.activate()?;
+        publication.dispatch();
+        Ok(self.view.current()?.snapshot)
+    }
+    #[cfg(test)]
     pub(crate) fn close_source_for_test(&self) -> Result<(), NetError> {
-        let mut snapshot = self.snapshot()?;
-        snapshot.state = MonitorState::Closed;
-        self.publisher.finish(snapshot)
+        self.view.close_source_for_test()
     }
 }
 impl Drop for NetworkObservationOwner {

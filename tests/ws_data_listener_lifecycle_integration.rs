@@ -127,3 +127,6 @@ async fn data_broadcast_shares_response_and_only_one_subscriber_claims_the_reque
     client.shutdown().await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -1727,3 +1727,6 @@ async fn dynamic_provider_refresh_and_local_rejection_use_observed_sessions() ->
     .await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

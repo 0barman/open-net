@@ -10,6 +10,9 @@ use tokio::sync::Semaphore;
 /// creation. [`crate::OpenNet::new_with_config`] validates them before creating
 /// channels or workers and reports invalid values as
 /// [`crate::error::ErrorKind::InvalidConfig`].
+/// When `ws-client` is enabled, configure a provider in the nested
+/// [`NetworkConfig`] before constructing [`crate::OpenNet`], unless the host
+/// application has already installed a process-wide rustls provider.
 #[derive(Clone, Debug)]
 pub struct OpenNetConfig {
     pub(crate) runtime_worker_threads: Option<usize>,
@@ -39,10 +42,22 @@ impl OpenNetConfig {
     ///
     /// ```no_run
     /// use open_net::{NetError, OpenNet, OpenNetConfig};
+    ///
+    /// #[cfg(feature = "ws-client")]
+    /// use open_net::network::{NetworkConfig, TlsConfig};
+    /// #[cfg(feature = "ws-client")]
+    /// use std::sync::Arc;
     /// # fn example() -> Result<(), NetError> {
-    /// let net = OpenNet::new_with_config(
-    ///     OpenNetConfig::default().with_runtime_worker_threads(2),
-    /// )?;
+    /// let config = OpenNetConfig::default().with_runtime_worker_threads(2);
+    /// #[cfg(feature = "ws-client")]
+    /// let config = config.with_network_config(
+    ///     NetworkConfig::default().with_tls(
+    ///         TlsConfig::default().with_crypto_provider(Arc::new(
+    ///             rustls_openssl::default_provider(),
+    ///         )),
+    ///     ),
+    /// );
+    /// let net = OpenNet::new_with_config(config)?;
     /// # Ok(())
     /// # }
     /// ```

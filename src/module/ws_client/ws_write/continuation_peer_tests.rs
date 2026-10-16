@@ -200,6 +200,7 @@ fn context(
         heartbeat_config: Some(crate::ws::HeartbeatConfig {
             interval: Duration::from_secs(3_600),
             pong_timeout: Duration::from_secs(7_200),
+            ..Default::default()
         }),
         heartbeat: Arc::new(HeartbeatState::new(generation)),
     })

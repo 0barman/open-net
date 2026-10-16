@@ -108,3 +108,6 @@ fn configuration_failures_identify_the_invalid_field() -> TestResult {
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

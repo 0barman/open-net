@@ -2,7 +2,7 @@
 
 use crate::module::net_status::inner::network_status_snapshot::NetworkStatusSnapshot;
 use crate::module::net_status::NetworkStatus;
-use futures::{future::BoxFuture, Sink, Stream};
+use futures_util::{future::BoxFuture, Sink, Stream};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};

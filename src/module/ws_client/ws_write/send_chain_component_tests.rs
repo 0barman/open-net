@@ -413,6 +413,7 @@ async fn send<W: Sink<Message, Error = WsError> + Unpin>(
     phase: &Arc<OperationControl>,
     cancel: &CancellationToken,
 ) -> Result<(), RequestWriteFailure> {
+    let mut recovery = super::HeartbeatRecovery::new(crate::ws::HeartbeatRetryConfig::default());
     send_request_message_with_phase(
         write,
         Message::Binary(payload),
@@ -424,6 +425,7 @@ async fn send<W: Sink<Message, Error = WsError> + Unpin>(
         LIMIT,
         &mut HeartbeatSchedule::from_interval(idle_heartbeat(), LIMIT),
         state,
+        &mut recovery,
         &CancellationToken::new(),
         cancel,
         phase,
@@ -764,6 +766,8 @@ async fn request_and_frame_deadlines_keep_absolute_order_during_pending_flush() 
         let (_tx, mut rx) = mpsc::channel(1);
         let heartbeat = HeartbeatState::new(905);
         let mut interval = HeartbeatSchedule::from_interval(idle_heartbeat(), LIMIT);
+        let mut recovery =
+            super::HeartbeatRecovery::new(crate::ws::HeartbeatRetryConfig::default());
         let connection_cancel = CancellationToken::new();
         let dispatch_cancel = CancellationToken::new();
         let phase = crate::module::ws_client::v2_test_support::operation(
@@ -784,6 +788,7 @@ async fn request_and_frame_deadlines_keep_absolute_order_during_pending_flush() 
             Duration::from_millis(frame_ms),
             &mut interval,
             &heartbeat,
+            &mut recovery,
             &connection_cancel,
             &dispatch_cancel,
             &phase,

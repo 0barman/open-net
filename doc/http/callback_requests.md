@@ -11,8 +11,24 @@ Replace `/path/to/open-net` with the library directory containing Cargo.toml.
 ```toml
 [dependencies]
 open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 Each Rust block is an independent `src/main.rs`; `cargo check` compiles it.
 Sending examples need a server at `http://127.0.0.1:8080` with the stated route.
@@ -102,6 +118,9 @@ impl HttpRequestTrait for Health {
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
@@ -189,6 +208,9 @@ impl HttpRequestTrait for Health {
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
@@ -279,6 +301,9 @@ impl HttpRequestTrait for Health {
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
@@ -366,6 +391,9 @@ impl HttpRequestTrait for Health {
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
@@ -442,7 +470,10 @@ finishes buffering the final body before invoking it. Intermediate redirect,
 authentication replay and retry responses are not delivered to this hook. If
 body collection fails (for example a size limit, timeout or transport error),
 the handler receives `Err` and the header hook is skipped, even if headers had
-already arrived. The hook cannot reject `Content-Length` before download;
+already arrived. Inspect `error.http_response_head()` in the error branch for
+the received status and headers of a buffered-body failure; explicit cancellation
+does not carry that metadata. See [response-head diagnostics](requests_and_responses.md#neterrorhttp_response_head).
+The hook cannot reject `Content-Length` before download;
 use [streaming](streaming_and_sse.md) to inspect headers before consuming a body.
 HTTP 4xx/5xx remain successful response values until the handler applies a status
 policy. Callback panics are reported through completion, not returned by the
@@ -456,10 +487,14 @@ Use immediate `send()` or independent workers for reentrant submissions.
 Required feature: `http-client`. This enum has no callbacks and represents
 `GET`, `POST`, `PUT`, `DELETE`, `HEAD`, `OPTIONS`, `CONNECT`, `PATCH`, `TRACE`,
 `QUERY` and `Extension(String)`. `as_str(&self) -> &str` returns its method text.
-Owned/borrowed conversions to and from `Method` are implemented; comparisons
-with Method work directly. Extension(String) must contain valid method bytes:
-converting an invalid extension to Method panics. Validate custom methods with
-`Method::from_bytes` before converting into HttpRequestMethod.
+Owned/borrowed conversions from `Method` are infallible. Conversions to `Method`
+use `TryFrom`/`TryInto` and return `NetError` with `InvalidInput` at `RequestBuild`
+for invalid extension tokens. Existing `Method::from(method)` / `method.into()`
+calls in this direction must use `Method::try_from(method)?` / `method.try_into()?`.
+Comparisons with Method work directly. Valid extension methods retain their exact
+text; invalid methods are never replaced with GET or sent to the server. For trait
+requests, validation happens after admission and the terminal callback receives the
+input error. The concrete request builder reports it from `build()`.
 
 ```rust
 use open_net::api::http::{HttpRequestMethod, Method};
@@ -468,7 +503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let validated = Method::from_bytes(b"CUSTOM")?;
     let method = HttpRequestMethod::from(validated.clone());
     assert_eq!(method.as_str(), "CUSTOM");
-    assert_eq!(Method::from(&method), validated);
+    assert_eq!(Method::try_from(&method)?, validated);
     Ok(())
 }
 ```
@@ -585,6 +620,9 @@ fn reject(client: &HttpClient) -> EnqueueError<Payload> {
 
 #[tokio::main]
 async fn main() -> Result<(), NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let request = Payload;
     assert_eq!(request.get_path(), "/echo");
     assert_eq!(request.get_method(), HttpRequestMethod::POST);
@@ -968,7 +1006,7 @@ A borrowed method string.
 
 ### Errors and behavior
 
-Known variants return their method text; Extension returns its stored text without validation. Converting an invalid Extension to Method panics, so validate through Method::from_bytes first.
+Known variants return their method text; Extension returns its stored text without validation. Converting an invalid Extension with `Method::try_from` returns an `InvalidInput` error. Conversion errors do not include the supplied method text.
 
 ### Example
 

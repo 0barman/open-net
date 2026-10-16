@@ -382,3 +382,6 @@ async fn middleware_runs_once_while_transport_retries() -> TestResult {
         "middleware was invoked once per transport attempt",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

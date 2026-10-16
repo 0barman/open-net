@@ -25,6 +25,9 @@ pub trait HttpRequestTrait: Send + 'static {
     fn get_path(&self) -> String;
 
     /// Return the HTTP method for this request.
+    ///
+    /// Invalid extension tokens fail validation after admission, before transport
+    /// starts. The terminal callback receives `InvalidInput` at `RequestBuild`.
     fn get_method(&self) -> HttpRequestMethod;
 
     /// Return a textual request body for legacy request implementations.
@@ -81,7 +84,9 @@ pub trait HttpRequestTrait: Send + 'static {
 
     /// Observe response headers on the callback lane.  The default implementation is a no-op.
     /// The callback may inspect the headers but cannot mutate worker state or
-    /// replace the eventual response.
+    /// replace the eventual response. Only fully buffered `Ok` responses invoke
+    /// this hook. Body failures expose received headers through
+    /// [`crate::api::error::NetError::http_response_head`] in the terminal callback.
     fn on_response_headers(&self, _headers: &HeaderMap) {}
 
     /// Consume this request with the final result.

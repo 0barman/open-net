@@ -104,3 +104,6 @@ async fn disabling_active_heartbeat_preserves_peer_pong_and_business_traffic() -
     tokio::time::timeout(Duration::from_secs(5), peer).await???;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

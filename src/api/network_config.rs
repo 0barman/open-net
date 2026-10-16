@@ -5,6 +5,7 @@
 //! policy replaces engine defaults, including TLS settings, and remains
 //! immutable for that client's lifetime.
 
+use crate::api::tls::CryptoProvider;
 use crate::error::NetError;
 use base64::Engine;
 use rustls::pki_types::pem::PemObject;
@@ -95,12 +96,8 @@ impl NetworkConfig {
             })?;
         }
         if let Some(identity) = &self.tls.identity {
-            identity.certified_key.keys_match().map_err(|_| {
-                NetError::config(
-                    "tls.client_identity.private_key",
-                    "private key does not match certificate",
-                )
-            })?;
+            let provider = crate::module::tls::select_provider(self.tls.provider.as_ref())?;
+            identity.compile(&provider)?;
         }
         Ok(())
     }
@@ -298,6 +295,7 @@ pub enum RootCertificateMode {
 /// Strict server-certificate validation with optional client authentication.
 #[derive(Clone, Default)]
 pub struct TlsConfig {
+    pub(crate) provider: Option<Arc<CryptoProvider>>,
     pub(crate) roots: Vec<CertificateDer<'static>>,
     pub(crate) root_mode: RootCertificateMode,
     pub(crate) identity: Option<ClientIdentity>,
@@ -307,6 +305,7 @@ impl fmt::Debug for TlsConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TlsConfig")
+            .field("crypto_provider_configured", &self.provider.is_some())
             .field("custom_certificate_count", &self.roots.len())
             .field("root_mode", &self.root_mode)
             .field("client_identity_configured", &self.identity.is_some())
@@ -315,6 +314,21 @@ impl fmt::Debug for TlsConfig {
 }
 
 impl TlsConfig {
+    /// Selects this client's rustls cryptography without changing global state.
+    ///
+    /// Takes precedence over the application's process default.
+    /// The provider also loads and validates this client's private key when the
+    /// network configuration is validated or compiled.
+    pub fn with_crypto_provider(mut self, provider: Arc<CryptoProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Returns the explicitly selected provider, if any, without resolving defaults.
+    pub fn crypto_provider(&self) -> Option<&Arc<CryptoProvider>> {
+        self.provider.as_ref()
+    }
+
     /// Replaces the custom CA bundle and selects its trust mode. Accepts one to
     /// 128 PEM certificates with a total size of at most 1 MiB; malformed,
     /// mismatched, or trailing non-whitespace blocks are rejected.
@@ -350,15 +364,27 @@ impl TlsConfig {
     }
 }
 
-/// A validated client certificate chain and its matching PKCS#8 private key.
-#[derive(Clone)]
+/// Parsed certificate material, validated cryptographically by the selected provider.
 pub struct ClientIdentity {
-    pub(crate) certified_key: Arc<CertifiedKey>,
+    certificates: Vec<CertificateDer<'static>>,
+    private_key: PrivatePkcs8KeyDer<'static>,
+}
+
+impl Clone for ClientIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            certificates: self.certificates.clone(),
+            private_key: self.private_key.clone_key(),
+        }
+    }
 }
 
 impl ClientIdentity {
     /// Loads a PEM certificate chain and exactly one unencrypted PKCS#8 key.
     /// Each input is limited to 1 MiB and the chain to 128 certificates.
+    /// This parses the PEM material without selecting cryptography. Key loading
+    /// and certificate/key matching happen during [`NetworkConfig::validate`]
+    /// and client construction, using the client's final provider.
     pub fn from_pem(
         certificates: impl AsRef<[u8]>,
         private_key: impl AsRef<[u8]>,
@@ -386,10 +412,17 @@ impl ClientIdentity {
                 "requires one valid PKCS#8 private key matching the certificate",
             )
         })?;
-        let certified_key = CertifiedKey::from_der(
+        Ok(Self {
             certificates,
-            PrivateKeyDer::Pkcs8(key),
-            &crate::module::tls::local_provider(),
+            private_key: key,
+        })
+    }
+
+    pub(crate) fn compile(&self, provider: &CryptoProvider) -> Result<Arc<CertifiedKey>, NetError> {
+        let certified_key = CertifiedKey::from_der(
+            self.certificates.clone(),
+            PrivateKeyDer::Pkcs8(self.private_key.clone_key()),
+            provider,
         )
         .map_err(|_| {
             NetError::config(
@@ -403,15 +436,12 @@ impl ClientIdentity {
                 "requires one valid PKCS#8 private key matching the certificate",
             )
         })?;
-        Ok(Self {
-            certified_key: Arc::new(certified_key),
-        })
+        Ok(Arc::new(certified_key))
     }
 
-    /// Returns the number of certificates in the validated client chain.
-    /// Returns the number of certificates in the validated chain.
+    /// Returns the number of certificates in the parsed client chain.
     pub fn certificate_count(&self) -> usize {
-        self.certified_key.cert.len()
+        self.certificates.len()
     }
 }
 
@@ -419,7 +449,7 @@ impl fmt::Debug for ClientIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ClientIdentity")
-            .field("certificate_count", &self.certified_key.cert.len())
+            .field("certificate_count", &self.certificates.len())
             .field("private_key", &"[redacted]")
             .finish()
     }

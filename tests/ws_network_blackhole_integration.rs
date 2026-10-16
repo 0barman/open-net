@@ -236,6 +236,7 @@ async fn real_tcp_blackhole_times_out_without_network_events_and_explicit_connec
         config.heartbeat = Some(open_net::ws::HeartbeatConfig {
             interval: HEARTBEAT_INTERVAL,
             pong_timeout: PONG_TIMEOUT,
+            ..Default::default()
         });
         config
     }))
@@ -327,3 +328,6 @@ async fn real_tcp_blackhole_times_out_without_network_events_and_explicit_connec
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -336,6 +336,9 @@ impl HttpClient {
     }
 
     /// Close admission, cancel registered requests, and join the worker lanes.
+    ///
+    /// Like [`Self::shutdown`], this works on an executor without a Tokio runtime.
+    /// Cancelling the waiting future does not cancel accepted cleanup work.
     pub async fn shutdown_graceful(&self) -> Result<(), NetError> {
         crate::log_s!(LogType::HTTP; "shutdown_graceful");
         self.inner.request_shutdown();
@@ -347,6 +350,11 @@ impl HttpClient {
     ///
     /// Concurrent callers observe the same completion result. Cancelling one waiter does not
     /// cancel shutdown or make another waiter return before callbacks finish.
+    /// Cleanup runs on an SDK-owned thread, so the waiting executor does not need Tokio and
+    /// its runtime may stop after its waiter is cancelled. If the OS cannot start cleanup,
+    /// this returns `RuntimeUnavailable` without losing worker ownership; a later call may retry.
+    /// Do not await shutdown from a request callback on these same workers: shutdown waits
+    /// for that callback to return. Request shutdown there and await completion externally.
     pub async fn shutdown(&self) -> Result<(), NetError> {
         crate::log_s!(LogType::HTTP; "shutdown");
         self.inner.request_shutdown();

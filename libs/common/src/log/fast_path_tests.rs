@@ -125,10 +125,7 @@ fn t12_empty_registry_avoids_read_lock_and_preserves_filtering() -> TestResult {
     check(records.try_recv().is_err(), "filtered record delivered")?;
     log_t!(LogType::Common; "enabled", "value", evaluated.fetch_add(1, Ordering::SeqCst));
     let record = records.recv_timeout(WAIT)?;
-    check(
-        record.tag == "ON_COMMON-enabled-T",
-        "enabled record was changed",
-    )?;
+    check(record.tag == "enabled", "enabled record was changed")?;
     check(
         evaluated.load(Ordering::SeqCst) == 1,
         "enabled argument not evaluated exactly once",
@@ -153,11 +150,11 @@ fn t13_registration_drop_clear_and_old_handles_preserve_new_subscriptions() -> T
         let (second, second_records) = subscribe(&[LogType::WSC])?;
         log_s!(LogType::WSC; "two");
         check(
-            old_records.recv_timeout(WAIT)?.tag == "ON_WSC-two-S",
+            old_records.recv_timeout(WAIT)?.tag == "two",
             "first subscription missing",
         )?;
         check(
-            second_records.recv_timeout(WAIT)?.tag == "ON_WSC-two-S",
+            second_records.recv_timeout(WAIT)?.tag == "two",
             "second subscription missing",
         )?;
         drop(second);
@@ -179,7 +176,7 @@ fn t13_registration_drop_clear_and_old_handles_preserve_new_subscriptions() -> T
         )?;
         log_s!(LogType::WSC; "new");
         check(
-            new_records.recv_timeout(WAIT)?.tag == "ON_WSC-new-S",
+            new_records.recv_timeout(WAIT)?.tag == "new",
             "new subscription did not receive",
         )?;
         check(
@@ -209,6 +206,43 @@ fn t13_registration_drop_clear_and_old_handles_preserve_new_subscriptions() -> T
         )?;
         drop(new);
         verify_empty_without_reads("new last handle dropped")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_capacity_is_rejected_before_worker_start_or_publication() -> TestResult {
+    if !isolated("invalid_capacity_is_rejected_before_worker_start_or_publication")? {
+        return Ok(());
+    }
+    for capacity in [0, 16_385, usize::MAX] {
+        FAIL_NEXT_WORKER_SPAWN.with(|fail| fail.set(true));
+        let error = OpenNetLogger::register_log_listener_with_capacity(
+            Box::new(|_| {}),
+            &[LogType::WSC],
+            capacity,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other(format!("capacity {capacity} was accepted")))?;
+        check(
+            error.kind() == io::ErrorKind::InvalidInput,
+            format!("capacity {capacity}: expected InvalidInput, got {error}"),
+        )?;
+        verify_empty_without_reads("invalid capacity with empty registry")?;
+
+        // Invalid input must not consume the worker-spawn failure injection.
+        let error = OpenNetLogger::register_log_listener_with_capacity(
+            Box::new(|_| {}),
+            &[LogType::WSC],
+            1,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("invalid capacity attempted to start a worker"))?;
+        check(
+            error.to_string() == "injected log worker creation failure",
+            format!("expected the pending worker failure, got {error}"),
+        )?;
+        verify_empty_without_reads("worker creation failure after invalid capacity")?;
     }
     Ok(())
 }
@@ -323,7 +357,7 @@ fn t14_cross_thread_publication_clear_and_drop_are_ordered() -> TestResult {
         reader.step(Step::Observe(true))?;
         reader.step(Step::Emit)?;
         check(
-            records.recv_timeout(WAIT)?.tag == "ON_WSC-worker-T",
+            records.recv_timeout(WAIT)?.tag == "worker",
             "published subscription missed worker record",
         )?;
         cleaner.step(Step::Drop(new))?;
@@ -340,7 +374,7 @@ fn t14_cross_thread_publication_clear_and_drop_are_ordered() -> TestResult {
         reader.step(Step::Observe(true))?;
         reader.step(Step::Emit)?;
         check(
-            records.recv_timeout(WAIT)?.tag == "ON_WSC-worker-T",
+            records.recv_timeout(WAIT)?.tag == "worker",
             "racing old drop hid new subscription",
         )?;
         drop(new);
@@ -357,7 +391,7 @@ fn t14_cross_thread_publication_clear_and_drop_are_ordered() -> TestResult {
         reader.step(Step::Emit)?;
         if active {
             check(
-                records.recv_timeout(WAIT)?.tag == "ON_WSC-worker-T",
+                records.recv_timeout(WAIT)?.tag == "worker",
                 "clear-before-registration lost new listener",
             )?;
         } else {
@@ -458,7 +492,7 @@ fn t14_callback_unsubscribe_preserves_recursion_suppression() -> TestResult {
         "recursive arguments evaluated",
     )?;
     check(
-        records.recv_timeout(WAIT)?.tag == "ON_WSC-outer-T",
+        records.recv_timeout(WAIT)?.tag == "outer",
         "other listener lost outer record",
     )?;
     check(records.try_recv().is_err(), "recursive record leaked")?;

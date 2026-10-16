@@ -181,6 +181,7 @@ fn config(capacity: usize, bytes: usize) -> WebSocketClientConfig {
         config.heartbeat = Some(open_net::ws::HeartbeatConfig {
             interval: Duration::from_secs(60),
             pong_timeout: Duration::from_secs(120),
+            ..Default::default()
         });
         config
     }
@@ -534,3 +535,6 @@ async fn raw_byte_budget_is_shared_across_reconnects_and_recovers_after_callback
     .await;
     cleanup(&net, NAME, &probe, outcome).await
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

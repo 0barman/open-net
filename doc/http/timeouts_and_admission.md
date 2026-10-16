@@ -1,25 +1,38 @@
 # Timeouts and admission
 
 Required features: `http-client`. There is no separate timeout or admission feature.
-Every Rust block below is a complete program. Use this consumer configuration,
+Every Rust block below is a complete program. Create a project with
+`cargo new timeouts-example` and add these dependencies to its `Cargo.toml`,
 with the path adjusted to your checkout:
 
 ```toml
-[package]
-name = "timeouts-example"
-version = "0.1.0"
-edition = "2021"
-
 [dependencies]
 open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 See [configuration](configuration.md) for queue defaults and [callback requests](callback_requests.md)
 for ownership when a submission is rejected. `async` creates a future;
 `.await` lets the runtime make progress while waiting. `?` returns an error to the
-caller. Poll request/admission and shutdown futures inside an active Tokio runtime
-with its drivers enabled; a bounded admission wait creates a Tokio timer. See
+caller. Poll request/admission futures inside an active Tokio runtime
+with its drivers enabled; a bounded admission wait creates a Tokio timer.
+HTTP shutdown waits use SDK-owned cleanup and need no caller Tokio runtime. See
 [the runtime contract and synchronous bridge](README.md) for the full boundary.
 Durations below use `std::time::Duration`, not an implicit integer unit.
 
@@ -94,6 +107,10 @@ An explicit disable overrides inherited fallback values. Disabling Admission doe
 not disable Total. Unrelated budgets continue running and any can end the operation.
 For response futures, budgets and admission policy are resolved at first poll,
 before middleware. Middleware cannot retroactively change admission.
+The total budget excludes client lookup/creation and preceding application work.
+For a deadline that also covers those steps, bound them in the application and
+pass the positive remaining duration to the request; see the
+[async response example](requests_and_responses.md#awaiting-a-buffered-response).
 
 Connect includes DNS, proxy setup and TLS for a new connection. Configure it with
 `HttpClientConfig::with_connect_timeout(Duration) -> Result<Self, NetError>`;
@@ -265,6 +282,9 @@ use open_net::api::http::{HttpAdmissionPolicy, HttpClient, HttpClientConfig, Htt
 use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let config = HttpClientConfig::new("http://127.0.0.1:8080")?
         .with_request_queue_capacity(1)?
         .with_admission_policy(HttpAdmissionPolicy::FailFast);

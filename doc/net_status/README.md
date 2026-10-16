@@ -4,9 +4,29 @@
 
 `NetStatusClient` observes host network conditions. Use it to display network state, react to changes, or inspect local IPv4/IPv6 capability. `Available` does not guarantee that your server, DNS service, or an Internet endpoint can be reached. Always handle failures from the actual network operation.
 
+Reachability describes the platform's network evidence. `Unavailable` does not
+prove that every LAN peer or remote endpoint is unreachable. An absent
+`snapshot.reachability` means there is no current observation; `Stopped`,
+`Starting`, `Failed`, and `Closed` are monitor lifecycle states, not synthetic
+`Unavailable` observations. Keep these distinctions when adapting the SDK to a
+two-state application API.
+
+Choose the observation contract your application needs:
+
+| Need | Contract |
+| --- | --- |
+| Display the latest state | `snapshot()` reads cached state; `subscribe()` and `on_change()` deliver state updates and can coalesce intermediate changes. |
+| Handle each committed reachability transition | `subscribe_events()` and `on_event()` preserve a bounded ordered prefix. Overflow ends that raw subscription; register again to obtain a new baseline. |
+| Continue observing after event-queue overflow | [`on_recoverable_event()`](#netstatusclienton_recoverable_event) automatically installs a new baseline under the same subscription ID and reports `Reconciled`; missed events are not replayed. |
+| Request a fresh Windows observation | `refresh()` samples reachability and the network name while the calling view is `Running`; `refresh_reachability()` skips the name query. IP-stack capability remains the current shared netwatch value. |
+| Query from an existing synchronous interface | `refresh_blocking()` and `refresh_reachability_blocking()` expose the same query results and budgets while blocking the calling thread. |
+| Inspect local LAN IPv4 addresses | [`query_lan_ipv4()`](#netstatusclientquery_lan_ipv4) makes a fresh synchronous OS query, including while monitoring is stopped. It returns candidates and an optional recommendation without changing network observations. |
+
+The event guarantee begins at an SDK commit. An operating system or its monitor can merge notifications before the SDK samples them, so events are not a complete history of physical cable, Wi-Fi, VPN, or sleep/resume changes.
+
 ## Required features and prerequisites
 
-Use Rust 1.89 or later and a supported platform: macOS, Windows, or Ubuntu with Linux kernel 5.0 or later. This is the project's support scope, not a claim that every platform or minimum kernel has been tested in this documentation change. Native build tools must be available; the macOS monitor includes a C component.
+Use Rust 1.89 or later and a supported platform: macOS, Windows, or Ubuntu with Linux kernel 5.0 or later. Native build tools must be available; the macOS monitor includes a C component. Validate monitoring on the platforms and kernels your application supports.
 
 Create a consumer project with `cargo new network-observer`, then use this dependency configuration. Replace the path with the location of the `open-net` package directory in your checkout, which contains its `Cargo.toml`:
 
@@ -64,6 +84,12 @@ Only `OpenNet` constructs a `NetStatusClient`; its `new` constructor is internal
 | Drop `OpenNet` | All its views become `Closed` | Terminate | Engine no longer exists |
 
 Stopping one named view does not stop another active view. The underlying operating-system monitor can stay active while another consumer still needs it. A newly created client reusing a destroyed name is a new view; old handles remain closed.
+
+The table describes a single client. To permanently close the entire engine and
+wait for its registered clients, monitoring and SDK callback workers, use
+[`OpenNet::begin_shutdown()` / `OpenNet::shutdown()`](../lifecycle.md).
+Client shutdown keeps the name registered; engine shutdown closes admission for
+all new work on that engine and cannot be reversed.
 
 ## OpenNet::new()
 
@@ -171,8 +197,8 @@ The two remaining inherent methods, `with_network_config(self, config:
 NetworkConfig) -> Self` and `network_config(&self) -> &NetworkConfig`, require
 `ws-client`. They set or borrow the default WebSocket network policy and do not
 configure this monitor or HTTP clients. They are outside this NetStatus guide
-and are unavailable under its minimal dependency declaration. No WebSocket
-tutorial is included in this documentation release.
+and are unavailable under its minimal dependency declaration. See the
+[WebSocket guide](../websocket/README.md) for transport configuration.
 
 ### Example
 
@@ -482,6 +508,104 @@ async fn main() -> Result<()> {
 }
 ```
 
+## NetStatusClient::query_lan_ipv4()
+
+Collect local IPv4 candidates and an optional recommendation using fresh
+interface, link and default-route evidence. This helps choose an address to
+show to a LAN peer; it does not prove that the peer can reach that address.
+
+### Required features
+
+`net-status`; use the dependency configuration at the top of this page.
+The query is supported on macOS, Windows and Linux. Unlike Windows-only
+`refresh()`, it does not require running network monitoring.
+
+### Function signature
+
+```text
+pub fn query_lan_ipv4(&self) -> Result<open_net::network::LanIpv4Snapshot>
+```
+
+### Steps
+
+Create or retrieve a named client, call the method, inspect completeness and
+diagnostics, then handle `recommended()` as an `Option`. `start()` is optional.
+Use a blocking worker from async or UI code because the OS query blocks its
+calling thread. If no client is needed, use
+[`network::lan_ipv4_snapshot()`](../lan_ipv4.md#networklan_ipv4_snapshot)
+directly without creating an engine.
+
+### Parameters
+
+Only `&self`, a borrowed client handle. There is no timeout, destination address
+or probe URL parameter.
+
+### Callback parameters
+
+Not applicable. The method does not register a callback, change
+`NetworkSnapshot`, advance observation revisions or emit network events.
+
+### Return values
+
+| Value | Meaning |
+| --- | --- |
+| `Ok(snapshot)` with candidates | An owned inventory, including candidates excluded by the default recommendation policy. |
+| `Ok(snapshot)` with no candidates | IPv4 enumeration succeeded but returned no addresses. |
+| `snapshot.recommended() == None` | No default recommendation was found; do not invent a loopback or arbitrary fallback address. |
+| `snapshot.completeness() == Partial` | Addresses were collected but some auxiliary evidence failed; inspect diagnostics. A recommendation can still exist. |
+| `Err(error)` | The client/engine is closed, address enumeration failed, or admission failed. The original enumeration I/O error is retained as an error source. |
+
+See the [LAN fields and selection guide](../lan_ipv4.md) for return types and
+the difference between unknown evidence and a negative fact.
+
+### Errors and behavior
+
+Stopped, Starting, Running and ordinary monitoring Failed states permit the
+query. Closed or destroyed clients and their clones, and a closing engine,
+reject new queries with `Closed`. An already admitted query can finish normally;
+client/engine shutdown does not wait for this caller's read-only OS query.
+
+Internet access is unnecessary. The query neither starts monitoring nor tests
+remote connectivity. Existing network events do not cover every LAN-only
+address change; applications needing DHCP/interface tracking must arrange fresh
+sampling. An error or Partial result is not proof that a previously healthy
+application endpoint disappeared. Listener rebinding and advertisement updates
+remain application responsibilities.
+
+`network::preferred_lan_ipv4()` uses subnet-based selection. Use this method or
+`lan_ipv4_snapshot()` for selection based on native interface and route evidence.
+
+### Example
+
+This complete program queries a stopped client on a blocking worker. It still
+attempts engine cleanup if the query or blocking task fails.
+
+```rust
+use open_net::OpenNet;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let net = OpenNet::new()?;
+    let client = net.create_net_status_client("lan-query").await?;
+    let queried = tokio::task::spawn_blocking(move || client.query_lan_ipv4()).await;
+    let cleanup = net.shutdown().await;
+    let snapshot = queried??;
+    cleanup?;
+    println!("Collection: {:?}", snapshot.completeness());
+    for diagnostic in snapshot.diagnostics() {
+        eprintln!("Collection detail: {diagnostic}");
+    }
+    match snapshot.recommended() {
+        Some(candidate) => println!(
+            "Candidate for LAN use: {} on {} ({:?})",
+            candidate.address(), candidate.interface_name(), candidate.recommendation_reason()
+        ),
+        None => println!("No default LAN recommendation; inspect candidates explicitly"),
+    }
+    Ok(())
+}
+```
+
 ## NetStatusClient::subscribe()
 
 Receive the current state followed by later states through an owned receiver.
@@ -519,7 +643,7 @@ Not applicable.
 
 Subscription does not start monitoring. The initial snapshot is preserved; subsequent changes use the latest state, so slow consumers can skip intermediate revisions. This is a state feed, not a complete event log. `stop()` leaves it alive for later `start()`. Normal shutdown delivers the final `Closed` snapshot and then `Ok(None)`; subscribing to a normally closed view also permits reading its final state.
 
-The current implementation allows 1,024 subscriptions per named view, including callbacks. Exhausting this limit yields `SubscriptionLimitReached`; allocation or identifier exhaustion can yield `ResourceExhausted`. Drop or unsubscribe to release capacity. Source failures are delivered through `recv()` as `Err`; a recoverable `Failed` monitor state is an ordinary snapshot.
+The current implementation allows 1,024 state subscriptions per named view, including state callbacks. Event subscriptions have a separate limit of 1,024, including event callbacks. Exhausting this limit yields `SubscriptionLimitReached`; allocation or identifier exhaustion can yield `ResourceExhausted`. Drop or unsubscribe to release capacity. Source failures are delivered through `recv()` as `Err`; a recoverable `Failed` monitor state is an ordinary snapshot.
 
 ### Example
 
@@ -610,6 +734,682 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+## NetStatusClient::subscribe_events()
+
+Receive each committed reachability transition through an independent bounded queue.
+
+### Required features
+
+`net-status` on all supported platforms. No additional Cargo feature is needed.
+
+### Function signature
+
+```text
+pub fn subscribe_events(
+    &self,
+    options: NetworkEventOptions,
+) -> Result<EventReceiver<NetworkEvent>>
+```
+
+### Steps
+
+Register before or after `start()`, retain the receiver, and consume `recv().await`.
+The first item is an atomic `Initial` baseline. Handle overflow by registering
+again and using the new baseline; the missing interval cannot be replayed.
+
+### Parameters
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `options` | `NetworkEventOptions` | Per-subscriber item and accounted-byte limits. Defaults are `capacity: 256` and `max_bytes: 256 * 1024`. Initial and lifecycle events use capacity. |
+
+Both limits must be positive and within supported semaphore limits; `max_bytes`
+is also limited to `u32::MAX`. Accounted bytes include the event value and owned
+network-name bytes; this is not a bound on total process memory. An individual
+event must fit, including the initial baseline.
+
+### Callback parameters
+
+Not applicable. Use `on_event()` or convert the receiver with `into_callback()`.
+
+### Return values
+
+| Value | Meaning |
+| --- | --- |
+| `Ok(receiver)` | An owned `EventReceiver<NetworkEvent>` with its baseline already installed. |
+| `Err(error)` | Invalid limits, insufficient space for Initial, subscription quota, or allocation/registration failure. |
+
+### Errors and behavior
+
+Registration does not start monitoring. It atomically captures the baseline and
+joins the same commit order as later events: no gap or duplicate is introduced
+between Initial and subsequent commits. Each subscriber sees its own ordered
+queue. Existing `subscribe()` and `on_change()` continue to coalesce state.
+
+The queue uses a fixed disconnect-on-overflow policy. It first delivers the
+retained ordered prefix, then `ReceiveError::Failed(error)` with
+`error.kind() == ErrorKind::CallbackOverflow`, and then ends. It does not silently
+drop the oldest event or block monitoring. Other subscribers and the shared
+monitor continue. A byte limit can overflow even when the item count is below
+`capacity`. Create a new subscription to resynchronize; this is a fresh Initial,
+not recovery of the lost events. A separately cancelled or dropped subscription
+discards pending deliveries rather than promising to drain them.
+
+An individual event larger than `max_bytes` is a separate `ItemTooLarge` error.
+If Initial is too large, `subscribe_events()` returns that error immediately.
+If a later event is too large, the receiver delivers its retained prefix, then
+`ReceiveError::Failed(error)` with `ErrorKind::ItemTooLarge`, and ends. Increase
+`max_bytes` before subscribing again; repeatedly using the same undersized limit
+cannot resynchronize. The example below treats this error as terminal and
+cancels its application work on exit.
+
+Each named view allows 1,024 event registrations, including event callbacks.
+This quota is separate from its 1,024 state registrations. Invalid limits return `InvalidConfig`; quota
+exhaustion returns `SubscriptionLimitReached`. Allocation or identifier
+exhaustion can return `ResourceExhausted`.
+
+`stop()` preserves the subscription and emits a lifecycle event. Restart uses a
+new local generation and emits `ObservationReady` for its first usable facts;
+it does not replay changes that occurred while this view was stopped. Normal
+shutdown emits the final lifecycle event and ends after queued events, unless
+this subscriber overflowed or was cancelled. A normally closed view can still
+supply an Initial containing its final snapshot and then end.
+
+`EventReceiver::recv()` returns `Ok(Some(event))`, `Ok(None)` at the end, or
+`ReceiveError`; cancelling a pending receive does not consume an unreturned
+item. `try_recv()` uses `TryReceiveError`, including `Empty` when nothing is
+ready. `id()` identifies the registration, `unsubscribe()` detaches it, and
+`into_callback()` transfers ownership to a `Subscription`. Dropping either
+owner releases its queue. This feed never selects the generic receiver's
+DropOldest policy, so overflow is a failure rather than `Lagged` recovery.
+
+### Example
+
+The [network_events example](../../examples/network_events.rs) observes the host
+for 15 seconds and keeps one cancellable application task. `Unavailable` cancels
+old work; a committed transition to `Available` starts recovery work.
+`Initial` and `ObservationReady` reconcile the baseline separately, without
+claiming a recovery transition. After overflow, it cancels the old work before
+subscribing again; the new Initial determines whether to initialize work again.
+
+The placeholder task deliberately has no server address. Replace its body with
+your actual connection/request loop, and extend `cancel()` to release application
+session and request ownership. Task abortion requests cancellation; an application
+that must await cleanup should also await task completion outside this handler.
+A host `Available` observation does not guarantee that reconnection will succeed.
+
+```rust
+use open_net::error::{ErrorKind, ReceiveError};
+use open_net::{
+    MonitorState, NetworkEvent, NetworkEventKind, NetworkEventOptions, NetworkSnapshot,
+    NetworkStatus, OpenNet, Result,
+};
+use std::time::Duration;
+
+#[derive(Default)]
+struct ConnectionWork {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ConnectionWork {
+    fn cancel(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        // Also clear your application's old session and pending request ownership here.
+    }
+
+    fn start_work(&mut self, reason: &'static str) {
+        self.cancel();
+        self.task = Some(tokio::spawn(async move {
+            println!("Starting connection work: {reason}");
+            // Replace this placeholder with your connect/reconnect and request loop.
+            // Available is only host evidence: handle actual connection failures here.
+            std::future::pending::<()>().await;
+        }));
+    }
+
+    fn establish_baseline(&mut self, snapshot: &NetworkSnapshot) {
+        self.cancel();
+        if matches!(snapshot.state, MonitorState::Running)
+            && snapshot.reachability == Some(NetworkStatus::Available)
+        {
+            // Initial/ObservationReady can initialize work without claiming recovery.
+            self.start_work("establish current baseline");
+        }
+    }
+
+    fn apply(&mut self, event: NetworkEvent) {
+        println!(
+            "sequence={} generation={} kind={:?}",
+            event.sequence, event.generation, event.kind
+        );
+        match event.kind {
+            NetworkEventKind::Initial | NetworkEventKind::ObservationReady => {
+                self.establish_baseline(&event.snapshot);
+            }
+            NetworkEventKind::ReachabilityChanged {
+                current: NetworkStatus::Unavailable,
+                ..
+            } => {
+                println!("Network became unavailable: cancel old connection work.");
+                self.cancel();
+            }
+            NetworkEventKind::ReachabilityChanged {
+                current: NetworkStatus::Available,
+                ..
+            } => {
+                self.start_work("recover after a committed availability transition");
+            }
+            NetworkEventKind::LifecycleChanged => self.cancel(),
+            _ => {} // NetworkEventKind is non-exhaustive.
+        }
+    }
+}
+
+impl Drop for ConnectionWork {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let net = OpenNet::new()?;
+    let client = net.create_net_status_client("ordered-events").await?;
+    let observed = async {
+        let options = NetworkEventOptions::default();
+        let mut receiver = client.subscribe_events(options)?;
+        let mut work = ConnectionWork::default();
+        if let Some(initial) = receiver.recv().await? {
+            work.apply(initial);
+        }
+        let started = client.start().await?;
+        if !matches!(started.state, MonitorState::Running) {
+            return Ok::<(), open_net::NetError>(());
+        }
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < until {
+            match tokio::time::timeout_at(until, receiver.recv()).await {
+                Ok(Ok(Some(event))) => work.apply(event),
+                Ok(Err(ReceiveError::Failed(error)))
+                    if error.kind() == ErrorKind::CallbackOverflow =>
+                {
+                    // The lost interval can include a disconnection: retire old work first.
+                    work.cancel();
+                    eprintln!("Event history ended after overflow; awaiting a new Initial.");
+                    receiver = client.subscribe_events(options)?;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Ok(Ok(None)) | Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+    .await;
+    // Cleanup also runs when startup or observation failed.
+    net.destroy_net_status_client("ordered-events").await?;
+    observed
+}
+```
+
+## NetStatusClient::on_event()
+
+Consume the same bounded ordered event feed on the shared callback pool.
+
+### Required features
+
+`net-status` on all supported platforms.
+
+### Function signature
+
+```text
+pub fn on_event<F>(
+    &self,
+    options: NetworkEventOptions,
+    callback: F,
+) -> Result<Subscription>
+where
+    F: Fn(CallbackContext, std::result::Result<NetworkEvent, ReceiveError>)
+        + Send + Sync + 'static,
+```
+
+### Steps
+
+Choose the queue bounds, install a short callback, and retain its `Subscription`.
+Dispatch UI changes to your application's UI thread. Use `close().await` outside
+the callback when you must await that callback's retirement.
+
+### Parameters
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `options` | `NetworkEventOptions` | The same limits and overflow policy as `subscribe_events()`. |
+| `callback` | `F` | A synchronous closure returning `()`; captured data must be safe to share across threads. |
+
+### Callback parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `context: CallbackContext` | Subscription identity and self-unsubscription. |
+| `result: Result<NetworkEvent, ReceiveError>` | A committed event or terminal receive failure. This error type differs from the state callback's `NetError`. |
+
+### Return values
+
+`Ok(Subscription)` owns the callback registration. `Err(NetError)` reports
+subscription setup or callback-pool startup failure.
+
+### Errors and behavior
+
+Each registration executes serially; independent registrations may run
+concurrently. Initial can arrive before `on_event()` returns. Use the supplied
+`CallbackContext` for self-unsubscription. A slow callback can exhaust its
+queue and receives the retained prefix followed by the overflow error. Queue
+limits do not count work your callback spawns elsewhere.
+
+A callback panic retires the registration and is observable through `close()`.
+Dropping the owner or unsubscribing cancels pending deliveries; an already
+running callback may finish. `close().await` waits for callback retirement,
+not delivery of every queued event. `stop()` keeps this registration alive.
+
+### Example
+
+```rust
+use open_net::{NetworkEventOptions, OpenNet, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let net = OpenNet::new()?;
+    let client = net.create_net_status_client("event-callback").await?;
+    let subscription = client.on_event(NetworkEventOptions::default(), |context, result| {
+        match result {
+            Ok(event) => println!("{}: {} {:?}", context.id(), event.sequence, event.kind),
+            Err(error) => eprintln!("Event subscription ended: {error}"),
+        }
+    })?;
+    let started = client.start().await;
+    let closed = client.shutdown().await;
+    let retired = subscription.close().await;
+    net.destroy_net_status_client("event-callback").await?;
+    started?;
+    closed?;
+    retired
+}
+```
+
+## NetStatusClient::refresh()
+
+Request new Windows reachability and network-name samples and commit them to
+shared network state. `snapshot()` remains a cheap cache read.
+
+### Required features
+
+`net-status`. The method is available on all platforms; active refresh is
+implemented on Windows. After timeout and local-lifecycle validation, other
+platforms return `Unsupported`.
+
+### Function signature
+
+```text
+pub async fn refresh(&self, timeout: Duration) -> Result<NetworkRefreshResult>
+```
+
+### Steps
+
+Start the named client and check its `Running` state. Await `refresh()` with a
+positive timeout, inspect the sampling result, and handle errors independently
+from network unavailability.
+
+Use `refresh_reachability()` when only Windows' Internet-connectivity observation is needed. It uses
+an independent bounded worker which never runs network-name queries. A failed,
+slow, or stuck name query therefore cannot block this operation. The returned
+name is the latest cached value, identified by `CachedObservation`; it is not
+claimed as a newly queried SSID. Lifecycle, cancellation and timeout rules are
+the same as for `refresh()`.
+
+### Parameters
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `timeout` | `std::time::Duration` | Positive total budget covering queue admission, system queries, and commit. It is not restarted for each stage. |
+
+### Callback parameters
+
+Not applicable. Successful changed observations also reach existing state and
+event subscriptions through the shared commit path. Successful refresh means
+the sample was committed; it does not wait for subscription callbacks or for
+application work those callbacks dispatch.
+
+### Return values
+
+| Value | Meaning |
+| --- | --- |
+| `Ok(result)` | New system queries completed, and their result was accepted for this view's current generation. `Unavailable` can be a successful result. |
+| `Err(error)` | The request did not produce a valid committed observation. Cached data is not returned as fresh success. |
+
+### Errors and behavior
+
+The calling named view itself must be `Running`. Another named
+client, HTTP observer, or WebSocket consumer keeping the shared monitor running
+does not satisfy this condition. A new, stopped, starting, or failed view returns
+`NotRunning`; a closed view returns `Closed`. A zero or unsupported timeout
+returns `InvalidInput`. Deadline expiry returns `TimedOut`; an invalidated
+request or generation returns `Cancelled`. System-query failures retain their
+cause as `Io` with `NetworkMonitor` stage. Timeout and local-lifecycle validation
+precede the platform check, so non-Windows calls can first return `InvalidInput`,
+`NotRunning`, or `Closed`; a valid running request returns `Unsupported`.
+
+Each sampling lane admits at most 16 outstanding manual queries, including a
+running query and cancelled queries whose blocking work has not yet retired.
+Further requests return `QueueFull`. Background monitoring has separate admission
+capacity and does not consume these manual-query slots.
+
+Every accepted full `refresh()` samples Windows Network List Manager reachability and
+queries the network name again. An active Wi-Fi SSID is preferred; a freshly
+queried connected NLM name is the fallback. A successful absence is represented
+by `None`. A query failure is not a disconnection and does not clear the last
+valid state or manufacture an `Unavailable` event. If a name-query fault is
+bypassed by a successful fresh fallback, `network_name_diagnostics` retains it.
+
+Reachability and name queries form a sampling window, not an atomic operating
+system snapshot. `ip_stack_source` is `BackgroundObservation`: `ip_stack` remains
+the latest background netwatch capability and is not freshly measured by this
+operation. A successful result with unchanged values has a new `sample_id` and
+sampling window, while `snapshot.revision` and `snapshot.observed_at` can remain
+unchanged. Do not infer request freshness from the snapshot revision alone.
+Reachability and name have independent sampling watermarks. If a full query's
+name finishes after a newer reachability query, its fresh name is merged without
+rolling reachability back. `sampled_reachability` is the result of this query's
+own NLM call; `snapshot.reachability` may retain a later observation. A newer
+name sample supersedes an older full query with `Cancelled`; a newer
+reachability sample similarly supersedes an older reachability-only query.
+
+The active query and background monitor share one ordered commit path. Active
+views observe the same new source facts, using their own local revisions;
+stopped views stay stopped. Dropping a pending refresh invalidates its
+uncommitted result. Deadline expiry, stop/restart, shutdown, and engine closure
+also prevent late results from committing. A blocking COM query cannot be
+forcibly interrupted: it runs on a dedicated worker rather than blocking a Tokio
+worker, may finish later, and its expired result is rejected. Shutdown does not
+wait for an uninterruptible COM call; its worker releases resources after it
+returns. The `netsh` subprocess is terminated and reaped when its query is cancelled or
+expires. These cleanup limits do not extend the successful query contract.
+
+The timeout is a validity budget for admission, sampling, and commit, not a hard
+wall-clock return deadline. Expired work cannot commit a late result, but lock
+contention, thread scheduling, and cleanup can delay when the caller regains control. The blocking
+methods use the same budget and do not automatically return `snapshot()` after
+a query failure.
+
+### Example
+
+The runnable [network_refresh example](../../examples/network_refresh.rs) also
+prints the sampling window, sampled and merged reachability, name provenance,
+cached-IP provenance, and fallback diagnostics. Pass `--blocking` to use the
+synchronous API, and `--reachability-only` to skip the name query. From the
+repository root:
+
+```bash
+cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_events
+cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_refresh
+cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_refresh -- --blocking
+cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_refresh -- --blocking --reachability-only
+```
+
+```rust
+use open_net::error::ErrorKind;
+use open_net::{MonitorState, OpenNet, Result};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let net = OpenNet::new()?;
+    let client = net.create_net_status_client("refresh").await?;
+    let queried = async {
+        let started = client.start().await?;
+        if !matches!(started.state, MonitorState::Running) {
+            return Ok::<(), open_net::NetError>(());
+        }
+        match client.refresh(Duration::from_secs(3)).await {
+            Ok(result) => println!(
+                "Sample {} ({:?} to {:?}): sampled={:?}, merged={:?}",
+                result.sample_id, result.sample_started_at, result.sampled_at,
+                result.sampled_reachability, result.snapshot.reachability
+            ),
+            Err(error) if error.kind() == ErrorKind::Unsupported => {
+                println!("Fresh queries require Windows; cached state: {started:?}");
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }.await;
+    net.destroy_net_status_client("refresh").await?;
+    queried
+}
+```
+
+## NetStatusClient::refresh_reachability()
+
+Query fresh Windows reachability without waiting for a network-name query.
+
+### Required features
+
+`net-status`. Active queries require Windows; after timeout and lifecycle
+validation, a valid running request on another platform returns `Unsupported`.
+
+### Function signature
+
+```text
+pub async fn refresh_reachability(&self, timeout: Duration) -> Result<NetworkRefreshResult>
+```
+
+### Steps
+
+Start this named view, confirm `Running`, and await the method. Use it when the
+network name does not need a fresh query.
+
+### Parameters
+
+`timeout: Duration` is a positive validity budget covering admission, sampling,
+and commit, with no per-stage reset or hard wall-clock return guarantee.
+
+### Callback parameters
+
+None. Changed observations use existing subscriptions; success does not wait
+for their callbacks to complete.
+
+### Return values
+
+`Ok(NetworkRefreshResult)` includes the fresh `sampled_reachability` and merged
+`snapshot`. The network name retains `CachedObservation` provenance and the IP
+stack retains `BackgroundObservation` provenance. `Err(NetError)` reports this
+query's failure without substituting cached success.
+
+### Errors and behavior
+
+The [refresh lifecycle, budget, and error rules](#netstatusclientrefresh) apply.
+This method uses an independent bounded sampling lane; a slow or failing name
+query cannot delay it. A newer reachability sample supersedes an older query
+with `Cancelled`. Dropping the future invalidates its uncommitted result.
+
+### Example
+
+The complete [async refresh example](#netstatusclientrefresh) shows lifecycle
+and result handling; use `refresh_reachability(timeout).await` for its query.
+Run the complete [network_refresh example](../../examples/network_refresh.rs)
+with `--reachability-only` to select this async method.
+
+## NetStatusClient::refresh_blocking()
+
+Use these methods when an existing synchronous interface needs a fresh Windows
+query. They drive the same operation as the corresponding async methods; they
+do not start monitoring, select a fallback policy, or create a second cache.
+Prefer `refresh().await` or `refresh_reachability().await` in async application
+code, and keep blocking queries off the UI thread.
+
+### Required features
+
+`net-status`. Both methods are available on all platforms. In supported calling
+contexts, timeout and local-lifecycle validation precede the platform check,
+just as for async refresh. A valid running non-Windows request returns
+`Unsupported`; no cached value is substituted.
+
+### Function signature
+
+```text
+pub fn refresh_blocking(&self, timeout: Duration) -> Result<NetworkRefreshResult>
+```
+
+### Steps
+
+Start the named view, check that it is `Running`, then call the method from a
+supported thread. Use the reachability-only variant below when no fresh name
+query is needed.
+
+### Parameters
+
+`timeout: Duration` is a positive validity budget covering admission, sampling,
+and commit. The timeout is not a hard wall-clock return deadline; lock
+contention, scheduling, and cleanup can delay return.
+
+### Callback parameters
+
+None. Existing subscriptions receive changed observations through the shared
+commit path; success does not wait for callback completion.
+
+### Return values
+
+`Ok(NetworkRefreshResult)` has the same fields and provenance as `refresh()`.
+`Err(NetError)` reports a query or calling-context failure. No cached result is
+substituted after an error.
+
+### Errors and behavior
+
+The [async refresh contract](#netstatusclientrefresh) applies, including the
+order of timeout, local-lifecycle, and platform checks in supported contexts.
+Calls from SDK-managed runtime or sampling threads are rejected before blocking
+with the context error described below. The blocking API does not expose a
+generic executor or depend on progress from the caller's runtime.
+
+### Calling contexts
+
+| Context | Behavior |
+| --- | --- |
+| Ordinary application thread | Supported; the current thread waits for the query. |
+| Inside an application futures executor or Tokio runtime | Supported, including nested executors and current-thread Tokio; the SDK drives its own query and timer, but the calling thread is blocked. Prefer the async method when possible. |
+| SDK callback-pool thread | Supported because callbacks use separate threads. Entering the SDK runtime context alone does not make the callback a runtime worker. A long query still occupies its callback slot. |
+| SDK-managed runtime thread (including its blocking pool) or sampling worker | Rejected with `InvalidInput` and error-context field `network_status.refresh_blocking.context` to avoid blocking query progress. |
+
+A successful call reports a committed observation, not callback completion.
+The sampling window's own reachability is `sampled_reachability`; the merged
+`snapshot.reachability` may already retain a newer observation. If cached
+fallback is appropriate for your application, handle the query error and read
+`snapshot()` explicitly, retaining the distinction between cached and fresh
+data.
+
+### Example
+
+See the complete [synchronous refresh example](#synchronous-refresh-example)
+below for synchronous lifecycle integration. Run the complete
+[network_refresh example](../../examples/network_refresh.rs) with `--blocking`
+to select a full synchronous query.
+
+## NetStatusClient::refresh_reachability_blocking()
+
+Query fresh Windows reachability synchronously without querying a network name.
+
+### Required features
+
+`net-status`. In supported calling contexts, timeout and local-lifecycle
+validation precede the platform check; a valid running non-Windows request
+returns `Unsupported`.
+
+### Function signature
+
+```text
+pub fn refresh_reachability_blocking(&self, timeout: Duration) -> Result<NetworkRefreshResult>
+```
+
+### Steps
+
+Start this named view, check `Running`, and call from a supported thread. Prefer
+`refresh_reachability().await` when the application interface is asynchronous.
+
+### Parameters
+
+`timeout: Duration` is a positive validity budget for admission, sampling, and
+commit. It is not a hard wall-clock return deadline.
+
+### Callback parameters
+
+None. Committing the query does not wait for subscription callbacks or their
+application work to complete.
+
+### Return values
+
+`Ok(NetworkRefreshResult)` includes the fresh sampled reachability and merged
+snapshot. The name retains `CachedObservation` provenance, and IP-stack data
+retains `BackgroundObservation` provenance. `Err(NetError)` never carries a
+cached snapshot as fresh success.
+
+### Errors and behavior
+
+The [blocking calling-context rules](#netstatusclientrefresh_blocking) and
+[reachability-only query rules](#netstatusclientrefresh_reachability) apply.
+This method uses the independent reachability sampling lane. SDK-managed runtime
+threads, including their blocking pool, and sampling threads return
+`InvalidInput` with field `network_status.refresh_blocking.context`; independent
+callback-pool threads are supported. It does not start or restart the monitor.
+
+### Example
+
+The complete [synchronous refresh example](#synchronous-refresh-example) calls
+this method on an ordinary thread. The runnable
+[network_refresh example](../../examples/network_refresh.rs) selects it with
+`--blocking --reachability-only`.
+
+## Event and refresh values
+
+`NetworkEvent`, `NetworkEventKind`, `NetworkEventOptions`, `NetworkObservation`, `NetworkRefreshResult`,
+`NetworkNameSource`, and `NetworkIpStackSource` are available from
+`open_net::net_status` and the crate root. Existing `NetworkSnapshot` fields and
+state-subscription behavior are unchanged.
+
+| Event field | Meaning |
+| --- | --- |
+| `sequence` | Monotonic event cursor within one named view; it does not reset on stop/restart. Initial carries the current cursor without advancing it. Compare only within that view. |
+| `generation` | Local activation generation. Clones share it; other named views have independent generations. |
+| `source_revision` | Revision of the shared engine observation associated with this event. Local lifecycle events may retain the same source revision. Compare only within that engine. |
+| `snapshot` | Coherent local snapshot at this event's commit. Its local revision is a separate counter from event sequence and source revision. |
+| `kind` | The category below. |
+
+| Event kind | Meaning |
+| --- | --- |
+| `Initial` | Subscription baseline, including when the client has no usable observation yet. |
+| `ObservationReady` | First usable observation after activation or initialization; neither an inferred disconnection nor a replay of missed changes. |
+| `ReachabilityChanged { previous, current }` | A committed change between known `Available` and `Unavailable` values. Repeated values and metadata-only changes do not emit this kind. |
+| `LifecycleChanged` | Starting, stopping, failure, or permanent shutdown. Lifecycle changes do not manufacture network loss. |
+
+Initial is delivered once per subscription. Lifecycle events and the first
+usable observation consume distinct sequence entries where they occur. Metadata
+changes remain observable through the state feed, even when they do not produce
+a network event. A new client reusing a destroyed name has a new identity and
+counter domain. `loss_epoch` is retained shared history, not the event count.
+
+| Refresh field | Meaning |
+| --- | --- |
+| `snapshot` | The calling view's latest snapshot after merging the sample; a slow full query preserves later reachability observations. |
+| `sampled_reachability` | This sampling window's own NLM result, which can differ from a later observation retained in `snapshot.reachability`. |
+| `sample_id` | Increasing sampling-start identifier within one engine; completion can be out of order and failures/cancellations can leave gaps. It is not an event sequence or snapshot revision. |
+| `sample_started_at`, `sampled_at` | Wall-clock bounds of the system-query window. Clock corrections may reverse wall time; use sample IDs for ordering. |
+| `network_name_source` | `WifiSsid`, `NetworkListManager`, or `None` after a successful name query; `CachedObservation` when reachability-only sampling preserved the cached name. |
+| `network_name_diagnostics` | Query faults bypassed by a successful fresh name fallback. |
+| `ip_stack_source` | `BackgroundObservation`, explicitly identifying the IP-stack value as cached background evidence. |
+
+The new enums and refresh result are non-exhaustive. Include a wildcard when
+matching enums outside the library, and read result fields rather than
+constructing refresh results yourself.
 
 ## NetStatusClient::stop()
 
@@ -1024,13 +1824,20 @@ Keep a `StateReceiver` or `Subscription` alive for as long as updates are useful
 | --- | --- |
 | Drop or unsubscribe a receiver | Releases its registration; later `recv()` returns `Ok(None)` after unsubscribe. |
 | Drop or unsubscribe a callback handle | Stops future delivery and releases capacity immediately; an already running callback can still finish. |
-| `Subscription::close().await` | Unsubscribes and waits for that callback's execution to retire, including any retained fault. |
+| `Subscription::close().await` from outside subscription callbacks | Unsubscribes and waits for that callback's execution to retire, including any retained fault. |
+| Poll `close()` inside any synchronous subscription callback | Unsubscribes, then returns `InvalidInput`; this does not confirm callback retirement. |
 | Drop a `recv()` future | Does not consume an update that was not returned; the receiver remains usable. |
 | Drop a `close()` future after calling `close()` | The consumed ownership handle is dropped and unsubscribes; there is no completed wait or guarantee that a running callback has returned. |
 | `stop()` the client | Retains both polling and callback subscriptions for restart. |
 | `shutdown()` the client | Publishes final `Closed`, then subscriptions terminate. It does not await application callback work. |
 
-The callback closure runs synchronously even though its scheduling is asynchronous. If it spawns its own work, `close()` does not wait for that separate application work. Do not wait inside a callback for its own `close()`, or for application work that needs the callback to return. Perform awaited cleanup from an independent task.
+The callback closure runs synchronously even though its scheduling is asynchronous.
+If it spawns its own work, `close()` does not wait for that separate application
+work. Never poll any subscription's `close()` from a synchronous subscription
+callback, including a different or already idle subscription. Use
+`CallbackContext::unsubscribe()` there and perform awaited cleanup from an
+independent owner. The check cannot detect indirect waits through another
+thread or task; do not block a callback waiting for work that needs it to return.
 
 ## StateReceiver::id()
 
@@ -1505,7 +2312,9 @@ pub async fn close(self) -> Result<()>
 
 ### Steps
 
-Move the handle into `close()` from outside its own callback and await completion.
+Move the handle into `close()` from outside all synchronous subscription callbacks
+and await completion. Inside a callback, use `CallbackContext::unsubscribe()` and
+let an external owner await the retained subscription handle.
 
 ### Parameters
 
@@ -1522,11 +2331,33 @@ Not applicable.
 | Value | Type | Description |
 | --- | --- | --- |
 | `Ok(())` | `()` | No callback invocation for this registration is still running. |
-| `Err(error)` | `NetError` | A retained callback panic or dispatch failure. |
+| `Err(error)` | `NetError` | A retained callback/source/dispatch failure, or `InvalidInput` for a forbidden callback-context wait. An error does not by itself confirm retirement. |
 
 ### Errors and behavior
 
-`close()` can return `CallbackPanicked` or a dispatch/runtime failure and preserves the recorded fault. It does not wait for work spawned by a callback after the closure returns. It also cancels pending, not-yet-started deliveries; do not use it as a promise that every queued snapshot or the final `Closed` snapshot was delivered. A callback that never returns can keep this wait pending. Dropping the handle or calling `unsubscribe()` never provides this wait.
+`close()` can return `CallbackPanicked` or a dispatch/runtime failure and
+preserves the recorded fault. It does not wait for work spawned by a callback
+after the closure returns. It also cancels pending, not-yet-started deliveries;
+do not use it as a promise that every queued snapshot or the final `Closed`
+snapshot was delivered. A callback that never returns can keep this wait
+pending. Dropping the handle or calling `unsubscribe()` never provides this wait.
+For `on_recoverable_event` subscriptions it also joins the recovery driver and
+retains source/recovery failures.
+
+For every subscription type, polling `close()` on a thread currently executing
+any synchronous subscription callback first unsubscribes, then returns
+`InvalidInput`, field `subscription.close`, stage `Dispatch`. This includes
+closing another subscription and closing an already idle one. That rejection
+does not mean an executing callback has retired. Use synchronous unsubscribe
+inside callbacks and await closure from an external owner.
+
+The context check occurs on every poll, not when the future is constructed.
+A future created in a callback can be awaited outside it after that callback
+returns. A previously pending future moved into a callback is rejected on its
+next poll. The check sees only the current thread's callback stack, so it cannot
+prevent an indirect deadlock through a separate application thread or task.
+Cancelling the waiting future never reactivates the subscription or interrupts
+an already running callback.
 
 ### Example
 
@@ -1880,9 +2711,20 @@ These notes describe the current implementation rather than a cross-platform val
 
 | Platform | Observation behavior |
 | --- | --- |
-| macOS | Uses netwatch interface/default-route facts. A supplementary native path monitor triggers refreshes; failure to initialize that extra hint source is logged and leaves the netwatch path in use. `network_name` is currently `None`. |
-| Windows | Tries NetworkListManager Internet connectivity flags for reachability; if that query cannot produce a result, falls back to netwatch-derived facts. Network names prefer an active Wi-Fi SSID and then a connected NetworkListManager name; either can be unavailable. |
-| Ubuntu / Linux | Uses netwatch capability flags plus a reachability query that checks operational interfaces and IPv4/IPv6 default routes from `/proc/net/route` and `/proc/net/ipv6_route`. Missing route files permit a less detailed default-interface fallback; other read errors are retained as monitor errors. `network_name` is currently `None`. |
+| macOS | `Available` requires netwatch to report a default-route interface and at least one IPv4/IPv6 capability. This is local route/interface evidence, not an Internet probe. A supplementary native path monitor triggers refreshes; failure to initialize that extra hint source is logged and leaves the netwatch path in use. `network_name` is currently `None`. |
+| Windows | Background reachability and `refresh_reachability()` use a dedicated sampler, independent of the full `refresh()` and background name sampler. Reachability requires NetworkListManager Internet connectivity flags; a failed NLM query is not replaced with cached or netwatch reachability. Names prefer a newly queried active Wi-Fi SSID, then a connected name from that sampling round's NLM query. IP-stack capability remains background netwatch evidence. |
+| Ubuntu / Linux | Uses netwatch capability flags plus a reachability query that checks operational interfaces and IPv4/IPv6 default routes from `/proc/net/route` and `/proc/net/ipv6_route`. This establishes local route/interface capability, not end-to-end Internet access. Missing route files permit a less detailed default-interface fallback; other read errors are retained as monitor errors. `network_name` is currently `None`. |
+
+After Windows monitoring is already `Running`, background sampling that encounters
+`TimedOut`, `QueueFull`, or sampling resource exhaustion retains its last
+successful snapshot and retries on a later monitoring cycle. These conditions
+do not themselves establish a network failure. Initial startup still requires a
+successful first reachability sample; native reachability query failures can
+produce `Failed`. Background names are independently retried and cannot delay
+startup or fail an otherwise running reachability monitor. Stopping the monitor
+cancels both sampling futures; late native work cannot update a later generation. Manual
+`refresh()` always reports its own failure and never returns the retained
+snapshot as fresh success.
 
 The locally available `IpStack` uses netwatch's IPv4/IPv6 capability flags consistently across platforms. Reachability has platform-specific evidence. None of these mechanisms sends a request to your target server to prove that service healthy. A captive portal, DNS error, TLS error, or firewall can still make a request fail while the monitor says `Available`.
 
@@ -1893,8 +2735,14 @@ The locally available `IpStack` uses netwatch's IPv4/IPv6 capability flags consi
 | `Available` but requests fail | Inspect the actual request's DNS, connection, TLS, timeout, and HTTP response errors. Monitor availability is host-level evidence. |
 | Missing or unexpected network name | Names are best effort; use `None` handling and do not assume a Wi-Fi SSID on every platform. |
 | A callback never appears | Retain its `Subscription` handle; dropping it unsubscribes. Check callback registration errors and ensure the engine remains alive. |
-| Fewer changes than expected | State updates are coalesced. Use current snapshots and revisions, not an assumed complete history. |
-| `SubscriptionLimitReached` | Close or drop unused receivers and callback owners. The current per-view limit is 1,024. |
+| Fewer state changes than expected | State updates are coalesced. Use `subscribe_events()` for ordered SDK commits; upstream OS notifications can still merge physical changes. |
+| Event receive fails with `CallbackOverflow` | The bounded queue ended after its retained prefix. Subscribe again for a new Initial baseline; the missing interval is not replayed. |
+| Event registration or receive fails with `ItemTooLarge` | One event exceeds `max_bytes`. Increase the byte limit before subscribing again; a later oversized event terminates its receiver after the retained prefix. |
+| Refresh returns `NotRunning` | Start this named view, even if another consumer already keeps the shared monitor active. |
+| Refresh returns `Unsupported` | Active refresh is Windows-only. Use cached snapshots and background observation on this platform. |
+| Refresh succeeds without changing snapshot revision | Identical observed values are deduplicated. Inspect `sample_id` and the sampling window for this query. |
+| Blocking refresh returns `InvalidInput` with field `network_status.refresh_blocking.context` | The call ran on an SDK-owned runtime thread or sampling worker. Use async refresh on a runtime worker, or move synchronous application work to a separate thread. |
+| `SubscriptionLimitReached` | Close or drop unused receivers and callback owners. Each named view has separate limits of 1,024 state and 1,024 event registrations, including their respective callbacks. |
 | A receive waits forever after `stop()` | The subscription intentionally survives stop/restart. Unsubscribe or shut down if the observer must end. |
 | `ClientAlreadyExists` after shutdown | Destroy the named client through `OpenNet`; shutdown alone keeps the name. |
 | `ConnectionClosing` during lookup/destroy | Destruction is already in progress. Await its original completion before reuse. |
@@ -1928,10 +2776,11 @@ fn main() {
 | Area | APIs covered |
 | --- | --- |
 | Engine ownership | `OpenNet::new`, `new_with_config`, `create_net_status_client`, `get_net_status_client`, `destroy_net_status_client` |
-| All six client methods | `start`, `snapshot`, `subscribe`, `on_change`, `stop`, `shutdown` |
+| Client methods | `start`, `snapshot`, `subscribe`, `on_change`, `subscribe_events`, `on_event`, `on_recoverable_event`, `refresh`, `refresh_reachability`, `refresh_blocking`, `refresh_reachability_blocking`, `stop`, `shutdown` |
+| Event and refresh values | `NetworkEvent`, `NetworkEventKind`, `NetworkEventOptions`, `NetworkObservation`, `NetworkRefreshResult`, `NetworkNameSource`, `NetworkIpStackSource` |
 | Snapshot values | All seven `NetworkSnapshot` fields; all current `MonitorState`, `NetworkStatus`, and `IpStack` variants |
 | Value helpers | `NetworkStatus::name`; `IpStack::name`, `has_ipv4`, `has_ipv6`, `is_dual_stack` |
-| Receiver | `StateReceiver::id`, `current`, `recv`, `unsubscribe`, `into_callback`; stream and drop behavior |
+| Receivers | `StateReceiver::id`, `current`, `recv`, `unsubscribe`, `into_callback`; `EventReceiver::id`, `recv`, `try_recv`, `unsubscribe`, `into_callback`; stream and drop behavior |
 | Callback ownership | `Subscription::id`, `is_active`, `unsubscribe`, `close`; `CallbackContext::id`, `unsubscribe`; `SubscriptionId::as_u64` |
 | Shared state and discovery | `OpenNet::network_status_context`, `NetworkStatusContext::snapshot`, `network::preferred_lan_ipv4` |
 
@@ -2273,3 +3122,165 @@ Rejects explicit worker counts outside 1 through 256 and either queue capacity o
 
 The complete [engine configuration example](#engine-configuration-example)
 calls this method and checks its result without starting any workers.
+
+## Synchronous refresh example
+
+This complete program uses an application runtime only for the existing async
+lifecycle APIs. The refresh itself is a synchronous call on the ordinary main
+thread. The runtime is not needed to drive that refresh's query or timeout.
+
+```rust
+use open_net::error::ErrorKind;
+use open_net::{MonitorState, OpenNet, Result};
+use std::time::Duration;
+
+fn main() -> Result<()> {
+    let lifecycle = tokio::runtime::Runtime::new()?;
+    let net = OpenNet::new()?;
+    let client = lifecycle.block_on(net.create_net_status_client("sync-query"))?;
+    let queried: Result<()> = (|| {
+        let started = lifecycle.block_on(client.start())?;
+        if !matches!(started.state, MonitorState::Running) {
+            return Ok(());
+        }
+        match client.refresh_reachability_blocking(Duration::from_secs(3)) {
+            Ok(result) => println!(
+                "Sample {}: sampled={:?}, merged={:?}, name source={:?}",
+                result.sample_id, result.sampled_reachability,
+                result.snapshot.reachability, result.network_name_source
+            ),
+            Err(error) if error.kind() == ErrorKind::Unsupported => {
+                println!("Fresh queries require Windows; no query result returned");
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    })();
+    let cleanup = lifecycle.block_on(net.destroy_net_status_client("sync-query"));
+    queried.and(cleanup)
+}
+```
+
+## NetStatusClient::on_recoverable_event()
+
+Observe ordered events through a stable callback subscription that replaces its
+underlying receiver after queue overflow.
+
+### Required features
+
+`net-status`.
+
+### Function signature
+
+```text
+pub fn on_recoverable_event<F>(
+    &self,
+    options: NetworkEventOptions,
+    callback: F,
+) -> Result<Subscription>
+where
+    F: Fn(CallbackContext, Result<NetworkObservation>) + Send + Sync + 'static
+```
+
+### Steps
+
+Retain the returned subscription, process each callback synchronously, and use
+`Reconciled` to compare the last delivered event with a new atomic baseline.
+Unsubscribe when the application no longer wants observations and await `close`
+from an external owner to finish cleanup.
+
+### Parameters
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| options | NetworkEventOptions | Existing per-receiver event and byte limits; reused on every recovery. |
+| callback | F | Serial observer receiving ordinary events, a reconciliation, or a terminal error. |
+
+### Callback parameters
+
+`CallbackContext` exposes the stable logical subscription ID and synchronous
+unsubscribe. `Ok(NetworkObservation::Event(event))` carries an original event,
+including the first `Initial`. `Ok(NetworkObservation::Reconciled { previous,
+current })` carries the last delivered event and the replacement receiver's
+atomic `Initial` event. `Err(NetError)` reports a terminal failure when callback
+delivery is still possible. The same error remains available from `close` even
+if the callback executor cannot deliver it. Match the non-exhaustive enum with
+a wildcard arm.
+
+### Return values
+
+A `Subscription` with one stable ID across receiver replacements. Retain it to
+keep observation active; dropping it requests unsubscribe without waiting.
+
+### Errors and behavior
+
+Initial registration has the same configuration, item-size and quota errors as
+`subscribe_events`. Only `CallbackOverflow` triggers recovery. Already retained events are delivered
+before reconciliation; missed events are not replayed. `ItemTooLarge`, callback
+panic, executor failure and other terminal errors stop observation. Callback
+panic is contained and ends the subscription; it does not trigger recovery.
+
+Callbacks for this subscription never overlap. This serial ordering ends when
+the callback returns: asynchronous work it spawns needs application coordination.
+`previous` is always present because a successful registration retains its first
+`Initial`. Compare `snapshot.loss_epoch` only within one `generation`. An increase
+records SDK-observed loss history; it cannot prove every physical outage. A
+generation change requires a fresh application baseline.
+
+The subscription can be created while the monitor is stopped and survives
+stop/start. It never starts or restarts the monitor, creates a replacement named
+client, or changes the raw `subscribe_events`/`on_event` overflow policy. A
+`Closed` lifecycle event is a normal final observation. If closure happens in an
+overflow gap, the replacement baseline reports that closed state and then ends.
+
+Unsubscribe prevents new callback admission and receiver recovery. Callbacks
+already admitted may finish. `close` waits for the driver, recovery and all
+admitted callbacks; a terminal error is returned after cleanup. Polling this
+subscription's `close` from any synchronous subscription callback requests
+cancellation but rejects the wait with `InvalidInput` (field
+`subscription.close`, stage `Dispatch`). This is the
+[shared close rule](#subscriptionclose), not a recoverable-only restriction.
+Use synchronous unsubscribe there and let an external owner join.
+
+### Example
+
+This complete program exercises lifecycle observation without requiring a
+particular network transition. Real networks can change while it runs; recovery
+occurs only if its bounded queue overflows.
+
+```rust
+use open_net::{NetworkEventOptions, NetworkObservation, OpenNet, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let net = OpenNet::new()?;
+    let monitor = net.create_net_status_client("recoverable-events").await?;
+    let subscription = monitor.on_recoverable_event(
+        NetworkEventOptions::default(),
+        |context, result| match result {
+            Ok(NetworkObservation::Event(event)) => {
+                println!("{} event {}: {:?}", context.id(), event.sequence, event.kind);
+            }
+            Ok(NetworkObservation::Reconciled { previous, current }) => {
+                if previous.generation != current.generation {
+                    println!("{}: new monitor generation; reset application baseline", context.id());
+                } else if current.snapshot.loss_epoch > previous.snapshot.loss_epoch {
+                    println!("{}: SDK loss history advanced during delivery gap", context.id());
+                }
+                println!("Reconciled to {:?}", current.snapshot);
+            }
+            Err(error) => eprintln!("{} stopped: {error}", context.id()),
+            _ => {}
+        },
+    )?;
+    let work: Result<()> = async {
+        monitor.start().await?;
+        monitor.stop().await?;
+        monitor.start().await?;
+        Ok(())
+    }.await;
+    let monitor_cleanup = net.destroy_net_status_client("recoverable-events").await;
+    let observer_cleanup = subscription.close().await;
+    work.and(monitor_cleanup).and(observer_cleanup)
+}
+```

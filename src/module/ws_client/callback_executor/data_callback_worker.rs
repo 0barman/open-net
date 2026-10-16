@@ -6,8 +6,8 @@ use tokio::sync::Notify;
 
 /// 一个无 Tokio 上下文的专用数据回调线程及其单任务邮箱。
 ///
-/// 工作器不持有邮箱发送端，客户端关闭入口后可自然退出；不保存 JoinHandle，避免
-/// 用户回调永久阻塞时把网络关闭流程也拖住。
+/// 工作器不持有邮箱发送端，客户端关闭入口后可自然退出。引擎保留退出回执；
+/// 单客户端网络关闭仍不等待永久阻塞的用户回调。
 pub(super) struct DataCallbackWorker {
     /// 仅接受已占用该 worker 运行槽的任务，不构成另一条待准入业务队列。
     sender: mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
@@ -19,14 +19,16 @@ pub(super) struct DataCallbackWorker {
 
 impl DataCallbackWorker {
     /// 按需创建一个线程；资源不足时保留操作系统错误供连接工作器处理。
-    pub(super) fn start(available: Arc<Notify>) -> io::Result<Self> {
+    pub(super) fn start(
+        available: Arc<Notify>,
+        threads: &Arc<crate::common::retirement::ThreadRegistry>,
+    ) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(1);
         let alive = Arc::new(AtomicBool::new(true));
         let worker_alive = Arc::clone(&alive);
         let worker_available = Arc::clone(&available);
-        std::thread::Builder::new()
-            .name("open-net-ws-data-callback".to_string())
-            .spawn(move || {
+        threads
+            .spawn_tracked_without_reaping("open-net-ws-data-callback", move || {
                 let _lifetime = WorkerLifetime {
                     alive: worker_alive,
                     available: worker_available,

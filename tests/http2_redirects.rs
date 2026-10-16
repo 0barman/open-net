@@ -57,15 +57,14 @@ impl Peer {
 }
 
 fn tls_acceptor(alpn: &[u8]) -> TestResult<TlsAcceptor> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(
-        CertificateDer::pem_slice_iter(SERVER).collect::<Result<Vec<_>, _>>()?,
-        PrivateKeyDer::from_pem_slice(SERVER_KEY)?,
-    )?;
+    let mut tls =
+        rustls::ServerConfig::builder_with_provider(Arc::new(rustls_openssl::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(
+                CertificateDer::pem_slice_iter(SERVER).collect::<Result<Vec<_>, _>>()?,
+                PrivateKeyDer::from_pem_slice(SERVER_KEY)?,
+            )?;
     tls.alpn_protocols = vec![alpn.to_vec()];
     Ok(TlsAcceptor::from(Arc::new(tls)))
 }
@@ -559,3 +558,6 @@ async fn combined_providers_reject_downgrades_and_preserve_secure_redirects() ->
     }
     preserves_secure_redirects(Provider::AuthAndCookies).await
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

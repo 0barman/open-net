@@ -8,6 +8,101 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
+#[cfg(test)]
+#[test]
+fn explicit_ws_providers_remain_isolated_and_preserve_protocol_policy() -> TestResult {
+    use crate::network::TlsConfig;
+    use std::sync::Arc;
+
+    let unrestricted = crate::module::tls::local_provider();
+    let mut restricted = (*unrestricted).clone();
+    restricted
+        .cipher_suites
+        .retain(|suite| suite.tls13().is_some());
+    let restricted = Arc::new(restricted);
+    let first = CompiledNetworkConfig::new(
+        NetworkConfig::default()
+            .with_tls(TlsConfig::default().with_crypto_provider(Arc::clone(&restricted))),
+    )?;
+    let second = CompiledNetworkConfig::new(
+        NetworkConfig::default()
+            .with_tls(TlsConfig::default().with_crypto_provider(Arc::clone(&unrestricted))),
+    )?;
+    assert!(Arc::ptr_eq(first.tls.crypto_provider(), &restricted));
+    assert!(Arc::ptr_eq(second.tls.crypto_provider(), &unrestricted));
+    assert!(first.tls.alpn_protocols.is_empty());
+    assert!(!first.tls.enable_early_data);
+    assert!(first.tls.enable_sni);
+    assert!(first
+        .tls
+        .crypto_provider()
+        .cipher_suites
+        .iter()
+        .all(|suite| suite.tls13().is_some()));
+    assert!(second
+        .tls
+        .crypto_provider()
+        .cipher_suites
+        .iter()
+        .any(|suite| suite.tls13().is_none()));
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn ws_identity_is_loaded_by_final_provider_in_either_builder_order() -> TestResult {
+    use crate::network::{ClientIdentity, TlsConfig};
+    use rustls::pki_types::PrivateKeyDer;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct RejectKeys;
+    impl rustls::crypto::KeyProvider for RejectKeys {
+        fn load_private_key(
+            &self,
+            _: PrivateKeyDer<'static>,
+        ) -> Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
+            Err(rustls::Error::General("test key rejection".into()))
+        }
+    }
+    static REJECT_KEYS: RejectKeys = RejectKeys;
+    let identity = ClientIdentity::from_pem(
+        include_bytes!("../../../tests/fixtures/network/client.pem"),
+        include_bytes!("../../../tests/fixtures/network/client-key.pem"),
+    )?;
+    let accepted = crate::module::tls::local_provider();
+    let mut rejected = (*accepted).clone();
+    rejected.key_provider = &REJECT_KEYS;
+    let rejected = Arc::new(rejected);
+    let normal = NetworkConfig::default().with_tls(
+        TlsConfig::default()
+            .with_client_identity(identity.clone())
+            .with_crypto_provider(accepted),
+    );
+    normal.validate()?;
+    assert!(CompiledNetworkConfig::new(normal)?
+        .tls
+        .client_auth_cert_resolver
+        .has_certs());
+    for tls in [
+        TlsConfig::default()
+            .with_client_identity(identity.clone())
+            .with_crypto_provider(rejected.clone()),
+        TlsConfig::default()
+            .with_crypto_provider(rejected)
+            .with_client_identity(identity),
+    ] {
+        let config = NetworkConfig::default().with_tls(tls);
+        assert!(
+            matches!(config.validate(), Err(error) if error.kind() == crate::error::ErrorKind::InvalidConfig)
+        );
+        assert!(
+            matches!(CompiledNetworkConfig::new(config), Err(error) if error.kind() == crate::error::ErrorKind::InvalidConfig)
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn network_status_policy_defaults_to_ignore_and_clones_preserve_opt_in() -> TestResult {
     use crate::api::network_config::NetworkStatusPolicy;

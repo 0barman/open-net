@@ -9,7 +9,7 @@ use crate::ws::{
     ConnectionId, IncomingMessage, IncomingOrigin, IncomingPayload, IoEndKind, PeerClose,
     ResponseRoute, ResponseRouting,
 };
-use futures::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc;

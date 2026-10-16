@@ -770,7 +770,10 @@ impl<T: Send + Sync + 'static> EventRegistration<T> {
                         id: self.id,
                         control: Arc::downgrade(&control),
                     };
-                    catch_unwind(AssertUnwindSafe(|| callback(context, item)))
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let _scope = super::CallbackScope::enter();
+                        callback(context, item)
+                    }))
                 }
                 (Delivery::Done, _) => {
                     self.unsubscribe();

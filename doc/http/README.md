@@ -12,8 +12,24 @@ the library directory containing `Cargo.toml` in your checkout.
 ```toml
 [dependencies]
 open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 Each Rust block is a separate program: copy one block to `src/main.rs` and run
 `cargo check` to compile it. Examples that send requests need an HTTP server at
@@ -25,7 +41,11 @@ Compilation alone does not test server availability or platform monitoring.
 `HttpClient` supports buffered responses, streaming bodies and owned callback
 requests. Import it from `open_net::api::http`; it is not re-exported at the crate
 root. `OpenNet` optionally manages named clients and attaches a network context.
-A standalone constructor is also supported.
+A standalone constructor is also supported. For lazy initialization shared by
+multiple consumers, register a fixed configuration with
+[`OpenNet::managed_http`](lifecycle.md#opennetmanaged_http), await its `get`, and
+use the returned `HttpClient` normally. The managed handle owns initialization
+and shutdown coordination; it does not duplicate request methods.
 
 `async fn` creates work that progresses when its future is polled; `.await` waits
 without blocking the async executor thread. `?` returns an error to the caller.
@@ -36,9 +56,10 @@ but those lanes do not replace the caller's Tokio runtime. Poll response-returni
 requests and waiting admission methods inside an active Tokio runtime with time
 enabled: their admission/total deadlines can create Tokio timers on the caller.
 Opening `stream()` or `sse()` additionally uses the caller's network I/O driver.
-Await `shutdown()` and `shutdown_graceful()` inside Tokio too: worker joins use
-`tokio::task::spawn_blocking`. Polling these operations with only a generic
-executor can panic instead of returning a `NetError`.
+`shutdown()` and `shutdown_graceful()` can be awaited on another executor without
+a caller Tokio runtime. The SDK owns cleanup; cancelling a shutdown waiter or
+stopping its runtime does not cancel accepted cleanup. This does not remove the
+runtime requirements for requests or open streams described above.
 
 `#[tokio::main]` provides the required runtime in the examples. Synchronous
 applications can own an enabled Tokio runtime and use its `block_on`, as shown
@@ -52,9 +73,12 @@ keep being driven. See [stream lifetime](streaming_and_sse.md#stream-lifetime-an
 
 Disabling default features removes the default WebSocket selection for this
 dependency declaration. `features = ["http-client"]` without
-`default-features = false` retains default WebSocket support. Cargo features
-are additive across dependencies. Response JSON decoding is included in
-`http-client`; request codecs require `http-client-codecs`.
+`default-features = false` retains that default. Neither transport feature
+selects a cryptographic provider. Configure a rustls 0.23 provider with
+`HttpTlsConfig::with_crypto_provider` or initialize it in the host application
+before client creation; see [TLS providers](../tls.md).
+Cargo features are additive across dependencies. Response JSON decoding is
+included in `http-client`; request codecs require `http-client-codecs`.
 
 ## Quick start
 
@@ -67,6 +91,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HttpStatusPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "quick-start",
     )?;
@@ -124,6 +151,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -182,6 +212,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let engine = open_net::OpenNet::new()?;
     let client = HttpClient::new_with_network_status(
         HttpClientConfig::new("http://127.0.0.1:8080")?,
@@ -206,7 +239,7 @@ but leaves their registry name reserved; destroy the client to release the name.
 | `OpenNet::new_with_config(config: OpenNetConfig) -> Result<Self, NetError>` | Engine configuration by value | New engine, or invalid configuration/runtime failure. HTTP settings still belong to HttpClientConfig. |
 | `async create_http_client_with_config(&self, thread_name: &str, config: HttpClientConfig) -> Result<HttpClient, NetError>` | Name and owned configuration | Shared handle bound to the engine's network context. `ClientAlreadyExists` for a reserved name; input/configuration/runtime errors otherwise. |
 | `get_http_client(&self, thread_name: &str) -> Result<HttpClient, NetError>` | Name | A clone of the same handle. `ClientNotFound` if absent; `ConnectionClosing` while creating/closing; `InvalidInput` if blank. |
-| `async destroy_http_client(&self, thread_name: &str) -> Result<(), NetError>` | Name | `Ok(())` after cancellation, callbacks and worker cleanup; releases the name. Missing name returns `ClientNotFound`; an already creating/closing slot returns `ConnectionClosing`. |
+| `async destroy_http_client(&self, thread_name: &str) -> Result<(), NetError>` | Name | `Ok(())` after cancellation, callbacks and worker cleanup; releases the name. Missing name returns `ClientNotFound`; a legacy creating/closing slot returns `ConnectionClosing`; a managed slot joins its shared shutdown. |
 
 The engine constructors have complete per-function descriptions in
 [OpenNet::new](../net_status/README.md#opennetnew) and
@@ -226,6 +259,9 @@ use open_net::api::http::HttpClientConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let engine = OpenNet::new_with_config(OpenNetConfig::default())?;
     let client = engine.create_http_client_with_config(
         "api", HttpClientConfig::new("http://127.0.0.1:8080")?,
@@ -241,10 +277,12 @@ async fn main() -> Result<(), open_net::NetError> {
 
 ## Integration guides
 
+- [Awaiting a buffered response](requests_and_responses.md#awaiting-a-buffered-response)
 - [Requests and buffered responses](requests_and_responses.md)
 - [Owned callback requests and completion handles](callback_requests.md)
 - [Streaming and raw SSE data](streaming_and_sse.md)
 - [Cancellation and shutdown](lifecycle.md)
+- [Engine shutdown and subscription lifetime](../lifecycle.md)
 - [Network observations](network_status.md)
 - [Client configuration](configuration.md)
 - [Request codecs](request_codecs.md)
@@ -268,6 +306,9 @@ async function, use `.await` directly instead of nesting `block_on`.
 use open_net::api::http::{HttpClient, HttpClientConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -349,7 +390,7 @@ Not applicable.
 
 ### Errors and behavior
 
-`InvalidInput` rejects a blank name, `ClientNotFound` means no slot exists, and `ConnectionClosing` means its slot is creating/closing. Clones share capacity and shutdown state. Shutting down the client does not release its registry name.
+`InvalidInput` rejects a blank name, `ClientNotFound` means no slot exists, and `ConnectionClosing` means its slot is not ready for retrieval. For a managed registration this includes declared-but-unused, initializing, closing and raw-client-closed states; this lookup never starts initialization. Use `ManagedHttpClient::get` to initialize it. Clones share capacity and shutdown state. Shutting down a raw client does not release its registry name.
 
 ### Example
 
@@ -385,7 +426,7 @@ Not applicable.
 
 ### Errors and behavior
 
-`ClientNotFound` means no registration exists; `ConnectionClosing` means creation/closing is in progress. Destruction closes admission and cancels accepted work while allowing callbacks to finish. Once submitted, the destruction job continues if its waiting future is dropped. Existing clones remain closed.
+`ClientNotFound` means no registration exists; `ConnectionClosing` means a legacy registration is creating/closing. A managed registration instead begins or joins its shared shutdown, including when it has never initialized. Destruction closes admission and cancels accepted work while allowing callbacks to finish. Once submitted, the destruction job continues if its waiting future is dropped. Existing clones remain closed.
 
 ### Example
 

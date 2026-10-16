@@ -37,6 +37,7 @@ pub(super) fn task_with_provider(
             client_config: WebSocketClientConfig::default(),
             network: Arc::new(CompiledNetworkConfig::new(NetworkConfig::default())?),
             provider_slots: Arc::new(Semaphore::new(1)),
+            resource_threads: Arc::new(crate::common::retirement::ThreadRegistry::new()),
             generation: 104,
             cancel: CancellationToken::new(),
             network_available: Arc::new(Notify::new()),

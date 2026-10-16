@@ -33,6 +33,41 @@ fn concurrent_first_start_creates_one_fixed_worker_set() -> TestResult {
 }
 
 #[test]
+fn engine_retirement_waits_for_listener_after_nonblocking_close() -> TestResult {
+    use crate::common::retirement::ExecutionScope;
+    let threads = Arc::new(ThreadRegistry::new());
+    let executor = ListenerExecutor::new_with_threads("retiring-listener", 1, 4, threads.clone())?;
+    let retained = executor.clone();
+    executor.ensure_started()?;
+    let (entered, started) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    executor.try_submit(Box::new(move || {
+        let _ = entered.send(ExecutionScope::is_current());
+        let _ = released.recv_timeout(DEADLINE);
+    }))?;
+    check!(started.recv_timeout(DEADLINE)?)?;
+    executor.close()?;
+    check!(retained.try_submit(Box::new(|| {})).is_err())?;
+    let (joining, joining_started) = mpsc::channel();
+    let (done, finished) = mpsc::channel();
+    let cleanup = std::thread::spawn(move || {
+        let _ = joining.send(());
+        let _ = done.send(threads.seal_and_join());
+    });
+    joining_started.recv_timeout(DEADLINE)?;
+    check!(matches!(
+        finished.recv_timeout(Duration::from_millis(30)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ))?;
+    release.send(())?;
+    check!(finished.recv_timeout(DEADLINE)?.is_ok())?;
+    cleanup
+        .join()
+        .map_err(|_| test_error("listener cleanup thread panicked"))?;
+    Ok(())
+}
+
+#[test]
 fn close_without_registration_starts_nothing_and_cannot_be_reopened() -> TestResult {
     let executor = ListenerExecutor::new("closed-lazy-listeners", 2, 8)?;
     executor.close()?;
@@ -58,13 +93,13 @@ fn close_during_startup_prevents_publication_and_retires_started_workers() -> Te
     let executor = ListenerExecutor::new("closing-starting-listeners", 2, 8)?;
     let finished = Arc::new(AtomicUsize::new(0));
     let mut attempts = 0;
-    let result = executor.ensure_started_with_spawner(|builder, task| {
+    let result = executor.ensure_started_with_spawner(|name, task| {
         attempts += 1;
         if attempts == 1 {
             executor.close().map_err(std::io::Error::other)?;
         }
         let finished = Arc::clone(&finished);
-        builder.spawn(move || {
+        executor.threads.spawn_tracked(name, move || {
             task();
             finished.fetch_add(1, Ordering::SeqCst);
         })
@@ -89,14 +124,14 @@ fn failed_startup_has_no_user_work_and_repeated_attempts_leave_no_workers() -> T
     for _ in 0..3 {
         let mut attempts = 0;
         let mut submission = None;
-        let result = executor.ensure_started_with_spawner(|builder, task| {
+        let result = executor.ensure_started_with_spawner(|name, task| {
             attempts += 1;
             if attempts == 2 {
                 submission = Some(executor.try_submit(Box::new(|| {})));
                 return Err(std::io::Error::other("injected startup failure"));
             }
             let active = Arc::clone(&active);
-            builder.spawn(move || {
+            executor.threads.spawn_tracked(name, move || {
                 active.fetch_add(1, Ordering::SeqCst);
                 task();
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -135,14 +170,14 @@ fn retry_waits_until_failed_workers_have_completely_exited() -> TestResult {
     let starter = Arc::clone(&executor);
     let failing = std::thread::Builder::new().spawn(move || {
         let mut attempts = 0;
-        starter.ensure_started_with_spawner(|builder, task| {
+        starter.ensure_started_with_spawner(|name, task| {
             attempts += 1;
             if attempts == 2 {
                 return Err(std::io::Error::other("injected startup failure"));
             }
             let retiring = retiring.clone();
             let released = Arc::clone(&released);
-            builder.spawn(move || {
+            starter.threads.spawn_tracked(name, move || {
                 task();
                 let _ = retiring.send(());
                 if let Ok(released) = released.lock() {
@@ -154,9 +189,9 @@ fn retry_waits_until_failed_workers_have_completely_exited() -> TestResult {
     observed_retiring.recv_timeout(DEADLINE)?;
     let retry_executor = Arc::clone(&executor);
     let retry = std::thread::Builder::new().spawn(move || {
-        retry_executor.ensure_started_with_spawner(|builder, task| {
+        retry_executor.ensure_started_with_spawner(|name, task| {
             let _ = retry_spawned.send(());
-            builder.spawn(task)
+            retry_executor.threads.spawn_tracked(name, task)
         })
     })?;
     check!(observed_retry

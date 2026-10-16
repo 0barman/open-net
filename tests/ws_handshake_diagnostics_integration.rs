@@ -1033,3 +1033,6 @@ async fn late_old_session_diagnostics_survive_a_new_session_without_cancelling_i
     .await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -5,9 +5,25 @@ Required feature: `http-client-cookies` (includes `http-client`). Cookie process
 ```toml
 [dependencies]
 open-net = { path = "../open-net", default-features = false, features = ["http-client-cookies"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 Adjust the local path to this checkout. Public Cookie types, `Url`, `Method`, `HeaderMap` and `HeaderValue` are re-exported by `open_net::api::http`. `Arc` is `std::sync::Arc`.
 
@@ -81,6 +97,9 @@ use open_net::NetError;
 
 #[tokio::main]
 async fn main() -> Result<(), NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let limits = CookieLimits { max_cookies: 100, ..CookieLimits::default() };
     limits.validate()?;
     let jar = CookieJar::with_limits(limits)?;

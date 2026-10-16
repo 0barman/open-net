@@ -196,9 +196,11 @@ fn public_configuration_still_rejects_invalid_proxy_and_tls_material() -> TestRe
             "invalid exclusive trust roots must remain rejected",
         )?;
     }
+    let mismatched =
+        ClientIdentity::from_pem(CLIENT, include_bytes!("fixtures/network/server-key.pem"))?;
     check(
         matches!(
-            ClientIdentity::from_pem(CLIENT, include_bytes!("fixtures/network/server-key.pem")),
+            NetworkConfig::default().with_tls(TlsConfig::default().with_client_identity(mismatched)).validate(),
             Err(ref __classified_error_0) if matches!(__classified_error_0.kind(), open_net::error::ErrorKind::InvalidConfig)),
         "mismatched private key must remain rejected",
     )
@@ -284,3 +286,6 @@ fn invalid_network_configuration_reports_fields_without_exposing_input() -> Test
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

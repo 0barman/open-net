@@ -28,6 +28,13 @@ pub(crate) struct CompiledNetworkConfig {
 impl CompiledNetworkConfig {
     pub(crate) fn new(config: NetworkConfig) -> Result<Self, NetError> {
         let original = Arc::new(config.clone());
+        let provider = crate::module::tls::select_provider(config.tls.provider.as_ref())?;
+        let identity = config
+            .tls
+            .identity
+            .as_ref()
+            .map(|identity| identity.compile(&provider))
+            .transpose()?;
         let mut roots = crate::module::tls::root_store(
             config.tls.root_mode == crate::api::network_config::RootCertificateMode::Append,
         );
@@ -39,15 +46,14 @@ impl CompiledNetworkConfig {
         if roots.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidConfig));
         }
-        let builder =
-            rustls::ClientConfig::builder_with_provider(crate::module::tls::local_provider())
-                .with_safe_default_protocol_versions()
-                .map_err(|_| NetError::from(crate::error::ErrorKind::InvalidConfig))?
-                .with_root_certificates(roots);
-        let mut tls = match config.tls.identity {
-            Some(identity) => builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(
-                identity.certified_key,
-            ))),
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| NetError::from(crate::error::ErrorKind::InvalidConfig))?
+            .with_root_certificates(roots);
+        let mut tls = match identity {
+            Some(identity) => {
+                builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(identity)))
+            }
             None => builder.with_no_client_auth(),
         };
         // Keep the original HTTP/1.1 upgrade behavior; do not offer h2/ALPN or

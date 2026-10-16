@@ -12,9 +12,25 @@ the library directory containing `Cargo.toml` in your checkout.
 ```toml
 [dependencies]
 open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 serde_json = "1"
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 Each Rust block is a separate program: copy one block to `src/main.rs` and run
 `cargo check` to compile it. Examples that send requests need an HTTP server at
@@ -101,6 +117,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HttpRequest, Method};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -159,6 +178,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -216,6 +238,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HeaderMap, HeaderValue};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -275,6 +300,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -333,6 +361,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HeaderMap, HeaderValue};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -389,6 +420,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -446,6 +480,9 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HeaderMap};
 
 #[tokio::main]
 async fn main() -> Result<(), open_net::NetError> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -472,7 +509,7 @@ arguments shown are required. There are no callbacks. Start with
 | Function signature | Purpose and defaults |
 | --- | --- |
 | `HttpRequest::builder() -> HttpRequestBuilder` | Defaults to GET, empty path, empty headers/body, inherited retry/admission and no timeout overrides. |
-| `method(self, method: impl Into<Method>) -> Self` | Change method; `Method` is re-exported by `open_net::api::http`. |
+| `method(self, method: impl TryInto<Method>) -> Self` | Change method; invalid tokens cause `build()` to return `InvalidInput`. `Method` is re-exported by `open_net::api::http`. |
 | `path(self, path: impl Into<String>) -> Self` | Set the target. Empty is invalid at build; full same-origin validation occurs at dispatch. |
 | `headers(self, headers: HeaderMap) -> Self` | Replace the entire request-specific map. |
 | `header(self, name: impl TryInto<HeaderName>, value: impl TryInto<HeaderValue>) -> Result<Self, NetError>` | Insert/replace one header; invalid conversions return `InvalidInput`. The method consumes the builder even on error. HeaderName is available at the crate root. |
@@ -601,6 +638,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 A missing Option value means that diagnostic is unavailable. Configuration errors
 expose `field() -> &str` and `reason() -> &str`.
 
+If response headers arrived but body collection failed, inspect
+`error.http_response_head()` for the retained status and headers. A retained head
+does not turn a failed body read into a successful response; handle the original
+error as well. Failures before response headers have no head.
+Explicit cancellation also has no head, even if headers arrived before the
+cancellation won. Retried attempts do not reuse an earlier attempt's metadata.
+See [`NetError::http_response_head()`](#neterrorhttp_response_head) for the full
+buffered-response contract and an inspection example.
+
 For HTTP-only consumers the public ErrorContext fields are
 `stage: Option<ErrorStage>`, `http_status: Option<StatusCode>`,
 `http_request_id: Option<HttpRequestId>`, `http_timeout_phase: Option<TimeoutPhase>`
@@ -610,6 +656,102 @@ Useful classifications include `InvalidInput`, `InvalidConfig`, `QueueFull`,
 `Closed`, `Dns`, `Tls`, `Io`, `Protocol`, `Cancelled`, `TimedOut`,
 `DeadlineExceeded`, `RetryExhausted`, `ItemTooLarge` and `HttpStatus`.
 Do not classify all errors as HTTP status failures.
+
+## `NetError::http_response_head()`
+
+Inspect status and headers received before a buffered response body failed.
+
+### Required features
+
+`http-client`. Import `HttpResponseHead` from `open_net::api::http`; `NetError`
+is also exported at the crate root.
+
+### Function signature
+
+```text
+pub fn http_response_head(&self) -> Option<&HttpResponseHead>
+```
+
+### Steps
+
+Match the request's `Result`. On `Err`, first inspect the original failure, then
+use this optional metadata to explain which response could not be fully read.
+Retain the error while borrowing its head, or clone the head to keep it separately.
+
+### Parameters
+
+No argument beyond `&self`, the error returned by a buffered request or delivered
+to a callback's `deal_with_response` handler.
+
+### Callback parameters
+
+None. This accessor does not invoke `HttpRequestTrait::on_response_headers`.
+That hook runs only for a final successfully buffered response.
+
+### Return values
+
+`Some(&HttpResponseHead)` borrows these public fields from the error:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `status` | `StatusCode` | Actual status received from the peer for this attempt. |
+| `headers` | `HeaderMap` | Received headers, including repeated and potentially sensitive values. |
+
+`None` means no retained head is available. `HttpResponseHead` implements `Clone`;
+its `Debug` output includes status and header count, omitting header values.
+`error.http_status()` also reports the status when a head is retained.
+
+### Errors and behavior
+
+The accessor itself cannot fail. Body size limits, read errors and body-phase
+timeouts can carry a head once headers have arrived. The request remains `Err`,
+even when the status is 200; this is not a partially successful `HttpResponse`
+and no partial body is exposed here. Continue handling `kind()`, `context()`,
+`source()` and `timeout_phase()` as the authoritative failure diagnostics.
+
+Failures before receiving a response and explicit cancellation have no head.
+Each retry has its own metadata: a later attempt that fails before headers does
+not inherit an earlier response. Streamed responses expose status and headers
+on `HttpStreamResponse` before body consumption; this accessor describes buffered
+collection failures. Read only the header values the application needs and avoid
+logging secrets or arbitrary peer-supplied values.
+
+### Example
+
+Run a local HTTP server whose `/large` route returns a body longer than 16 bytes.
+This program deliberately sets a small buffered-body limit. A size failure after
+headers should print a retained status; a connection failure before headers prints
+that no head is available. Cleanup runs in either case.
+
+```rust
+use open_net::api::http::{HttpClient, HttpClientConfig};
+use std::error::Error;
+
+#[tokio::main]
+async fn main() -> open_net::Result<()> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
+    let config = HttpClientConfig::new("http://127.0.0.1:8080")?
+        .with_max_response_bytes(16)?;
+    let client = HttpClient::new(config, "response-head")?;
+    let result = client.get("/large").await;
+    let cleanup = client.shutdown().await;
+    match result {
+        Ok(response) => println!("Complete response: {}", response.status()),
+        Err(error) => {
+            eprintln!("Failure: {:?}, timeout: {:?}", error.kind(), error.timeout_phase());
+            if let Some(head) = error.http_response_head() {
+                eprintln!("Received HTTP {}, {} headers", head.status, head.headers.len());
+            } else {
+                eprintln!("No retained response head");
+            }
+            eprintln!("Underlying source present: {}", error.source().is_some());
+        }
+    }
+    cleanup
+}
+```
 
 ## `HttpRequest::builder()`
 
@@ -656,7 +798,7 @@ Defaults are GET, empty headers/body/path, inherited retry/admission and no time
 ### Function signature
 
 ```text
-pub fn method(self, method: impl Into<Method>) -> Self
+pub fn method(self, method: impl TryInto<Method>) -> Self
 ```
 
 ### Steps
@@ -677,7 +819,11 @@ The updated owned builder.
 
 ### Errors and behavior
 
-The last call replaces the previous method. Choosing a non-idempotent method changes replay safety; see the retry guide. Conversion follows the supplied Into implementation.
+The last call replaces the previous method, including any conversion error.
+Conversion follows the supplied TryInto implementation. Invalid method tokens are
+reported by `build()` as `InvalidInput` at `RequestBuild`, without exposing the
+supplied text or substituting another method. Choosing a non-idempotent method
+changes replay safety; see the retry guide.
 
 ### Example
 
@@ -1732,3 +1878,84 @@ This classifies a user or transport provider failure. Specific SDK provider boun
 ### Example
 
 [Structured error example](#structured-error-example) calls this method without contacting a server.
+
+## Awaiting a buffered response
+
+When application code needs one buffered response to continue an async operation,
+use `client.request(request).await` directly. There is no need to implement
+`HttpRequestTrait`, forward its callback through a oneshot channel, or maintain a
+second cancel-on-drop guard. Owned callbacks are useful when the SDK should
+run a request's response handler; see [callback requests](callback_requests.md).
+
+This example uses waiting admission and explicitly disables retries even
+if the client's defaults change. `remaining` must be positive. Disabling the
+separate admission timeout leaves the total budget in force, including while
+waiting for capacity. The program needs a local `/echo` endpoint and the
+dependencies listed above.
+
+```rust
+use open_net::api::http::{
+    HttpAdmissionPolicy, HttpClient, HttpClientConfig, HttpRequest, HttpResponse,
+    HttpTimeouts, RetryPolicy,
+};
+use std::time::Duration;
+
+async fn post_json(
+    client: &HttpClient,
+    body: String,
+    remaining: Duration,
+) -> open_net::Result<HttpResponse> {
+    let request = HttpRequest::builder()
+        .method("POST")
+        .path("/echo")
+        .header("content-type", "application/json")?
+        .body(body.into_bytes().into())
+        .admission_policy(HttpAdmissionPolicy::Wait)
+        .retry_policy(RetryPolicy::no_retry())
+        .timeouts(
+            HttpTimeouts::new()
+                .with_total_timeout(remaining)
+                .without_admission_timeout(),
+        )
+        .build()?;
+    client.request(request).await
+}
+
+#[tokio::main]
+async fn main() -> open_net::Result<()> {
+    rustls_openssl::default_provider()
+        .install_default()
+        .expect("install the application TLS provider once");
+    let client = HttpClient::new(
+        HttpClientConfig::new("http://127.0.0.1:8080")?, "async-response",
+    )?;
+    let result = post_json(&client, r#"{"hello":"world"}"#.into(), Duration::from_secs(3)).await;
+    let cleanup = client.shutdown().await;
+    if let Err(error) = &result {
+        if let Some(head) = error.http_response_head() {
+            eprintln!("HTTP {} received before failure; {} headers", head.status, head.headers.len());
+        }
+    }
+    let response = result?;
+    cleanup?;
+    println!("{}: {} bytes", response.status(), response.body().len());
+    Ok(())
+}
+```
+
+The request's total budget starts when it is polled for admission. It excludes
+client lookup/creation and earlier application work. If those operations share
+one application deadline, bound them separately, compute the remaining duration
+before building the request, and reject an exhausted budget instead of passing
+zero. Keep [the caller's Tokio runtime](README.md#start-here) alive while requests
+or open streams use it; the Future API requires that runtime as well.
+Shutdown itself can be awaited without that runtime because the SDK
+owns cleanup.
+
+Dropping a pending request future requests cancellation; it neither waits for
+cleanup nor rolls back server-side effects. Session checks, 401 handling,
+application error codes, accepting only status 200, and application URL construction
+belong in the application's adapter. Recheck application state before applying a
+delivered result. For teardown, follow [cancellation and shutdown](lifecycle.md):
+HTTP request callbacks must finish, while network observation callbacks require
+their own external `Subscription::close()` wait.

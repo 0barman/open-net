@@ -94,7 +94,9 @@ fn succeeds(provider: &str, order: &str) -> TestResult<String> {
             }
         }
     }
-    if order.split(',').any(|step| step == "sdk-http")
+    if order
+        .split(',')
+        .any(|step| matches!(step, "sdk-http" | "sdk-http-explicit-tls13"))
         && (!stdout.contains("sdk-http-response:200:ok")
             || !stdout.contains("handshake:TLSv1_3:alpn=http/1.1"))
     {
@@ -110,7 +112,7 @@ fn succeeds(provider: &str, order: &str) -> TestResult<String> {
 fn initialized_host_supports_every_cold_start_order() -> TestResult {
     let orders = permutations(&["legacy", "open-net", "sdk-http", "http"]);
     assert_eq!(orders.len(), 24);
-    for provider in ["ring", "aws-lc", "custom"] {
+    for provider in ["openssl", "custom"] {
         for order in &orders {
             succeeds(provider, order)?;
         }
@@ -119,18 +121,32 @@ fn initialized_host_supports_every_cold_start_order() -> TestResult {
 }
 
 #[test]
-fn no_host_provider_supports_real_sdk_http_and_ws_in_every_order() -> TestResult {
-    let orders = permutations(&["open-net", "sdk-http", "http"]);
+fn no_host_provider_returns_typed_errors_and_explicit_clients_work_in_every_order() -> TestResult {
+    let orders = permutations(&[
+        "missing-provider",
+        "sdk-ws-explicit-tls13",
+        "sdk-http-explicit-tls13",
+    ]);
     assert_eq!(orders.len(), 6);
     for order in orders {
-        succeeds("none", &order)?;
+        let stdout = succeeds("none", &order)?;
+        if !stdout.contains("sdk-ws-missing-provider:InvalidConfig")
+            || !stdout.contains("sdk-http-missing-provider:InvalidConfig")
+        {
+            return Err("missing-provider errors were not verified for both clients".into());
+        }
     }
     Ok(())
 }
 
 #[test]
 fn missing_default_remains_ambiguous_after_sdk_or_external_http() -> TestResult {
-    for order in permutations(&["legacy", "open-net", "sdk-http", "http"]) {
+    for order in permutations(&[
+        "legacy",
+        "sdk-ws-explicit-tls13",
+        "sdk-http-explicit-tls13",
+        "http",
+    ]) {
         let output = child("none", &order)?;
         let stderr = String::from_utf8(output.stderr)?;
         if output.status.success()
@@ -166,9 +182,12 @@ fn missing_default_remains_ambiguous_after_sdk_or_external_http() -> TestResult 
 
 #[test]
 fn unrestricted_providers_support_sdk_http_and_ws_tls12() -> TestResult {
-    for provider in ["none", "ring", "aws-lc"] {
-        for order in ["sdk-http-tls12,sdk-ws-tls12", "sdk-ws-tls12,sdk-http-tls12"] {
-            let stdout = succeeds(provider, order)?;
+    for (provider, steps) in [
+        ("none", ["sdk-http-explicit-tls12", "sdk-ws-explicit-tls12"]),
+        ("openssl", ["sdk-http-tls12", "sdk-ws-tls12"]),
+    ] {
+        for order in permutations(&steps) {
+            let stdout = succeeds(provider, &order)?;
             if !stdout.contains("sdk-http-response:200:ok")
                 || !stdout.contains("handshake:TLSv1_2:alpn=http/1.1")
                 || !stdout.contains("handshake:TLSv1_2:alpn=none")
@@ -184,15 +203,16 @@ fn unrestricted_providers_support_sdk_http_and_ws_tls12() -> TestResult {
 }
 
 #[test]
-fn custom_host_restricts_http_but_sdk_ws_keeps_its_local_provider() -> TestResult {
+fn custom_host_restricts_both_clients_and_explicit_providers_override_it() -> TestResult {
     // The TLS 1.3 positive request rules out broken roots/configuration as an
     // explanation for TLS 1.2 rejection. Both orders expose global pollution.
     for order in [
-        "sdk-http,sdk-http-reject-tls12,sdk-ws-tls12",
-        "sdk-ws-tls12,sdk-http-reject-tls12,sdk-http",
+        "sdk-http,open-net,sdk-http-reject-tls12,sdk-ws-reject-tls12,sdk-http-explicit-tls12,sdk-ws-explicit-tls12",
+        "sdk-ws-explicit-tls12,sdk-http-explicit-tls12,sdk-ws-reject-tls12,sdk-http-reject-tls12,open-net,sdk-http",
     ] {
         let stdout = succeeds("custom", order)?;
         if !stdout.contains("sdk-http-rejected:Tls")
+            || !stdout.contains("sdk-ws-rejected:Tls")
             || !stdout.contains("handshake-rejected:TLSv1_2:host-restriction:")
             || !stdout.contains("handshake:TLSv1_2:alpn=none")
         {

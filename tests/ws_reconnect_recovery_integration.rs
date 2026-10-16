@@ -1049,3 +1049,6 @@ async fn one_hundred_concurrent_context_requests_admit_one_connection_owner() ->
     cleanup(&client, &mut peer).await?;
     outcome
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

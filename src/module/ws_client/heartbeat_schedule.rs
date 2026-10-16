@@ -57,6 +57,7 @@ mod tests {
         let mut timer = HeartbeatSchedule::new(Some(HeartbeatConfig {
             interval: Duration::from_secs(5),
             pong_timeout: Duration::from_secs(1),
+            ..Default::default()
         }))?;
         if timer.tick().now_or_never().is_some() {
             return Err(NetError::input("heartbeat", "first probe was immediate"));

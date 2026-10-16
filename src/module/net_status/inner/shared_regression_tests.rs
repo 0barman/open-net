@@ -29,6 +29,28 @@ fn service() -> Result<Arc<SharedNetworkService>, NetError> {
     )?))
 }
 
+#[tokio::test]
+async fn service_shutdown_closes_both_sampling_lanes_with_retained_handles() -> TestResult {
+    let service = service()?;
+    let context = service.context();
+    let names = context.windows_sampler()?;
+    let reachability = context.windows_reachability_sampler()?;
+    bounded(service.shutdown()).await??;
+    for sampler in [names, reachability] {
+        let result = sampler
+            .sample_background(
+                std::time::Instant::now() + Duration::from_secs(5),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        check(
+            matches!(result, Err(error) if error.kind() == ErrorKind::Closed),
+            "retained sampling lane accepted work after service shutdown",
+        )?;
+    }
+    Ok(())
+}
+
 async fn await_state(
     facts: &mut watch::Receiver<NetworkSnapshot>,
     predicate: impl Fn(&MonitorState) -> bool,

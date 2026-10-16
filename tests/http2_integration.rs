@@ -40,7 +40,7 @@ impl Peer {
 }
 
 async fn tls_peer(alpn_protocols: Vec<Vec<u8>>) -> TestResult<Peer> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls_openssl::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
@@ -222,3 +222,6 @@ async fn streaming_snapshot_updates_without_affecting_existing_lifecycle() -> Te
     peer.finish().await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;
