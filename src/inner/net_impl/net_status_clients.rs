@@ -19,6 +19,7 @@ impl OpenNetInner {
             .net_status_clients
             .lock()
             .map_err(NetError::from_poison)?;
+        self.ensure_open()?;
         if clients.contains_key(thread_name) {
             return Err(NetError::from(crate::error::ErrorKind::ClientAlreadyExists));
         }
@@ -36,6 +37,7 @@ impl OpenNetInner {
         &self,
         thread_name: &str,
     ) -> Result<NetStatusClient, NetError> {
+        self.ensure_open()?;
         let clients = self
             .net_status_clients
             .lock()
@@ -53,6 +55,7 @@ impl OpenNetInner {
         &self,
         thread_name: &str,
     ) -> Result<(), NetError> {
+        self.ensure_open()?;
         let client = {
             let mut clients = self
                 .net_status_clients

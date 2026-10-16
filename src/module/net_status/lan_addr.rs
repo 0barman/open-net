@@ -84,7 +84,7 @@ const VIRTUAL_IFACE_NAME_HINTS: &[&str] = &[
 
 /// Whether `ip` falls inside `base/prefix` (pure octet comparison; no
 /// third-party CIDR library).
-fn in_cidr(ip: Ipv4Addr, base: [u8; 4], prefix: u8) -> bool {
+pub(super) fn in_cidr(ip: Ipv4Addr, base: [u8; 4], prefix: u8) -> bool {
     let ip_bits = u32::from_be_bytes(ip.octets());
     let base_bits = u32::from_be_bytes(base);
     if prefix == 0 {
@@ -125,7 +125,7 @@ fn classify_lan_ipv4(ip: Ipv4Addr) -> Option<LanScore> {
 }
 
 /// Whether an interface name hits a virtual/proxy feature word.
-fn looks_like_virtual_iface(name: &str) -> bool {
+pub(super) fn looks_like_virtual_iface(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     // Linux container/VM networks commonly use these interface-name prefixes.
     // Keep this platform-specific and prefix-only: a host LAN may legitimately
@@ -188,7 +188,11 @@ fn pick_lan_ipv4_from(candidates: &[IfaceCandidate]) -> Option<Ipv4Addr> {
 }
 
 pub(crate) fn preferred_lan_ipv4() -> Result<Option<Ipv4Addr>, NetError> {
-    select_interface_address(if_addrs::get_if_addrs())
+    select_interface_address(enumerate_interfaces())
+}
+
+pub(super) fn enumerate_interfaces() -> std::io::Result<Vec<if_addrs::Interface>> {
+    if_addrs::get_if_addrs()
 }
 
 fn select_interface_address(

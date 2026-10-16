@@ -10,9 +10,10 @@ use crate::module::ws_client::write::control_message::ControlMessage;
 use crate::module::ws_client::write::priority_write_queue::PriorityWriteQueue;
 use crate::module::ws_client::write::queued_request::QueuedRequest;
 use crate::module::ws_client::write::write_loop_context::WriteLoopContext;
+use crate::ws::HeartbeatRetryConfig;
 use crate::ws::IoEndKind;
 use bytes::Bytes;
-use futures::{FutureExt, Sink, SinkExt};
+use futures_util::{FutureExt, Sink, SinkExt};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +35,134 @@ use tokio_util::sync::CancellationToken;
 /// 两段控制处理叠加成双倍窗口。控制通道本身仍保持高优先级，下一帧边界会
 /// 继续处理剩余项。
 const MAX_READY_CONTROLS_PER_BOUNDARY: usize = 16;
+
+struct HeartbeatRecovery {
+    config: HeartbeatRetryConfig,
+    active: bool,
+    rounds_started: usize,
+    next_deadline: Option<Instant>,
+    awaiting_pong: bool,
+    normal_retry_payload: Option<Bytes>,
+    normal_retry_attempts: usize,
+    normal_retry_deadline: Option<Instant>,
+    recovery_flush_pending: bool,
+}
+
+impl HeartbeatRecovery {
+    fn new(config: HeartbeatRetryConfig) -> Self {
+        Self {
+            config,
+            active: false,
+            rounds_started: 0,
+            next_deadline: None,
+            awaiting_pong: false,
+            normal_retry_payload: None,
+            normal_retry_attempts: 0,
+            normal_retry_deadline: None,
+            recovery_flush_pending: false,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn start(&mut self) {
+        self.active = true;
+        self.rounds_started = 0;
+        self.next_deadline = None;
+        self.awaiting_pong = false;
+        self.clear_normal_retry();
+        self.recovery_flush_pending = false;
+    }
+
+    fn finish(&mut self) {
+        self.active = false;
+        self.rounds_started = 0;
+        self.next_deadline = None;
+        self.awaiting_pong = false;
+        self.clear_normal_retry();
+        self.recovery_flush_pending = false;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.active && self.next_deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.next_deadline
+    }
+
+    fn awaiting_pong(&self) -> bool {
+        self.awaiting_pong
+    }
+
+    fn normal_retry_deadline(&self) -> Option<Instant> {
+        self.normal_retry_deadline
+    }
+
+    fn normal_retry_due(&self, now: Instant) -> bool {
+        self.normal_retry_deadline
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    fn clear_normal_retry(&mut self) {
+        self.normal_retry_payload = None;
+        self.normal_retry_attempts = 0;
+        self.normal_retry_deadline = None;
+    }
+
+    fn schedule_normal_retry(&mut self, payload: Bytes, now: Instant) -> Result<(), NetError> {
+        let deadline = now
+            .checked_add(self.config.ping_write_retry_interval)
+            .ok_or_else(|| {
+                NetError::config(
+                    "heartbeat.retry.ping_write_retry_interval",
+                    "cannot represent the retry deadline",
+                )
+            })?;
+        self.normal_retry_payload = Some(payload);
+        self.normal_retry_attempts = 1;
+        self.normal_retry_deadline = Some(deadline);
+        Ok(())
+    }
+
+    fn advance_normal_retry(&mut self, now: Instant) -> Result<(), NetError> {
+        self.normal_retry_attempts = self.normal_retry_attempts.saturating_add(1);
+        self.normal_retry_deadline = Some(
+            now.checked_add(self.config.ping_write_retry_interval)
+                .ok_or_else(|| {
+                    NetError::config(
+                        "heartbeat.retry.ping_write_retry_interval",
+                        "cannot represent the retry deadline",
+                    )
+                })?,
+        );
+        Ok(())
+    }
+
+    fn begin_round(&mut self) -> bool {
+        if self.rounds_started >= self.config.pong_recovery_attempts {
+            return false;
+        }
+        self.rounds_started = self.rounds_started.saturating_add(1);
+        self.next_deadline = None;
+        true
+    }
+
+    fn arm_wait(&mut self, now: Instant) -> Result<(), NetError> {
+        let deadline = now
+            .checked_add(self.config.pong_retry_interval)
+            .ok_or_else(|| {
+                NetError::config(
+                    "heartbeat.retry.pong_retry_interval",
+                    "cannot represent the recovery deadline",
+                )
+            })?;
+        self.next_deadline = Some(deadline);
+        Ok(())
+    }
+}
 
 /// 驱动一个连接代次的 WebSocket 写半部，直至取消、关闭或发生 I/O 错误。
 ///
@@ -94,6 +223,10 @@ pub(crate) async fn run_write_loop<W>(
         heartbeat_config,
         heartbeat: heartbeat_state,
     } = context;
+    let heartbeat_retry = heartbeat_config
+        .as_ref()
+        .map(|config| config.retry.clone())
+        .map_or_else(HeartbeatRetryConfig::default, |retry| retry);
     let mut heartbeat = match HeartbeatSchedule::new(heartbeat_config) {
         Ok(schedule) => schedule,
         Err(error) => {
@@ -101,6 +234,7 @@ pub(crate) async fn run_write_loop<W>(
             return;
         }
     };
+    let mut recovery = HeartbeatRecovery::new(heartbeat_retry);
     let mut consecutive_controls = 0usize;
     loop {
         // `select!` intentionally prioritizes control traffic, but a peer can keep that
@@ -110,7 +244,16 @@ pub(crate) async fn run_write_loop<W>(
             crate::log_s!(LogType::WSC; "run_write_loop", "state|generation", "write_cancelled", generation);
             return;
         }
-        if heartbeat_state.is_timed_out(Instant::now()) {
+        if recovery.is_active()
+            && !heartbeat_state.has_outstanding_probe()
+            && recovery.awaiting_pong()
+        {
+            recovery.finish();
+        }
+        if heartbeat_state.is_timed_out(Instant::now())
+            || recovery.due(Instant::now())
+            || recovery.normal_retry_due(Instant::now())
+        {
             // Tungstenite queues the peer-Close reply while reading the Close frame and then
             // rejects later Ping writes. Give one already-ready control a chance to flush that
             // reply before retiring the connection for a simultaneous Pong timeout.
@@ -138,17 +281,20 @@ pub(crate) async fn run_write_loop<W>(
                 }
                 None => {}
             }
-            // A matching Pong may have raced with the ready control above.
-            if heartbeat_state.is_timed_out(Instant::now()) {
-                send_write_end(
-                    &io_event_tx,
-                    generation,
-                    NetError::from(crate::error::ErrorKind::TimedOut)
-                        .with_stage(crate::error::ErrorStage::Heartbeat),
-                    write.end_kind(),
-                    &cancel,
-                )
-                .await;
+            if let Err(error) = service_due_heartbeat_work(
+                &mut write,
+                &heartbeat_state,
+                &mut recovery,
+                control_write_timeout,
+                None,
+                &cancel,
+            )
+            .await
+            {
+                if error.kind() != crate::error::ErrorKind::Cancelled {
+                    send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                        .await;
+                }
                 return;
             }
         }
@@ -181,9 +327,10 @@ pub(crate) async fn run_write_loop<W>(
                 }
                 None => {}
             }
-            if let Err(error) = handle_heartbeat_tick(
+            if let Err(error) = handle_heartbeat_tick_with_recovery(
                 &mut write,
                 &heartbeat_state,
+                &mut recovery,
                 pong_timeout,
                 control_write_timeout,
                 &cancel,
@@ -225,6 +372,8 @@ pub(crate) async fn run_write_loop<W>(
                 _ = cancel.cancelled() => WriteLoopEvent::Cancelled,
                 control = control_rx.recv() => WriteLoopEvent::Control(control),
                 _ = wait_for_pong_deadline(&heartbeat_state) => WriteLoopEvent::HeartbeatTimedOut,
+                _ = wait_for_recovery_deadline(recovery.next_deadline()) => WriteLoopEvent::HeartbeatRecovery,
+                _ = wait_for_recovery_deadline(recovery.normal_retry_deadline()) => WriteLoopEvent::HeartbeatRetry,
                 pong_timeout = heartbeat.tick() => WriteLoopEvent::Heartbeat(pong_timeout),
                 request = urgent_queue.next() => WriteLoopEvent::Request(
                     request,
@@ -269,26 +418,68 @@ pub(crate) async fn run_write_loop<W>(
                 return;
             }
             WriteLoopEvent::HeartbeatTimedOut => {
-                // The sleep may refer to a probe that a racing matching Pong already
-                // cleared. Re-check shared state before terminating the connection.
-                if heartbeat_state.is_timed_out(Instant::now()) {
-                    send_write_end(
-                        &io_event_tx,
-                        generation,
-                        NetError::from(crate::error::ErrorKind::TimedOut)
-                            .with_stage(crate::error::ErrorStage::Heartbeat),
-                        write.end_kind(),
-                        &cancel,
-                    )
-                    .await;
+                if let Err(error) = drive_heartbeat_recovery(
+                    &mut write,
+                    &heartbeat_state,
+                    &mut recovery,
+                    control_write_timeout,
+                    &cancel,
+                )
+                .await
+                {
+                    if error.kind() != crate::error::ErrorKind::Cancelled {
+                        send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                            .await;
+                    }
+                    return;
+                }
+            }
+            WriteLoopEvent::HeartbeatRecovery => {
+                if recovery.is_active()
+                    && !heartbeat_state.has_outstanding_probe()
+                    && recovery.awaiting_pong()
+                {
+                    recovery.finish();
+                } else if let Err(error) = drive_heartbeat_recovery(
+                    &mut write,
+                    &heartbeat_state,
+                    &mut recovery,
+                    control_write_timeout,
+                    &cancel,
+                )
+                .await
+                {
+                    if error.kind() != crate::error::ErrorKind::Cancelled {
+                        send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                            .await;
+                    }
+                    return;
+                }
+            }
+            WriteLoopEvent::HeartbeatRetry => {
+                if let Err(error) = drive_normal_ping_retry(
+                    &mut write,
+                    &heartbeat_state,
+                    &mut recovery,
+                    control_write_timeout,
+                    None,
+                    &cancel,
+                )
+                .await
+                {
+                    if error.kind() != crate::error::ErrorKind::Cancelled {
+                        send_write_end(&io_event_tx, generation, error, write.end_kind(), &cancel)
+                            .await;
+                    }
                     return;
                 }
             }
             WriteLoopEvent::Heartbeat(pong_timeout) => {
                 consecutive_controls = 0;
-                if let Err(error) = handle_heartbeat_tick(
+                if let Err(error) = handle_heartbeat_tick_with_recovery(
                     &mut write,
                     &heartbeat_state,
+                    &mut recovery,
                     pong_timeout,
                     control_write_timeout,
                     &cancel,
@@ -340,6 +531,7 @@ pub(crate) async fn run_write_loop<W>(
                     data_frame_write_timeout,
                     &mut heartbeat,
                     &heartbeat_state,
+                    &mut recovery,
                     &cancel,
                 )
                 .await;
@@ -390,6 +582,8 @@ enum WriteLoopEvent {
     Cancelled,
     Control(Option<ControlMessage>),
     HeartbeatTimedOut,
+    HeartbeatRecovery,
+    HeartbeatRetry,
     Heartbeat(Duration),
     Request(
         Option<QueuedRequest>,
@@ -526,6 +720,7 @@ async fn handle_queued_request<W>(
     data_frame_write_timeout: Duration,
     heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
     connection_cancel: &CancellationToken,
 ) -> RequestAction
 where
@@ -587,6 +782,7 @@ where
         data_frame_write_timeout,
         heartbeat,
         heartbeat_state,
+        recovery,
         connection_cancel,
         &request.dispatch_cancel,
         &request.dispatch_phase,
@@ -865,13 +1061,14 @@ where
 
 /// 在写下一个 data frame 前处理一批已经进入控制通道的指令。
 #[allow(clippy::too_many_arguments)]
-async fn drain_ready_controls<W>(
+async fn drain_ready_controls_with_recovery<W>(
     write: &mut W,
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     timeout: Duration,
     cancel: &CancellationToken,
     heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
     request_deadline: Instant,
     remaining_controls: &mut usize,
 ) -> Result<ControlAction, NetError>
@@ -887,8 +1084,16 @@ where
             crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "TimeoutError");
             return Err(NetError::from(crate::error::ErrorKind::TimedOut));
         }
-        let pong_timed_out = heartbeat_state.is_timed_out(now);
-        if *remaining_controls == 0 && !pong_timed_out {
+        service_due_heartbeat_work(
+            write,
+            heartbeat_state,
+            recovery,
+            timeout.min(request_deadline.saturating_duration_since(now)),
+            Some(request_deadline),
+            cancel,
+        )
+        .await?;
+        if *remaining_controls == 0 {
             if control_rx.is_closed() && control_rx.is_empty() {
                 return Ok(ControlAction::Stop(ControlStop::ConnectionClosed));
             }
@@ -911,11 +1116,19 @@ where
                 ) {
                     return Ok(action);
                 }
-                if pong_timed_out || heartbeat_state.is_timed_out(Instant::now()) {
-                    crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "SocketRecvTimeout");
-                    return Err(NetError::from(crate::error::ErrorKind::TimedOut)
-                        .with_stage(crate::error::ErrorStage::Heartbeat));
+                let now = Instant::now();
+                if now >= request_deadline {
+                    return Err(NetError::from(crate::error::ErrorKind::TimedOut));
                 }
+                service_due_heartbeat_work(
+                    write,
+                    heartbeat_state,
+                    recovery,
+                    timeout.min(request_deadline.saturating_duration_since(now)),
+                    Some(request_deadline),
+                    cancel,
+                )
+                .await?;
                 // A ready-control producer can refill the channel between every receive.
                 // Poll the interval after each control, not merely after the whole batch, so
                 // creation of a new Ping is delayed by at most one bounded control write.
@@ -925,9 +1138,10 @@ where
                         crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "TimeoutError");
                         return Err(NetError::from(crate::error::ErrorKind::TimedOut));
                     }
-                    handle_heartbeat_tick(
+                    handle_heartbeat_tick_with_recovery(
                         write,
                         heartbeat_state,
+                        recovery,
                         pong_timeout,
                         timeout.min(request_deadline.saturating_duration_since(now)),
                         cancel,
@@ -936,11 +1150,6 @@ where
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => {
-                if pong_timed_out {
-                    crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "SocketRecvTimeout");
-                    return Err(NetError::from(crate::error::ErrorKind::TimedOut)
-                        .with_stage(crate::error::ErrorStage::Heartbeat));
-                }
                 return Ok(ControlAction::Continue);
             }
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -954,7 +1163,302 @@ where
     Ok(ControlAction::Continue)
 }
 
+#[cfg(test)]
+async fn drain_ready_controls<W>(
+    write: &mut W,
+    control_rx: &mut mpsc::Receiver<ControlMessage>,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    heartbeat: &mut HeartbeatSchedule,
+    heartbeat_state: &HeartbeatState,
+    request_deadline: Instant,
+    remaining_controls: &mut usize,
+) -> Result<ControlAction, NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig::default());
+    drain_ready_controls_with_recovery(
+        write,
+        control_rx,
+        timeout,
+        cancel,
+        heartbeat,
+        heartbeat_state,
+        &mut recovery,
+        request_deadline,
+        remaining_controls,
+    )
+    .await
+}
+
 /// 检查当前 probe 的 Pong deadline，或发送一次新的有界等待 Ping。
+async fn handle_heartbeat_tick_with_recovery<W>(
+    write: &mut W,
+    heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
+    pong_timeout: Duration,
+    control_write_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<(), NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    crate::log_t!(LogType::WSC; "handle_heartbeat_tick", "pong_timeout_seconds|control_write_timeout_seconds", pong_timeout.as_secs_f64(), control_write_timeout.as_secs_f64());
+    if recovery.is_active() {
+        if !heartbeat_state.has_outstanding_probe() && recovery.awaiting_pong() {
+            recovery.finish();
+            return Ok(());
+        }
+        if heartbeat_state.is_timed_out(Instant::now()) || recovery.due(Instant::now()) {
+            return drive_heartbeat_recovery(
+                write,
+                heartbeat_state,
+                recovery,
+                control_write_timeout,
+                cancel,
+            )
+            .await;
+        }
+        return Ok(());
+    }
+    let payload = match heartbeat_state.on_tick(Instant::now(), pong_timeout) {
+        HeartbeatTick::Waiting => {
+            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state", "probe_already_outstanding");
+            return Ok(());
+        }
+        HeartbeatTick::TimedOut => {
+            return drive_heartbeat_recovery(
+                write,
+                heartbeat_state,
+                recovery,
+                control_write_timeout,
+                cancel,
+            )
+            .await;
+        }
+        HeartbeatTick::SendProbe(payload) => {
+            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|payload_bytes", "ping_write_started", payload.len());
+            payload
+        }
+    };
+    let send_result = send_control_frame_outcome(
+        write,
+        Message::Ping(payload.clone()),
+        control_write_timeout,
+        cancel,
+    )
+    .await;
+    match send_result {
+        ControlWriteOutcome::Complete => {
+            // If the matching Pong raced ahead of `send` completion, the reader
+            // has already cleared this payload and `mark_sent` intentionally does nothing.
+            let awaiting_pong = heartbeat_state.mark_sent(payload.as_ref(), Instant::now());
+            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|awaiting_pong", "ping_written", awaiting_pong);
+            Ok(())
+        }
+        ControlWriteOutcome::Retryable(error) if recovery.config.ping_write_retries > 0 => {
+            recovery.schedule_normal_retry(payload.clone(), Instant::now())?;
+            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|error", "ping_write_retry_scheduled", format!("{error:?}"));
+            Ok(())
+        }
+        ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => {
+            heartbeat_state.abandon_probe(payload.as_ref());
+            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|error", "probe_abandoned", format!("{error:?}"));
+            Err(error)
+        }
+    }
+}
+
+async fn drive_heartbeat_recovery<W>(
+    write: &mut W,
+    heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
+    control_write_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<(), NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    if recovery.is_active() && !heartbeat_state.has_outstanding_probe() && recovery.awaiting_pong()
+    {
+        recovery.finish();
+        return Ok(());
+    }
+    if !recovery.is_active() {
+        if !heartbeat_state.is_timed_out(Instant::now()) {
+            return Ok(());
+        }
+        if recovery.config.pong_recovery_attempts == 0 {
+            return Err(NetError::from(crate::error::ErrorKind::TimedOut)
+                .with_stage(crate::error::ErrorStage::Heartbeat));
+        }
+        recovery.start();
+    }
+    if heartbeat_state.has_outstanding_probe() && !heartbeat_state.is_timed_out(Instant::now()) {
+        return Ok(());
+    }
+    if heartbeat_state.is_timed_out(Instant::now())
+        || recovery.due(Instant::now())
+        || recovery.next_deadline().is_none()
+    {
+        if !recovery.begin_round() {
+            return Err(NetError::from(crate::error::ErrorKind::TimedOut)
+                .with_stage(crate::error::ErrorStage::Heartbeat));
+        }
+        if recovery.recovery_flush_pending {
+            if let Err(error) = flush_sink(write, control_write_timeout, cancel).await {
+                recovery.recovery_flush_pending = false;
+                return Err(error);
+            }
+            recovery.recovery_flush_pending = false;
+        }
+        let payload = heartbeat_state
+            .start_recovery_probe(Instant::now(), recovery.config.pong_retry_interval)
+            .ok_or_else(|| {
+                NetError::from(crate::error::ErrorKind::Internal)
+                    .with_stage(crate::error::ErrorStage::Heartbeat)
+            })?;
+        match send_control_frame_outcome(
+            write,
+            Message::Ping(payload.clone()),
+            control_write_timeout,
+            cancel,
+        )
+        .await
+        {
+            ControlWriteOutcome::Complete => {
+                heartbeat_state.mark_sent(payload.as_ref(), Instant::now());
+                if !heartbeat_state.has_outstanding_probe() {
+                    recovery.finish();
+                } else {
+                    recovery.awaiting_pong = true;
+                    recovery.arm_wait(Instant::now())?;
+                }
+                Ok(())
+            }
+            ControlWriteOutcome::Retryable(error) => {
+                heartbeat_state.abandon_probe(payload.as_ref());
+                recovery.awaiting_pong = false;
+                recovery.recovery_flush_pending = true;
+                recovery.arm_wait(Instant::now())?;
+                crate::log_s!(LogType::WSC; "drive_heartbeat_recovery", "state|error", "retryable_probe_write", format!("{error:?}"));
+                Ok(())
+            }
+            ControlWriteOutcome::Failed(error) => {
+                heartbeat_state.abandon_probe(payload.as_ref());
+                Err(error)
+            }
+        }
+    } else {
+        Ok(())
+    }
+}
+
+async fn drive_normal_ping_retry<W>(
+    write: &mut W,
+    heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
+    control_write_timeout: Duration,
+    request_deadline: Option<Instant>,
+    cancel: &CancellationToken,
+) -> Result<(), NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    let Some(payload) = recovery.normal_retry_payload.clone() else {
+        return Ok(());
+    };
+    // A matching Pong can race with the retry timer. If the reader already
+    // cleared the exact probe, do not emit a duplicate Ping.
+    if !heartbeat_state.has_outstanding_probe() {
+        recovery.clear_normal_retry();
+        return Ok(());
+    }
+    let now = Instant::now();
+    let timeout = match request_deadline {
+        Some(deadline) => {
+            if now >= deadline {
+                heartbeat_state.abandon_probe(payload.as_ref());
+                recovery.clear_normal_retry();
+                return Err(NetError::from(crate::error::ErrorKind::TimedOut));
+            }
+            control_write_timeout.min(deadline.saturating_duration_since(now))
+        }
+        None => control_write_timeout,
+    };
+    // WriteBufferFull means the attempted Ping was returned before acceptance. Flush the
+    // already-buffered frames first, then retry the same exact payload from this writer.
+    if let Err(error) = flush_sink(write, timeout, cancel).await {
+        heartbeat_state.abandon_probe(payload.as_ref());
+        recovery.clear_normal_retry();
+        return Err(error);
+    }
+    match send_control_frame_outcome(write, Message::Ping(payload.clone()), timeout, cancel).await {
+        ControlWriteOutcome::Complete => {
+            heartbeat_state.mark_sent(payload.as_ref(), Instant::now());
+            recovery.clear_normal_retry();
+            Ok(())
+        }
+        ControlWriteOutcome::Retryable(error)
+            if recovery.normal_retry_attempts
+                < recovery.config.ping_write_retries.saturating_add(1) =>
+        {
+            recovery.advance_normal_retry(Instant::now())?;
+            crate::log_s!(LogType::WSC; "drive_normal_ping_retry", "state|error", "retryable_ping_write", format!("{error:?}"));
+            Ok(())
+        }
+        ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => {
+            heartbeat_state.abandon_probe(payload.as_ref());
+            recovery.clear_normal_retry();
+            Err(error)
+        }
+    }
+}
+
+async fn service_due_heartbeat_work<W>(
+    write: &mut W,
+    heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
+    control_write_timeout: Duration,
+    request_deadline: Option<Instant>,
+    cancel: &CancellationToken,
+) -> Result<(), NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    if recovery.normal_retry_due(Instant::now()) {
+        drive_normal_ping_retry(
+            write,
+            heartbeat_state,
+            recovery,
+            control_write_timeout,
+            request_deadline,
+            cancel,
+        )
+        .await?;
+    }
+    if heartbeat_state.is_timed_out(Instant::now()) || recovery.due(Instant::now()) {
+        drive_heartbeat_recovery(
+            write,
+            heartbeat_state,
+            recovery,
+            control_write_timeout,
+            cancel,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_recovery_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
 async fn handle_heartbeat_tick<W>(
     write: &mut W,
     heartbeat_state: &HeartbeatState,
@@ -965,43 +1469,16 @@ async fn handle_heartbeat_tick<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "handle_heartbeat_tick", "pong_timeout_seconds|control_write_timeout_seconds", pong_timeout.as_secs_f64(), control_write_timeout.as_secs_f64());
-    let payload = match heartbeat_state.on_tick(Instant::now(), pong_timeout) {
-        HeartbeatTick::Waiting => {
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state", "probe_already_outstanding");
-            return Ok(());
-        }
-        HeartbeatTick::TimedOut => {
-            crate::log_e!(LogType::WSC; "handle_heartbeat_tick", "error", "pong_timeout");
-            return Err(NetError::from(crate::error::ErrorKind::TimedOut)
-                .with_stage(crate::error::ErrorStage::Heartbeat));
-        }
-        HeartbeatTick::SendProbe(payload) => {
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|payload_bytes", "ping_write_started", payload.len());
-            payload
-        }
-    };
-    let send_result = send_control_frame(
+    let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig::default());
+    handle_heartbeat_tick_with_recovery(
         write,
-        Message::Ping(payload.clone()),
+        heartbeat_state,
+        &mut recovery,
+        pong_timeout,
         control_write_timeout,
         cancel,
     )
-    .await;
-    match send_result {
-        Ok(()) => {
-            // If the matching Pong raced ahead of `send` completion, the reader
-            // has already cleared this payload and `mark_sent` intentionally does nothing.
-            let awaiting_pong = heartbeat_state.mark_sent(payload.as_ref(), Instant::now());
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|awaiting_pong", "ping_written", awaiting_pong);
-            Ok(())
-        }
-        Err(error) => {
-            heartbeat_state.abandon_probe(payload.as_ref());
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|error", "probe_abandoned", format!("{error:?}"));
-            Err(error)
-        }
-    }
+    .await
 }
 
 /// Waits for the currently outstanding probe's Pong deadline.
@@ -1031,6 +1508,7 @@ async fn send_request_message_with_phase<W>(
     data_frame_write_timeout: Duration,
     heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
     connection_cancel: &CancellationToken,
     dispatch_cancel: &CancellationToken,
     dispatch_phase: &OperationControl,
@@ -1061,13 +1539,14 @@ where
         let mut remaining_controls = next_control_budget;
         next_control_budget = MAX_READY_CONTROLS_PER_BOUNDARY;
         // 控制指令优先于已经到期的 heartbeat。
-        let control_action = drain_ready_controls(
+        let control_action = drain_ready_controls_with_recovery(
             write,
             control_rx,
             control_write_timeout,
             connection_cancel,
             heartbeat,
             heartbeat_state,
+            recovery,
             write_deadline,
             &mut remaining_controls,
         )
@@ -1098,9 +1577,10 @@ where
             if now >= write_deadline {
                 return Err(RequestWriteFailure::deadline(wrote_frame, wrote_frame));
             }
-            handle_heartbeat_tick(
+            handle_heartbeat_tick_with_recovery(
                 write,
                 heartbeat_state,
+                recovery,
                 pong_timeout,
                 control_write_timeout.min(write_deadline.saturating_duration_since(now)),
                 connection_cancel,
@@ -1110,13 +1590,14 @@ where
         }
         // heartbeat 写入期间可能又收到 Ping/Close，因此紧邻 data frame 再排空一次。
         if remaining_controls > 0 {
-            let control_action = drain_ready_controls(
+            let control_action = drain_ready_controls_with_recovery(
                 write,
                 control_rx,
                 control_write_timeout,
                 connection_cancel,
                 heartbeat,
                 heartbeat_state,
+                recovery,
                 write_deadline,
                 &mut remaining_controls,
             )
@@ -1238,7 +1719,7 @@ where
     let request_deadline_wins = request_deadline <= frame_deadline;
     let mut frame = Some(frame);
     let send = async {
-        futures::future::poll_fn(|cx| {
+        std::future::poll_fn(|cx| {
             match Pin::new(&mut *write).poll_ready(cx) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
                 std::task::Poll::Ready(Err(error)) => {
@@ -1340,6 +1821,7 @@ where
             false,
         ));
     }
+    let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig::default());
     send_request_message_with_phase(
         write,
         message,
@@ -1351,6 +1833,7 @@ where
         data_frame_write_timeout,
         heartbeat,
         heartbeat_state,
+        &mut recovery,
         connection_cancel,
         dispatch_cancel,
         &phase,
@@ -1400,6 +1883,58 @@ where
 }
 
 /// 发送一个控制帧；超时意味着底层提交状态未知，当前连接不得继续使用。
+enum ControlWriteOutcome {
+    Complete,
+    Retryable(NetError),
+    Failed(NetError),
+}
+
+async fn send_control_frame_outcome<W>(
+    write: &mut W,
+    frame: Message,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> ControlWriteOutcome
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    let expected_ping = match &frame {
+        Message::Ping(payload) => Some(payload.clone()),
+        _ => None,
+    };
+    let deadline = match Instant::now().checked_add(timeout) {
+        Some(deadline) => deadline,
+        None => {
+            return ControlWriteOutcome::Failed(NetError::from(
+                crate::error::ErrorKind::InvalidConfig,
+            ));
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => ControlWriteOutcome::Failed(NetError::from(crate::error::ErrorKind::Cancelled)),
+        result = tokio::time::timeout_at(deadline, write.send(frame)) => match result {
+            Ok(Ok(())) => ControlWriteOutcome::Complete,
+            Ok(Err(WsError::WriteBufferFull(rejected)))
+                if expected_ping.as_ref().is_some_and(|expected| {
+                    matches!(&*rejected, Message::Ping(payload) if payload == expected)
+                }) =>
+            {
+                ControlWriteOutcome::Retryable(
+                    NetError::from(crate::error::ErrorKind::QueueFull)
+                        .with_stage(crate::error::ErrorStage::Write),
+                )
+            }
+            Ok(Err(WsError::WriteBufferFull(_))) => ControlWriteOutcome::Failed(
+                NetError::from(crate::error::ErrorKind::DeliveryUnknown)
+                    .with_stage(crate::error::ErrorStage::Write),
+            ),
+            Ok(Err(error)) => ControlWriteOutcome::Failed(error.into()),
+            Err(_) => ControlWriteOutcome::Failed(NetError::from(crate::error::ErrorKind::DeliveryUnknown)),
+        },
+    }
+}
+
 async fn send_control_frame<W>(
     write: &mut W,
     frame: Message,
@@ -1410,30 +1945,9 @@ where
     W: Sink<Message, Error = WsError> + Unpin,
 {
     crate::log_t!(LogType::WSC; "send_control_frame", "frame_type|frame_bytes|timeout_seconds", match &frame { Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", _ => "data" }, frame.len(), timeout.as_secs_f64());
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        crate::log_e!(LogType::WSC; "send_control_frame", "error", "unrepresentable_deadline");
-        NetError::from(crate::error::ErrorKind::InvalidConfig)
-    })?;
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            crate::log_s!(LogType::WSC; "send_control_frame", "state", "cancelled");
-            Err(NetError::from(crate::error::ErrorKind::Cancelled))
-        },
-        result = tokio::time::timeout_at(deadline, write.send(frame)) => match result {
-            Ok(Ok(())) => {
-                crate::log_s!(LogType::WSC; "send_control_frame", "state", "sink_operation_completed");
-                Ok(())
-            },
-            Ok(Err(error)) => {
-                crate::log_e!(LogType::WSC; "send_control_frame", "error", crate::common::log::summary::error(&error));
-                Err(error.into())
-            },
-            Err(_) => {
-                crate::log_e!(LogType::WSC; "send_control_frame", "error|delivery", "sink_operation_timeout", "unknown");
-                Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
-            },
-        },
+    match send_control_frame_outcome(write, frame, timeout, cancel).await {
+        ControlWriteOutcome::Complete => Ok(()),
+        ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => Err(error),
     }
 }
 
@@ -1975,6 +2489,64 @@ mod tests {
             _context: &mut Context<'_>,
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Pending
+        }
+    }
+
+    struct RetryablePingSink {
+        attempts: usize,
+        messages: Arc<Mutex<Vec<Message>>>,
+    }
+
+    impl RetryablePingSink {
+        fn new() -> Self {
+            Self {
+                attempts: 0,
+                messages: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn recorded(&self) -> Arc<Mutex<Vec<Message>>> {
+            Arc::clone(&self.messages)
+        }
+    }
+
+    impl Sink<Message> for RetryablePingSink {
+        type Error = WsError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+            let this = self.get_mut();
+            if this.attempts == 0 && matches!(message, Message::Ping(_)) {
+                this.attempts = 1;
+                return Err(WsError::WriteBufferFull(Box::new(message)));
+            }
+            this.messages
+                .lock()
+                .map_err(|error| {
+                    WsError::Io(std::io::Error::other(format!("messages lock: {error}")))
+                })?
+                .push(message);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -2861,6 +3433,186 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn normal_ping_retries_only_a_provably_unaccepted_write() -> TestResult {
+        let mut sink = RetryablePingSink::new();
+        let recorded = sink.recorded();
+        let retry = HeartbeatRetryConfig {
+            ping_write_retries: 1,
+            ping_write_retry_interval: Duration::from_millis(5),
+            ..HeartbeatRetryConfig::default()
+        };
+        let cancel = CancellationToken::new();
+        let heartbeat_state = HeartbeatState::new(79);
+        let mut recovery = HeartbeatRecovery::new(retry);
+        check_eq!(
+            handle_heartbeat_tick_with_recovery(
+                &mut sink,
+                &heartbeat_state,
+                &mut recovery,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &cancel,
+            )
+            .await,
+            Ok(())
+        )?;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        check_eq!(
+            service_due_heartbeat_work(
+                &mut sink,
+                &heartbeat_state,
+                &mut recovery,
+                Duration::from_secs(1),
+                None,
+                &cancel,
+            )
+            .await,
+            Ok(())
+        )?;
+        let messages = recorded
+            .lock()
+            .map_err(|error| test_error(format!("messages lock: {error:?}")))?;
+        check_eq!(messages.len(), 1)?;
+        check!(matches!(&messages[0], Message::Ping(payload) if !payload.is_empty()))?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn normal_ping_retry_does_not_repeat_an_unknown_delivery() -> TestResult {
+        let mut sink = PendingSink::default();
+        let state = HeartbeatState::new(80);
+        let cancel = CancellationToken::new();
+        let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig {
+            ping_write_retries: 3,
+            ping_write_retry_interval: Duration::from_millis(1),
+            ..HeartbeatRetryConfig::default()
+        });
+        let result = handle_heartbeat_tick_with_recovery(
+            &mut sink,
+            &state,
+            &mut recovery,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            &cancel,
+        )
+        .await;
+        check_eq!(
+            result,
+            Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn normal_ping_retry_is_cancelled_after_a_matching_pong_race() -> TestResult {
+        let mut sink = RetryablePingSink::new();
+        let recorded = sink.recorded();
+        let heartbeat_state = HeartbeatState::new(82);
+        let now = Instant::now();
+        let HeartbeatTick::SendProbe(payload) =
+            heartbeat_state.on_tick(now, Duration::from_secs(1))
+        else {
+            return Err(test_error("normal probe was not created"));
+        };
+        let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig {
+            ping_write_retries: 1,
+            ping_write_retry_interval: Duration::from_millis(5),
+            ..HeartbeatRetryConfig::default()
+        });
+        recovery.schedule_normal_retry(payload.clone(), now)?;
+        check!(heartbeat_state.acknowledge_pong(payload.as_ref()))?;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        service_due_heartbeat_work(
+            &mut sink,
+            &heartbeat_state,
+            &mut recovery,
+            Duration::from_secs(1),
+            None,
+            &CancellationToken::new(),
+        )
+        .await?;
+        let messages = recorded
+            .lock()
+            .map_err(|error| test_error(format!("messages lock: {error:?}")))?;
+        check!(messages.is_empty())?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pong_timeout_uses_the_configured_bounded_recovery_rounds() -> TestResult {
+        let heartbeat_state = HeartbeatState::new(81);
+        let mut sink = RecordingSink::new(None);
+        let recorded = sink.recorded();
+        let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig {
+            pong_recovery_attempts: 2,
+            pong_retry_interval: Duration::from_secs(1),
+            ..HeartbeatRetryConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        check_eq!(
+            handle_heartbeat_tick_with_recovery(
+                &mut sink,
+                &heartbeat_state,
+                &mut recovery,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &cancel,
+            )
+            .await,
+            Ok(())
+        )?;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        check_eq!(
+            handle_heartbeat_tick_with_recovery(
+                &mut sink,
+                &heartbeat_state,
+                &mut recovery,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &cancel,
+            )
+            .await,
+            Ok(())
+        )?;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        check_eq!(
+            service_due_heartbeat_work(
+                &mut sink,
+                &heartbeat_state,
+                &mut recovery,
+                Duration::from_secs(1),
+                None,
+                &cancel,
+            )
+            .await,
+            Ok(())
+        )?;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = service_due_heartbeat_work(
+            &mut sink,
+            &heartbeat_state,
+            &mut recovery,
+            Duration::from_secs(1),
+            None,
+            &cancel,
+        )
+        .await;
+        let error = result
+            .err()
+            .ok_or_else(|| test_error("recovery unexpectedly succeeded"))?;
+        check_eq!(error.kind(), crate::error::ErrorKind::TimedOut)?;
+        check_eq!(
+            error.context().stage,
+            Some(crate::error::ErrorStage::Heartbeat)
+        )?;
+        let messages = recorded
+            .lock()
+            .map_err(|error| test_error(format!("messages lock: {error:?}")))?;
+        check_eq!(messages.len(), 3)?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_delayed_first_tick_sends_a_probe_instead_of_timing_out_old_idle_time() -> TestResult
     {
         let heartbeat_state = HeartbeatState::new(23);
@@ -3107,6 +3859,7 @@ mod tests {
                 heartbeat_config: Some(crate::ws::HeartbeatConfig {
                     interval: Duration::from_secs(60),
                     pong_timeout: Duration::from_secs(5),
+                    ..Default::default()
                 }),
                 heartbeat: heartbeat_state,
             },
@@ -3172,6 +3925,7 @@ mod tests {
                 heartbeat_config: Some(crate::ws::HeartbeatConfig {
                     interval: Duration::from_secs(60),
                     pong_timeout: Duration::from_secs(5),
+                    ..Default::default()
                 }),
                 heartbeat: heartbeat_state,
             },
@@ -3240,6 +3994,7 @@ mod tests {
                 heartbeat_config: Some(crate::ws::HeartbeatConfig {
                     interval: Duration::from_secs(3_600),
                     pong_timeout: Duration::from_secs(7_200),
+                    ..Default::default()
                 }),
                 heartbeat: Arc::new(HeartbeatState::new(36)),
             },
@@ -3307,6 +4062,7 @@ mod tests {
                     tokio::time::interval_at(Instant::now() + period, period),
                     period,
                 );
+                let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig::default());
                 let action = handle_queued_request(
                     &mut sink,
                     request,
@@ -3320,6 +4076,7 @@ mod tests {
                     Duration::from_secs(1),
                     &mut schedule,
                     &heartbeat,
+                    &mut recovery,
                     &CancellationToken::new(),
                 )
                 .await;

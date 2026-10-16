@@ -2,3 +2,6 @@
 // and register listeners concurrently.
 #[path = "../libs/common/src/log/tests.rs"]
 mod tests;
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

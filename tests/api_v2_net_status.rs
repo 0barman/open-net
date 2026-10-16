@@ -283,3 +283,6 @@ async fn clones_share_restartable_stop_and_permanent_shutdown() -> TestResult {
     bounded(net.destroy_net_status_client("api-v2-net-status-restart")).await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

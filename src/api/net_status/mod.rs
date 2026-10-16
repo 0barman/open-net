@@ -1,14 +1,22 @@
 //! Shared network monitoring with versioned snapshots and owned subscriptions.
 
+mod events;
 mod ip_stack;
 mod net_status_client;
 mod network_status;
+mod refresh;
 
 pub use crate::module::net_status::inner::shared::NetworkStatusContext;
+pub use crate::network::{
+    LanInterfaceKind, LanIpv4Candidate, LanIpv4Completeness, LanIpv4Exclusion,
+    LanIpv4RecommendationReason, LanIpv4Snapshot,
+};
 use crate::NetError;
+pub use events::{NetworkEvent, NetworkEventKind, NetworkEventOptions, NetworkObservation};
 pub use ip_stack::IpStack;
 pub use net_status_client::NetStatusClient;
 pub use network_status::NetworkStatus;
+pub use refresh::{NetworkIpStackSource, NetworkNameSource, NetworkRefreshResult};
 use std::time::SystemTime;
 
 /// One coherent observation, or an explicit state with no current observation.

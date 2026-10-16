@@ -315,3 +315,6 @@ async fn invalid_utf8_and_reserved_opcode_have_protocol_receive_errors() -> Test
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -198,3 +198,6 @@ async fn middleware_cannot_disable_frozen_attempt_during_auth_preparation() -> T
         "auth timeout lost request ID",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -6,6 +6,7 @@ pub(crate) mod common_error;
 pub(crate) mod inner;
 pub mod log;
 pub mod platform;
+pub(crate) mod retirement;
 pub(crate) mod utils;
 
 pub use common_engine::CommonEngine;

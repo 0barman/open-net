@@ -1,15 +1,137 @@
 # TLS certificates and HTTP proxies
 
-Required feature: `http-client`. HTTPS, custom trust roots, mutual TLS and explicit HTTP proxies need no additional open-net feature.
+Required transport feature: `http-client`. Client creation also requires a rustls
+cryptographic provider supplied by the application, explicitly per client or as
+a host-installed process provider. HTTPS, custom
+trust roots, mutual TLS and explicit HTTP proxies need no other open-net feature.
+See [TLS providers](../tls.md) for platform setup and dependency choices.
 
 ```toml
 [dependencies]
 open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 ```
+
+## Application TLS provider
+
+open-net does not choose a cryptographic provider. Each complete program that
+creates an HTTP client below initializes the example application's provider in
+`main`; copy the program as written. Configuration-only examples need no provider
+until a client is built. Client creation requires a provider even for plain HTTP
+and otherwise returns `InvalidConfig` for `tls.provider`.
+
+The examples use OpenSSL through `rustls-openssl`, an application dependency.
+Another compatible rustls 0.23 provider can replace it. Install a process provider
+once in the host application, or pass an explicit per-client provider. A library
+using open-net should accept the host's choice rather than install its own global
+provider. See [TLS providers](../tls.md) for build prerequisites, provider
+precedence and complete examples of both approaches.
 
 The local path assumes your consumer project is beside this checkout's `open-net` directory; adjust it. The examples validate configuration offline. Fallible `with_*` methods that take `self` consume the input configuration on both success and error; `Err(NetError)` does not return the original object. Clone first if you need to retain a previous configuration for another attempt. A real request also needs a reachable server, a valid hostname/certificate chain and, when configured, a working proxy.
 
 TLS configuration validates HTTPS peers; it does not by itself prohibit an HTTP redirect target. With the optional `http-client-http2` feature, [`HttpVersionPolicy::Http2Only`](http2.md) requires HTTPS for both the initial URL and followed redirect targets, preventing a connection to a downgraded target or request-body replay there. `Auto` and `Http1Only` do not impose that restriction. This is a request-target policy, so an explicitly configured HTTP proxy can still tunnel an HTTPS request through CONNECT.
+
+## Cryptographic provider
+
+```text
+HttpTlsConfig::with_crypto_provider(self, provider: Arc<open_net::tls::CryptoProvider>) -> Self
+HttpTlsConfig::crypto_provider(&self) -> Option<&Arc<open_net::tls::CryptoProvider>>
+```
+
+An explicitly configured provider takes precedence over the process-wide rustls
+provider. open-net has no built-in provider or fallback and never installs a
+process-wide provider. With no available provider,
+client creation returns `InvalidConfig` for `tls.provider`, including for an
+initial `http://` URL: HTTP clients prepare a connector that also supports HTTPS.
+
+The setter replaces the explicitly selected provider, shares it through `Arc`,
+and does not validate an identity or perform a handshake. Its position relative
+to root and identity setters does not matter. The getter reports only the
+explicit choice; `None` does not mean that a host-installed process provider is
+unavailable. `HttpTlsConfig::default()` has no explicit choice. See the
+[complete custom-provider program](../tls.md#select-a-provider-per-client).
+
+## `HttpTlsConfig::with_crypto_provider()`
+
+### Required features
+
+`http-client`, plus an application dependency providing compatible rustls 0.23
+cryptography. open-net has no provider feature.
+
+### Function signature
+
+```text
+HttpTlsConfig::with_crypto_provider(self, provider: Arc<open_net::tls::CryptoProvider>) -> Self
+```
+
+### Steps
+
+Create the application's provider, wrap it in `Arc`, and install it in the TLS
+configuration before constructing the HTTP client.
+
+### Parameters
+
+`provider` is a required, owned `Arc`. Configuration clones share that provider.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The updated `HttpTlsConfig`, replacing any previously explicit provider.
+
+### Errors and behavior
+
+The setter is infallible and does not load keys or install a process-wide
+provider. Its order relative to identity and root setters does not matter.
+At client creation this explicit selection overrides the host's process provider;
+unsupported key material or invalid provider settings can then fail validation.
+
+### Example
+
+The [complete per-client program](../tls.md#select-a-provider-per-client) calls
+`HttpTlsConfig::default().with_crypto_provider(Arc::clone(&provider))` before
+creating its HTTP client.
+
+## `HttpTlsConfig::crypto_provider()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpTlsConfig::crypto_provider(&self) -> Option<&Arc<open_net::tls::CryptoProvider>>
+```
+
+### Steps
+
+Borrow the TLS configuration to inspect its explicit provider before installation.
+
+### Parameters
+
+Only the borrowed TLS configuration.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+`Some(&Arc<CryptoProvider>)` for an explicit selection, or `None` for no explicit
+selection. The reference borrows the configuration.
+
+### Errors and behavior
+
+Infallible. It does not resolve or install the process default. `None` alone does
+not imply that client creation will fail: the host may have installed a provider.
+
+### Example
+
+The [complete per-client program](../tls.md#select-a-provider-per-client) checks
+`http_tls.crypto_provider()` with `Arc::ptr_eq` before constructing the client.
 
 ## Trust roots
 
@@ -118,11 +240,25 @@ None.
 
 ### Errors and behavior
 
-Malformed chains, wrong PEM labels, multiple keys, unsupported/encrypted keys, or key/certificate mismatch return `InvalidConfig` under `tls.client_identity`, `.certificates` or `.private_key`. Private material is owned by configuration and omitted from `Debug`; cloning retains another owned key copy. Configuration success does not prove that a server will accept the identity.
+This setter performs strict, bounded PEM and certificate parsing, rejects wrong
+labels, multiple keys and encrypted-key blocks, and retains the decoded material.
+It does not load the key through a provider or prove that the key matches the
+certificate. `HttpClient::new` or the engine's HTTP factory performs those checks
+when compiling the TLS connector with the final selected provider. Unsupported
+key algorithms, invalid key contents and key/certificate mismatch then return
+`InvalidConfig` under `tls.client_identity` or `.private_key`; malformed input can
+fail earlier under `.certificates` or `.private_key`.
+
+`HttpClientConfig::validate()` alone does not compile the TLS connector. Private
+material is owned by configuration and omitted from `Debug`; cloning retains
+another owned key copy. Neither parsing nor client construction proves that a
+server will accept the identity.
 
 ### Example
 
-Run with two arguments: certificate-chain PEM and private-key PEM. Without both arguments, no files are opened.
+Run with two arguments: certificate-chain PEM and private-key PEM. Without both
+arguments, no files are opened. This parses and stores the identity offline;
+construct a client to validate it with the selected provider.
 
 ```rust
 use open_net::api::http::{HttpClientConfig, HttpTlsConfig};

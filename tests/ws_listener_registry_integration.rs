@@ -160,3 +160,6 @@ async fn concurrent_registrations_preserve_every_id_across_shared_session_handle
     net.destroy_ws_client("registry-concurrent").await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

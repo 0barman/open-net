@@ -3,19 +3,39 @@
 pub(crate) mod common;
 
 pub mod api;
+
+// Unit-test clients use an application-owned provider, just like downstream
+// applications. This initializer and its dependency are never part of the SDK.
+#[cfg(test)]
+#[cfg(any(feature = "ws-client", feature = "http-client"))]
+#[ctor::ctor]
+fn install_unit_test_crypto_provider() {
+    if rustls_openssl::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("unit-test TLS provider was already installed; retaining the existing provider");
+    }
+}
 pub(crate) mod inner;
 pub(crate) mod module;
 
 // Keep existing import paths as re-exports of the canonical API modules.
+#[cfg(any(feature = "ws-client", feature = "http-client"))]
+pub use api::tls;
 pub use api::{config, error, network, subscription};
 #[cfg(feature = "net-status")]
-pub use api::{net_status, IpStack, MonitorState, NetStatusClient, NetworkSnapshot, NetworkStatus};
+pub use api::{
+    net_status, IpStack, MonitorState, NetStatusClient, NetworkEvent, NetworkEventKind,
+    NetworkEventOptions, NetworkIpStackSource, NetworkNameSource, NetworkObservation,
+    NetworkRefreshResult, NetworkSnapshot, NetworkStatus,
+};
 #[cfg(feature = "ws-client")]
 pub use api::{ws, WebSocketClient};
 pub use api::{
-    BoxError, Bytes, EnqueueError, HeaderMap, HeaderName, HeaderValue, LogInfo, LogLevel,
-    LogListener, LogSubscription, LogType, Metadata, NetError, OpenNet, OpenNetConfig,
-    OpenNetLogger, Result, StatusCode,
+    BoxError, Bytes, EnqueueError, HeaderMap, HeaderName, HeaderValue, LogDropStats, LogInfo,
+    LogLevel, LogListener, LogSubscription, LogSubscriptionOptions, LogType, Metadata, NetError,
+    OpenNet, OpenNetConfig, OpenNetLogger, Result, SharedLogListener, StatusCode,
 };
 #[cfg(feature = "http-client")]
 pub use async_trait::async_trait;

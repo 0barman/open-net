@@ -31,6 +31,8 @@ pub mod http_status;
 /// Streaming HTTP response values.
 pub mod http_stream;
 pub mod http_timeouts;
+/// Lazy fixed-configuration clients with SDK-owned initialization and shutdown.
+pub mod managed_http_client;
 /// Composable middleware for concrete HTTP request and stream APIs.
 #[cfg(feature = "http-client-middleware")]
 pub mod middleware;
@@ -65,10 +67,11 @@ pub use http_request_handle::{
 };
 pub use http_request_method::HttpRequestMethod;
 pub use http_request_trait::HttpRequestTrait;
-pub use http_response::{HttpRequestId, HttpResponse, HttpResponseResult};
+pub use http_response::{HttpRequestId, HttpResponse, HttpResponseHead, HttpResponseResult};
 pub use http_status::HttpStatusPolicy;
 pub use http_stream::{HttpByteStream, HttpStreamResponse};
 pub use http_timeouts::{HttpTimeouts, TimeoutPhase};
+pub use managed_http_client::ManagedHttpClient;
 #[cfg(feature = "http-client-middleware")]
 pub use middleware::{
     HttpCall, HttpCallMetadata, HttpMiddleware, HttpMiddlewareResponse, HttpResponseMode, Next,

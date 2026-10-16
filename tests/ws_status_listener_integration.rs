@@ -80,3 +80,6 @@ async fn status_subscriptions_have_distinct_ids_and_can_unregister_themselves() 
     )?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

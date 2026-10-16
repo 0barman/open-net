@@ -51,6 +51,7 @@ async fn drive<W: Sink<Message, Error = WsError> + Unpin>(
         tokio::time::interval_at(Instant::now() + period, period),
         period,
     );
+    let mut recovery = super::HeartbeatRecovery::new(crate::ws::HeartbeatRetryConfig::default());
     handle_queued_request(
         sink,
         request,
@@ -64,6 +65,7 @@ async fn drive<W: Sink<Message, Error = WsError> + Unpin>(
         Duration::from_secs(1),
         &mut heartbeat,
         &HeartbeatState::new(1),
+        &mut recovery,
         &CancellationToken::new(),
     )
     .await

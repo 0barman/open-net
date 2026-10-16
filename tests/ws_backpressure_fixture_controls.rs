@@ -67,3 +67,6 @@ async fn native_tcp_confirms_paused_reader_pressure_then_full_transfer() -> Test
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -1,7 +1,7 @@
 //! Physical-connection diagnostics, independent of the winning terminal cause.
 
 use crate::ws::{IoEndKind, PeerClose};
-use futures::Sink;
+use futures_util::Sink;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use std::task::{Context, Poll};
@@ -57,6 +57,9 @@ impl<W> ClassifiedSink<W> {
 
     fn observe(&mut self, result: &Result<(), WsError>) {
         if let Err(error) = result {
+            if matches!(error, WsError::WriteBufferFull(_)) {
+                return;
+            }
             self.first_error
                 .get_or_insert_with(|| classify_io_error(error));
         }
@@ -197,6 +200,7 @@ mod tests {
                     heartbeat_config: Some(crate::ws::HeartbeatConfig {
                         interval: Duration::from_secs(60),
                         pong_timeout: Duration::from_secs(5),
+                        ..Default::default()
                     }),
                     heartbeat: Arc::new(HeartbeatState::new(17)),
                 },
@@ -246,6 +250,22 @@ mod tests {
         ] {
             check_eq!(classify_io_error(&error), kind)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn write_buffer_full_does_not_hide_a_later_terminal_io_classification() -> TestResult {
+        let mut sink = ClassifiedSink::new(ResetSink(FailAt::Send));
+        let buffered = Err(WsError::WriteBufferFull(Box::new(Message::Ping(
+            bytes::Bytes::from_static(b"probe"),
+        ))));
+        sink.observe(&buffered);
+        check_eq!(sink.end_kind(), IoEndKind::Other)?;
+        let reset = Err(WsError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        sink.observe(&reset);
+        check_eq!(sink.end_kind(), IoEndKind::ConnectionReset)?;
         Ok(())
     }
 }

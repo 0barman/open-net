@@ -99,6 +99,42 @@ impl HeartbeatState {
         tick
     }
 
+    /// Starts a recovery probe when idle or after an expired Pong wait.
+    pub(crate) fn start_recovery_probe(
+        &self,
+        now: Instant,
+        pong_timeout: Duration,
+    ) -> Option<Bytes> {
+        let mut inner = self.lock_inner();
+        let can_start = match inner.outstanding.as_ref() {
+            None => true,
+            Some(probe) => match probe.phase {
+                ProbePhase::Sending => false,
+                ProbePhase::AwaitingPong { sent_at } => sent_at
+                    .checked_add(probe.pong_timeout)
+                    .is_some_and(|deadline| now >= deadline),
+            },
+        };
+        if !can_start {
+            return None;
+        }
+        let sequence = inner.next_sequence;
+        inner.next_sequence = inner.next_sequence.wrapping_add(1).max(1);
+        let payload = heartbeat_payload(self.generation, sequence);
+        inner.outstanding = Some(OutstandingProbe {
+            payload: payload.clone(),
+            pong_timeout,
+            phase: ProbePhase::Sending,
+        });
+        drop(inner);
+        crate::log_s!(LogType::WSC; "start_recovery_probe", "generation|payload_bytes", self.generation, payload.len());
+        Some(payload)
+    }
+
+    pub(crate) fn has_outstanding_probe(&self) -> bool {
+        self.lock_inner().outstanding.is_some()
+    }
+
     /// Starts the Pong deadline if `payload` is still the probe being written.
     ///
     /// A matching Pong can arrive while `SinkExt::send` is completing. In that
@@ -176,7 +212,13 @@ impl HeartbeatState {
                     // Public configuration rejects unrepresentable durations. Falling back to
                     // `sent_at` keeps a corrupted/internal value fail-closed instead of either
                     // panicking the writer or silently disabling heartbeat expiry.
-                    Some(sent_at.checked_add(probe.pong_timeout).unwrap_or(sent_at))
+                    match sent_at.checked_add(probe.pong_timeout) {
+                        Some(deadline) => Some(deadline),
+                        None => {
+                            crate::log_e!(LogType::WSC; "pong_deadline", "error", "pong_deadline_overflow");
+                            Some(sent_at)
+                        }
+                    }
                 }
             })
     }
@@ -193,10 +235,13 @@ impl HeartbeatState {
 
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, HeartbeatStateInner> {
         crate::log_t!(LogType::WSC; "lock_inner");
-        self.inner.lock().unwrap_or_else(|poisoned| {
-            crate::log_e!(LogType::WSC; "lock_inner", "error", "lock_poisoned_recovered");
-            poisoned.into_inner()
-        })
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                crate::log_e!(LogType::WSC; "lock_inner", "error", "lock_poisoned_recovered");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -355,6 +400,66 @@ mod tests {
                 HeartbeatTick::TimedOut
             )?;
         }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_probe_allows_a_new_normal_probe() -> TestResult {
+        let heartbeat = HeartbeatState::new(79);
+        let now = Instant::now();
+        let HeartbeatTick::SendProbe(first) = heartbeat.on_tick(now, Duration::from_secs(5)) else {
+            return Err(test_error("normal probe was not created"));
+        };
+        heartbeat.abandon_probe(first.as_ref());
+        let HeartbeatTick::SendProbe(next) =
+            heartbeat.on_tick(now + Duration::from_millis(1), Duration::from_secs(5))
+        else {
+            return Err(test_error("abandoning a probe must allow a new probe"));
+        };
+        check_ne!(first, next)?;
+        check!(heartbeat.mark_sent(next.as_ref(), now + Duration::from_millis(1)))?;
+        check!(!heartbeat.acknowledge_pong(first.as_ref()))?;
+        check!(heartbeat.acknowledge_pong(next.as_ref()))?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_probe_replaces_only_expired_probe() -> TestResult {
+        let heartbeat = HeartbeatState::new(80);
+        let timeout = Duration::from_secs(5);
+        let now = Instant::now();
+        let HeartbeatTick::SendProbe(first) = heartbeat.on_tick(now, timeout) else {
+            return Err(test_error("normal probe was not created"));
+        };
+        check!(heartbeat.start_recovery_probe(now, timeout).is_none())?;
+        check!(heartbeat.mark_sent(first.as_ref(), now))?;
+        check!(heartbeat
+            .start_recovery_probe(now + timeout - Duration::from_nanos(1), timeout)
+            .is_none())?;
+        let expired = now
+            .checked_add(timeout)
+            .ok_or_else(|| test_error("test deadline overflow"))?;
+        let recovery = heartbeat
+            .start_recovery_probe(expired, timeout)
+            .ok_or_else(|| test_error("expired probe did not start recovery"))?;
+        check_ne!(first, recovery)?;
+        check!(!heartbeat.acknowledge_pong(first.as_ref()))?;
+        check!(heartbeat.has_outstanding_probe())?;
+        check!(heartbeat.mark_sent(recovery.as_ref(), expired))?;
+        check!(heartbeat.acknowledge_pong(recovery.as_ref()))?;
+        check!(!heartbeat.has_outstanding_probe())?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_probe_starts_from_idle_state() -> TestResult {
+        let heartbeat = HeartbeatState::new(81);
+        let payload = heartbeat
+            .start_recovery_probe(Instant::now(), Duration::from_secs(1))
+            .ok_or_else(|| test_error("idle state did not start recovery"))?;
+        check!(heartbeat.has_outstanding_probe())?;
+        check!(heartbeat.mark_sent(payload.as_ref(), Instant::now()))?;
+        check!(heartbeat.acknowledge_pong(payload.as_ref()))?;
         Ok(())
     }
 }

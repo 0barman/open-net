@@ -75,14 +75,19 @@ impl CommonEngine {
                 })
             }),
             Ok(_) => {
-                let handle = std::thread::Builder::new()
-                    .name("open-net-runtime-bridge".to_string())
-                    .spawn(move || std::panic::catch_unwind(AssertUnwindSafe(f)))
+                let (sent, received) = std::sync::mpsc::channel();
+                let handle = self.resource_threads()
+                    .spawn_tracked("open-net-runtime-bridge", move || {
+                        let _ = sent.send(std::panic::catch_unwind(AssertUnwindSafe(f)));
+                    })
                     .map_err(|error| {
                         log_e!(LogType::Common; "run_blocking_on_engine_rt", "error", crate::common::log::summary::error(&error));
                         CommonError::RuntimeError
                     })?;
-                match handle.join() {
+                match handle
+                    .join()
+                    .and_then(|()| received.recv().map_err(|_| CommonError::RuntimeError))
+                {
                     Ok(Ok(v)) => Ok(v),
                     Ok(Err(payload)) => {
                         log_e!(LogType::Common; "run_blocking_on_engine_rt",
@@ -92,15 +97,13 @@ impl CommonEngine {
                                 crate::common::log::summary::error(&panic_payload_message(&payload))
                             )
                         );
+                        crate::common::retirement::discard_panic_payload(payload);
                         Err(CommonError::RuntimeError)
                     }
-                    Err(payload) => {
+                    Err(error) => {
                         log_e!(LogType::Common; "run_blocking_on_engine_rt",
                             DESC,
-                            format!(
-                                "helper thread panicked: {}",
-                                crate::common::log::summary::error(&panic_payload_message(&payload))
-                            )
+                            format!("helper thread panicked: {error:?}")
                         );
                         Err(CommonError::RuntimeError)
                     }
@@ -125,6 +128,9 @@ impl CommonEngine {
         T: Future<Output = F> + Send + 'static,
         F: Send + 'static,
     {
+        if self.management_is_closed() {
+            return Err(CommonError::PostError);
+        }
         crate::log_t!(LogType::Common; "invoke", "future_type", std::any::type_name_of_val(&future));
         let (result_tx, result_rx) = oneshot::channel();
         crate::log_s!(LogType::Common; "invoke", "stage", "submit_sync_task");
@@ -152,6 +158,9 @@ impl CommonEngine {
     where
         T: Future<Output = ()> + Send + 'static,
     {
+        if self.management_is_closed() {
+            return;
+        }
         crate::log_t!(LogType::Common; "post", "future_type", std::any::type_name_of_val(&future));
         let rt = Arc::clone(&self.rt);
         let async_tx = self.async_tx.clone();

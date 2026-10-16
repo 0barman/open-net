@@ -432,11 +432,17 @@ impl<T: Clone + Send + Sync + 'static> Registration<T> {
             let outcome = match (delivery, callback) {
                 (Delivery::Value(value), Some(callback)) => {
                     let context = self.context();
-                    catch_unwind(AssertUnwindSafe(|| callback(context, Ok((*value).clone()))))
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let _scope = super::CallbackScope::enter();
+                        callback(context, Ok((*value).clone()))
+                    }))
                 }
                 (Delivery::Error(error), Some(callback)) => {
                     let context = self.context();
-                    catch_unwind(AssertUnwindSafe(|| callback(context, Err(error))))
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let _scope = super::CallbackScope::enter();
+                        callback(context, Err(error))
+                    }))
                 }
                 (Delivery::Done, _) => {
                     self.unsubscribe();

@@ -192,6 +192,14 @@ impl NativeTaskObserver {
         }
     }
 
+    /// The client root retires the shared executor after publishing terminals.
+    /// Session closure alone must not stop the pool shared by later sessions.
+    pub(crate) fn close_executor(&self) {
+        if let Err(error) = self.executor.close() {
+            crate::log_e!(LogType::WSC; "task_executor_close", "error", format!("{error:?}"));
+        }
+    }
+
     fn prune_detached(&self) {
         let retired = {
             let mut state = lock(&self.state);
@@ -331,7 +339,7 @@ impl TaskObserverSnapshot {
                     lane,
                 });
             }
-            let detached = futures::future::select_all(
+            let detached = futures_util::future::select_all(
                 registrations
                     .iter()
                     .map(|registration| Box::pin(registration.publisher.receiver_closed())),

@@ -74,22 +74,38 @@ impl HandshakeProvider {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn provide(
         &self,
         attempt: HandshakeAttempt,
         slots: Arc<Semaphore>,
     ) -> Result<HandshakeHeaders> {
+        self.provide_with_threads(
+            attempt,
+            slots,
+            Arc::new(crate::common::retirement::ThreadRegistry::new()),
+        )
+        .await
+    }
+
+    pub(crate) async fn provide_with_threads(
+        &self,
+        attempt: HandshakeAttempt,
+        slots: Arc<Semaphore>,
+        threads: Arc<crate::common::retirement::ThreadRegistry>,
+    ) -> Result<HandshakeHeaders> {
         let identity = (attempt.client_id, attempt.session_id, attempt.attempt_id);
         let result = match &self.inner {
-            ProviderKind::Async(provider) => match provider(attempt) {
+            ProviderKind::Async(provider) => match {
+                let _scope = crate::common::retirement::ExecutionScope::enter();
+                provider(attempt)
+            } {
                 Ok(future) => GuardedFuture::new(future).await,
                 Err(error) => Err(error),
             },
             ProviderKind::Blocking(provider) => {
                 run_blocking_with_spawn(provider.clone(), attempt, slots, |job| {
-                    std::thread::Builder::new()
-                        .name("open-net-ws-context-provider".to_owned())
-                        .spawn(job)
+                    threads.spawn("open-net-ws-context-provider", job)
                 })
                 .await
             }
@@ -323,6 +339,7 @@ impl Future for GuardedFuture {
     type Output = Result<HandshakeHeaders>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _scope = crate::common::retirement::ExecutionScope::enter();
         let Some(future) = self.future.value.as_mut() else {
             return Poll::Ready(Err(internal_failure()));
         };
@@ -331,13 +348,18 @@ impl Future for GuardedFuture {
     }
 }
 
+impl Drop for GuardedFuture {
+    fn drop(&mut self) {
+        let _scope = crate::common::retirement::ExecutionScope::enter();
+        retire(self.future.value.take());
+    }
+}
+
 async fn run_blocking_with_spawn(
     provider: Arc<BlockingProvider>,
     attempt: HandshakeAttempt,
     slots: Arc<Semaphore>,
-    spawn: impl FnOnce(
-        Box<dyn FnOnce() + Send + 'static>,
-    ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>,
 ) -> Result<HandshakeHeaders> {
     let permit = slots.try_acquire_owned().map_err(|error| {
         NetError::with_source(ErrorKind::ResourceExhausted, error).with_stage(ErrorStage::Provider)
@@ -352,7 +374,7 @@ async fn run_blocking_with_spawn(
             drop(result);
         }
     });
-    spawn(job).map(drop).map_err(|error| {
+    spawn(job).map_err(|error| {
         NetError::with_source(ErrorKind::RuntimeUnavailable, error).with_stage(ErrorStage::Provider)
     })?;
     let mut output = received.await.map_err(|error| {

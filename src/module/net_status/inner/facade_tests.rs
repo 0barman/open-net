@@ -260,13 +260,7 @@ async fn local_revision_exhaustion_still_closes_demand_and_bridge() -> TestResul
     bounded(entered.recv())
         .await?
         .ok_or("factory not entered")?;
-    owner
-        .local
-        .lock()
-        .map_err(NetError::from_poison)?
-        .view
-        .snapshot
-        .revision = u64::MAX;
+    owner.view.exhaust_revision_for_test()?;
     owner.request_close();
     bounded(owner.wait_cleanup()).await??;
     check(
@@ -556,5 +550,71 @@ async fn first_source_failure_is_preserved_across_close_and_late_failures() -> T
     )?;
     bounded(owner.wait_cleanup()).await??;
     bounded(service.shutdown()).await??;
+    Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn refresh_returns_target_projection_error_after_dispatching_healthy_views() -> TestResult {
+    use crate::net_status::{NetworkEventKind, NetworkEventOptions, NetworkStatus};
+    for exhaust_sequence in [false, true] {
+        let service = service()?;
+        let source = service.context().observation_source()?;
+        let (publisher, starting) = source.begin_generation()?;
+        starting.dispatch()?;
+        publisher
+            .prepare_observation(NetworkStatus::Available, None, None)?
+            .dispatch()?;
+        let target = NetworkObservationOwner::new(service.context())?;
+        let healthy = NetworkObservationOwner::new(service.context())?;
+        target.activate_view_for_test()?;
+        healthy.activate_view_for_test()?;
+        let mut target_events = target.subscribe_events(NetworkEventOptions::default())?;
+        let mut healthy_events = healthy.subscribe_events(NetworkEventOptions::default())?;
+        let _ = target_events.recv().await?;
+        let _ = healthy_events.recv().await?;
+        let captured = target.refresh_target()?;
+        if exhaust_sequence {
+            target.view.exhaust_event_sequence_for_test()?;
+        } else {
+            target.view.exhaust_revision_for_test()?;
+        }
+        let result = target.commit_refresh(
+            captured,
+            1,
+            NetworkStatus::Unavailable,
+            None,
+            None,
+            std::time::SystemTime::now(),
+            || Ok(()),
+        );
+        check(
+            matches!(result, Err(error) if error.kind() == ErrorKind::ResourceExhausted),
+            "facade refresh returned Ok(Closed) for a failed target",
+        )?;
+        check(
+            matches!(target.snapshot(), Err(error) if error.kind() == ErrorKind::ResourceExhausted),
+            "facade refresh and snapshot disagree about failure",
+        )?;
+        let event = bounded(healthy_events.recv())
+            .await??
+            .ok_or("healthy event stream ended")?;
+        check(
+            matches!(
+                event.kind,
+                NetworkEventKind::ReachabilityChanged {
+                    current: NetworkStatus::Unavailable,
+                    ..
+                }
+            ),
+            "healthy view's prepared event was not dispatched",
+        )?;
+        let failed = bounded(target_events.recv()).await?;
+        check(
+            matches!(failed, Err(crate::error::ReceiveError::Failed(error)) if error.kind() == ErrorKind::ResourceExhausted),
+            "failed target's prepared terminal notification was discarded",
+        )?;
+        bounded(service.shutdown()).await??;
+    }
     Ok(())
 }

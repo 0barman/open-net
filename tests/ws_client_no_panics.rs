@@ -226,6 +226,9 @@ fn is_reviewed_ffi_file(path: &str) -> bool {
         path,
         "src/module/net_status/inner/platform/macos.rs"
             | "src/module/net_status/inner/platform/macos_tests.rs"
+            | "src/module/net_status/inner/platform/windows.rs"
+            | "src/module/net_status/lan_platform/macos.rs"
+            | "src/module/net_status/lan_platform/windows.rs"
     )
 }
 
@@ -297,7 +300,7 @@ fn remove_reviewed_ffi_findings(
 ) -> TestResult<Vec<String>> {
     if let Some(reviewed) = audit.fingerprints.get(relative_path) {
         if source_fingerprint(source)? != *reviewed {
-            return Err(format!("reviewed macOS FFI source changed: {relative_path}").into());
+            return Err(format!("reviewed native FFI source changed: {relative_path}").into());
         }
     }
     // The count-limited matcher also keys each entry by exact file, operation
@@ -690,7 +693,13 @@ fn ws_client_sources_do_not_contain_panicking_operations() -> TestResult {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let files = guarded_sources(manifest)?;
     let baseline = read_legacy_baseline()?;
-    let ffi_audit = parse_reviewed_ffi_audit(include_str!("fixtures/macos-ffi-unsafe-audit.tsv"))?;
+    let ffi_audit = parse_reviewed_ffi_audit(concat!(
+        include_str!("fixtures/macos-ffi-unsafe-audit.tsv"),
+        "\n",
+        include_str!("fixtures/windows-ffi-unsafe-audit.tsv"),
+        "\n",
+        include_str!("fixtures/lan-ffi-unsafe-audit.tsv"),
+    ))?;
     let mut findings = Vec::new();
     for file in files {
         let source = std::fs::read_to_string(&file)?;
@@ -852,3 +861,6 @@ fn scanner_excludes_only_explicit_test_items_and_keeps_production_violations() -
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

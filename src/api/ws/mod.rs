@@ -24,8 +24,8 @@ pub use response::Response;
 
 mod config;
 pub use config::{
-    DispatchLimits, FrameConfig, HeartbeatConfig, QueueLimit, QueueLimits, RequestLimits,
-    TcpConfig, TcpKeepaliveConfig, WebSocketClientConfig,
+    DispatchLimits, FrameConfig, HeartbeatConfig, HeartbeatRetryConfig, QueueLimit, QueueLimits,
+    RequestLimits, TcpConfig, TcpKeepaliveConfig, WebSocketClientConfig,
 };
 
 mod reconnect;

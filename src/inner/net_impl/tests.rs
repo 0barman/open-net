@@ -9,13 +9,23 @@ use tokio_util::sync::CancellationToken;
 
 const FACTORY_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn engine() -> TestResult<OpenNet> {
+    Ok(OpenNet::new_with_config(
+        OpenNetConfig::default().with_network_config(
+            NetworkConfig::default()
+                .with_network_status_policy(crate::network::NetworkStatusPolicy::Ignore),
+        ),
+    )?)
+}
+
 #[test]
 fn empty_destroy_guard_reports_error_without_panicking() -> Result<(), Box<dyn std::error::Error>> {
     let guard = DestroyClientGuard {
+        engine: Arc::new(CommonEngine::new(4, 4)?),
         clients: Arc::new(Mutex::new(HashMap::new())),
+        clients_changed: Arc::new(tokio::sync::Notify::new()),
         thread_name: "empty-guard".to_string(),
         entry: None,
-        cleanup_handed_off: false,
     };
     match guard.client() {
         Err(error) if error.kind() == crate::error::ErrorKind::Internal => Ok(()),
@@ -32,6 +42,85 @@ async fn factory_queue_fence(engine: &OpenNet) -> TestResult {
     });
     tokio::time::timeout(FACTORY_TEST_TIMEOUT, completion).await??;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_or_create_ws_client_reuses_one_named_client_for_concurrent_callers() -> TestResult {
+    let engine = engine()?;
+    let result: TestResult = async {
+        let mut first_config = WebSocketClientConfig::default();
+        first_config.queues.normal.max_items = 257;
+        let second_config = WebSocketClientConfig::default();
+        let (first, second) = tokio::join!(
+            engine.get_or_create_ws_client_with_config("shared-get-or-create", first_config),
+            engine.get_or_create_ws_client_with_config("shared-get-or-create", second_config),
+        );
+        let first = first?;
+        let second = second?;
+        check_eq!(first.id(), second.id())?;
+        check_eq!(first.config().queues.normal.max_items, 257)?;
+        engine
+            .destroy_ws_client_if_exists("shared-get-or-create")
+            .await?;
+        engine
+            .destroy_ws_client_if_exists("shared-get-or-create")
+            .await?;
+        check!(
+            matches!(
+                engine.get_ws_client("shared-get-or-create"),
+                Err(ref error) if error.kind() == crate::error::ErrorKind::ClientNotFound
+            ),
+            "idempotent cleanup must release the client name"
+        )?;
+        Ok(())
+    }
+    .await;
+    finish_factory_case(&engine, result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_ws_client_if_exists_waits_for_creation_and_is_repeatable() -> TestResult {
+    let engine = engine()?;
+    let release = CancellationToken::new();
+    let release_on_drop = release.clone().drop_guard();
+    let gate = release.clone();
+    let (entered, entry) = oneshot::channel();
+    engine.inner.common_engine.post(async move {
+        if entered.send(()).is_ok() {
+            gate.cancelled().await;
+        }
+    });
+
+    let result: TestResult = async {
+        tokio::time::timeout(FACTORY_TEST_TIMEOUT, entry).await??;
+        let mut creating = Box::pin(engine.get_or_create_ws_client_with_config(
+            "destroy-during-create",
+            WebSocketClientConfig::default(),
+        ));
+        let first_poll = poll_fn(|context| Poll::Ready(creating.as_mut().poll(context))).await;
+        check!(
+            first_poll.is_pending(),
+            "creation must be held by the queue gate"
+        )?;
+
+        let mut destroying = Box::pin(engine.destroy_ws_client_if_exists("destroy-during-create"));
+        let destroy_poll = poll_fn(|context| Poll::Ready(destroying.as_mut().poll(context))).await;
+        check!(
+            destroy_poll.is_pending(),
+            "cleanup must wait for the in-flight creation"
+        )?;
+
+        release.cancel();
+        creating.await?;
+        destroying.await?;
+        engine
+            .destroy_ws_client_if_exists("destroy-during-create")
+            .await?;
+        Ok(())
+    }
+    .await;
+    drop(release_on_drop);
+    finish_factory_case(&engine, result).await
 }
 
 /// Run even after a fallible check fails so that successful earlier creations do
@@ -471,16 +560,18 @@ async fn accepted_factories_cannot_register_after_the_source_engine_drops() -> T
         )?;
         drop(http);
     }
+    // The marker is accepted before shutdown closes management admission. It
+    // confirms that the preceding accepted factories have really retired.
+    let (completed, completion) = oneshot::channel();
+    runtime.post(async move {
+        let _ = completed.send(());
+    });
     drop(engine);
     check!(matches!(
         context.snapshot()?.state,
         crate::net_status::MonitorState::Closed
     ))?;
     release.cancel();
-    let (completed, completion) = oneshot::channel();
-    runtime.post(async move {
-        let _ = completed.send(());
-    });
     tokio::time::timeout(FACTORY_TEST_TIMEOUT, completion).await??;
     check_eq!(
         service.active_consumers_for_test()?,

@@ -631,3 +631,6 @@ async fn active_monitor_does_not_block_websocket_creation_on_the_common_engine()
     bounded(net.destroy_net_status_client("monitor")).await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

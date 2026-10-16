@@ -39,7 +39,7 @@ impl Drop for Peer {
 }
 
 fn tls_acceptor() -> TestResult<TlsAcceptor> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls_openssl::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
@@ -226,3 +226,6 @@ async fn http2_tls_stall_retains_typed_connect_phase() -> TestResult {
     drop(peer);
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

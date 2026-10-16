@@ -97,7 +97,8 @@ fn late_source_failure_cannot_overwrite_closed_terminal_state() -> TestResult {
     if !matches!(snapshot.state, MonitorState::Closed) {
         return Err("late source failure replaced the Closed terminal state".into());
     }
-    if source.subscribe_failure().borrow().is_some() {
+    let failed = ::tokio::sync::watch::Receiver::borrow(&source.subscribe_failure()).is_some();
+    if failed {
         return Err("late source failure populated the Closed failure channel".into());
     }
     Ok(())
@@ -581,5 +582,81 @@ fn rejected_and_noop_failed_input_sources_are_released_after_outer_lock() -> Tes
             return Err("counter exhaustion swallowed failed publication error".into());
         }
     }
+    Ok(())
+}
+
+#[test]
+fn sample_validation_runs_under_source_lock_before_advancing_watermark() -> TestResult {
+    use crate::{error::ErrorKind, net_status::IpStack};
+    use std::{sync::TryLockError, time::SystemTime};
+
+    let source = NetworkStatusSource::for_test()?;
+    let (publisher, starting) = source.begin_generation()?;
+    starting.dispatch()?;
+    publisher
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?
+        .dispatch()?;
+    let before = source.snapshot()?;
+    let skipped = publisher.prepare_sampled_observation(
+        1,
+        NetworkStatus::Unavailable,
+        Some(IpStack::V4Only),
+        Some("expired-sample".into()),
+        SystemTime::now(),
+        || {
+            // The final deadline check must run only after taking the source
+            // lock; checking before that lock leaves another late-commit race.
+            if !matches!(source.state.try_lock(), Err(TryLockError::WouldBlock)) {
+                return Err(NetError::from(ErrorKind::Internal));
+            }
+            Ok(false)
+        },
+    )?;
+    check_equal(skipped.is_none(), true)?;
+    let after = source.snapshot()?;
+    check_equal(after.revision, before.revision)?;
+    check_equal(after.reachability, before.reachability)?;
+    check_equal(after.ip_stack, before.ip_stack)?;
+    check_equal(after.observed_at, before.observed_at)?;
+    check_equal(
+        source
+            .state
+            .lock()
+            .map_err(NetError::from_poison)?
+            .last_sample_id,
+        0,
+    )?;
+
+    let strict = publisher.prepare_sampled_observation(
+        1,
+        NetworkStatus::Unavailable,
+        Some(IpStack::V4Only),
+        None,
+        SystemTime::now(),
+        || Err(ErrorKind::TimedOut.into()),
+    );
+    if !matches!(strict, Err(error) if error.kind() == ErrorKind::TimedOut) {
+        return Err("strict initial deadline was swallowed".into());
+    }
+    publisher
+        .prepare_sampled_observation(
+            1,
+            NetworkStatus::Unavailable,
+            Some(IpStack::V4Only),
+            None,
+            SystemTime::now(),
+            || Ok(true),
+        )?
+        .ok_or("skipped sample advanced the freshness watermark")?
+        .dispatch()?;
+    check_equal(source.snapshot()?.revision, before.revision + 1)?;
+    check_equal(
+        source
+            .state
+            .lock()
+            .map_err(NetError::from_poison)?
+            .last_sample_id,
+        1,
+    )?;
     Ok(())
 }

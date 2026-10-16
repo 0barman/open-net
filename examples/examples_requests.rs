@@ -1,12 +1,14 @@
 //! Echo protocol example: wire messages contain "request-id|payload".
 //! A real application's ResponseProtocol should decode its actual wire format.
 use open_net::{
+    network::{NetworkConfig, TlsConfig},
     ws::{
         ConnectOptions, IncomingMessage, InitialMessages, Message, Request, RequestId,
         ResponseProtocol, ResponseRoute, ResponseRouting,
     },
     BoxError, OpenNet,
 };
+use std::sync::Arc;
 
 struct EchoProtocol;
 impl ResponseProtocol for EchoProtocol {
@@ -29,7 +31,10 @@ async fn main() -> Result<(), BoxError> {
     let url = std::env::args()
         .nth(1)
         .ok_or("provide a WebSocket echo URL")?;
-    let net = OpenNet::new()?;
+    // The application selects cryptography; open-net supplies no default provider.
+    let tls =
+        TlsConfig::default().with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    let net = OpenNet::new_with_network_config(NetworkConfig::default().with_tls(tls))?;
     let client = net.create_ws_client("requests").await?;
     let mut options = ConnectOptions::new(url);
     options.routing = ResponseRouting::protocol(EchoProtocol);

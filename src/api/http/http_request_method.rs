@@ -1,10 +1,15 @@
+use crate::api::error::NetError;
 use http::Method;
 
 /// The HTTP methods supported by the request API.
 ///
 /// This type keeps the public request contract independent from the `http`
 /// crate. Convert it to [`http::Method`] at the transport boundary with
-/// [`From::from`]. Extension methods are retained losslessly in `Extension`.
+/// [`TryFrom::try_from`]. Extension methods are retained losslessly in `Extension`,
+/// and conversion rejects invalid HTTP method tokens with
+/// [`crate::error::ErrorKind::InvalidInput`] instead of panicking or changing the method.
+/// Use `Method::try_from(method)` or `method.try_into()` for this fallible direction;
+/// conversion from an already validated [`http::Method`] remains infallible.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum HttpRequestMethod {
     GET,
@@ -20,9 +25,19 @@ pub enum HttpRequestMethod {
     Extension(String),
 }
 
-impl From<HttpRequestMethod> for Method {
-    fn from(method: HttpRequestMethod) -> Self {
-        match method {
+impl TryFrom<HttpRequestMethod> for Method {
+    type Error = NetError;
+
+    fn try_from(method: HttpRequestMethod) -> Result<Self, Self::Error> {
+        Self::try_from(&method)
+    }
+}
+
+impl TryFrom<&HttpRequestMethod> for Method {
+    type Error = NetError;
+
+    fn try_from(method: &HttpRequestMethod) -> Result<Self, Self::Error> {
+        Ok(match method {
             HttpRequestMethod::GET => Method::GET,
             HttpRequestMethod::POST => Method::POST,
             HttpRequestMethod::PUT => Method::PUT,
@@ -34,14 +49,8 @@ impl From<HttpRequestMethod> for Method {
             HttpRequestMethod::TRACE => Method::TRACE,
             HttpRequestMethod::QUERY => Method::QUERY,
             HttpRequestMethod::Extension(method) => Method::from_bytes(method.as_bytes())
-                .expect("HttpRequestMethod::Extension must contain a valid method"),
-        }
-    }
-}
-
-impl From<&HttpRequestMethod> for Method {
-    fn from(method: &HttpRequestMethod) -> Self {
-        method.clone().into()
+                .map_err(|_| NetError::input("method", "invalid HTTP method token"))?,
+        })
     }
 }
 
@@ -103,9 +112,10 @@ impl HttpRequestMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::error::{ErrorKind, ErrorStage};
 
     #[test]
-    fn converts_all_standard_methods_in_both_directions() {
+    fn converts_all_standard_methods_in_both_directions() -> Result<(), NetError> {
         let methods = [
             (HttpRequestMethod::GET, Method::GET),
             (HttpRequestMethod::POST, Method::POST),
@@ -120,16 +130,40 @@ mod tests {
         ];
 
         for (request_method, http_method) in methods {
-            assert_eq!(Method::from(request_method.clone()), http_method);
-            assert_eq!(HttpRequestMethod::try_from(http_method), Ok(request_method));
+            assert_eq!(Method::try_from(&request_method)?, http_method);
+            assert_eq!(Method::try_from(request_method.clone())?, http_method);
+            assert_eq!(HttpRequestMethod::from(http_method), request_method);
         }
+        Ok(())
     }
 
     #[test]
-    fn preserves_extension_methods() {
-        let method = Method::from_bytes(b"CUSTOM").expect("valid extension method");
-        let request_method = HttpRequestMethod::try_from(method.clone()).unwrap();
-        assert_eq!(request_method.as_str(), "CUSTOM");
-        assert_eq!(Method::from(request_method), method);
+    fn preserves_extension_methods() -> Result<(), NetError> {
+        for token in ["CUSTOM", "custom", "CuStOm", "X!#$%&'*+-.^_`|~"] {
+            let request_method = HttpRequestMethod::Extension(token.to_owned());
+            let method = Method::try_from(&request_method)?;
+            assert_eq!(method.as_str(), token);
+            assert_eq!(Method::try_from(request_method.clone())?, method);
+            assert_eq!(HttpRequestMethod::from(method), request_method);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_extension_methods_without_exposing_input() {
+        for token in ["", "BAD METHOD", "GET\r\nsecret", "GÉT", "GET/", "GET\0"] {
+            let request_method = HttpRequestMethod::Extension(token.to_owned());
+            for error in [
+                Method::try_from(&request_method).expect_err("invalid borrowed method"),
+                Method::try_from(request_method).expect_err("invalid owned method"),
+            ] {
+                assert_eq!(error.kind(), ErrorKind::InvalidInput);
+                assert_eq!(error.context().stage, Some(ErrorStage::RequestBuild));
+                let detail = error.config_error().expect("method error details");
+                assert_eq!(detail.field(), "method");
+                assert_eq!(detail.reason(), "invalid HTTP method token");
+                assert!(!format!("{error} {error:?}").contains("secret"));
+            }
+        }
     }
 }

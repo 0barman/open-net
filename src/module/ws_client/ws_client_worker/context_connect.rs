@@ -23,6 +23,7 @@ pub(super) struct ContextConnectTask {
     pub(super) client_config: WebSocketClientConfig,
     pub(super) network: Arc<CompiledNetworkConfig>,
     pub(super) provider_slots: Arc<Semaphore>,
+    pub(super) resource_threads: Arc<crate::common::retirement::ThreadRegistry>,
     pub(super) generation: u64,
     pub(super) cancel: CancellationToken,
     pub(super) network_available: Arc<Notify>,
@@ -251,7 +252,11 @@ impl ContextConnectTask {
             Some(
                 tokio::time::timeout_at(
                     deadline.at(),
-                    provider.provide(attempt.clone(), Arc::clone(&self.provider_slots)),
+                    provider.provide_with_threads(
+                        attempt.clone(),
+                        Arc::clone(&self.provider_slots),
+                        Arc::clone(&self.resource_threads),
+                    ),
                 )
                 .await
                 .map_err(|error| {

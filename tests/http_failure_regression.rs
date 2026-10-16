@@ -515,3 +515,6 @@ async fn cancellation_and_deadline_during_body_backoff_replace_previous_reason()
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -10,6 +10,9 @@ mod macos;
 #[cfg(target_os = "linux")]
 pub(super) mod linux;
 
+#[cfg(any(target_os = "windows", test))]
+pub(super) mod windows;
+
 #[cfg(target_os = "macos")]
 use super::refresh_trigger::{self, RefreshTriggerEvent, RefreshTriggerReceiver};
 

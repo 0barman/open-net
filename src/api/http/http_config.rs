@@ -17,7 +17,7 @@ use crate::api::http::HttpAdmissionPolicy;
 use crate::api::http::HttpMiddleware;
 use http::{HeaderMap, HeaderName};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::sign::CertifiedKey;
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +40,7 @@ pub enum HttpRootCertificateMode {
 /// bounded buffers so the worker can build its rustls connector once during startup.
 #[derive(Clone)]
 pub struct HttpTlsConfig {
+    provider: Option<Arc<rustls::crypto::CryptoProvider>>,
     root_certificates: Vec<Vec<u8>>,
     root_mode: HttpRootCertificateMode,
     client_identity: Option<HttpClientIdentity>,
@@ -64,6 +65,7 @@ impl Clone for HttpClientIdentity {
 impl Default for HttpTlsConfig {
     fn default() -> Self {
         Self {
+            provider: None,
             root_certificates: Vec::new(),
             root_mode: HttpRootCertificateMode::Append,
             client_identity: None,
@@ -72,6 +74,35 @@ impl Default for HttpTlsConfig {
 }
 
 impl HttpTlsConfig {
+    /// Select the rustls cryptographic provider for this HTTP client.
+    ///
+    /// An explicit provider takes precedence over the process-wide rustls
+    /// provider. This does not install a process-wide provider. Without either
+    /// provider, client creation returns a configuration error. Configure this
+    /// before creating the client; its order relative to certificate and
+    /// private-key setters is immaterial.
+    ///
+    /// ```
+    /// use open_net::api::http::HttpTlsConfig;
+    /// use open_net::tls::CryptoProvider;
+    /// use std::sync::Arc;
+    ///
+    /// fn configure(provider: Arc<CryptoProvider>) -> HttpTlsConfig {
+    ///     let tls = HttpTlsConfig::default().with_crypto_provider(Arc::clone(&provider));
+    ///     assert!(tls.crypto_provider().is_some_and(|selected| Arc::ptr_eq(selected, &provider)));
+    ///     tls
+    /// }
+    /// ```
+    pub fn with_crypto_provider(mut self, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Return the explicitly configured cryptographic provider, if any.
+    pub fn crypto_provider(&self) -> Option<&Arc<rustls::crypto::CryptoProvider>> {
+        self.provider.as_ref()
+    }
+
     /// Configure one PEM bundle as the custom trust-root set.
     ///
     /// The bundle must contain one or more valid `CERTIFICATE` PEM blocks and
@@ -125,9 +156,11 @@ impl HttpTlsConfig {
 
     /// Configure a client certificate chain and PKCS#8 private key from PEM.
     ///
-    /// The certificate chain and key are parsed and checked for a matching key
-    /// before they are retained. Private material is never exposed by the
-    /// public API or by the type's `Debug` implementation.
+    /// This validates bounded PEM formatting and retains the decoded material.
+    /// When the client is created, its final cryptographic provider loads the
+    /// key and verifies that it matches the certificate. This allows provider
+    /// selection before or after this method. Private material is never exposed
+    /// by the public API or by the type's `Debug` implementation.
     pub fn with_client_identity_pem(
         mut self,
         certificates: impl AsRef<[u8]>,
@@ -153,15 +186,6 @@ impl HttpTlsConfig {
         }
         let key = PrivatePkcs8KeyDer::from_pem_slice(keys[0])
             .map_err(|_| invalid_config("tls.client_identity.private_key"))?;
-        let certified = CertifiedKey::from_der(
-            chain.clone(),
-            PrivateKeyDer::Pkcs8(key.clone_key()),
-            &crate::module::tls::local_provider(),
-        )
-        .map_err(|_| invalid_config("tls.client_identity"))?;
-        certified
-            .keys_match()
-            .map_err(|_| invalid_config("tls.client_identity"))?;
         self.client_identity = Some(HttpClientIdentity {
             certificates: chain,
             private_key: key,
@@ -171,20 +195,24 @@ impl HttpTlsConfig {
 
     pub(crate) fn compile(
         &self,
-        provider: Arc<rustls::crypto::CryptoProvider>,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Result<rustls::ClientConfig, NetError> {
-        let builder = rustls::ClientConfig::builder_with_provider(provider)
+        let provider = crate::module::tls::select_provider(self.provider.as_ref())?;
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .map_err(|_| invalid_config("tls.provider"))?
             .with_root_certificates(self.compile_roots()?);
         let mut tls = if let Some(identity) = &self.client_identity {
-            builder
-                .with_client_auth_cert(
-                    identity.certificates.clone(),
-                    PrivateKeyDer::Pkcs8(identity.private_key.clone_key()),
-                )
-                .map_err(|_| invalid_config("tls.client_identity"))?
+            let certified = CertifiedKey::from_der(
+                identity.certificates.clone(),
+                PrivateKeyDer::Pkcs8(identity.private_key.clone_key()),
+                &provider,
+            )
+            .map_err(|_| invalid_config("tls.client_identity"))?;
+            certified
+                .keys_match()
+                .map_err(|_| invalid_config("tls.client_identity"))?;
+            builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified)))
         } else {
             builder.with_no_client_auth()
         };
@@ -306,6 +334,7 @@ impl fmt::Debug for HttpTlsConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpTlsConfig")
+            .field("crypto_provider_configured", &self.provider.is_some())
             .field("custom_root_count", &self.root_certificates.len())
             .field("root_mode", &self.root_mode)
             .field(
@@ -677,6 +706,9 @@ impl HttpClientConfig {
     }
 
     /// Validate a configuration assembled with public fields.
+    ///
+    /// TLS provider availability and client certificate/key compatibility are
+    /// checked once when the HTTP client is created.
     pub fn validate(&self) -> Result<(), NetError> {
         let scheme = self.base_url.scheme();
         if (scheme != "http" && scheme != "https") || self.base_url.host_str().is_none() {
@@ -1200,9 +1232,21 @@ mod tests {
 
     #[test]
     fn compiled_http_tls_uses_selected_provider_and_enables_sni() -> TestResult {
-        let provider = crate::module::tls::local_provider();
+        let provider = Arc::new(rustls_openssl::default_provider());
         let alpn = vec![b"http/1.1".to_vec()];
-        let tls = HttpTlsConfig::default().compile(Arc::clone(&provider), alpn.clone())?;
+        let configured = HttpTlsConfig::default().with_crypto_provider(Arc::clone(&provider));
+        check(
+            configured
+                .crypto_provider()
+                .is_some_and(|configured| Arc::ptr_eq(configured, &provider)),
+            "explicit HTTP TLS provider was not retained",
+        )?;
+        let debug = format!("{configured:?}");
+        check(
+            debug.contains("crypto_provider_configured: true") && !debug.contains("cipher_suites"),
+            "HTTP TLS Debug must report only whether a provider is configured",
+        )?;
+        let tls = configured.compile(alpn.clone())?;
         check(
             Arc::ptr_eq(&provider, tls.crypto_provider()),
             "compiled HTTP TLS replaced the selected provider",
@@ -1240,21 +1284,34 @@ mod tests {
         let certificates = include_bytes!("../../../tests/fixtures/network/client.pem");
         let key = include_bytes!("../../../tests/fixtures/network/client-key.pem");
         let configured = HttpTlsConfig::default().with_client_identity_pem(certificates, key)?;
-        let clone = configured.clone();
-        let local = crate::module::tls::local_provider();
+        let clone = configured
+            .clone()
+            .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
         check(
             clone
-                .compile(local, vec![b"http/1.1".to_vec()])?
+                .compile(vec![b"http/1.1".to_vec()])?
                 .client_auth_cert_resolver
                 .has_certs(),
             "cloning the configuration lost the client identity",
         )?;
-        let mut custom = rustls::crypto::aws_lc_rs::default_provider();
+        let mut custom = rustls_openssl::default_provider();
         custom.key_provider = &REJECT_KEYS;
-        let result = configured.compile(Arc::new(custom), vec![b"http/1.1".to_vec()]);
+        let provider = Arc::new(custom);
+        let result = configured
+            .with_crypto_provider(Arc::clone(&provider))
+            .compile(vec![b"http/1.1".to_vec()]);
         check(
             result.is_err(),
             "client identity bypassed the selected provider's key loader",
+        )?;
+        // Setting the provider first must not make the PEM setter load keys.
+        // Both setter orders defer key loading to client creation.
+        let configured = HttpTlsConfig::default()
+            .with_crypto_provider(provider)
+            .with_client_identity_pem(certificates, key)?;
+        check(
+            configured.compile(vec![b"http/1.1".to_vec()]).is_err(),
+            "identity setter order changed provider selection",
         )
     }
 
@@ -1292,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_or_mismatched_identity_material() -> TestResult {
+    fn rejects_malformed_pem_and_defers_key_matching_to_client_creation() -> TestResult {
         let certificates = include_bytes!("../../../tests/fixtures/network/client.pem");
         let private_key = include_bytes!("../../../tests/fixtures/network/client-key.pem");
         let valid = HttpTlsConfig::default().with_client_identity_pem(certificates, private_key)?;
@@ -1301,7 +1358,10 @@ mod tests {
             "valid client identity was not retained",
         )?;
         let wrong_key = include_bytes!("../../../tests/fixtures/network/other-client-key.pem");
-        let result = HttpTlsConfig::default().with_client_identity_pem(certificates, wrong_key);
+        let configured = HttpTlsConfig::default()
+            .with_client_identity_pem(certificates, wrong_key)?
+            .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+        let result = configured.compile(vec![b"http/1.1".to_vec()]);
         check(result.is_err(), "mismatched certificate and key must fail")?;
         let malformed = b"-----BEGIN CERTIFICATE-----\n-----END PRIVATE KEY-----";
         let result = HttpTlsConfig::default().with_root_certificates(malformed, false);

@@ -68,7 +68,7 @@ fn tls_server_config(
     mtls: bool,
     version: &'static rustls::SupportedProtocolVersion,
 ) -> TestResult<rustls::ServerConfig> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls_openssl::default_provider());
     let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[version])?;
     let builder = if mtls {
@@ -412,8 +412,12 @@ fn network_configuration_rejects_invalid_material_before_connecting() -> TestRes
     let cert = include_bytes!("fixtures/network/client.pem");
     let key = include_bytes!("fixtures/network/client-key.pem");
     ClientIdentity::from_pem(cert, key)?;
-    if ClientIdentity::from_pem(cert, include_bytes!("fixtures/network/server-key.pem")).is_ok() {
-        return Err("mismatched client key was accepted".into());
+    let mismatched =
+        ClientIdentity::from_pem(cert, include_bytes!("fixtures/network/server-key.pem"))?;
+    let invalid =
+        NetworkConfig::default().with_tls(TlsConfig::default().with_client_identity(mismatched));
+    if invalid.validate().is_ok() {
+        return Err("mismatched client key was accepted at configuration validation".into());
     }
     let duplicate = [key.as_slice(), key.as_slice()].concat();
     if ClientIdentity::from_pem(cert, &duplicate).is_ok() {
@@ -531,12 +535,32 @@ fn config_debug_does_not_reveal_proxy_or_private_key_material() -> TestResult {
 /// crypto provider used to terminate the connection task before ClientHello.
 #[tokio::test]
 async fn standalone_ws_writes_tls_client_hello_without_global_provider() -> TestResult {
+    if std::env::var_os("OPEN_NET_SKIP_TEST_CRYPTO_PROVIDER").is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "standalone_ws_writes_tls_client_hello_without_global_provider",
+                "--nocapture",
+            ])
+            .env("OPEN_NET_SKIP_TEST_CRYPTO_PROVIDER", "1")
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "explicit provider probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        return Ok(());
+    }
     if rustls::crypto::CryptoProvider::get_default().is_some() {
         return Err("a different test installed a global TLS provider in this process".into());
     }
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let engine = OpenNet::new()?;
+    let engine = OpenNet::new_with_network_config(NetworkConfig::default().with_tls(
+        TlsConfig::default().with_crypto_provider(Arc::new(rustls_openssl::default_provider())),
+    ))?;
     let client = engine.create_ws_client("network-provider-probe").await?;
     let peer = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await?;
@@ -777,6 +801,7 @@ async fn explicit_tls_provider_coexists_with_a_host_provider() -> TestResult {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("OPEN_NET_SKIP_TEST_CRYPTO_PROVIDER", "1")
             .env("HTTP_PROXY", "http://127.0.0.1:1")
             .env("HTTPS_PROXY", "http://127.0.0.1:1")
             .env("ALL_PROXY", "http://127.0.0.1:1")
@@ -787,7 +812,7 @@ async fn explicit_tls_provider_coexists_with_a_host_provider() -> TestResult {
         }
         return Ok(());
     }
-    let mut host_provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut host_provider = rustls_openssl::default_provider();
     host_provider
         .cipher_suites
         .retain(|suite| suite.version() == &rustls::version::TLS13);
@@ -795,7 +820,12 @@ async fn explicit_tls_provider_coexists_with_a_host_provider() -> TestResult {
         .install_default()
         .map_err(|_| "test host provider was already installed")?;
     let (address, peer) = tls_peer(SERVER, SERVER_KEY, false, &rustls::version::TLS12).await?;
-    let engine = OpenNet::new_with_network_config(trusted_config(false)?)?;
+    let config = trusted_config(false)?;
+    let explicit = config
+        .tls()
+        .clone()
+        .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    let engine = OpenNet::new_with_network_config(config.with_tls(explicit))?;
     let client = engine.create_ws_client("host-provider-coexistence").await?;
     let connected = SessionGuard::establish(&client, {
         let mut connect_options = session_options(&format!("wss://{address}/"), one_attempt());
@@ -1029,3 +1059,6 @@ async fn connect_proxy_mtls_retry_fetches_updated_token_for_second_upgrade() -> 
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

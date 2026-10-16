@@ -1,0 +1,28 @@
+# Reviewed LAN snapshot FFI boundary; separate from historical panic allowances.
+# See open-net/doc/lan_ipv4_native_safety.md and adjacent SAFETY comments for ownership,
+# native allocation contracts, null/type checks and processing bounds.
+# Only the two exact files and unsafe statements below are reviewed.
+# Full normalized token fingerprints detect edits inside operation bodies;
+# the FNV-1a64 value is a change detector, not a cryptographic signature.
+# Rows: count<TAB>exact file<TAB>unsafe<TAB>exact trimmed source line.
+fingerprint	src/module/net_status/lan_platform/macos.rs	02b126bc6a671e5b
+1	src/module/net_status/lan_platform/macos.rs	unsafe	.push(format!("SCNetworkInterfaceCopyAll failed: {}", unsafe {
+1	src/module/net_status/lan_platform/macos.rs	unsafe	Ok(unsafe { CFDictionary::wrap_under_create_rule(values) })
+1	src/module/net_status/lan_platform/macos.rs	unsafe	Some(unsafe { CFType::wrap_under_get_rule(value) })
+1	src/module/net_status/lan_platform/macos.rs	unsafe	callback: Option<unsafe extern "C" fn(*const c_void, CFArrayRef, *mut c_void)>,
+1	src/module/net_status/lan_platform/macos.rs	unsafe	if interface.type_of() != unsafe { SCNetworkInterfaceGetTypeID() } {
+2	src/module/net_status/lan_platform/macos.rs	unsafe	let (name, kind) = unsafe {
+1	src/module/net_status/lan_platform/macos.rs	unsafe	let interfaces = unsafe { SCNetworkInterfaceCopyAll() };
+1	src/module/net_status/lan_platform/macos.rs	unsafe	let interfaces: CFArray<CFType> = unsafe { CFArray::wrap_under_create_rule(interfaces) };
+1	src/module/net_status/lan_platform/macos.rs	unsafe	let store = unsafe {
+1	src/module/net_status/lan_platform/macos.rs	unsafe	let store = unsafe { CFType::wrap_under_create_rule(store) };
+1	src/module/net_status/lan_platform/macos.rs	unsafe	let values = unsafe {
+1	src/module/net_status/lan_platform/macos.rs	unsafe	return Err(format!("SCDynamicStoreCopyMultiple failed: {}", unsafe {
+1	src/module/net_status/lan_platform/macos.rs	unsafe	return Err(format!("SCDynamicStoreCreate failed: {}", unsafe {
+fingerprint	src/module/net_status/lan_platform/windows.rs	0e71c416f256b0c9
+1	src/module/net_status/lan_platform/windows.rs	unsafe	let count = unsafe { (*owner.0).NumEntries } as usize;
+1	src/module/net_status/lan_platform/windows.rs	unsafe	let result = unsafe { GetIfEntry2(&mut row) };
+1	src/module/net_status/lan_platform/windows.rs	unsafe	let result = unsafe { GetIpForwardTable2(AF_INET, &mut table) };
+1	src/module/net_status/lan_platform/windows.rs	unsafe	let result = unsafe { GetIpInterfaceEntry(&mut interface) };
+1	src/module/net_status/lan_platform/windows.rs	unsafe	unsafe { FreeMibTable(self.0.cast()) };
+1	src/module/net_status/lan_platform/windows.rs	unsafe	unsafe { std::slice::from_raw_parts(std::ptr::addr_of!((*owner.0).Table).cast(), count) };

@@ -56,6 +56,10 @@ pub enum ErrorKind {
     ObservationLagged,
     /// The requested operation requires an established connection.
     NotConnected,
+    /// The operation requires an actively running network monitor view.
+    NotRunning,
+    /// The operation is not implemented on this platform.
+    Unsupported,
     /// A session with the requested identity is already active.
     SessionAlreadyExists,
     /// The connection is already performing its closing sequence.
@@ -160,7 +164,7 @@ pub struct ErrorContext {
     #[cfg(feature = "ws-client")]
     /// Request identifier associated with the failure, when available.
     pub request_id: Option<crate::ws::RequestId>,
-    /// HTTP status associated with a protocol or upgrade failure.
+    /// HTTP status received from the peer, including protocol or body-read failures.
     pub http_status: Option<http::StatusCode>,
     #[cfg(feature = "http-client")]
     /// HTTP request identifier associated with the failure, when available.
@@ -225,6 +229,8 @@ pub struct NetError {
     context: ErrorContext,
     config_error: Option<Arc<ConfigError>>,
     source: Option<Arc<dyn StdError + Send + Sync + 'static>>,
+    #[cfg(feature = "http-client")]
+    http_response_head: Option<Arc<crate::api::http::HttpResponseHead>>,
 }
 
 impl NetError {
@@ -240,6 +246,8 @@ impl NetError {
             context: ErrorContext::default(),
             config_error: None,
             source: None,
+            #[cfg(feature = "http-client")]
+            http_response_head: None,
         }
     }
 
@@ -318,6 +326,27 @@ impl NetError {
     /// Returns the HTTP status associated with the failure, if one was recorded.
     pub fn http_status(&self) -> Option<http::StatusCode> {
         self.context.http_status
+    }
+
+    /// Returns the received status and headers when a buffered HTTP response
+    /// body failed to complete. The error kind, source and timeout phase remain
+    /// authoritative; metadata must not be interpreted as a successful response.
+    ///
+    /// Failures before a response is received and explicit cancellation do not
+    /// carry a response head. Retried attempts never reuse an earlier head.
+    #[cfg(feature = "http-client")]
+    pub fn http_response_head(&self) -> Option<&crate::api::http::HttpResponseHead> {
+        self.http_response_head.as_deref()
+    }
+
+    #[cfg(feature = "http-client")]
+    pub(crate) fn with_http_response_head(
+        mut self,
+        head: crate::api::http::HttpResponseHead,
+    ) -> Self {
+        self.context.http_status = Some(head.status);
+        self.http_response_head = Some(Arc::new(head));
+        self
     }
 
     /// Returns structured configuration details, if the failure came from invalid input.

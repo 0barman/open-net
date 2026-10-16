@@ -992,3 +992,6 @@ async fn full_shutdown_wakes_unbounded_buffered_and_stream_waiters() -> TestResu
     empty_client(&client, &mut peer).await?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

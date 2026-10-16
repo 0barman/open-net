@@ -1,21 +1,28 @@
 //! Provider and trust-root primitives shared by the TLS transports.
 //!
-//! Configurations use explicit providers and never install a process default.
-//! HTTP preserves the host's provider choice; WebSocket keeps its independent
-//! AWS-LC policy. Each transport owns its protocol and session settings.
+//! Explicit client providers take precedence over the host's process default.
+//! Applications own all cryptography; no path installs a process default.
 
+use crate::NetError;
 use rustls::crypto::CryptoProvider;
 use std::sync::Arc;
 
-pub(crate) fn local_provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+pub(crate) fn select_provider(
+    explicit: Option<&Arc<CryptoProvider>>,
+) -> Result<Arc<CryptoProvider>, NetError> {
+    if let Some(provider) = explicit.or_else(|| CryptoProvider::get_default()) {
+        return Ok(Arc::clone(provider));
+    }
+    Err(NetError::config(
+        "tls.provider",
+        "configure a rustls CryptoProvider or install an application process default",
+    ))
 }
 
-#[cfg(feature = "http-client")]
-pub(crate) fn http_provider() -> Arc<CryptoProvider> {
-    CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(local_provider)
+/// Explicit provider for test peers; never affects production feature selection.
+#[cfg(test)]
+pub(crate) fn local_provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls_openssl::default_provider())
 }
 
 pub(crate) fn root_store(include_builtin: bool) -> rustls::RootCertStore {
@@ -37,43 +44,33 @@ mod tests {
     }
 
     #[test]
-    fn local_provider_does_not_install_a_process_default() {
+    fn explicit_provider_is_preserved_without_changing_the_process_default() {
         let before = CryptoProvider::get_default().cloned();
-        let local = local_provider();
-        assert!(!local.cipher_suites.is_empty());
+        let custom = local_provider();
+        let selected = select_provider(Some(&custom)).expect("explicit provider");
+        assert!(Arc::ptr_eq(&custom, &selected));
         match (before, CryptoProvider::get_default()) {
             (None, None) => {}
             (Some(before), Some(after)) => assert!(Arc::ptr_eq(&before, after)),
-            _ => panic!("constructing a local provider changed the process default"),
+            _ => panic!("selecting a provider changed the process default"),
         }
     }
 
-    #[cfg(feature = "http-client")]
     #[test]
-    fn http_provider_preserves_the_process_default() {
+    fn default_selection_does_not_install_a_provider() {
         let before = CryptoProvider::get_default().cloned();
-        let selected = http_provider();
+        let selected = select_provider(None);
         match (before, CryptoProvider::get_default()) {
             (None, None) => {
-                let aws_lc = local_provider();
-                assert_eq!(
-                    selected
-                        .cipher_suites
-                        .iter()
-                        .map(|suite| suite.suite())
-                        .collect::<Vec<_>>(),
-                    aws_lc
-                        .cipher_suites
-                        .iter()
-                        .map(|suite| suite.suite())
-                        .collect::<Vec<_>>()
+                assert!(
+                    matches!(selected, Err(error) if matches!(error.kind(), crate::error::ErrorKind::InvalidConfig))
                 );
             }
             (Some(before), Some(after)) => {
-                assert!(Arc::ptr_eq(&selected, &before));
+                assert!(Arc::ptr_eq(&selected.expect("process default"), &before));
                 assert!(Arc::ptr_eq(&before, after));
             }
-            _ => panic!("selecting an HTTP provider changed the process default"),
+            _ => panic!("selecting a provider changed the process default"),
         }
     }
 }

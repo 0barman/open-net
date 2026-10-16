@@ -542,6 +542,7 @@ async fn run_real_backpressure(lane: Option<MessageLane>, cancel_in_flight: bool
             config.heartbeat = Some(open_net::ws::HeartbeatConfig {
                 interval: Duration::from_secs(3600),
                 pong_timeout: Duration::from_secs(7200),
+                ..Default::default()
             });
             config
         }),
@@ -782,3 +783,6 @@ async fn run_real_backpressure(lane: Option<MessageLane>, cancel_in_flight: bool
     })
     .await?
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

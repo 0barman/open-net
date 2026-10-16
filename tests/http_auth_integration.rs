@@ -641,3 +641,6 @@ async fn basic_auth_injects_a_redacted_static_credential() -> TestResult {
         "basic authorization header missing",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -6,6 +6,9 @@ use super::*;
 /// 单线程 Tokio 运行时中驱动。工作器串行处理客户端命令与 I/O 任务事件，负责连接状态
 /// 转换、连接及重连任务、读写任务、回调分发以及关闭时的资源清理。
 pub(crate) struct WSClientWorker {
+    /// Retains engine ownership of callback/provider threads through their actual exit.
+    pub(in crate::module::ws_client) resource_threads:
+        Arc<crate::common::retirement::ThreadRegistry>,
     /// 终态任务监听登记表，用于连接结束和关闭时完成尚未结算的观察任务。
     pub(in crate::module::ws_client) task_observers: Arc<NativeTaskObserver>,
     /// 创建客户端时编译好的代理、TLS 和网络传输配置快照。

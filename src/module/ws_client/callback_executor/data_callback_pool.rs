@@ -13,6 +13,7 @@ type Callback = Box<dyn FnOnce() + Send>;
 /// One client-wide pool. Registration prepares one real worker; dispatch grows
 /// it lazily up to the original limit and reuses busy workers if growth fails.
 pub(in crate::module::ws_client) struct DataCallbackPool {
+    threads: Arc<crate::common::retirement::ThreadRegistry>,
     state: Mutex<PoolState>,
     max_concurrency: usize,
     available: Arc<Notify>,
@@ -36,8 +37,20 @@ struct Preparation {
 
 impl DataCallbackPool {
     /// Construction does not start threads. All sessions share this same pool.
+    #[cfg(test)]
     pub(in crate::module::ws_client) fn new(max_concurrency: usize) -> Self {
+        Self::new_with_threads(
+            max_concurrency,
+            Arc::new(crate::common::retirement::ThreadRegistry::new()),
+        )
+    }
+
+    pub(in crate::module::ws_client) fn new_with_threads(
+        max_concurrency: usize,
+        threads: Arc<crate::common::retirement::ThreadRegistry>,
+    ) -> Self {
         Self {
+            threads,
             state: Mutex::new(PoolState {
                 workers: Vec::new(),
                 closed: false,
@@ -187,7 +200,7 @@ impl DataCallbackPool {
             }
             state.workers.try_reserve(1).map_err(io::Error::other)?;
         }
-        let worker = DataCallbackWorker::start(Arc::clone(&self.available))?;
+        let worker = DataCallbackWorker::start(Arc::clone(&self.available), &self.threads)?;
         match vacant.and_then(|index| state.workers.get_mut(index).map(|slot| (index, slot))) {
             Some((index, slot)) => Ok((index, Some(std::mem::replace(slot, worker)))),
             None => {

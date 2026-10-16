@@ -1,5 +1,6 @@
 use crate::common::common_error::CommonError;
 use crate::common::log::log_def::LogType;
+use crate::common::retirement::ThreadRegistry;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,6 +21,8 @@ pub(crate) struct LazyCallbackPool {
 struct PoolOwner {
     thread_count: usize,
     ready: Mutex<Option<Arc<Workers>>>,
+    closed: std::sync::atomic::AtomicBool,
+    threads: Arc<ThreadRegistry>,
     #[cfg(test)]
     fail_after: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -45,6 +48,8 @@ impl LazyCallbackPool {
             owner: Arc::new(PoolOwner {
                 thread_count,
                 ready: Mutex::new(None),
+                closed: std::sync::atomic::AtomicBool::new(false),
+                threads: Arc::new(ThreadRegistry::new()),
                 #[cfg(test)]
                 fail_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 #[cfg(test)]
@@ -67,6 +72,9 @@ impl LazyCallbackPool {
             .ready
             .lock()
             .map_err(|_| CommonError::RuntimeError)?;
+        if self.owner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(CommonError::PostError);
+        }
         if let Some(workers) = ready.as_ref() {
             return Ok(Arc::clone(workers));
         }
@@ -97,13 +105,14 @@ impl LazyCallbackPool {
                         "injected callback worker spawn failure",
                     ));
                 }
-                std::thread::Builder::new()
-                    .name(format!("open-net-callback-{index}"))
-                    .spawn(move || {
+                self.owner.threads.spawn_tracked_without_reaping(
+                    format!("open-net-callback-{index}"),
+                    move || {
                         #[cfg(test)]
                         let _count = WorkerCountGuard::new(counts);
                         shared.run();
-                    })
+                    },
+                )
             };
             match spawn() {
                 Ok(handle) => handles.push(handle),
@@ -125,8 +134,8 @@ impl LazyCallbackPool {
             }
         }
         *ready = Some(Arc::clone(&workers));
-        // Workers drain accepted jobs after the final owner closes the queue.
-        // Their handles are detached to make callback-initiated teardown safe.
+        // The registry retains handles for explicit shutdown. Ordinary Drop
+        // still closes without joining, including callback-initiated teardown.
         drop(handles);
         Ok(workers)
     }
@@ -169,6 +178,23 @@ impl LazyCallbackPool {
         if let Err(error) = self.execute(job) {
             crate::log_e!(LogType::Common; "callback_dispatch", "error", format!("{error:?}"));
         }
+    }
+
+    pub(crate) fn shutdown_blocking(&self) -> Result<(), CommonError> {
+        {
+            let ready = self
+                .owner
+                .ready
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.owner
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(workers) = ready.as_ref() {
+                workers.close();
+            }
+        }
+        self.owner.threads.seal_and_join()
     }
 
     #[cfg(test)]

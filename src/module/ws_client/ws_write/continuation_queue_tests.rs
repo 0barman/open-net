@@ -168,6 +168,7 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
             heartbeat_config: Some(crate::ws::HeartbeatConfig {
                 interval: Duration::from_secs(3600),
                 pong_timeout: Duration::from_secs(7200),
+                ..Default::default()
             }),
             heartbeat: Arc::new(HeartbeatState::new(GENERATION)),
         },

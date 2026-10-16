@@ -442,6 +442,7 @@ async fn registration_cancel_during_real_backpressure_retires_an_active_ping_rea
             config.heartbeat = Some(open_net::ws::HeartbeatConfig {
                 interval: Duration::from_secs(3600),
                 pong_timeout: Duration::from_secs(7200),
+                ..Default::default()
             });
             config
         }),
@@ -550,3 +551,6 @@ async fn registration_cancel_during_real_backpressure_retires_an_active_ping_rea
     );
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

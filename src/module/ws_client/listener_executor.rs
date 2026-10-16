@@ -1,6 +1,7 @@
 //! Bounded OS-thread executor shared by a client's listener registrations.
 
 use crate::common::log::log_def::LogType;
+use crate::common::retirement::{ThreadHandle, ThreadRegistry};
 use crate::error::NetError;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -17,6 +18,7 @@ pub(crate) const MAX_LISTENER_WORKERS: usize = 256;
 /// The first registration starts the fixed worker set. Submission never creates
 /// workers, and a blocked callback holds its worker without a replacement.
 pub(crate) struct ListenerExecutor {
+    threads: Arc<ThreadRegistry>,
     shared: Arc<ExecutorShared>,
     startup: Mutex<bool>,
     name: String,
@@ -40,10 +42,25 @@ struct ExecutorState {
 }
 
 impl ListenerExecutor {
+    #[cfg(test)]
     pub(crate) fn new(
         name: &str,
         workers: usize,
         queue_capacity: usize,
+    ) -> Result<Arc<Self>, NetError> {
+        Self::new_with_threads(
+            name,
+            workers,
+            queue_capacity,
+            Arc::new(ThreadRegistry::new()),
+        )
+    }
+
+    pub(crate) fn new_with_threads(
+        name: &str,
+        workers: usize,
+        queue_capacity: usize,
+        threads: Arc<ThreadRegistry>,
     ) -> Result<Arc<Self>, NetError> {
         if workers == 0 || workers > MAX_LISTENER_WORKERS || queue_capacity == 0 {
             return Err(NetError::from(crate::error::ErrorKind::InvalidConfig));
@@ -63,6 +80,7 @@ impl ListenerExecutor {
             queue_capacity,
         });
         let executor = Arc::new(Self {
+            threads,
             shared,
             startup: Mutex::new(false),
             name: name.to_owned(),
@@ -80,7 +98,7 @@ impl ListenerExecutor {
     pub(crate) fn ensure_started(&self) -> Result<(), NetError> {
         #[cfg(test)]
         let mut attempted = 0;
-        self.ensure_started_with_spawner(|builder, task| {
+        self.ensure_started_with_spawner(|name, task| {
             #[cfg(test)]
             {
                 if self
@@ -92,13 +110,13 @@ impl ListenerExecutor {
                 }
                 attempted += 1;
             }
-            builder.spawn(task)
+            self.threads.spawn_tracked_without_reaping(name, task)
         })
     }
 
     fn ensure_started_with_spawner<F>(&self, mut spawn: F) -> Result<(), NetError>
     where
-        F: FnMut(std::thread::Builder, CallbackJob) -> std::io::Result<std::thread::JoinHandle<()>>,
+        F: FnMut(String, CallbackJob) -> std::io::Result<ThreadHandle>,
     {
         let mut started = self.startup.lock().map_err(NetError::from_poison)?;
         {
@@ -119,8 +137,8 @@ impl ListenerExecutor {
             let shared = Arc::clone(&self.shared);
             let worker_cancelled = Arc::clone(&cancelled);
             let job: CallbackJob = Box::new(move || shared.run_worker(&worker_cancelled));
-            let builder = std::thread::Builder::new().name(format!("{}-{index}", self.name));
-            match spawn(builder, job) {
+            let name = format!("{}-{index}", self.name);
+            match spawn(name, job) {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     self.rollback_startup(&cancelled, handles);
@@ -153,12 +171,13 @@ impl ListenerExecutor {
         *started = true;
         drop(state);
         self.shared.changed.notify_all();
-        // Running callbacks are never joined, including on ordinary close/drop.
+        // Ordinary client close does not join callbacks. The engine retains
+        // their real thread handles independently of subscription clones.
         drop(handles);
         Ok(())
     }
 
-    fn rollback_startup(&self, cancelled: &AtomicBool, handles: Vec<std::thread::JoinHandle<()>>) {
+    fn rollback_startup(&self, cancelled: &AtomicBool, handles: Vec<ThreadHandle>) {
         {
             // Coordinate with the wait predicate so cancellation cannot miss a
             // worker about to sleep. No user job is admitted before ready=true.
@@ -392,13 +411,13 @@ mod tests {
         let (finished_tx, finished_rx) = mpsc::channel();
         let mut attempts = 0;
         let executor = ListenerExecutor::new("listener-executor-spawn-failure", 2, 1)?;
-        let result = executor.ensure_started_with_spawner(|builder, task| {
+        let result = executor.ensure_started_with_spawner(|name, task| {
             attempts += 1;
             if attempts == 2 {
                 return Err(std::io::Error::other("injected thread resource exhaustion"));
             }
             let finished_tx = finished_tx.clone();
-            builder.spawn(move || {
+            executor.threads.spawn_tracked(name, move || {
                 task();
                 let _ = finished_tx.send(());
             })

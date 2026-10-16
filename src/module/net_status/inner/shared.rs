@@ -30,6 +30,30 @@ impl std::fmt::Debug for NetworkStatusContext {
     }
 }
 impl NetworkStatusContext {
+    pub(super) fn observation_source(
+        &self,
+    ) -> Result<super::network_status_snapshot::NetworkStatusSource, NetError> {
+        self.service
+            .upgrade()
+            .map(|service| service.inner.observation_source())
+            .ok_or_else(|| NetError::from(ErrorKind::Closed))
+    }
+    #[cfg(any(windows, test))]
+    pub(super) fn windows_sampler(&self) -> Result<Arc<super::refresh::WindowsSampler>, NetError> {
+        self.service
+            .upgrade()
+            .map(|service| service.inner.windows_sampler())
+            .ok_or_else(|| NetError::from(ErrorKind::Closed))
+    }
+    #[cfg(any(windows, test))]
+    pub(super) fn windows_reachability_sampler(
+        &self,
+    ) -> Result<Arc<super::refresh::WindowsSampler>, NetError> {
+        self.service
+            .upgrade()
+            .map(|service| service.inner.windows_reachability_sampler())
+            .ok_or_else(|| NetError::from(ErrorKind::Closed))
+    }
     /// Read the cached observation without starting or retrying monitoring.
     pub fn snapshot(&self) -> Result<NetworkSnapshot, NetError> {
         if let Some(error) = ::tokio::sync::watch::Receiver::borrow(&self.failure).clone() {

@@ -283,7 +283,7 @@ async fn same_engine_routes_inherited_overridden_and_explicit_default_clients_in
 }
 
 async fn mtls_origin() -> TestResult<(String, TaskGuard)> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls_openssl::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from_pem_slice(CA)?)?;
     let server = Arc::new(
@@ -560,3 +560,6 @@ async fn client_proxy_override_survives_retry_reconnect_reuse_and_context_sessio
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -194,3 +194,6 @@ fn session_end_carries_the_owned_physical_close_without_promoting_it_to_an_error
         "scheduled retry lost its sampled delay",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

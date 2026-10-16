@@ -448,3 +448,6 @@ async fn prepared_commit_preserves_session_close_winner() -> TestResult {
     }
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

@@ -3,7 +3,7 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 description = "A cross-platform async networking library with WebSocket clients and network status monitoring."
@@ -23,12 +23,24 @@ required-features = ["ws-client"]
 name = "examples_requests"
 required-features = ["ws-client"]
 
+[[example]]
+name = "ws_client_lifecycle"
+required-features = ["ws-client"]
+
+[[example]]
+name = "network_events"
+required-features = ["net-status"]
+
+[[example]]
+name = "network_refresh"
+required-features = ["net-status"]
+
 [features]
 default = ["ws-client"]
 # Shared monitoring and LAN discovery. Transports enable this capability because
 # their existing network observation and lifecycle contracts depend on it.
-net-status = ["dep:if-addrs", "dep:n0-watcher", "dep:netwatch", "dep:windows", "dep:cc"]
-ws-client = ["net-status", "tokio/net", "tokio/io-util", "dep:tokio-tungstenite", "dep:tokio-util", "dep:socket2", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:httparse", "dep:base64", "dep:uuid", "dep:getrandom"]
+net-status = ["dep:if-addrs", "dep:n0-watcher", "dep:netwatch", "dep:windows", "dep:core-foundation", "dep:cc"]
+ws-client = ["net-status", "tokio/net", "tokio/io-util", "futures-util/sink", "dep:tokio-tungstenite", "dep:tokio-util", "dep:socket2", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:httparse", "dep:base64", "dep:uuid", "dep:getrandom"]
 http-client = ["net-status", "dep:chrono", "dep:async-trait", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:tower-layer"]
 # Optional RFC 6265 cookie storage for the HTTP client.  The store is SDK-owned
 # and is deliberately not enabled by any default feature.
@@ -58,14 +70,12 @@ tokio = { version = "1.53.1", default-features = false, features = [
     "time",
 ] }
 chrono = { version = "0.4.45", default-features = false, features = ["now"], optional = true }
-indexmap = { version = "2.14.1", features = ["serde"] }
 if-addrs = { version = "0.15.0", optional = true }
 n0-watcher = { version = "=1.0.0-rc.0", optional = true }
 netwatch = { version = "0.18.0", optional = true }
 
-# The SDK uses Tokio for execution. Keep the futures executor and polling macros
-# in dev-dependencies so downstream builds only receive the traits/utilities.
-futures = { version = "0.3.34", default-features = false, features = ["std"] }
+# The SDK uses Tokio for execution and only needs futures-util in production.
+# Keep the futures facade, executor and polling macros in dev-dependencies.
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 bytes = "1.12.1"
 http = "1.5.0"
@@ -73,7 +83,7 @@ http = "1.5.0"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 tokio-util = { version = "0.7.19", features = ["rt"], optional = true }
 socket2 = { version = "0.6.5", optional = true }
-rustls = { version = "0.23.43", default-features = false, features = ["std", "aws-lc-rs", "tls12"], optional = true }
+rustls = { version = "0.23.43", default-features = false, features = ["std", "tls12"], optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"], optional = true }
 webpki-roots = { version = "1.0.9", optional = true }
 httparse = { version = "1.10.1", optional = true }
@@ -101,12 +111,17 @@ tower-layer = { version = "=0.3.3", optional = true }
 
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Networking_NetworkListManager", "Win32_System_Com"], optional = true }
+windows = { version = "0.62.2", features = ["Win32_Networking_NetworkListManager", "Win32_System_Com", "Win32_System_Pipes", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10.1", optional = true }
 
 [build-dependencies]
 cc = { version = "1.4.4", optional = true }
 
 [dev-dependencies]
+ctor = "0.2.9"
+rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 futures = { version = "0.3.34", default-features = false, features = ["std", "executor", "async-await"] }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }

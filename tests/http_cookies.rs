@@ -1393,3 +1393,6 @@ async fn installed_auth_and_cookie_stores_share_the_same_redirect_lifecycle() ->
         "auth redirect invoked cookie store with wrong hop count",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

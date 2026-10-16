@@ -118,7 +118,7 @@ fn report_abandoned(abandoned: Abandoned) {
 /// A successful queue admission does not guarantee that a worker starts the job.
 /// Synchronous rejection retains its original error; later abandonment closes
 /// the registration even if a pool cannot create a worker or shuts its queue.
-pub(super) fn submit_tracked(
+pub(crate) fn submit_tracked(
     executor: &dyn CallbackExecutor,
     job: Box<dyn FnOnce() + Send + 'static>,
     abandoned: impl FnOnce(NetError) + Send + 'static,

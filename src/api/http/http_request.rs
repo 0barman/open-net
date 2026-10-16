@@ -91,7 +91,7 @@ impl std::fmt::Debug for HttpRequest {
 /// body, and inherited retry and admission settings. `build` rejects an empty path; the
 /// client performs same-origin validation when the request is submitted.
 pub struct HttpRequestBuilder {
-    method: Method,
+    method: Result<Method, NetError>,
     path: String,
     headers: HeaderMap,
     body: Bytes,
@@ -117,7 +117,7 @@ impl HttpRequest {
     /// Start constructing a request with safe defaults.
     pub fn builder() -> HttpRequestBuilder {
         HttpRequestBuilder {
-            method: Method::GET,
+            method: Ok(Method::GET),
             path: String::new(),
             headers: HeaderMap::new(),
             body: Bytes::new(),
@@ -181,8 +181,13 @@ impl HttpRequestBuilder {
     }
 
     /// Set the HTTP method.
-    pub fn method(mut self, method: impl Into<Method>) -> Self {
-        self.method = method.into();
+    ///
+    /// Invalid methods are reported by [`Self::build`] as input errors. A later
+    /// call replaces the previous method, including any conversion error.
+    pub fn method(mut self, method: impl TryInto<Method>) -> Self {
+        self.method = method
+            .try_into()
+            .map_err(|_| NetError::input("method", "invalid HTTP method token"));
         self
     }
     /// Set the relative request path.
@@ -337,11 +342,12 @@ impl HttpRequestBuilder {
         Ok(self)
     }
 
-    /// Validate the path and produce an owned request value.
+    /// Validate the method and path and produce an owned request value.
     ///
-    /// Timeout durations and the nonempty path are checked here; the client later
-    /// rejects absolute, cross-origin, or otherwise unsafe paths.
+    /// Method tokens, timeout durations and the nonempty path are checked here;
+    /// the client later rejects absolute, cross-origin, or otherwise unsafe paths.
     pub fn build(self) -> Result<HttpRequest, NetError> {
+        let method = self.method?;
         self.timeouts.validate_request()?;
         if self.path.is_empty() {
             return Err(NetError::input("path", "path must not be empty"));
@@ -364,7 +370,7 @@ impl HttpRequestBuilder {
             }
         }
         Ok(HttpRequest {
-            method: self.method,
+            method,
             path: self.path,
             headers: self.headers,
             body: self.body,
@@ -375,6 +381,58 @@ impl HttpRequestBuilder {
             #[cfg(feature = "http-client-cookies")]
             cookie_context: self.cookie_context,
         })
+    }
+}
+
+#[cfg(test)]
+mod method_builder_tests {
+    use super::*;
+    use crate::api::error::{ErrorKind, ErrorStage};
+    use crate::api::http::HttpRequestMethod;
+
+    #[test]
+    fn builder_rejects_invalid_methods_without_panicking_or_exposing_input() {
+        for token in ["", "BAD METHOD", "GET\r\nsecret", "GÉT", "GET/", "GET\0"] {
+            let method = HttpRequestMethod::Extension(token.to_owned());
+            for result in [
+                HttpRequest::builder().method(&method).path("/").build(),
+                HttpRequest::builder().method(method).path("/").build(),
+                HttpRequest::builder().method(token).path("/").build(),
+            ] {
+                let error = result.expect_err("invalid methods cannot build a request");
+                assert_eq!(error.kind(), ErrorKind::InvalidInput);
+                assert_eq!(error.context().stage, Some(ErrorStage::RequestBuild));
+                let detail = error.config_error().expect("method error details");
+                assert_eq!(detail.field(), "method");
+                assert_eq!(detail.reason(), "invalid HTTP method token");
+                assert!(!format!("{error} {error:?}").contains("secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn builder_preserves_valid_method_and_allows_replacing_invalid_method() -> Result<(), NetError>
+    {
+        for token in [
+            "GET",
+            "POST",
+            "QUERY",
+            "CUSTOM",
+            "custom",
+            "CuStOm",
+            "X!#$%&'*+-.^_`|~",
+        ] {
+            let method = HttpRequestMethod::Extension(token.to_owned());
+            let request = HttpRequest::builder().method(method).path("/").build()?;
+            assert_eq!(request.method.as_str(), token);
+        }
+        let request = HttpRequest::builder()
+            .method(HttpRequestMethod::Extension("BAD METHOD".to_owned()))
+            .method(HttpRequestMethod::PATCH)
+            .path("/")
+            .build()?;
+        assert_eq!(request.method, Method::PATCH);
+        Ok(())
     }
 }
 
@@ -438,7 +496,8 @@ mod admission_tests {
     }
 }
 
-#[cfg(all(test, feature = "http-client-codecs"))]
+#[cfg(test)]
+#[cfg(feature = "http-client-codecs")]
 mod codec_builder_tests {
     use super::*;
     use bytes::Bytes;

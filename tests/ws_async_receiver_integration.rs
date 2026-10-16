@@ -180,3 +180,6 @@ async fn async_receiver_reports_disconnect_overflow_and_unsubscribe_is_terminal(
     bounded(client.shutdown()).await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

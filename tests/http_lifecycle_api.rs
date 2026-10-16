@@ -1053,3 +1053,6 @@ fn fixture_audits_results_published_after_response_slots_are_exhausted() -> Test
         "cleanup hid an IO failure or an EOF without recorded socket cleanup",
     )
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

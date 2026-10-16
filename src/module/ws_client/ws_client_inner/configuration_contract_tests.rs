@@ -176,6 +176,7 @@ fn heartbeat_timeouts_are_independent_and_write_buffer_boundaries_are_preserved(
             config.heartbeat = Some(crate::ws::HeartbeatConfig {
                 interval: Duration::from_secs(20),
                 pong_timeout: Duration::from_millis(pong_ms),
+                ..Default::default()
             });
             config
         });

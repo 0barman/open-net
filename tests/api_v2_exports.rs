@@ -39,7 +39,10 @@ fn logging_api_types_match_compatible_imports() -> TestResult {
     let _: fn(log::LogInfo) -> open_net::LogInfo = identity;
     let _: fn(log::LogLevel) -> open_net::LogLevel = identity;
     let _: fn(log::LogListener) -> open_net::LogListener = identity;
+    let _: fn(log::SharedLogListener) -> open_net::SharedLogListener = identity;
     let _: fn(log::LogSubscription) -> open_net::LogSubscription = identity;
+    let _: fn(log::LogSubscriptionOptions) -> open_net::LogSubscriptionOptions = identity;
+    let _: fn(log::LogDropStats) -> open_net::LogDropStats = identity;
     let _: fn(log::LogType) -> open_net::LogType = identity;
     let _: fn(log::OpenNetLogger) -> open_net::OpenNetLogger = identity;
     Ok(())
@@ -81,3 +84,6 @@ fn websocket_api_types_match_compatible_imports() -> TestResult {
     network::NetworkConfig::default().validate()?;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

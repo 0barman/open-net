@@ -10,7 +10,8 @@ pub struct LogInfo {
     pub location: String,
     /// Log severity.
     pub level: LogLevel,
-    /// Log tag identifying the subsystem or operation.
+    /// Operation label, kept exactly as supplied (for example, `start_session`).
+    /// No origin, SDK prefix or severity suffix is added.
     pub tag: String,
     /// Log payload, often JSON formatted by the exported log macros.
     pub content: String,

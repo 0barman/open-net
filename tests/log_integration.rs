@@ -81,6 +81,7 @@ async fn public_listener_observes_entry_arguments_and_v2_api_error() -> TestResu
     check(
         log.level == LogLevel::Info
             && log.log_type == LogType::WSC
+            && log.tag == "argument_probe"
             && log.location.contains("log_integration.rs:")
             && log.create_time > 0,
         "log metadata",
@@ -226,3 +227,6 @@ async fn dropping_log_subscription_releases_a_client_capture_outside_registry_lo
     bounded(rx).await??;
     Ok(())
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

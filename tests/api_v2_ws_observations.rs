@@ -171,3 +171,6 @@ const _: [HandshakeBodyCaptureState; 7] = [
     HandshakeBodyCaptureState::Unrecognized,
     HandshakeBodyCaptureState::Captured,
 ];
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

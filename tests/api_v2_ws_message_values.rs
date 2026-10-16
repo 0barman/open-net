@@ -86,3 +86,6 @@ fn public_message_values_support_the_declared_owned_interfaces() {
     let _into_message: fn(Response) -> Message = Response::into_message;
     let _parts: fn(Request) -> (RequestId, Message, Metadata) = Request::into_parts;
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

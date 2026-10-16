@@ -616,3 +616,6 @@ async fn result_api_client_created_by_factory_is_available_from_registry() -> Te
     destroy_client(net, "result-registry").await?;
     server.finish().await
 }
+
+#[path = "support/crypto_provider.rs"]
+mod crypto_provider;

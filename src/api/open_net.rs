@@ -22,6 +22,40 @@ pub struct OpenNet {
 }
 
 impl OpenNet {
+    /// Permanently close this engine's admission and request cancellation.
+    ///
+    /// Idempotent and safe inside SDK callbacks. It does not wait for callback,
+    /// provider, worker or runtime retirement. Use [`Self::shutdown`] from an
+    /// external control flow to confirm completion. The engine cannot reopen.
+    pub fn begin_shutdown(&self) {
+        self.inner.begin_shutdown(false);
+    }
+
+    /// Close this engine and wait for its running resources to exit.
+    ///
+    /// The first poll also calls [`Self::begin_shutdown`]. Concurrent/repeated
+    /// waiters share the result; cancelling a waiter never cancels cleanup.
+    /// No caller Tokio runtime is required. Success confirms retirement of
+    /// registered clients, their SDK callbacks/providers, network monitoring,
+    /// engine callback workers and runtime, even while public handles survive.
+    ///
+    /// Standalone HTTP workers, other engines, process-wide logging and the
+    /// process-wide retirement reaper are outside this boundary. A standalone
+    /// HTTP client using this engine's network context keeps its HTTP workers;
+    /// only its engine-owned observations retire. User-retained data is not freed.
+    /// Application tasks on an application-owned runtime remain its owner's duty.
+    ///
+    /// SDK callback/worker contexts are conservatively rejected on every poll
+    /// with `InvalidInput` (field `open_net.shutdown`, stage `Close`), including
+    /// cross-engine waits. Closing still starts; use `begin_shutdown` then return.
+    /// Indirect cross-thread waits cannot be detected. A callback/provider that
+    /// never returns can prevent completion; a caller timeout only ends its wait.
+    /// Errors do not certify that all resources have retired. Dropping the engine
+    /// still initiates automatic cleanup, but Drop itself is not a completion receipt.
+    pub async fn shutdown(&self) -> Result<(), NetError> {
+        self.inner.shutdown().await
+    }
+
     /// Creates an engine with an immutable default network policy for WebSocket clients.
     ///
     /// Proxy and TLS settings are validated before any work starts. This
@@ -36,6 +70,11 @@ impl OpenNet {
     }
 
     /// Creates an engine with default settings and queue capacities of 128.
+    ///
+    /// When the `ws-client` feature is enabled, the default WebSocket TLS
+    /// connector is compiled during this call. Supply a provider with
+    /// [`Self::new_with_network_config`] or install the application's process
+    /// provider before calling this constructor. The SDK never installs one.
     pub fn new() -> Result<Self, NetError> {
         crate::log_s!(LogType::Engine; "OpenNet-new");
         Self::new_with_config(OpenNetConfig::default())
@@ -44,16 +83,28 @@ impl OpenNet {
     /// Creates an engine with the supplied runtime, queue capacities, and network policy.
     ///
     /// Validates configuration before creating channels or workers. Invalid
-    /// capacities or worker counts return `InvalidConfig`; values remain fixed thereafter.
+    /// capacities, worker counts, or missing WebSocket TLS providers return
+    /// `InvalidConfig`; values remain fixed thereafter.
     ///
     /// ```no_run
     /// use open_net::{config::OpenNetConfig, NetError, OpenNet};
+    /// #[cfg(feature = "ws-client")]
+    /// use open_net::network::{NetworkConfig, TlsConfig};
+    /// #[cfg(feature = "ws-client")]
+    /// use std::sync::Arc;
     /// # fn example() -> Result<(), NetError> {
-    /// let net = OpenNet::new_with_config(
-    ///     OpenNetConfig::default()
-    ///         .with_async_queue_capacity(256)
-    ///         .with_sync_queue_capacity(128),
-    /// )?;
+    /// let config = OpenNetConfig::default()
+    ///     .with_async_queue_capacity(256)
+    ///     .with_sync_queue_capacity(128);
+    /// #[cfg(feature = "ws-client")]
+    /// let config = config.with_network_config(
+    ///     NetworkConfig::default().with_tls(
+    ///         TlsConfig::default().with_crypto_provider(Arc::new(
+    ///             rustls_openssl::default_provider(),
+    ///         )),
+    ///     ),
+    /// );
+    /// let net = OpenNet::new_with_config(config)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -111,6 +162,36 @@ impl OpenNet {
         })
     }
 
+    /// Returns the named WebSocket client, creating it when the name is not
+    /// registered yet.
+    ///
+    /// The supplied configuration is used only when this call creates the
+    /// client. If another caller has already registered the name, this method
+    /// returns a clone of that client and keeps its original immutable
+    /// configuration. Concurrent callers wait for the same lifecycle
+    /// transition and do not receive `ClientAlreadyExists` for the same name.
+    #[cfg(feature = "ws-client")]
+    pub async fn get_or_create_ws_client_with_config(
+        &self,
+        thread_name: &str,
+        config: WebSocketClientConfig,
+    ) -> Result<WebSocketClient, NetError> {
+        crate::log_t!(LogType::WSC; "get_or_create_ws_client_with_config", "thread_name|config", thread_name, format!("{:?}", config));
+        let result: Result<WebSocketClient, NetError> = async {
+            let thread_name = thread_name.trim();
+            if thread_name.is_empty() || thread_name.contains('\0') {
+                return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
+            }
+            self.inner
+                .get_or_create_ws_client(thread_name.to_string(), config)
+                .await
+        }
+        .await;
+        result.inspect_err(|error| {
+            crate::log_e!(LogType::WSC; "get_or_create_ws_client_with_config", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
+        })
+    }
+
     /// Creates a WebSocket client with an immutable per-client proxy and TLS policy.
     ///
     /// The supplied policy completely replaces engine defaults. `default()` selects
@@ -120,14 +201,26 @@ impl OpenNet {
     /// future does not cancel creation; retrieve and later destroy the client by name.
     ///
     /// ```no_run
-    /// use open_net::{network::{NetworkConfig, ProxyConfig}, ws::WebSocketClientConfig, NetError, OpenNet};
+    /// use open_net::{
+    ///     network::{NetworkConfig, ProxyConfig, TlsConfig},
+    ///     tls::CryptoProvider,
+    ///     ws::WebSocketClientConfig,
+    ///     NetError, OpenNet,
+    /// };
+    /// use std::sync::Arc;
     /// # async fn example() -> Result<(), NetError> {
+    /// let provider: Arc<CryptoProvider> =
+    ///     Arc::new(rustls_openssl::default_provider());
     /// let defaults = NetworkConfig::default()
-    ///     .with_proxy(ProxyConfig::http_connect("http://127.0.0.1:8080", None)?);
+    ///     .with_proxy(ProxyConfig::http_connect("http://127.0.0.1:8080", None)?)
+    ///     .with_tls(TlsConfig::default().with_crypto_provider(Arc::clone(&provider)));
     /// let net = OpenNet::new_with_network_config(defaults.clone())?;
     /// let inherited = net.create_ws_client("inherited").await?;
     /// let direct = net.create_ws_client_with_network_config(
-    ///     "direct", WebSocketClientConfig::default(), NetworkConfig::default(),
+    ///     "direct", WebSocketClientConfig::default(),
+    ///     NetworkConfig::default().with_tls(
+    ///         TlsConfig::default().with_crypto_provider(Arc::clone(&provider)),
+    ///     ),
     /// ).await?;
     /// let other = net.create_ws_client_with_network_config(
     ///     "other", WebSocketClientConfig::default(),
@@ -179,6 +272,13 @@ impl OpenNet {
 
     #[cfg(feature = "ws-client")]
     /// Permanently destroys a named WebSocket client after its worker exits.
+    ///
+    /// This future can be awaited without a caller Tokio runtime, including via
+    /// `futures::executor::block_on`. The SDK owns the worker join. Cancelling
+    /// the wait does not cancel cleanup or release the name before worker exit.
+    /// A concurrent destroy returns [`crate::error::ErrorKind::ConnectionClosing`];
+    /// an absent name returns [`crate::error::ErrorKind::ClientNotFound`]. Use
+    /// [`Self::destroy_ws_client_if_exists`] for repeated, idempotent cleanup.
     pub async fn destroy_ws_client(&self, thread_name: &str) -> Result<(), NetError> {
         crate::log_t!(LogType::WSC; "destroy_ws_client", "thread_name", thread_name);
         let result: Result<(), NetError> = async {
@@ -190,6 +290,30 @@ impl OpenNet {
         .await;
         result.inspect_err(|error| {
             crate::log_e!(LogType::WSC; "destroy_ws_client", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
+        })
+    }
+
+    /// Permanently destroys a named WebSocket client when it exists.
+    ///
+    /// Missing names are treated as success, so this method can be used from
+    /// repeated or best-effort cleanup paths. If creation or destruction is
+    /// already in progress, it waits for that lifecycle operation and then
+    /// completes the requested cleanup.
+    /// Like [`Self::destroy_ws_client`], this does not require a caller Tokio
+    /// runtime and accepted cleanup continues if its waiter is cancelled.
+    #[cfg(feature = "ws-client")]
+    pub async fn destroy_ws_client_if_exists(&self, thread_name: &str) -> Result<(), NetError> {
+        crate::log_t!(LogType::WSC; "destroy_ws_client_if_exists", "thread_name", thread_name);
+        let result: Result<(), NetError> = async {
+            let thread_name = thread_name.trim();
+            if thread_name.is_empty() || thread_name.contains('\0') {
+                return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
+            }
+            self.inner.destroy_ws_client_if_exists(thread_name).await
+        }
+        .await;
+        result.inspect_err(|error| {
+            crate::log_e!(LogType::WSC; "destroy_ws_client_if_exists", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
         })
     }
 }
@@ -210,7 +334,20 @@ impl OpenNet {
     ///
     /// ```no_run
     /// use open_net::{NetError, OpenNet};
+    /// #[cfg(feature = "ws-client")]
+    /// use open_net::network::{NetworkConfig, TlsConfig};
+    /// #[cfg(feature = "ws-client")]
+    /// use std::sync::Arc;
     /// # async fn example() -> Result<(), NetError> {
+    /// #[cfg(feature = "ws-client")]
+    /// let net = OpenNet::new_with_network_config(
+    ///     NetworkConfig::default().with_tls(
+    ///         TlsConfig::default().with_crypto_provider(Arc::new(
+    ///             rustls_openssl::default_provider(),
+    ///         )),
+    ///     ),
+    /// )?;
+    /// #[cfg(not(feature = "ws-client"))]
     /// let net = OpenNet::new()?;
     /// let client = net.create_net_status_client("network-status").await?;
     /// client.start().await?;
@@ -257,6 +394,25 @@ impl OpenNet {
 }
 
 impl OpenNet {
+    /// Register a lazy HTTP client with fixed configuration and its own shutdown boundary.
+    ///
+    /// Names share the existing HTTP registry and must be nonblank and contain
+    /// no NUL. Registration validates configuration without constructing HTTP
+    /// workers. Clone the returned handle to share initialization and shutdown;
+    /// declaring an already reserved name returns `ClientAlreadyExists`.
+    #[cfg(feature = "http-client")]
+    pub fn managed_http(
+        &self,
+        name: &str,
+        config: HttpClientConfig,
+    ) -> Result<crate::api::http::ManagedHttpClient, NetError> {
+        let name = name.trim();
+        if name.is_empty() || name.contains('\0') {
+            return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
+        }
+        self.inner.managed_http(name.to_owned(), config)
+    }
+
     #[cfg(feature = "http-client")]
     /// Creates an HTTP client with the supplied configuration.
     pub async fn create_http_client_with_config(

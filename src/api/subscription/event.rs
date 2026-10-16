@@ -234,7 +234,7 @@ impl<T> EventReceiver<T> {
     /// `Err` reports lag or a source failure. The receive future is cancellation
     /// safe: polling it does not remove an item unless the item is returned.
     pub async fn recv(&mut self) -> std::result::Result<Option<T>, ReceiveError> {
-        futures::future::poll_fn(|cx| self.registration.poll_next(cx))
+        std::future::poll_fn(|cx| self.registration.poll_next(cx))
             .await
             .transpose()
     }
@@ -252,6 +252,14 @@ impl<T> EventReceiver<T> {
     /// Calling it while a callback is running does not block that callback.
     pub fn unsubscribe(&self) -> bool {
         self.registration.unsubscribe()
+    }
+    /// Internal cancellation authority without transferring receiver ownership.
+    #[cfg(feature = "net-status")]
+    pub(crate) fn control(&self) -> Arc<dyn SubscriptionControl>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.registration.clone()
     }
     /// Consume the receiver and deliver subsequent events to a callback.
     ///
@@ -281,7 +289,7 @@ impl<T> EventReceiver<T> {
         })
     }
 }
-impl<T> futures::Stream for EventReceiver<T> {
+impl<T> futures_util::Stream for EventReceiver<T> {
     type Item = std::result::Result<T, ReceiveError>;
     fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.registration.poll_next(cx)

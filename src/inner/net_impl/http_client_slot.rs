@@ -1,6 +1,8 @@
 #![cfg(feature = "http-client")]
 
+use super::managed_http_client::ManagedHttpClientInner;
 use crate::api::http::http_client::HttpClient;
+use std::sync::Arc;
 
 /// Registration state for an HTTP client owned by an [`OpenNetInner`].
 ///
@@ -12,13 +14,14 @@ pub(super) enum HttpClientSlot {
     Creating,
     Ready(HttpClient),
     Closing(HttpClient),
+    Managed(Arc<ManagedHttpClientInner>),
 }
 
 impl HttpClientSlot {
     pub(super) fn into_client(self) -> Option<HttpClient> {
         match self {
             Self::Ready(client) | Self::Closing(client) => Some(client),
-            Self::Creating => None,
+            Self::Creating | Self::Managed(_) => None,
         }
     }
 }
