@@ -28,11 +28,11 @@ use tokio_tungstenite::accept_async;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const CA: &[u8] = include_bytes!("fixtures/network/ca.pem");
+const CA: &[u8] = include_bytes!("../src/test_fixtures/network/ca.pem");
 const SERVER: &[u8] = include_bytes!("fixtures/network/server.pem");
 const SERVER_KEY: &[u8] = include_bytes!("fixtures/network/server-key.pem");
-const CLIENT: &[u8] = include_bytes!("fixtures/network/client.pem");
-const CLIENT_KEY: &[u8] = include_bytes!("fixtures/network/client-key.pem");
+const CLIENT: &[u8] = include_bytes!("../src/test_fixtures/network/client.pem");
+const CLIENT_KEY: &[u8] = include_bytes!("../src/test_fixtures/network/client-key.pem");
 
 struct TaskGuard<T> {
     task: tokio::task::JoinHandle<T>,
@@ -217,7 +217,7 @@ async fn certificate_rejections_are_tls_errors_without_http_status() -> TestResu
             SERVER,
             SERVER_KEY,
             NetworkConfig::default().with_tls(TlsConfig::default().with_root_certificates(
-                include_bytes!("fixtures/network/other-ca.pem"),
+                include_bytes!("../src/test_fixtures/network/other-ca.pem"),
                 RootCertificateMode::Replace,
             )?),
         ),
@@ -409,8 +409,8 @@ fn network_configuration_rejects_invalid_material_before_connecting() -> TestRes
     {
         return Err("invalid CA material was accepted".into());
     }
-    let cert = include_bytes!("fixtures/network/client.pem");
-    let key = include_bytes!("fixtures/network/client-key.pem");
+    let cert = include_bytes!("../src/test_fixtures/network/client.pem");
+    let key = include_bytes!("../src/test_fixtures/network/client-key.pem");
     ClientIdentity::from_pem(cert, key)?;
     let mismatched =
         ClientIdentity::from_pem(cert, include_bytes!("fixtures/network/server-key.pem"))?;
@@ -624,7 +624,7 @@ async fn rejected_tls_socket_is_retained_until_client_closes() -> TestResult {
 async fn mtls_rejects_missing_and_untrusted_client_certificates() -> TestResult {
     let other = ClientIdentity::from_pem(
         include_bytes!("fixtures/network/other-client.pem"),
-        include_bytes!("fixtures/network/other-client-key.pem"),
+        include_bytes!("../src/test_fixtures/network/other-client-key.pem"),
     )?;
     for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
         for (identity, config) in [

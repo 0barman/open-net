@@ -3,7 +3,7 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.89"
 description = "A cross-platform async networking library with WebSocket clients and network status monitoring."
@@ -13,7 +13,9 @@ documentation = "https://docs.rs/open-net"
 keywords = ["networking", "websocket", "async", "tokio", "cross-platform"]
 categories = ["network-programming", "asynchronous"]
 readme = "README.md"
-include = ["/src/**", "/libs/common/src/**", "/tests/**", "/examples/**", "/doc/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/rust-toolchain.toml", "/rustfmt.toml"]
+# Integration tests stay in the repository. Shared unit-test fixtures under
+# src/test_fixtures keep the published crate's library tests self-contained.
+include = ["/src/**", "/libs/common/src/**", "/examples/**", "/doc/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/rust-toolchain.toml", "/rustfmt.toml"]
 
 [[example]]
 name = "examples_messages"
@@ -41,7 +43,7 @@ default = ["ws-client"]
 # their existing network observation and lifecycle contracts depend on it.
 net-status = ["dep:if-addrs", "dep:n0-watcher", "dep:netwatch", "dep:windows", "dep:core-foundation", "dep:cc"]
 ws-client = ["net-status", "tokio/net", "tokio/io-util", "futures-util/sink", "dep:tokio-tungstenite", "dep:tokio-util", "dep:socket2", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:httparse", "dep:base64", "dep:uuid", "dep:getrandom"]
-http-client = ["net-status", "dep:chrono", "dep:async-trait", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:tower-layer"]
+http-client = ["net-status", "dep:httpdate", "dep:async-trait", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:tower-layer"]
 # Optional RFC 6265 cookie storage for the HTTP client.  The store is SDK-owned
 # and is deliberately not enabled by any default feature.
 http-client-cookies = [
@@ -69,7 +71,7 @@ tokio = { version = "1.53.1", default-features = false, features = [
     "macros",
     "time",
 ] }
-chrono = { version = "0.4.45", default-features = false, features = ["now"], optional = true }
+httpdate = { version = "1.0.3", optional = true }
 if-addrs = { version = "0.15.0", optional = true }
 n0-watcher = { version = "=1.0.0-rc.0", optional = true }
 netwatch = { version = "0.18.0", optional = true }
@@ -99,9 +101,9 @@ cookie_store = { version = "=0.22.1", default-features = false, optional = true 
 psl = { version = "=2.1.240", optional = true }
 url = { version = "2.5.7", optional = true }
 serde_qs = { version = "1.1.3", default-features = false, optional = true }
-reqwest = { version = "0.12.28", default-features = false, optional = true, features = [
+reqwest = { version = "0.13.5", default-features = false, optional = true, features = [
     "stream",
-    "rustls-tls-manual-roots-no-provider",
+    "rustls-no-provider",
 ] }
 hyper = { version = "1.11.1", default-features = false, optional = true, features = ["http1"] }
 # These private typed-error compatibility boundaries are tied to the audited lock versions.

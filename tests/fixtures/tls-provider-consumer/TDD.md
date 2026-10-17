@@ -1,6 +1,6 @@
 # OpenSSL provider 消费者契约（2026-10-11）
 
-本次迁移保留 rustls，以 `rustls-openssl` 0.4.2 提供密码算法。消费者的 reqwest 使用 `rustls-tls-manual-roots-no-provider`；不再通过宿主依赖引入 AWS-LC 或 ring。旧 tokio-tungstenite 0.28 仍用于验证依赖共存及缺失进程 provider 的负对照。
+本次迁移保留 rustls，以 `rustls-openssl` 0.4.2 提供密码算法。消费者的 reqwest 0.13.5 使用 `rustls-no-provider`；该 feature 引入 `rustls-platform-verifier`，SDK 仍通过 `tls_backend_preconfigured()` 注入自定义 rustls 配置，保留自身的根证书和 provider 策略，不再通过宿主依赖引入 AWS-LC 或 ring。旧 tokio-tungstenite 0.28 仍用于验证依赖共存及缺失进程 provider 的负对照。
 
 SDK 的选择顺序为每客户端显式 provider、宿主进程 provider；均未配置时返回类型化 InvalidConfig。SDK 不内置、安装或替换进程 provider。HTTP 与 WS 使用相同规则。
 

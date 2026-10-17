@@ -434,7 +434,7 @@ impl HttpClientConfig {
             connect_timeout: None,
             timeouts: HttpTimeouts::new(),
             admission_policy: HttpAdmissionPolicy::default(),
-            // reqwest 0.12 defaults to a 15 second TCP keepalive.
+            // reqwest defaults to a 15 second TCP keepalive.
             tcp_keepalive: Some(Duration::from_secs(15)),
             max_response_bytes: 1024 * 1024 * 1024,
             request_queue_capacity: 128,
@@ -1184,8 +1184,8 @@ mod tests {
 
     #[test]
     fn supports_replacing_and_appending_custom_roots() -> TestResult {
-        let ca = include_bytes!("../../../tests/fixtures/network/ca.pem");
-        let other_ca = include_bytes!("../../../tests/fixtures/network/other-ca.pem");
+        let ca = include_bytes!("../../test_fixtures/network/ca.pem");
+        let other_ca = include_bytes!("../../test_fixtures/network/other-ca.pem");
         let config = HttpTlsConfig::default()
             .with_root_certificates(ca, true)?
             .with_additional_root_certificate(other_ca)?;
@@ -1201,8 +1201,8 @@ mod tests {
 
     #[test]
     fn compiled_roots_retain_every_certificate_in_each_bundle() -> TestResult {
-        let ca = include_bytes!("../../../tests/fixtures/network/ca.pem");
-        let other_ca = include_bytes!("../../../tests/fixtures/network/other-ca.pem");
+        let ca = include_bytes!("../../test_fixtures/network/ca.pem");
+        let other_ca = include_bytes!("../../test_fixtures/network/other-ca.pem");
         let bundle = [ca.as_slice(), other_ca.as_slice()].concat();
         let replaced = HttpTlsConfig::default().with_root_certificates(&bundle, true)?;
         let replaced_roots = replaced.compile_roots()?;
@@ -1263,7 +1263,7 @@ mod tests {
         // Passing ClientConfig itself is essential: reqwest rejects an Arc or
         // a different rustls version through its type-erased TLS boundary.
         reqwest::Client::builder()
-            .use_preconfigured_tls(tls)
+            .tls_backend_preconfigured(tls)
             .build()?;
         Ok(())
     }
@@ -1281,8 +1281,8 @@ mod tests {
             }
         }
         static REJECT_KEYS: RejectSigningKeys = RejectSigningKeys;
-        let certificates = include_bytes!("../../../tests/fixtures/network/client.pem");
-        let key = include_bytes!("../../../tests/fixtures/network/client-key.pem");
+        let certificates = include_bytes!("../../test_fixtures/network/client.pem");
+        let key = include_bytes!("../../test_fixtures/network/client-key.pem");
         let configured = HttpTlsConfig::default().with_client_identity_pem(certificates, key)?;
         let clone = configured
             .clone()
@@ -1350,14 +1350,14 @@ mod tests {
 
     #[test]
     fn rejects_malformed_pem_and_defers_key_matching_to_client_creation() -> TestResult {
-        let certificates = include_bytes!("../../../tests/fixtures/network/client.pem");
-        let private_key = include_bytes!("../../../tests/fixtures/network/client-key.pem");
+        let certificates = include_bytes!("../../test_fixtures/network/client.pem");
+        let private_key = include_bytes!("../../test_fixtures/network/client-key.pem");
         let valid = HttpTlsConfig::default().with_client_identity_pem(certificates, private_key)?;
         check(
             format!("{valid:?}").contains("client_identity_configured: true"),
             "valid client identity was not retained",
         )?;
-        let wrong_key = include_bytes!("../../../tests/fixtures/network/other-client-key.pem");
+        let wrong_key = include_bytes!("../../test_fixtures/network/other-client-key.pem");
         let configured = HttpTlsConfig::default()
             .with_client_identity_pem(certificates, wrong_key)?
             .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));

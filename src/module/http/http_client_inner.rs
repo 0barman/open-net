@@ -14,6 +14,7 @@ use crate::module::http::http_failure::{
 use crate::module::http::network_observation::HttpNetworkObservation;
 use crate::module::http::request_wait_guard::RequestWaitGuard;
 use crate::module::http::result_request::ResultRequest;
+use crate::module::http::retry_after::parse_retry_after;
 use crate::net_status::{NetworkSnapshot, NetworkStatusContext};
 use crate::subscription::StateReceiver;
 use admission::Admission;
@@ -1554,7 +1555,7 @@ fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
         default_headers
     };
     let builder = Client::builder()
-        .use_preconfigured_tls(config.tls.compile(config.tls_alpn_protocols())?)
+        .tls_backend_preconfigured(config.tls.compile(config.tls_alpn_protocols())?)
         .tcp_keepalive(config.tcp_keepalive)
         .default_headers(default_headers);
     #[cfg(not(feature = "http-client-http2"))]
@@ -2285,22 +2286,6 @@ async fn wait_for_retry(
         _ = control.wait() => false,
         _ = tokio::time::sleep(delay) => !control.is_cancelled() && deadline.is_none_or(|limit| Instant::now() < limit),
     }
-}
-
-fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
-    let value = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
-    let value = value.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
-    }
-    let date = chrono::DateTime::parse_from_rfc2822(value)
-        .ok()?
-        .with_timezone(&chrono::Utc);
-    let now = chrono::Utc::now();
-    if date <= now {
-        return Some(Duration::ZERO);
-    }
-    (date - now).to_std().ok()
 }
 
 async fn receive_loop(
@@ -3311,31 +3296,6 @@ mod tests {
         check(
             registry.is_empty()?,
             "terminal finish did not release registration",
-        )
-    }
-
-    #[test]
-    fn retry_after_accepts_delta_seconds_and_http_date(
-    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::RETRY_AFTER,
-            http::HeaderValue::from_static("3"),
-        );
-        check(
-            parse_retry_after(&headers) == Some(Duration::from_secs(3)),
-            "delta-seconds Retry-After was not parsed",
-        )?;
-
-        let future = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc2822();
-        let value = http::HeaderValue::from_str(future.as_str())
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        headers.insert(http::header::RETRY_AFTER, value);
-        let delay = parse_retry_after(&headers)
-            .ok_or_else(|| std::io::Error::other("HTTP-date Retry-After was not parsed"))?;
-        check(
-            delay <= Duration::from_secs(2) && delay >= Duration::from_millis(500),
-            "HTTP-date Retry-After produced an unexpected delay",
         )
     }
 }

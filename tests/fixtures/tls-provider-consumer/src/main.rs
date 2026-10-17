@@ -18,7 +18,7 @@ mod session;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const CA: &[u8] = include_bytes!("../../network/ca.pem");
+const CA: &[u8] = include_bytes!("../../../../src/test_fixtures/network/ca.pem");
 const SERVER: &[u8] = include_bytes!("../../network/server.pem");
 const SERVER_KEY: &[u8] = include_bytes!("../../network/server-key.pem");
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -277,7 +277,7 @@ async fn external_https() -> TestResult {
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let client = reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
+        .tls_backend_preconfigured(tls)
         .no_proxy()
         .http1_only()
         .build()?;
