@@ -3,6 +3,12 @@
 These certificates and deliberately public private keys are disposable fixtures
 for loopback TLS and mTLS regression tests. Never use them outside tests.
 
+The CA certificates, ordinary client identity, and alternate client private key
+are shared with library unit tests and live in
+[`src/test_fixtures/network`](../../../src/test_fixtures/network/README.md).
+Integration tests reference those files directly. The remaining integration-only
+fixtures stay here; the entire `tests` directory is excluded from release crates.
+
 The fixtures use ECDSA P-256 keys and SHA-256 signatures generated with OpenSSL.
 `ca.pem` signs `server`, `client`, `wrong-host`, and `expired`; `other-ca.pem`
 signs `other-client`. The ordinary server covers localhost, 127.0.0.1, and ::1.

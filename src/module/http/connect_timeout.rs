@@ -130,7 +130,7 @@ mod tests {
                 .with_root_certificates(crate::module::tls::root_store(true))
                 .with_no_client_auth();
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(reqwest::Client::builder().use_preconfigured_tls(tls))
+        Ok(reqwest::Client::builder().tls_backend_preconfigured(tls))
     }
 
     fn check(condition: bool, message: &str) -> TestResult {

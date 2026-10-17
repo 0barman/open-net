@@ -12,7 +12,7 @@ publish = false
 open-net = { path = "../../..", features = ["http-client"] }
 # Deliberately add HTTP/2 from the host. The SDK itself does not enable
 # http-client-http2; its HTTP/1.1 policy must survive dependency feature merging.
-reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "http2"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "http2"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 rustls = { version = "=0.23.43", default-features = false, features = ["std", "tls12"] }
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "time", "io-util"] }

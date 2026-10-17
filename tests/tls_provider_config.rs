@@ -22,8 +22,8 @@ async fn injected_provider_builds_clients_without_installing_a_process_default()
     {
         use open_net::network::{ClientIdentity, NetworkConfig, TlsConfig};
         let identity = ClientIdentity::from_pem(
-            include_bytes!("fixtures/network/client.pem"),
-            include_bytes!("fixtures/network/client-key.pem"),
+            include_bytes!("../src/test_fixtures/network/client.pem"),
+            include_bytes!("../src/test_fixtures/network/client-key.pem"),
         )?;
         let tls = TlsConfig::default()
             .with_client_identity(identity)
@@ -45,8 +45,8 @@ async fn injected_provider_builds_clients_without_installing_a_process_default()
         use open_net::api::http::{HttpClient, HttpClientConfig, HttpTlsConfig};
         let tls = HttpTlsConfig::default()
             .with_client_identity_pem(
-                include_bytes!("fixtures/network/client.pem"),
-                include_bytes!("fixtures/network/client-key.pem"),
+                include_bytes!("../src/test_fixtures/network/client.pem"),
+                include_bytes!("../src/test_fixtures/network/client-key.pem"),
             )?
             .with_crypto_provider(provider.clone());
         check(

@@ -67,8 +67,8 @@ fn ws_identity_is_loaded_by_final_provider_in_either_builder_order() -> TestResu
     }
     static REJECT_KEYS: RejectKeys = RejectKeys;
     let identity = ClientIdentity::from_pem(
-        include_bytes!("../../../tests/fixtures/network/client.pem"),
-        include_bytes!("../../../tests/fixtures/network/client-key.pem"),
+        include_bytes!("../../test_fixtures/network/client.pem"),
+        include_bytes!("../../test_fixtures/network/client-key.pem"),
     )?;
     let accepted = crate::module::tls::local_provider();
     let mut rejected = (*accepted).clone();
@@ -134,7 +134,7 @@ fn network_status_policy_builder_preserves_proxy_and_tls_configuration() -> Test
     let original = NetworkConfig::default()
         .with_proxy(ProxyConfig::http_connect("http://127.0.0.1:8080", None)?)
         .with_tls(TlsConfig::default().with_root_certificates(
-            include_bytes!("../../../tests/fixtures/network/ca.pem"),
+            include_bytes!("../../test_fixtures/network/ca.pem"),
             RootCertificateMode::Replace,
         )?);
     let configured = original

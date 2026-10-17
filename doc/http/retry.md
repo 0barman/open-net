@@ -225,6 +225,23 @@ exists in RespectWithCap mode. `Retry-After` does not itself authorize a retry;
 the status/error must qualify. The transport handles supported delta-seconds and
 HTTP-date values; malformed hints fall back to configured backoff.
 
+Date parsing uses `httpdate` for IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`),
+obsolete RFC 850, and asctime forms. A compatibility adapter also accepts the
+previous parser's common RFC 2822 forms: numeric offsets such as `+0000`,
+`-0000`, `+0200`, and `-0400`; `GMT`, `UT`, `UTC`, and the US timezone names
+`EST`/`EDT`, `CST`/`CDT`, `MST`/`MDT`, `PST`/`PDT`. It preserves case-insensitive
+names, extra ASCII whitespace, a missing weekday or seconds, a one-digit day,
+and one simple trailing parenthesized comment. Explicit weekdays and calendar
+dates must agree. Past dates select zero delay, including dates before 1970;
+`:60` seconds normalize to the following second.
+
+The compatibility adapter supports years `0000` through `9999`; RFC 2822
+two-digit years retain the `1950..2049` interpretation. Obsolete RFC 850 dates
+use `httpdate`'s fixed `1970..2069` interpretation, rather than a rolling
+50-year window. Nested, escaped, or multiple comments and other unsupported
+date syntax fall back to backoff. Applications should send IMF-fixdate or
+delta-seconds for interoperable HTTP headers.
+
 ### Example
 
 This program runs offline and checks delay selection.

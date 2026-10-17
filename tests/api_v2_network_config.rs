@@ -7,10 +7,10 @@ use open_net::network::{
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const CA: &[u8] = include_bytes!("fixtures/network/ca.pem");
-const OTHER_CA: &[u8] = include_bytes!("fixtures/network/other-ca.pem");
-const CLIENT: &[u8] = include_bytes!("fixtures/network/client.pem");
-const CLIENT_KEY: &[u8] = include_bytes!("fixtures/network/client-key.pem");
+const CA: &[u8] = include_bytes!("../src/test_fixtures/network/ca.pem");
+const OTHER_CA: &[u8] = include_bytes!("../src/test_fixtures/network/other-ca.pem");
+const CLIENT: &[u8] = include_bytes!("../src/test_fixtures/network/client.pem");
+const CLIENT_KEY: &[u8] = include_bytes!("../src/test_fixtures/network/client-key.pem");
 
 fn check(condition: bool, message: &str) -> TestResult {
     if condition {

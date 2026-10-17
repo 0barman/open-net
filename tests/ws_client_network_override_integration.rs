@@ -30,11 +30,11 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-const CA: &[u8] = include_bytes!("fixtures/network/ca.pem");
+const CA: &[u8] = include_bytes!("../src/test_fixtures/network/ca.pem");
 const SERVER: &[u8] = include_bytes!("fixtures/network/server.pem");
 const SERVER_KEY: &[u8] = include_bytes!("fixtures/network/server-key.pem");
-const CLIENT: &[u8] = include_bytes!("fixtures/network/client.pem");
-const CLIENT_KEY: &[u8] = include_bytes!("fixtures/network/client-key.pem");
+const CLIENT: &[u8] = include_bytes!("../src/test_fixtures/network/client.pem");
+const CLIENT_KEY: &[u8] = include_bytes!("../src/test_fixtures/network/client-key.pem");
 
 async fn bounded<T>(future: impl Future<Output = T>) -> TestResult<T> {
     Ok(tokio::time::timeout(Duration::from_secs(4), future).await?)
@@ -374,7 +374,10 @@ async fn explicit_client_defaults_replace_engine_ca_and_identity_without_cross_c
         .create_ws_client_with_network_config(
             "other-trust",
             client_config(),
-            trust_with_identity(include_bytes!("fixtures/network/other-ca.pem"), true)?,
+            trust_with_identity(
+                include_bytes!("../src/test_fixtures/network/other-ca.pem"),
+                true,
+            )?,
         )
         .await?;
     // Creation after all overrides also detects accidental mutation of engine defaults.

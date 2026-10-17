@@ -8,7 +8,7 @@ Example dependencies: none; the review commands require Cargo and Python 3.11 or
 
 The manifest contains **39 distinct direct dependency names**
 (41 declarations across normal/build/dev kinds). The lockfile contains
-**261 third-party package records**, including multiple versions of the same crate.
+**279 third-party package records**, including multiple versions of the same crate.
 A Cargo version requirement is distinct from a resolved version: rustls's declared
 `0.23.43` resolves to `0.23.45` in this checkout.
 Requirements without a leading `=` allow compatible releases; a requirement such
@@ -43,6 +43,12 @@ of `h2` and macOS's `netwatch` through `netdev` and `plist`.
 With all features disabled, the six direct library dependencies are `bytes`,
 `futures-util`, `http`, `serde`, `serde_json` and `tokio`.
 
+`http-client` uses the dependency-free `httpdate` crate and standard-library
+`SystemTime` for Retry-After dates. The SDK no longer declares `chrono` directly;
+it remains in the all-target lockfile because Windows monitoring uses it through
+`netwatch` and `wmi`. Its presence there does not imply that macOS or Linux HTTP
+consumers compile it.
+
 HTTP and WebSocket clients require an application-selected crypto provider,
 either supplied explicitly or installed as the process default. The SDK's normal
 and build dependency graph does not select AWS-LC, ring or OpenSSL. The OpenSSL
@@ -65,8 +71,7 @@ own license terms.
 | async-trait | 0.1.92 | 0.1.92 | Async HTTP request/authentication trait adapters | normal | `http-client` | All |
 | base64 | 0.22.1 | 0.22.1 | WebSocket handshake and optional HTTP Basic authentication | normal | `ws-client`, `http-client-auth` | All |
 | bytes | 1.12.1 | 1.12.1 | Shared owned byte buffers | normal | Always for this dependency kind | All |
-| cc | 1.4.4 | 1.6.0 | Native monitor build support | build | `net-status` | All |
-| chrono | 0.4.45 | 0.4.45 | HTTP date and retry timing support | normal | `http-client` | All |
+| cc | 1.4.4 | 1.4.7 | Native monitor build support | build | `net-status` | All |
 | cookie | =0.18.2 | 0.18.2 | Cookie parsing | normal | `http-client-cookies` | All |
 | cookie_store | =0.22.1 | 0.22.1 | RFC 6265 cookie storage | normal | `http-client-cookies` | All |
 | core-foundation | 0.10.1 | 0.10.1 | macOS Core Foundation ownership for interface, link and default-route queries | normal | `net-status` | cfg(target_os = "macos") |
@@ -74,33 +79,34 @@ own license terms.
 | futures | 0.3.34 | 0.3.34 | Test executor, polling macros and async utilities | dev | Always for this dependency kind | All |
 | futures-util | 0.3.34 | 0.3.34 | Production async traits, streams, futures and WebSocket sink utilities | normal | Always for this dependency kind | All |
 | getrandom | 0.3.4 | 0.3.4 | WebSocket and multipart randomness | normal | `ws-client`, `http-client-codecs` | All |
-| h2 | 0.4.19 | 0.4.20 | HTTP/2 test server support | dev | Always for this dependency kind | All |
+| h2 | 0.4.19 | 0.4.19 | HTTP/2 test server support | dev | Always for this dependency kind | All |
 | http | 1.5.0 | 1.5.0 | HTTP methods, headers, status codes | normal | Always for this dependency kind | All |
 | httparse | 1.10.1 | 1.10.1 | WebSocket HTTP upgrade parsing | normal | `ws-client` | All |
-| hyper | 1.11.1 | 1.12.0 | HTTP transport error classification and protocol support | normal | `http-client` | All |
+| httpdate | 1.0.3 | 1.0.3 | HTTP Retry-After date parsing | normal | `http-client` | All |
+| hyper | 1.11.1 | 1.11.1 | HTTP transport error classification and protocol support | normal | `http-client` | All |
 | hyper-util | =0.1.20 | 0.1.20 | HTTP transport integration | normal | `http-client` | All |
 | if-addrs | 0.15.0 | 0.15.0 | Interface and LAN address discovery | normal | `net-status` | All |
 | n0-watcher | =1.0.0-rc.0 | 1.0.0-rc.0 | Network observation subscriptions | normal | `net-status` | All |
 | netwatch | 0.18.0 | 0.18.0 | Native network change observation | normal | `net-status` | All |
 | proc-macro2 | 1.0.107 | 1.0.107 | API syntax/span checks in tests | dev | Always for this dependency kind | All |
 | psl | =2.1.240 | 2.1.240 | Public suffix checks for cookies | normal | `http-client-cookies` | All |
-| reqwest | 0.12.28 | 0.12.28 | HTTP transport | normal | `http-client` | All |
+| reqwest | 0.13.5 | 0.13.5 | HTTP transport | normal | `http-client` | All |
 | rustls | 0.23.43 | 0.23.45 | TLS protocol and provider configuration | normal | `ws-client`, `http-client` | All |
 | rustls-openssl | =0.4.2 | 0.4.2 | Application-selected OpenSSL provider for test peers | dev | Always for this dependency kind | All |
 | serde | 1.0.229 | 1.0.229 | Serialization traits and derives | normal | Always for this dependency kind | All |
 | serde_json | 1.0.151 | 1.0.151 | JSON values, encoding, decoding, logging | normal | Always for this dependency kind | All |
 | serde_qs | 1.1.3 | 1.1.3 | Query and form request encoding | normal | `http-client-codecs` | All |
 | socket2 | 0.6.5 | 0.6.5 | WebSocket socket configuration | normal | `ws-client` | All |
-| tokio | 1.53.1 | 1.53.2 | Async runtime, scheduling, synchronization | dev | Always for this dependency kind | All |
-| tokio | 1.53.1 | 1.53.2 | Async runtime, scheduling, synchronization | normal | Always for this dependency kind | All |
-| tokio-rustls | 0.26.4 | 0.26.6 | WebSocket TLS; TLS server fixtures in dev builds | dev | Always for this dependency kind | All |
-| tokio-rustls | 0.26.4 | 0.26.6 | WebSocket TLS; TLS server fixtures in dev builds | normal | `ws-client` | All |
+| tokio | 1.53.1 | 1.53.1 | Async runtime, scheduling, synchronization | dev | Always for this dependency kind | All |
+| tokio | 1.53.1 | 1.53.1 | Async runtime, scheduling, synchronization | normal | Always for this dependency kind | All |
+| tokio-rustls | 0.26.4 | 0.26.5 | WebSocket TLS; TLS server fixtures in dev builds | dev | Always for this dependency kind | All |
+| tokio-rustls | 0.26.4 | 0.26.5 | WebSocket TLS; TLS server fixtures in dev builds | normal | `ws-client` | All |
 | tokio-tungstenite | 0.30.0 | 0.30.0 | Asynchronous WebSocket protocol | normal | `ws-client` | All |
-| tokio-util | 0.7.19 | 0.7.20 | WebSocket cancellation support | normal | `ws-client` | All |
+| tokio-util | 0.7.19 | 0.7.19 | WebSocket cancellation support | normal | `ws-client` | All |
 | tower-layer | =0.3.3 | 0.3.3 | HTTP transport connector layering | normal | `http-client` | All |
 | tower-service | =0.3.3 | 0.3.3 | HTTP transport service interface | normal | `http-client` | All |
 | url | 2.5.7 | 2.5.8 | Cookie URL context | normal | `http-client-cookies` | All |
-| uuid | 1.26.1 | 1.27.0 | WebSocket identifiers | normal | `ws-client` | All |
+| uuid | 1.26.1 | 1.26.1 | WebSocket identifiers | normal | `ws-client` | All |
 | webpki-roots | 1.0.9 | 1.0.9 | Bundled TLS certificate roots | normal | `ws-client`, `http-client` | All |
 | windows | 0.62.2 | 0.62.2 | Windows network-list, refresh-helper pipes, interface/link and IPv4 route APIs | normal | `net-status` | cfg(windows) |
 
@@ -120,11 +126,12 @@ own license terms.
 | block2 | 0.6.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | bumpalo | 3.20.3 | `registry+https://github.com/rust-lang/crates.io-index` |
 | bytes | 1.12.1 | `registry+https://github.com/rust-lang/crates.io-index` |
-| cc | 1.6.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| cc | 1.4.7 | `registry+https://github.com/rust-lang/crates.io-index` |
 | cfg-if | 1.0.5 | `registry+https://github.com/rust-lang/crates.io-index` |
 | cfg_aliases | 0.2.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | chacha20 | 0.10.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | chrono | 0.4.45 | `registry+https://github.com/rust-lang/crates.io-index` |
+| combine | 4.6.8 | `registry+https://github.com/rust-lang/crates.io-index` |
 | const-oid | 0.10.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | convert_case | 0.10.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | cookie | 0.18.2 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -148,7 +155,7 @@ own license terms.
 | equivalent | 1.0.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | errno | 0.3.14 | `registry+https://github.com/rust-lang/crates.io-index` |
 | fastrand | 2.5.0 | `registry+https://github.com/rust-lang/crates.io-index` |
-| find-msvc-tools | 0.1.14 | `registry+https://github.com/rust-lang/crates.io-index` |
+| find-msvc-tools | 0.1.13 | `registry+https://github.com/rust-lang/crates.io-index` |
 | fnv | 1.0.7 | `registry+https://github.com/rust-lang/crates.io-index` |
 | foreign-types | 0.3.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | foreign-types-shared | 0.1.1 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -168,14 +175,15 @@ own license terms.
 | getrandom | 0.2.17 | `registry+https://github.com/rust-lang/crates.io-index` |
 | getrandom | 0.3.4 | `registry+https://github.com/rust-lang/crates.io-index` |
 | getrandom | 0.4.3 | `registry+https://github.com/rust-lang/crates.io-index` |
-| h2 | 0.4.20 | `registry+https://github.com/rust-lang/crates.io-index` |
+| h2 | 0.4.19 | `registry+https://github.com/rust-lang/crates.io-index` |
 | hashbrown | 0.17.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | http | 1.5.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | http-body | 1.1.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | http-body-util | 0.1.5 | `registry+https://github.com/rust-lang/crates.io-index` |
 | httparse | 1.10.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| httpdate | 1.0.3 | `registry+https://github.com/rust-lang/crates.io-index` |
 | hybrid-array | 0.4.15 | `registry+https://github.com/rust-lang/crates.io-index` |
-| hyper | 1.12.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| hyper | 1.11.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | hyper-rustls | 0.27.10 | `registry+https://github.com/rust-lang/crates.io-index` |
 | hyper-util | 0.1.20 | `registry+https://github.com/rust-lang/crates.io-index` |
 | iana-time-zone | 0.1.65 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -193,9 +201,13 @@ own license terms.
 | indexmap | 2.14.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | ipnet | 2.12.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | itoa | 1.0.18 | `registry+https://github.com/rust-lang/crates.io-index` |
-| js-sys | 0.3.106 | `registry+https://github.com/rust-lang/crates.io-index` |
-| lazy_static | 1.5.1 | `registry+https://github.com/rust-lang/crates.io-index` |
-| libc | 0.2.190 | `registry+https://github.com/rust-lang/crates.io-index` |
+| jni | 0.22.4 | `registry+https://github.com/rust-lang/crates.io-index` |
+| jni-macros | 0.22.4 | `registry+https://github.com/rust-lang/crates.io-index` |
+| jni-sys | 0.4.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| jni-sys-macros | 0.4.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| js-sys | 0.3.105 | `registry+https://github.com/rust-lang/crates.io-index` |
+| lazy_static | 1.5.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| libc | 0.2.189 | `registry+https://github.com/rust-lang/crates.io-index` |
 | litemap | 0.8.3 | `registry+https://github.com/rust-lang/crates.io-index` |
 | litrs | 1.0.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | log | 0.4.34 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -203,7 +215,7 @@ own license terms.
 | mac-addr | 0.3.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | matchers | 0.2.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | memchr | 2.8.3 | `registry+https://github.com/rust-lang/crates.io-index` |
-| mio | 1.2.4 | `registry+https://github.com/rust-lang/crates.io-index` |
+| mio | 1.2.3 | `registry+https://github.com/rust-lang/crates.io-index` |
 | n0-error | 1.0.0-rc.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | n0-error-macros | 1.0.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | n0-future | 0.3.2 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -219,7 +231,7 @@ own license terms.
 | nu-ansi-term | 0.50.3 | `registry+https://github.com/rust-lang/crates.io-index` |
 | num-conv | 0.2.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | num-traits | 0.2.19 | `registry+https://github.com/rust-lang/crates.io-index` |
-| objc2 | 0.6.5 | `registry+https://github.com/rust-lang/crates.io-index` |
+| objc2 | 0.6.4 | `registry+https://github.com/rust-lang/crates.io-index` |
 | objc2-core-foundation | 0.3.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | objc2-core-wlan | 0.3.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | objc2-encode | 4.1.0 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -230,6 +242,7 @@ own license terms.
 | once_cell | 1.21.4 | `registry+https://github.com/rust-lang/crates.io-index` |
 | openssl | 0.10.81 | `registry+https://github.com/rust-lang/crates.io-index` |
 | openssl-macros | 0.1.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| openssl-probe | 0.2.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | openssl-sys | 0.9.117 | `registry+https://github.com/rust-lang/crates.io-index` |
 | parking | 2.2.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | paste | 1.0.15 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -240,7 +253,7 @@ own license terms.
 | pkg-config | 0.3.34 | `registry+https://github.com/rust-lang/crates.io-index` |
 | plist | 1.10.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | potential_utf | 0.1.6 | `registry+https://github.com/rust-lang/crates.io-index` |
-| powerfmt | 0.2.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| powerfmt | 0.2.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | proc-macro2 | 1.0.107 | `registry+https://github.com/rust-lang/crates.io-index` |
 | psl | 2.1.240 | `registry+https://github.com/rust-lang/crates.io-index` |
 | psl-types | 2.0.11 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -252,16 +265,23 @@ own license terms.
 | rand_core | 0.10.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | regex-automata | 0.4.18 | `registry+https://github.com/rust-lang/crates.io-index` |
 | regex-syntax | 0.8.11 | `registry+https://github.com/rust-lang/crates.io-index` |
-| reqwest | 0.12.28 | `registry+https://github.com/rust-lang/crates.io-index` |
+| reqwest | 0.13.5 | `registry+https://github.com/rust-lang/crates.io-index` |
 | ring | 0.17.14 | `registry+https://github.com/rust-lang/crates.io-index` |
 | rustc_version | 0.4.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | rustls | 0.23.45 | `registry+https://github.com/rust-lang/crates.io-index` |
+| rustls-native-certs | 0.8.4 | `registry+https://github.com/rust-lang/crates.io-index` |
 | rustls-openssl | 0.4.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | rustls-pki-types | 1.15.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| rustls-platform-verifier | 0.7.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| rustls-platform-verifier-android | 0.1.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | rustls-webpki | 0.103.15 | `registry+https://github.com/rust-lang/crates.io-index` |
 | rustversion | 1.0.23 | `registry+https://github.com/rust-lang/crates.io-index` |
 | ryu | 1.0.23 | `registry+https://github.com/rust-lang/crates.io-index` |
+| same-file | 1.0.6 | `registry+https://github.com/rust-lang/crates.io-index` |
+| schannel | 0.1.29 | `registry+https://github.com/rust-lang/crates.io-index` |
 | scoped-tls | 1.0.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| security-framework | 3.7.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| security-framework-sys | 2.17.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | semver | 1.0.28 | `registry+https://github.com/rust-lang/crates.io-index` |
 | send_wrapper | 0.6.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | serde | 1.0.229 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -269,13 +289,14 @@ own license terms.
 | serde_derive | 1.0.229 | `registry+https://github.com/rust-lang/crates.io-index` |
 | serde_json | 1.0.151 | `registry+https://github.com/rust-lang/crates.io-index` |
 | serde_qs | 1.1.3 | `registry+https://github.com/rust-lang/crates.io-index` |
-| serde_urlencoded | 0.7.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | sha1 | 0.11.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | sharded-slab | 0.1.7 | `registry+https://github.com/rust-lang/crates.io-index` |
 | shlex | 2.0.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | signal-hook-registry | 1.4.8 | `registry+https://github.com/rust-lang/crates.io-index` |
+| simd_cesu8 | 1.2.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| simdutf8 | 0.1.5 | `registry+https://github.com/rust-lang/crates.io-index` |
 | slab | 0.4.12 | `registry+https://github.com/rust-lang/crates.io-index` |
-| smallvec | 1.16.2 | `registry+https://github.com/rust-lang/crates.io-index` |
+| smallvec | 1.16.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | socket2 | 0.6.5 | `registry+https://github.com/rust-lang/crates.io-index` |
 | spez | 0.1.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | spin | 0.10.1 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -285,18 +306,18 @@ own license terms.
 | syn | 3.0.6 | `registry+https://github.com/rust-lang/crates.io-index` |
 | sync_wrapper | 1.0.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | synstructure | 0.14.0 | `registry+https://github.com/rust-lang/crates.io-index` |
-| thiserror | 2.0.21 | `registry+https://github.com/rust-lang/crates.io-index` |
-| thiserror-impl | 2.0.21 | `registry+https://github.com/rust-lang/crates.io-index` |
+| thiserror | 2.0.20 | `registry+https://github.com/rust-lang/crates.io-index` |
+| thiserror-impl | 2.0.20 | `registry+https://github.com/rust-lang/crates.io-index` |
 | thread_local | 1.1.10 | `registry+https://github.com/rust-lang/crates.io-index` |
 | time | 0.3.55 | `registry+https://github.com/rust-lang/crates.io-index` |
 | time-core | 0.1.9 | `registry+https://github.com/rust-lang/crates.io-index` |
 | time-macros | 0.2.32 | `registry+https://github.com/rust-lang/crates.io-index` |
 | tinystr | 0.8.4 | `registry+https://github.com/rust-lang/crates.io-index` |
-| tokio | 1.53.2 | `registry+https://github.com/rust-lang/crates.io-index` |
+| tokio | 1.53.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | tokio-macros | 2.7.2 | `registry+https://github.com/rust-lang/crates.io-index` |
-| tokio-rustls | 0.26.6 | `registry+https://github.com/rust-lang/crates.io-index` |
+| tokio-rustls | 0.26.5 | `registry+https://github.com/rust-lang/crates.io-index` |
 | tokio-tungstenite | 0.30.0 | `registry+https://github.com/rust-lang/crates.io-index` |
-| tokio-util | 0.7.20 | `registry+https://github.com/rust-lang/crates.io-index` |
+| tokio-util | 0.7.19 | `registry+https://github.com/rust-lang/crates.io-index` |
 | tower | 0.5.3 | `registry+https://github.com/rust-lang/crates.io-index` |
 | tower-http | 0.6.11 | `registry+https://github.com/rust-lang/crates.io-index` |
 | tower-layer | 0.3.3 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -315,25 +336,28 @@ own license terms.
 | untrusted | 0.9.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | url | 2.5.8 | `registry+https://github.com/rust-lang/crates.io-index` |
 | utf8_iter | 1.0.4 | `registry+https://github.com/rust-lang/crates.io-index` |
-| uuid | 1.27.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| uuid | 1.26.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | valuable | 0.1.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | vcpkg | 0.2.15 | `registry+https://github.com/rust-lang/crates.io-index` |
 | version_check | 0.9.5 | `registry+https://github.com/rust-lang/crates.io-index` |
-| want | 0.3.2 | `registry+https://github.com/rust-lang/crates.io-index` |
+| walkdir | 2.5.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| want | 0.3.1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | wasi | 0.11.1+wasi-snapshot-preview1 | `registry+https://github.com/rust-lang/crates.io-index` |
 | wasip2 | 1.0.4+wasi-0.2.12 | `registry+https://github.com/rust-lang/crates.io-index` |
-| wasm-bindgen | 0.2.129 | `registry+https://github.com/rust-lang/crates.io-index` |
-| wasm-bindgen-futures | 0.4.79 | `registry+https://github.com/rust-lang/crates.io-index` |
-| wasm-bindgen-macro | 0.2.129 | `registry+https://github.com/rust-lang/crates.io-index` |
-| wasm-bindgen-macro-support | 0.2.129 | `registry+https://github.com/rust-lang/crates.io-index` |
-| wasm-bindgen-shared | 0.2.129 | `registry+https://github.com/rust-lang/crates.io-index` |
-| wasm-streams | 0.4.2 | `registry+https://github.com/rust-lang/crates.io-index` |
-| web-sys | 0.3.106 | `registry+https://github.com/rust-lang/crates.io-index` |
+| wasm-bindgen | 0.2.128 | `registry+https://github.com/rust-lang/crates.io-index` |
+| wasm-bindgen-futures | 0.4.78 | `registry+https://github.com/rust-lang/crates.io-index` |
+| wasm-bindgen-macro | 0.2.128 | `registry+https://github.com/rust-lang/crates.io-index` |
+| wasm-bindgen-macro-support | 0.2.128 | `registry+https://github.com/rust-lang/crates.io-index` |
+| wasm-bindgen-shared | 0.2.128 | `registry+https://github.com/rust-lang/crates.io-index` |
+| wasm-streams | 0.5.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| web-sys | 0.3.105 | `registry+https://github.com/rust-lang/crates.io-index` |
 | web-time | 1.1.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| webpki-root-certs | 1.0.9 | `registry+https://github.com/rust-lang/crates.io-index` |
 | webpki-roots | 0.26.11 | `registry+https://github.com/rust-lang/crates.io-index` |
 | webpki-roots | 1.0.9 | `registry+https://github.com/rust-lang/crates.io-index` |
 | winapi | 0.3.9 | `registry+https://github.com/rust-lang/crates.io-index` |
 | winapi-i686-pc-windows-gnu | 0.4.0 | `registry+https://github.com/rust-lang/crates.io-index` |
+| winapi-util | 0.1.11 | `registry+https://github.com/rust-lang/crates.io-index` |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | windows | 0.62.2 | `registry+https://github.com/rust-lang/crates.io-index` |
 | windows-collections | 0.3.2 | `registry+https://github.com/rust-lang/crates.io-index` |
@@ -361,10 +385,10 @@ own license terms.
 | wmi | 0.18.4 | `registry+https://github.com/rust-lang/crates.io-index` |
 | writeable | 0.6.4 | `registry+https://github.com/rust-lang/crates.io-index` |
 | yoke | 0.8.3 | `registry+https://github.com/rust-lang/crates.io-index` |
-| yoke-derive | 0.8.4 | `registry+https://github.com/rust-lang/crates.io-index` |
+| yoke-derive | 0.8.3 | `registry+https://github.com/rust-lang/crates.io-index` |
 | zerofrom | 0.1.8 | `registry+https://github.com/rust-lang/crates.io-index` |
 | zerofrom-derive | 0.1.8 | `registry+https://github.com/rust-lang/crates.io-index` |
-| zeroize | 1.9.1 | `registry+https://github.com/rust-lang/crates.io-index` |
+| zeroize | 1.9.0 | `registry+https://github.com/rust-lang/crates.io-index` |
 | zerotrie | 0.2.5 | `registry+https://github.com/rust-lang/crates.io-index` |
 | zerovec | 0.11.8 | `registry+https://github.com/rust-lang/crates.io-index` |
 | zerovec-derive | 0.11.6 | `registry+https://github.com/rust-lang/crates.io-index` |

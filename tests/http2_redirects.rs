@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
-const CA: &[u8] = include_bytes!("fixtures/network/ca.pem");
+const CA: &[u8] = include_bytes!("../src/test_fixtures/network/ca.pem");
 const SERVER: &[u8] = include_bytes!("fixtures/network/server.pem");
 const SERVER_KEY: &[u8] = include_bytes!("fixtures/network/server-key.pem");
 const REQUEST_BODY: &[u8] = b"private body that must never reach cleartext";
