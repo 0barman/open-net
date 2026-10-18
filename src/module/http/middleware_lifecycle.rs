@@ -37,7 +37,7 @@ impl MiddlewareCompletion {
             Err(poisoned) => (f(&mut poisoned.into_inner()), true),
         };
         if poisoned {
-            crate::log_e!(crate::LogType::HTTP; "middleware_completion", "error", "state_poisoned");
+            crate::log_e!(crate::LogType::HTTP; "http.middleware_completion.state", "error|f", "state_poisoned", "provided");
         }
         result
     }

@@ -15,7 +15,7 @@ use crate::ws::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -65,10 +65,77 @@ struct PendingEvent {
     lease: EventLease,
 }
 
+// Fixed-size diagnostic metadata owned by the existing session lifecycle. No
+// user metadata, error sources, or close-frame text crosses the state lock.
+struct ReconnectLog {
+    started: Instant,
+    attempts: u64,
+    last_error: Option<(ErrorKind, Option<ErrorStage>)>,
+}
+
+struct LifecycleLog {
+    event: &'static str,
+    sequence: u64,
+    cycle: Option<u64>,
+    attempt: Option<u64>,
+    reason: Option<TerminationReason>,
+    error: Option<(ErrorKind, Option<ErrorStage>)>,
+    last_reconnect_error: Option<(ErrorKind, Option<ErrorStage>)>,
+    reconnect_attempts: Option<u64>,
+    reconnect_elapsed_ms: Option<u64>,
+}
+
+impl LifecycleLog {
+    fn capture(state: &SessionState, event: &'static str) -> Self {
+        Self {
+            event,
+            sequence: state.last_sequence,
+            cycle: state.cycle,
+            attempt: state
+                .last_attempt
+                .as_ref()
+                .map(|last| last.attempt.attempt_id.as_u64()),
+            reason: None,
+            error: None,
+            last_reconnect_error: None,
+            reconnect_attempts: None,
+            reconnect_elapsed_ms: None,
+        }
+    }
+
+    fn finish_reconnect(&mut self, state: &mut SessionState) {
+        if let Some(reconnect) = state.reconnect_log.take() {
+            self.reconnect_attempts = Some(reconnect.attempts);
+            self.reconnect_elapsed_ms = Some(
+                reconnect
+                    .started
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            );
+            self.last_reconnect_error = reconnect.last_error;
+        }
+    }
+
+    fn emit(self, client_id: u64, session_id: u64) {
+        crate::log_s!(crate::LogType::WSC, crate::LogLevel::Key;
+            "ws.connection_session.emit",
+            "event|client_id|session_id|sequence|cycle_id|attempt_id|reason|error_kind|error_stage|reconnect_attempts|reconnect_elapsed_ms|last_reconnect_kind|last_reconnect_stage",
+            self.event, client_id, session_id, self.sequence, self.cycle, self.attempt,
+            self.reason.map(|value| format!("{value:?}")),
+            self.error.map(|(kind, _)| format!("{kind:?}")),
+            self.error.and_then(|(_, stage)| stage).map(|value| format!("{value:?}")),
+            self.reconnect_attempts, self.reconnect_elapsed_ms,
+            self.last_reconnect_error.map(|(kind, _)| format!("{kind:?}")),
+            self.last_reconnect_error.and_then(|(_, stage)| stage).map(|value| format!("{value:?}")));
+    }
+}
+
 struct SessionState {
     snapshot: Arc<ConnectionSnapshot>,
     cycle: Option<u64>,
     reconnecting: bool,
+    reconnect_log: Option<ReconnectLog>,
     closing: bool,
     state_failed: bool,
     session_terminal_slot: Option<EventLease>,
@@ -108,6 +175,9 @@ struct Publication {
     refunds: [Option<OwnedSemaphorePermit>; 3],
     close: bool,
     failed: bool,
+    connection_log: Option<LifecycleLog>,
+    reconnect_log: Option<LifecycleLog>,
+    terminal_log: Option<LifecycleLog>,
 }
 
 /// The first close caller owns the frame and absolute cleanup budget.
@@ -262,6 +332,7 @@ impl ConnectionSession {
                 snapshot,
                 cycle: None,
                 reconnecting: false,
+                reconnect_log: None,
                 closing: false,
                 state_failed: false,
                 session_terminal_slot: Some(terminal_slot),
@@ -380,6 +451,9 @@ impl ConnectionSession {
             state.cycle = Some(cycle);
             state.reconnecting = reconnecting;
             publication.next_state = Some(Self::preparing_state(state, None)?);
+            if reconnecting {
+                Self::start_reconnect_log(state, publication);
+            }
             Ok(())
         })
     }
@@ -440,6 +514,17 @@ impl ConnectionSession {
             })
         } else {
             Ok(ConnectionState::Connecting)
+        }
+    }
+
+    fn start_reconnect_log(state: &mut SessionState, publication: &mut Publication) {
+        if state.reconnect_log.is_none() {
+            state.reconnect_log = Some(ReconnectLog {
+                started: Instant::now(),
+                attempts: 0,
+                last_error: None,
+            });
+            publication.reconnect_log = Some(LifecycleLog::capture(state, "ws.reconnect.started"));
         }
     }
 
@@ -563,7 +648,11 @@ impl ConnectionSession {
                 },
                 started.take().ok_or_else(Self::internal)?,
                 publication,
-            )
+            )?;
+            if let Some(reconnect) = &mut state.reconnect_log {
+                reconnect.attempts = reconnect.attempts.saturating_add(1);
+            }
+            Ok(())
         })
     }
 
@@ -643,10 +732,15 @@ impl ConnectionSession {
             let lease = active.result_slot.take().ok_or_else(Self::internal)?;
             self.publish(state, kind, lease, publication)?;
             publication.previous_attempt_error = state.last_attempt_error.replace(error.clone());
+            let failure_summary = (error.kind(), error.context().stage);
             publication.next_error = Some(error);
             if matches!(retry, RetryDecision::Scheduled { .. }) {
                 state.reconnecting = true;
                 publication.next_state = Some(Self::preparing_state(state, None)?);
+                Self::start_reconnect_log(state, publication);
+            }
+            if let Some(reconnect) = &mut state.reconnect_log {
+                reconnect.last_error = Some(failure_summary);
             }
             Ok(())
         })
@@ -717,6 +811,9 @@ impl ConnectionSession {
                 terminal_slot: active.connection_slot.take(),
             });
             publication.next_state = Some(ConnectionState::Connected(info));
+            let mut log = LifecycleLog::capture(state, "ws.connection.established");
+            log.finish_reconnect(state);
+            publication.connection_log = Some(log);
             Ok(())
         })
     }
@@ -801,6 +898,14 @@ impl ConnectionSession {
         };
         let lease = active.terminal_slot.take().ok_or_else(Self::internal)?;
         self.publish(state, kind, lease, publication)?;
+        let mut log = LifecycleLog::capture(state, "ws.connection.disconnected");
+        log.reason = Some(reason);
+        log.error = end
+            .error
+            .as_ref()
+            .map(|error| (error.kind(), error.context().stage));
+        let disconnected_error = log.error;
+        publication.connection_log = Some(log);
         publication.next_error = end.error.clone();
         publication.previous_end = state.last_connection_end.replace(end);
         state.last_connection_info = Some(info);
@@ -808,6 +913,10 @@ impl ConnectionSession {
             state.cycle = Some(next_cycle);
             state.reconnecting = true;
             publication.next_state = Some(Self::preparing_state(state, None)?);
+            Self::start_reconnect_log(state, publication);
+            if let Some(reconnect) = &mut state.reconnect_log {
+                reconnect.last_error = disconnected_error;
+            }
         } else {
             state.closing = true;
             publication.next_state = Some(ConnectionState::Closing);
@@ -951,6 +1060,17 @@ impl ConnectionSession {
             state.terminated = true;
             state.closing = true;
             publication.close = true;
+            let mut log = LifecycleLog::capture(state, "ws.session.closed");
+            log.reason = Some(reason);
+            log.finish_reconnect(state);
+            if log.error.is_none() {
+                log.error = state
+                    .terminal_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .map(|error| (error.kind(), error.context().stage));
+            }
+            publication.terminal_log = Some(log);
             Ok(())
         });
         // A poisoned state is also a cleanup completion, never a hanging owner.
@@ -1134,6 +1254,11 @@ impl ConnectionSession {
                 Self::log_observation_error("state", &error);
             }
         }
+        let logs = [
+            publication.connection_log.take(),
+            publication.reconnect_log.take(),
+            publication.terminal_log.take(),
+        ];
         drop(publication);
         if close {
             #[cfg(test)]
@@ -1153,6 +1278,9 @@ impl ConnectionSession {
             self.finished.cancel();
         }
         self.lifecycle_changed.notify_waiters();
+        for log in logs.into_iter().flatten() {
+            log.emit(self.client_instance_id, self.session_id);
+        }
         result
     }
 
@@ -1230,7 +1358,7 @@ impl ConnectionSession {
 
     fn log_observation_error(source: &str, error: &NetError) {
         crate::log_e!(crate::common::log::log_def::LogType::WSC;
-            "connection_observation", "source|kind", source, format!("{:?}", error.kind()));
+            "ws.connection_session.log_observation_error", "source|kind|stage", source, format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, SessionState>, NetError> {
@@ -1473,3 +1601,7 @@ mod observation_regression_tests;
 #[cfg(test)]
 #[path = "connection_session_journal_tests.rs"]
 mod journal_tests;
+
+#[cfg(test)]
+#[path = "connection_session_logging_tests.rs"]
+mod logging_tests;

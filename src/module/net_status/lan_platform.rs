@@ -15,6 +15,9 @@ pub(crate) struct InterfaceMetadata {
 pub(crate) struct PlatformSnapshot {
     pub(crate) interfaces: HashMap<String, InterfaceMetadata>,
     pub(crate) diagnostics: Vec<String>,
+    // Fixed logging classification, independent of potentially sensitive diagnostics.
+    // Bits 2/3: route/interface queries actually failed (missing metadata is not failure).
+    pub(crate) failure_classes: u8,
 }
 
 pub(crate) fn interface_key(iface: &if_addrs::Interface) -> &str {

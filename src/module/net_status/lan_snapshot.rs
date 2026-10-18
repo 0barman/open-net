@@ -22,7 +22,10 @@ fn capture(
     collect: impl FnOnce(&[if_addrs::Interface]) -> PlatformSnapshot,
     started: SystemTime,
 ) -> Result<LanIpv4Snapshot, NetError> {
-    let mut interfaces = interfaces.map_err(NetError::from)?;
+    let mut interfaces = interfaces.map_err(|error| {
+        super::logging::lan_failure(1);
+        NetError::from(error)
+    })?;
     interfaces.retain(|iface| iface.ip().is_ipv4());
     // An empty successful IPv4 inventory needs no auxiliary metadata lookup.
     let platform = if interfaces.is_empty() {
@@ -47,7 +50,7 @@ fn capture(
             interface_name: iface.name.clone(),
             interface_index: iface.index,
             address: address.ip,
-            netmask: address_netmask(address)?,
+            netmask: address_netmask(address).inspect_err(|_| super::logging::lan_failure(2))?,
             prefix_len: address.prefixlen,
             interface_kind: metadata.kind,
             oper_up,
@@ -58,6 +61,7 @@ fn capture(
             recommendation: None,
         });
     }
+    super::logging::lan_failure(platform.failure_classes);
     Ok(select(candidates, platform.diagnostics, started))
 }
 

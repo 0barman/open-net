@@ -51,6 +51,8 @@ pub(crate) enum RefreshWorkOutcome {
     // 刷新请求返回成功；不意味着此处已得出新的网络状态。
     Requested,
     // 刷新请求返回错误，仅供诊断，不能据此制造网络状态。
+    // netwatch::Monitor::network_change only sends to its actor: its current
+    // failure class is channel closure. Diagnose once in the owning loop.
     RequestFailed,
     // 停止分支先完成，刷新 Future 未继续执行。
     Stopped,

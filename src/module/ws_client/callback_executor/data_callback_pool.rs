@@ -106,7 +106,7 @@ impl DataCallbackPool {
                 } = preparation;
                 drop(retired);
                 if let Some(error) = growth_error {
-                    crate::log_e!(LogType::WSC; "data_callback_pool", "growth_error", crate::common::log::summary::error(&error));
+                    crate::log_e!(LogType::WSC; "ws.data_callback_pool.dispatch", "arg_callback_present|growth_error_kind", true, format!("{:?}", error.kind()));
                 }
                 if let Some(ReadyWorker { sender, lease }) = worker {
                     let submitted = try_start_user_callback_with(

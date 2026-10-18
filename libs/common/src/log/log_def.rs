@@ -141,8 +141,12 @@ macro_rules! log_r {
 
 /// Emits a Debug record. Use `LogType::WSC; "function", "a|b", a, b` for a typed record.
 /// The legacy form without a type uses `LogType::Engine`.
+/// Use `LogType::WSC, LogLevel::Key; "function"` for a key lifecycle record.
 #[macro_export]
 macro_rules! log_s {
+    ($log_type:expr, $level:expr; $($arg:expr),+ $(,)?) => {
+        $crate::internal_log!($log_type, $level, $($arg),+)
+    };
     ($log_type:expr; $($arg:expr),+ $(,)?) => {
         $crate::internal_log!($log_type, $crate::LogLevel::Debug, $($arg),+)
     };

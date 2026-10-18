@@ -221,7 +221,7 @@ impl SessionRuntime {
         let connection = match self.connection.lock() {
             Ok(mut current) => current.take(),
             Err(poisoned) => {
-                crate::log_e!(crate::common::log::log_def::LogType::WSC; "session_close", "error", "connection_lock_poisoned_recovered");
+                crate::log_e!(crate::common::log::log_def::LogType::WSC; "ws.session_runtime.end", "arg_error_kind|arg_error_stage|cause|error", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")), format!("{cause:?}"), "connection_lock_poisoned_recovered");
                 poisoned.into_inner().take()
             }
         };
@@ -231,7 +231,7 @@ impl SessionRuntime {
         let references = match self.operations.lock() {
             Ok(mut map) => std::mem::take(&mut *map),
             Err(poisoned) => {
-                crate::log_e!(crate::common::log::log_def::LogType::WSC; "session_close", "error", "operations_lock_poisoned_recovered");
+                crate::log_e!(crate::common::log::log_def::LogType::WSC; "ws.session_runtime.end", "arg_error_kind|arg_error_stage|cause|error", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")), format!("{cause:?}"), "operations_lock_poisoned_recovered");
                 std::mem::take(&mut *poisoned.into_inner())
             }
         };
@@ -241,13 +241,13 @@ impl SessionRuntime {
             self.pending.close(error.clone(), cause)
         };
         if let Err(failure) = pending_result {
-            crate::log_e!(crate::common::log::log_def::LogType::WSC; "session_pending_close", "error", format!("{failure:?}"));
+            crate::log_e!(crate::common::log::log_def::LogType::WSC; "ws.session_runtime.end", "arg_error_kind|arg_error_stage|cause|event|kind|stage", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")), format!("{cause:?}"), "pending_close_failed", format!("{:?}", failure.kind()), failure.context().stage.map(|stage| format!("{stage:?}")));
             // A failed grace snapshot must not leave registrations admitted to
             // a terminal session. Ordinary close retires the table without a
             // fallible allocation and the remaining controls are also selected.
             preserve_responses = false;
             if let Err(failure) = self.pending.close(error.clone(), cause) {
-                crate::log_e!(crate::common::log::log_def::LogType::WSC; "session_pending_force_close", "error", format!("{failure:?}"));
+                crate::log_e!(crate::common::log::log_def::LogType::WSC; "ws.session_runtime.end", "arg_error_kind|arg_error_stage|cause|event|kind|stage", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")), format!("{cause:?}"), "pending_force_close_failed", format!("{:?}", failure.kind()), failure.context().stage.map(|stage| format!("{stage:?}")));
             }
         }
         for reference in references.into_values() {
@@ -256,7 +256,7 @@ impl SessionRuntime {
                     continue;
                 }
                 if let Err(failure) = control.terminate(error.clone(), cause) {
-                    crate::log_e!(crate::common::log::log_def::LogType::WSC; "session_operation_close", "error",format!("{failure:?}"));
+                    crate::log_e!(crate::common::log::log_def::LogType::WSC; "ws.session_runtime.end", "arg_error_kind|arg_error_stage|cause|event|kind|stage", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")), format!("{cause:?}"), "operation_close_failed", format!("{:?}", failure.kind()), failure.context().stage.map(|stage| format!("{stage:?}")));
                 }
             }
         }
@@ -285,7 +285,7 @@ impl SessionRuntime {
                     .map(|(id, control)| (*id, control.clone()))
                     .collect::<Vec<_>>(),
                 Err(_) => {
-                    crate::log_e!(crate::common::log::log_def::LogType::WSC;"operation_timer","error","lock_poisoned");
+                    crate::log_e!(crate::common::log::log_def::LogType::WSC;"ws.session_runtime.run_timers", "arg_weak_present|error", true, "lock_poisoned");
                     return;
                 }
             };
@@ -303,7 +303,7 @@ impl SessionRuntime {
                 if let Some(at) = control.absolute_deadline() {
                     if Instant::now() >= at {
                         if let Err(error) = control.expire() {
-                            crate::log_e!(crate::common::log::log_def::LogType::WSC;"operation_timer","error",format!("{error:?}"));
+                            crate::log_e!(crate::common::log::log_def::LogType::WSC;"ws.session_runtime.run_timers", "arg_weak_present|kind|stage", true, format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
                         }
                     } else {
                         deadline = Some(deadline.map_or(at, |current| current.min(at)));

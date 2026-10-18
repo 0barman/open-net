@@ -102,7 +102,7 @@ impl SharedBody {
             (operation(&mut guard), poisoned)
         };
         if poisoned {
-            crate::log_e!(crate::LogType::HTTP; "stream_body", "error", "state_poisoned");
+            crate::log_e!(crate::LogType::HTTP; "http.stream_body.with_state", "error|operation", "state_poisoned", "provided");
         }
         result
     }

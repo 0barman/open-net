@@ -325,7 +325,119 @@ enum ResponseWait {
     TimedOut,
     Closed,
     Cancelled,
-    Failed(ErrorKind),
+    Failed(HeartbeatFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeartbeatPhase {
+    SendOptions,
+    Send,
+    Connection,
+    ResponseWait,
+    Matcher,
+    Receive,
+}
+
+impl HeartbeatPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SendOptions => "send_options",
+            Self::Send => "send",
+            Self::Connection => "connection",
+            Self::ResponseWait => "response_wait",
+            Self::Matcher => "matcher",
+            Self::Receive => "receive",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeartbeatFailure {
+    phase: HeartbeatPhase,
+    kind: ErrorKind,
+    stage: Option<ErrorStage>,
+}
+
+const HEARTBEAT_STAGE_SLOTS: usize = ErrorStage::Runtime as usize + 2;
+
+#[derive(Default)]
+struct HeartbeatDiagnostics {
+    client_id: u64,
+    last: Option<HeartbeatFailure>,
+    failures: u64,
+    // One bit per SDK ErrorKind for each fixed phase/stage, including no stage.
+    // None of these slots are keyed by user-controlled data.
+    reported: [[u64; HEARTBEAT_STAGE_SLOTS]; 6],
+}
+
+impl HeartbeatDiagnostics {
+    fn should_report(&mut self, failure: HeartbeatFailure, enabled: bool) -> bool {
+        if matches!(failure.kind, ErrorKind::Cancelled | ErrorKind::Closed) {
+            self.last = None;
+            self.failures = 0;
+            self.reported = [[0; HEARTBEAT_STAGE_SLOTS]; 6];
+            return false;
+        }
+        self.last = Some(failure);
+        self.failures = self.failures.saturating_add(1);
+        if !enabled {
+            // An unobserved failure does not spend a later subscriber's first
+            // diagnostic. Queue rejection retains the logger's drop semantics.
+            self.reported = [[0; HEARTBEAT_STAGE_SLOTS]; 6];
+            return false;
+        }
+        // ErrorKind currently has 40 data-free variants. Keep future out-of-range
+        // classifications bounded as well, without risking a diagnostic panic.
+        let bit = 1_u64
+            .checked_shl(failure.kind as u32)
+            .unwrap_or(1_u64 << 63);
+        let stage = failure
+            .stage
+            .map_or(0, |stage| stage as usize + 1)
+            .min(HEARTBEAT_STAGE_SLOTS - 1);
+        let reported = &mut self.reported[failure.phase as usize][stage];
+        let first = *reported & bit == 0;
+        *reported |= bit;
+        first
+    }
+
+    fn failed(&mut self, session_id: u64, failure: HeartbeatFailure) {
+        if self.should_report(
+            failure,
+            crate::OpenNetLogger::is_enabled_for(crate::LogType::WSC, crate::LogLevel::Error),
+        ) {
+            crate::log_e!(crate::LogType::WSC; "ws.heartbeat.failed",
+                "client_id|session_id|phase|kind|stage|failures", self.client_id, session_id, failure.phase.name(),
+                format!("{:?}", failure.kind), failure.stage.map(|stage| format!("{stage:?}")), self.failures);
+        }
+    }
+
+    fn error(&mut self, session_id: u64, phase: HeartbeatPhase, error: &NetError) {
+        self.failed(
+            session_id,
+            HeartbeatFailure {
+                phase,
+                kind: error.kind(),
+                stage: error.context().stage,
+            },
+        );
+    }
+
+    fn recovered(&mut self, session_id: u64) {
+        if let Some(failure) = self.last.take() {
+            crate::log_s!(crate::LogType::WSC, crate::LogLevel::Key; "ws.heartbeat.recovered",
+                "client_id|session_id|phase|failures", self.client_id, session_id, failure.phase.name(), self.failures);
+        }
+        self.failures = 0;
+        self.reported = [[0; HEARTBEAT_STAGE_SLOTS]; 6];
+    }
+
+    fn stopped(&self, session_id: u64) {
+        if let Some(failure) = self.last {
+            crate::log_s!(crate::LogType::WSC, crate::LogLevel::Key; "ws.heartbeat.stopped",
+                "client_id|session_id|phase|kind|failures", self.client_id, session_id, failure.phase.name(), format!("{:?}", failure.kind), self.failures);
+        }
+    }
 }
 
 async fn run_heartbeat(
@@ -344,7 +456,13 @@ async fn run_heartbeat(
     let mut ticker = time::interval_at(first_tick, config.interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut consecutive_missed = 0_u32;
+    let mut stopped_by_policy = false;
     let session_closed = runtime.closed_token();
+    let session_id = runtime.id.as_u64();
+    let mut diagnostics = HeartbeatDiagnostics {
+        client_id: runtime.client_id.as_u64(),
+        ..Default::default()
+    };
 
     'heartbeat: loop {
         tokio::select! {
@@ -357,6 +475,7 @@ async fn run_heartbeat(
                 let options = match send_options(config.send_timeout) {
                     Ok(options) => options,
                     Err(error) => {
+                        diagnostics.error(session_id, HeartbeatPhase::SendOptions, &error);
                         // A configuration/deadline failure is not a missed
                         // response. Keep the response-timeout streak scoped to
                         // actual response deadlines.
@@ -367,6 +486,7 @@ async fn run_heartbeat(
                             config.failure_action,
                         );
                         if should_stop {
+                            stopped_by_policy = true;
                             break 'heartbeat;
                         }
                         continue;
@@ -383,6 +503,7 @@ async fn run_heartbeat(
                     result = send => result,
                 };
                 if let Err(error) = send_result {
+                    diagnostics.error(session_id, HeartbeatPhase::Send, &error);
                     // A write failure breaks the response-timeout streak; the
                     // next successful write starts a new response sequence.
                     consecutive_missed = 0;
@@ -392,6 +513,7 @@ async fn run_heartbeat(
                         config.failure_action,
                     );
                     if should_stop {
+                        stopped_by_policy = true;
                         break 'heartbeat;
                     }
                     continue;
@@ -402,6 +524,7 @@ async fn run_heartbeat(
                 let (Some(matcher), Some(receiver)) =
                     (config.matcher.as_ref(), receiver.as_mut())
                 else {
+                    diagnostics.recovered(session_id);
                     continue;
                 };
                 let connection_id = match runtime.current_connection_id() {
@@ -420,11 +543,21 @@ async fn run_heartbeat(
                             config.failure_action,
                         );
                         if should_stop {
+                            // The retirement race is expected, but a policy stop
+                            // still names its actual cause instead of an older fault.
+                            diagnostics.last = Some(HeartbeatFailure {
+                                phase: HeartbeatPhase::Connection,
+                                kind: ErrorKind::NotConnected,
+                                stage: Some(ErrorStage::Runtime),
+                            });
+                            diagnostics.failures = diagnostics.failures.saturating_add(1);
+                            stopped_by_policy = true;
                             break 'heartbeat;
                         }
                         continue;
                     }
                     Err(error) => {
+                        diagnostics.error(session_id, HeartbeatPhase::Connection, &error);
                         // A connection/lifecycle lookup failure is not a
                         // response timeout and must not carry a stale streak
                         // into the next heartbeat.
@@ -435,6 +568,7 @@ async fn run_heartbeat(
                             config.failure_action,
                         );
                         if should_stop {
+                            stopped_by_policy = true;
                             break 'heartbeat;
                         }
                         continue;
@@ -462,8 +596,12 @@ async fn run_heartbeat(
                             increment(&mut current.matched_responses);
                             current.state = ApplicationHeartbeatState::Running;
                         });
+                        diagnostics.recovered(session_id);
                     }
                     ResponseWait::TimedOut => {
+                        diagnostics.failed(session_id, HeartbeatFailure {
+                            phase: HeartbeatPhase::ResponseWait, kind: ErrorKind::TimedOut, stage: Some(ErrorStage::Receive),
+                        });
                         consecutive_missed = consecutive_missed.saturating_add(1);
                         snapshot_update(&snapshot, |current| {
                             increment(&mut current.missed_responses);
@@ -474,20 +612,23 @@ async fn run_heartbeat(
                         if config.failure_action == ApplicationHeartbeatFailureAction::Stop
                             && consecutive_missed >= config.max_missed_responses
                         {
+                            stopped_by_policy = true;
                             break 'heartbeat;
                         }
                     }
                     ResponseWait::Closed | ResponseWait::Cancelled => break 'heartbeat,
-                    ResponseWait::Failed(kind) => {
+                    ResponseWait::Failed(failure) => {
+                        diagnostics.failed(session_id, failure);
                         // Receiver and matcher failures are distinct from a
                         // response deadline, so they reset consecutive misses.
                         consecutive_missed = 0;
                         let should_stop = record_failure_kind(
                             &snapshot,
-                            kind,
+                            failure.kind,
                             config.failure_action,
                         );
                         if should_stop {
+                            stopped_by_policy = true;
                             break 'heartbeat;
                         }
                     }
@@ -501,6 +642,9 @@ async fn run_heartbeat(
     snapshot_update(&snapshot, |current| {
         current.state = ApplicationHeartbeatState::Stopped;
     });
+    if stopped_by_policy {
+        diagnostics.stopped(session_id);
+    }
 }
 
 async fn wait_for_response(
@@ -530,7 +674,9 @@ async fn wait_for_response(
                         }
                         let matches = match catch_unwind(AssertUnwindSafe(|| matcher(&message))) {
                             Ok(matches) => matches,
-                            Err(_) => return ResponseWait::Failed(ErrorKind::CallbackPanicked),
+                            Err(_) => return ResponseWait::Failed(HeartbeatFailure {
+                                phase: HeartbeatPhase::Matcher, kind: ErrorKind::CallbackPanicked, stage: Some(ErrorStage::Receive),
+                            }),
                         };
                         if matches {
                             return ResponseWait::Matched;
@@ -544,7 +690,9 @@ async fn wait_for_response(
                     // socket failure.
                     Err(ReceiveError::Lagged { .. }) => continue,
                     Err(ReceiveError::Failed(error)) => {
-                        return ResponseWait::Failed(error.kind());
+                        return ResponseWait::Failed(HeartbeatFailure {
+                            phase: HeartbeatPhase::Receive, kind: error.kind(), stage: error.context().stage,
+                        });
                     }
                 }
             }
@@ -616,7 +764,7 @@ fn lock_snapshot<'a>(
         Ok(guard) => guard,
         Err(poisoned) => {
             crate::log_e!(crate::common::log::log_def::LogType::WSC;
-                "application_heartbeat_snapshot", "error", "lock_poisoned_recovered");
+                "ws.heartbeat.lock_snapshot", "arg_snapshot_present|error", true, "lock_poisoned_recovered");
             poisoned.into_inner()
         }
     }

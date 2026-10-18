@@ -39,7 +39,7 @@ impl NetworkGate {
         };
         if let Err(error) = result {
             // Observation failure never turns a valid transport operation into failure.
-            crate::log_e!(LogType::WSC; "connection_state_progress", "cycle|kind", cycle, format!("{:?}", error.kind()));
+            crate::log_e!(LogType::WSC; "ws.worker.network_gate.publish_progress", "next_attempt_at|cycle|kind", format!("{next_attempt_at:?}"), cycle, format!("{:?}", error.kind()));
         }
     }
 

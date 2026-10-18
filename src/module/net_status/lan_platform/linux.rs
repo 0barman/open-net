@@ -44,15 +44,20 @@ fn collect_names<'a>(
     files: &impl NetworkFiles,
 ) -> PlatformSnapshot {
     let mut diagnostics = Vec::new();
+    let mut failure_classes = 0;
     let routes = match files.read("/proc/net/route") {
         Ok(contents) => match default_routes(&contents) {
             Ok(routes) => Some(routes),
             Err(error) => {
+                failure_classes |= 4;
                 diagnostics.push(format!("Linux IPv4 default route metadata: {error}"));
                 None
             }
         },
         Err(error) => {
+            if error.kind() != io::ErrorKind::NotFound {
+                failure_classes |= 4;
+            }
             diagnostics.push(format!("read /proc/net/route: {error}"));
             None
         }
@@ -76,6 +81,7 @@ fn collect_names<'a>(
     PlatformSnapshot {
         interfaces,
         diagnostics,
+        failure_classes,
     }
 }
 

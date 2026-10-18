@@ -432,5 +432,5 @@ fn allocation_error(error: std::collections::TryReserveError) -> NetError {
 }
 fn log_observer_failure(error: &NetError) {
     crate::log_e!(crate::common::log::log_def::LogType::WSC;
-        "connection_history_observer", "kind", format!("{:?}", error.kind()));
+        "ws.connection_history.log_observer_failure", "kind|stage", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
 }

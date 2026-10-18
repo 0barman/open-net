@@ -250,7 +250,7 @@ fn retire<T>(value: T) -> bool {
         Ok(()) => false,
         Err(payload) => {
             crate::log_e!(crate::common::log::log_def::LogType::WSC;
-                "handshake_provider", "stage|error", "provider", "user_value_cleanup_panicked");
+                "ws.handshake.retire", "arg_value|stage|error", "redacted", "provider", "user_value_cleanup_panicked");
             dispose_payload(payload);
             true
         }
@@ -261,7 +261,7 @@ fn dispose_payload(payload: Box<dyn std::any::Any + Send>) {
     // Only a second unwind while destroying a caught panic payload is abandoned.
     if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
         crate::log_e!(crate::common::log::log_def::LogType::WSC;
-            "handshake_provider", "stage|error", "provider", "panic_payload_cleanup_panicked");
+            "ws.handshake.dispose_payload", "arg_payload|stage|error", "redacted", "provider", "panic_payload_cleanup_panicked");
         std::mem::forget(secondary);
     }
 }

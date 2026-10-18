@@ -5,6 +5,179 @@ use std::time::Duration;
 
 type TestResult = std::result::Result<(), crate::BoxError>;
 
+#[test]
+fn heartbeat_diagnostics_bound_alternating_failures_and_preserve_first_after_subscription(
+) -> TestResult {
+    let send = HeartbeatFailure {
+        phase: HeartbeatPhase::Send,
+        kind: ErrorKind::Io,
+        stage: Some(ErrorStage::Write),
+    };
+    let matcher = HeartbeatFailure {
+        phase: HeartbeatPhase::Matcher,
+        kind: ErrorKind::CallbackPanicked,
+        stage: Some(ErrorStage::Receive),
+    };
+    let mut first = HeartbeatDiagnostics::default();
+    let mut second = HeartbeatDiagnostics::default();
+    check(
+        !first.should_report(send, false),
+        "unsubscribed failure emitted",
+    )?;
+    check(
+        first.should_report(send, true),
+        "unsubscribed failure consumed first diagnostic",
+    )?;
+    check(
+        first.should_report(matcher, true),
+        "new reason was suppressed",
+    )?;
+    let queue_timeout = HeartbeatFailure {
+        phase: HeartbeatPhase::Send,
+        kind: ErrorKind::TimedOut,
+        stage: Some(ErrorStage::Queue),
+    };
+    let write_timeout = HeartbeatFailure {
+        stage: Some(ErrorStage::Write),
+        ..queue_timeout
+    };
+    let unstaged_timeout = HeartbeatFailure {
+        stage: None,
+        ..queue_timeout
+    };
+    check(
+        first.should_report(queue_timeout, true),
+        "queue timeout was suppressed",
+    )?;
+    check(
+        first.should_report(write_timeout, true),
+        "same kind at a different stage was suppressed",
+    )?;
+    check(
+        first.should_report(unstaged_timeout, true),
+        "unstaged reason shared a stage slot",
+    )?;
+    for _ in 0..1_000 {
+        check(
+            !first.should_report(send, true),
+            "alternating send failure emitted again",
+        )?;
+        check(
+            !first.should_report(matcher, true),
+            "alternating matcher failure emitted again",
+        )?;
+        check(
+            !first.should_report(queue_timeout, true),
+            "alternating queue timeout emitted again",
+        )?;
+        check(
+            !first.should_report(write_timeout, true),
+            "alternating write timeout emitted again",
+        )?;
+        check(
+            !first.should_report(unstaged_timeout, true),
+            "alternating unstaged timeout emitted again",
+        )?;
+    }
+    check(
+        second.should_report(send, true),
+        "one heartbeat suppressed another",
+    )?;
+    first.recovered(98_101);
+    check(
+        first.should_report(send, true),
+        "recovery did not reset fault cycle",
+    )?;
+    check(
+        !first.should_report(send, false),
+        "disabled interval emitted",
+    )?;
+    check(
+        first.should_report(send, true),
+        "re-enabled subscription missed failure",
+    )?;
+    first.failures = u64::MAX;
+    check(
+        !first.should_report(send, true) && first.failures == u64::MAX,
+        "failure counter wrapped",
+    )?;
+    check(
+        !first.should_report(
+            HeartbeatFailure {
+                kind: ErrorKind::Cancelled,
+                ..send
+            },
+            true,
+        ),
+        "normal cancellation logged as error",
+    )
+}
+
+#[test]
+fn heartbeat_diagnostics_emit_safe_phases_and_one_recovery() -> TestResult {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _subscription = crate::OpenNetLogger::register_log_listener(
+        Box::new(move |record| {
+            if record.tag.starts_with("ws.heartbeat.") && record.content.contains("98102") {
+                let _ = tx.send(record);
+            }
+        }),
+        &[crate::LogType::WSC],
+    )?;
+    let mut diagnostics = HeartbeatDiagnostics {
+        client_id: 98_102,
+        ..Default::default()
+    };
+    let error = NetError::with_source(
+        ErrorKind::Io,
+        std::io::Error::other("SECRET_heartbeat_source"),
+    )
+    .with_stage(ErrorStage::Write);
+    for _ in 0..100 {
+        diagnostics.error(98_102, HeartbeatPhase::Send, &error);
+    }
+    diagnostics.recovered(98_102);
+    diagnostics.recovered(98_102);
+    diagnostics.failed(
+        98_102,
+        HeartbeatFailure {
+            phase: HeartbeatPhase::Matcher,
+            kind: ErrorKind::CallbackPanicked,
+            stage: Some(ErrorStage::Receive),
+        },
+    );
+    diagnostics.stopped(98_102);
+    crate::log_s!(crate::LogType::WSC, crate::LogLevel::Key; "ws.heartbeat.test_barrier", "client_id", 98_102);
+    let mut records = Vec::new();
+    loop {
+        let record = rx.recv_timeout(Duration::from_secs(3))?;
+        if record.tag == "ws.heartbeat.test_barrier" {
+            break;
+        }
+        check(
+            !record.content.contains("SECRET_"),
+            "heartbeat log exposed source",
+        )?;
+        records.push(record);
+    }
+    check(
+        records.len() == 4,
+        "heartbeat emitted duplicate or missing lifecycle logs",
+    )?;
+    check(
+        records[0].level == crate::LogLevel::Error && records[0].content.contains("send"),
+        "send phase absent",
+    )?;
+    check(
+        records[1].tag == "ws.heartbeat.recovered" && records[1].content.contains("100"),
+        "recovery did not summarize failures",
+    )?;
+    check(
+        records[2].content.contains("matcher") && records[3].tag == "ws.heartbeat.stopped",
+        "matcher or stop phase absent",
+    )
+}
+
 fn check(condition: bool, message: &str) -> TestResult {
     if condition {
         Ok(())

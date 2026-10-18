@@ -2,11 +2,13 @@
 use crate::error::{ErrorKind, ErrorStage, NetError};
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use tokio::sync::Notify;
 
 type Cleanup = Box<dyn FnOnce() + Send + 'static>;
+static NEXT_LOG_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) enum WorkerJoin {
     Owned(JoinHandle<()>),
@@ -31,6 +33,8 @@ struct State {
 }
 
 pub(super) struct WorkerShutdown {
+    log_id: u64,
+    launch_failure_reported: AtomicBool,
     state: Mutex<State>,
     notify: Notify,
     threads: Option<Arc<crate::common::retirement::ThreadRegistry>>,
@@ -48,6 +52,8 @@ impl WorkerShutdown {
     ) -> Self {
         let retired = joins.is_empty();
         Self {
+            log_id: NEXT_LOG_ID.fetch_add(1, Ordering::Relaxed),
+            launch_failure_reported: AtomicBool::new(false),
             state: Mutex::new(State {
                 joins,
                 started: false,
@@ -86,16 +92,29 @@ impl WorkerShutdown {
     where
         F: FnOnce(Cleanup) -> io::Result<()>,
     {
+        let error_enabled =
+            crate::OpenNetLogger::is_enabled_for(crate::LogType::HTTP, crate::LogLevel::Error);
         let mut state = self.locked();
         if state.started || state.result.is_some() {
             return Ok(());
         }
         let owner = Arc::clone(self);
-        launch(Box::new(move || owner.join_workers())).map_err(|error| {
-            NetError::with_source(ErrorKind::RuntimeUnavailable, error)
-                .with_stage(ErrorStage::Runtime)
-        })?;
+        if let Err(error) = launch(Box::new(move || owner.join_workers())) {
+            let report =
+                error_enabled && !self.launch_failure_reported.swap(true, Ordering::Relaxed);
+            drop(state);
+            if report {
+                crate::log_e!(crate::LogType::HTTP; "http.worker_cleanup.start_with", "event|worker_group_id|launch|failure_class", "failed", self.log_id, "provided", "thread_launch_failed");
+            }
+            return Err(NetError::with_source(ErrorKind::RuntimeUnavailable, error)
+                .with_stage(ErrorStage::Runtime));
+        }
         state.started = true;
+        let recovered = self.launch_failure_reported.swap(false, Ordering::Relaxed);
+        drop(state);
+        if recovered {
+            crate::log_s!(crate::LogType::HTTP, crate::LogLevel::Key; "http.worker_cleanup.start_with", "event|worker_group_id|launch|operation", "recovered", self.log_id, "provided", "thread_launch");
+        }
         Ok(())
     }
 
@@ -120,6 +139,8 @@ impl WorkerShutdown {
         };
         let mut failed = false;
         let mut retired = true;
+        let mut worker_panics = 0usize;
+        let mut join_panics = 0usize;
         for join in joins {
             match catch_unwind(AssertUnwindSafe(|| join.join())) {
                 Ok(Ok(())) => {}
@@ -127,6 +148,7 @@ impl WorkerShutdown {
                     // A panicking worker has still exited. Its payload is user
                     // owned and may itself panic on drop; finish every join.
                     failed = true;
+                    worker_panics = worker_panics.saturating_add(1);
                     drop_panic_payload(payload);
                 }
                 Err(payload) => {
@@ -134,9 +156,17 @@ impl WorkerShutdown {
                     // Drop fallback), so retirement is not confirmed.
                     failed = true;
                     retired = false;
+                    join_panics = join_panics.saturating_add(1);
                     drop_panic_payload(payload);
                 }
             }
+        }
+        if failed {
+            crate::log_e!(crate::LogType::HTTP; "http.worker_cleanup.join_workers", "worker_group_id|failure_class|worker_panics|join_panics", self.log_id, match (worker_panics != 0, join_panics != 0) {
+                (true, true) => "worker_and_join_panicked",
+                (true, false) => "worker_panicked",
+                _ => "join_panicked",
+            }, worker_panics, join_panics);
         }
         let result = if failed {
             Err(NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Close))

@@ -159,7 +159,11 @@ impl RequestReceipt {
     pub async fn response(self) -> Result<Response> {
         self.response
             .await
-            .map_err(|_| NetError::from(ErrorKind::EngineDropped))?
+            .map_err(|_| {
+                crate::log_e!(crate::LogType::WSC; "ws.request.response",
+                    "session_id|operation_id", self.handle.registration().session_id().as_u64(), self.handle.id().as_u64());
+                NetError::from(ErrorKind::EngineDropped)
+            })?
     }
 }
 /// Request that has registered and reserved send resources but has not yet been
@@ -176,10 +180,10 @@ pub struct PreparedRequest {
 }
 impl PreparedRequest {
     fn new(mut admission: dispatch::Admission) -> Result<Self> {
-        let (handle, response) = admission
-            .request
-            .take()
-            .ok_or_else(|| NetError::from(ErrorKind::Internal))?;
+        let (handle, response) = admission.request.take().ok_or_else(|| {
+            dispatch::log_invariant(&admission.control, "request_registration_missing");
+            NetError::from(ErrorKind::Internal)
+        })?;
         Ok(Self {
             admission,
             handle,
@@ -196,10 +200,10 @@ impl PreparedRequest {
     /// write or a peer response. Cancellation, close, or an expired deadline can
     /// still make the commit fail.
     pub fn commit(mut self) -> Result<RequestReceipt> {
-        let response = self
-            .response
-            .take()
-            .ok_or_else(|| NetError::from(ErrorKind::Internal))?;
+        let response = self.response.take().ok_or_else(|| {
+            dispatch::log_invariant(&self.admission.control, "prepared_response_missing");
+            NetError::from(ErrorKind::Internal)
+        })?;
         self.admission.commit()?;
         Ok(RequestReceipt {
             handle: self.handle.clone(),

@@ -106,6 +106,7 @@ fn interface_types(snapshot: &mut PlatformSnapshot) {
     // SAFETY: no input; the native API returns a retained array or null.
     let interfaces = unsafe { SCNetworkInterfaceCopyAll() };
     if interfaces.is_null() {
+        snapshot.failure_classes |= 8;
         // SAFETY: SCError has no pointer inputs.
         snapshot
             .diagnostics
@@ -117,6 +118,7 @@ fn interface_types(snapshot: &mut PlatformSnapshot) {
     // SAFETY: the non-null Copy result contains CF interface objects owned by the array.
     let interfaces: CFArray<CFType> = unsafe { CFArray::wrap_under_create_rule(interfaces) };
     if interfaces.len() > 65_536 {
+        snapshot.failure_classes |= 8;
         snapshot
             .diagnostics
             .push("native interface inventory exceeded collection budget".to_owned());
@@ -126,6 +128,7 @@ fn interface_types(snapshot: &mut PlatformSnapshot) {
         // SAFETY: GetTypeID has no inputs; interface-specific getters below are used
         // only after checking the object type while its owning array remains alive.
         if interface.type_of() != unsafe { SCNetworkInterfaceGetTypeID() } {
+            snapshot.failure_classes |= 8;
             snapshot
                 .diagnostics
                 .push("SCNetworkInterfaceCopyAll returned an unexpected CF object".to_owned());
@@ -195,7 +198,10 @@ pub(crate) fn collect(ifaces: &[if_addrs::Interface]) -> PlatformSnapshot {
             names.dedup();
             apply_store(&values, &names, &mut snapshot);
         }
-        Err(error) => snapshot.diagnostics.push(error),
+        Err(error) => {
+            snapshot.failure_classes |= 4 | 8;
+            snapshot.diagnostics.push(error);
+        }
     }
     snapshot
 }

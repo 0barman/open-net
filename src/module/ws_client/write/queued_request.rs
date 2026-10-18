@@ -50,6 +50,11 @@ impl QueuedRequest {
         }
     }
     pub(crate) fn complete(mut self, result: Result<()>) {
+        let arg_result_kind = result.as_ref().err().map(NetError::kind);
+        let arg_result_stage = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.context().stage);
         self.dispatch_retirement();
         if self.completed {
             return;
@@ -80,7 +85,7 @@ impl QueuedRequest {
                 _ => TaskEndCause::Failed,
             };
             if let Err(error) = self.dispatch_phase.terminate(error, cause) {
-                crate::log_e!(crate::common::log::log_def::LogType::WSC; "complete_operation", "error", format!("{error:?}"));
+                crate::log_e!(crate::common::log::log_def::LogType::WSC; "ws.queued_request.complete", "arg_result_kind|arg_result_stage|kind|stage", arg_result_kind.map(|kind| format!("{kind:?}")), arg_result_stage.map(|stage| format!("{stage:?}")), format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
             }
         }
     }

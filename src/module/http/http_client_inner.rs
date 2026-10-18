@@ -84,6 +84,13 @@ mod shutdown_admission_tests;
 #[path = "cookie_worker_tests.rs"]
 mod cookie_worker_tests;
 
+#[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
+fn provider_failure_log(operation: &'static str, reason: &'static str) {
+    // Only the captured call boundary owns this diagnostic. Never format the
+    // application's error, panic payload, URL, headers, or request identifier.
+    crate::log_e!(crate::LogType::HTTP; "http.provider_failure_log", "operation|reason", operation, reason);
+}
+
 pub(crate) fn create_http_client(
     thread_name: String,
     config: HttpClientConfig,
@@ -134,6 +141,7 @@ pub(crate) struct HttpClientInner {
     admission_gate: Mutex<()>,
     shutdown_notify: Arc<Notify>,
     shutdown_state: Arc<WorkerShutdown>,
+    observation_cleanup_reported: AtomicBool,
     client: Client,
     config: Arc<HttpClientConfig>,
     registry: Arc<RequestRegistry>,
@@ -586,7 +594,7 @@ impl RequestRegistry {
                 }
             }
             Err(_) => {
-                crate::log_e!(crate::LogType::HTTP; "request_registry", "error", "registry_poisoned");
+                crate::log_e!(crate::LogType::HTTP; "http.request_registry.finish", "error|request_id|control", "registry_poisoned", "<redacted>", "provided");
                 None
             }
         };
@@ -763,6 +771,7 @@ impl HttpClientInner {
                 vec![send_thread, receive_thread, callback_thread],
                 threads,
             )),
+            observation_cleanup_reported: AtomicBool::new(false),
             client,
             config,
             registry: Arc::new(RequestRegistry::new()),
@@ -1287,10 +1296,12 @@ impl HttpClientInner {
                         .await?;
                         let action = match decision {
                             Ok(result) => result.map_err(|_| {
+                                provider_failure_log("auth_unauthorized", "returned_error");
                                 NetError::from(ErrorKind::ProviderFailed)
                                     .with_stage(ErrorStage::Provider)
                             })?,
                             Err(_) => {
+                                provider_failure_log("auth_unauthorized", "panicked");
                                 return Err(NetError::from(ErrorKind::ProviderFailed)
                                     .with_stage(ErrorStage::Provider));
                             }
@@ -1450,7 +1461,20 @@ impl HttpClientInner {
             Some(observation) => observation.wait_cleanup().await,
             None => Ok(()),
         };
+        self.record_observation_cleanup(&observations);
         workers.and(observations)
+    }
+
+    fn record_observation_cleanup(&self, result: &Result<(), NetError>) {
+        if let Err(error) = result {
+            if crate::OpenNetLogger::is_enabled_for(crate::LogType::HTTP, crate::LogLevel::Error)
+                && !self
+                    .observation_cleanup_reported
+                    .swap(true, Ordering::Relaxed)
+            {
+                crate::log_e!(crate::LogType::HTTP; "http.record_observation_cleanup", "operation|error_kind|stage", "observation_cleanup", format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
+            }
+        }
     }
 
     async fn join_workers(&self) -> Result<(), NetError> {
@@ -1691,7 +1715,7 @@ async fn send_loop(
             }
             completed = jobs.join_next(), if !jobs.is_empty() => {
                 if let Some(Err(_)) = completed {
-                    crate::log_e!(crate::LogType::HTTP; "send_loop", "error", "request_task_failed");
+                    crate::log_e!(crate::LogType::HTTP; "http.send_loop", "error|request_rx|supervisor_rx|response_tx|client|config_timeout|config_max_response_bytes|config_request_queue_capacity|config_response_queue_capacity|config_callback_queue_capacity|shutdown_notify|shutdown_sent", "request_task_failed", "provided", "provided", "provided", "provided", config.timeout, config.max_response_bytes, config.request_queue_capacity, config.response_queue_capacity, config.callback_queue_capacity, "provided", shutdown_sent.load(Ordering::Acquire));
                 }
             }
         }
@@ -1719,7 +1743,7 @@ async fn send_loop(
             },
             completed = jobs.join_next(), if !jobs.is_empty() => {
                 if let Some(Err(_)) = completed {
-                    crate::log_e!(crate::LogType::HTTP; "send_loop", "error", "request_task_failed");
+                    crate::log_e!(crate::LogType::HTTP; "http.send_loop", "error|request_rx|supervisor_rx|response_tx|client|config_timeout|config_max_response_bytes|config_request_queue_capacity|config_response_queue_capacity|config_callback_queue_capacity|shutdown_notify|shutdown_sent", "request_task_failed", "provided", "provided", "provided", "provided", config.timeout, config.max_response_bytes, config.request_queue_capacity, config.response_queue_capacity, config.callback_queue_capacity, "provided", shutdown_sent.load(Ordering::Acquire));
                 }
             }
         }
@@ -1741,7 +1765,7 @@ async fn process_job(
     {
         Ok(result) => result,
         Err(_) => {
-            crate::log_e!(crate::LogType::HTTP; "process_job", "error", "request_task_panicked");
+            crate::log_e!(crate::LogType::HTTP; "http.process_job", "error|job_request_id|job_completion_present|client|config_timeout|config_max_response_bytes|response_tx|initial_attempt", "request_task_panicked", "<redacted>", job.completion.is_some(), "provided", config.timeout, config.max_response_bytes, "provided", initial_attempt);
             Err(NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Dispatch))
         }
     };
@@ -1760,7 +1784,7 @@ async fn process_job(
         completion: job.completion,
     };
     if let Err(error) = response_tx.send(response).await {
-        crate::log_e!(crate::LogType::HTTP; "request_response_queue", "error", "response_queue_closed");
+        crate::log_e!(crate::LogType::HTTP; "http.process_job", "error|job_request_id|job_completion_present|client|config_timeout|config_max_response_bytes|response_tx|initial_attempt", "response_queue_closed", "<redacted>", error.0.completion.is_some(), "provided", config.timeout, config.max_response_bytes, "provided", initial_attempt);
         run_callback(error.0).await;
     }
 }
@@ -1913,15 +1937,17 @@ async fn run_request(
                                 .await?;
                             let action = match decision {
                                 Ok(result) => result.map_err(|_| {
+                                    provider_failure_log("auth_unauthorized", "returned_error");
                                     NetError::from(ErrorKind::ProviderFailed)
                                         .with_stage(ErrorStage::Provider)
                                 })?,
                                 Err(_) => {
+                                    provider_failure_log("auth_unauthorized", "panicked");
                                     return terminal_error(
                                         &mut lifecycle,
                                         NetError::from(ErrorKind::ProviderFailed)
                                             .with_stage(ErrorStage::Provider),
-                                    )
+                                    );
                                 }
                             };
                             if matches!(action, AuthAction::RetryWithFreshCredentials) {
@@ -2117,12 +2143,14 @@ async fn build_request(
             .await;
         match applied {
             Ok(result) => result.map_err(|_| {
+                provider_failure_log("auth_apply", "returned_error");
                 NetError::from(ErrorKind::ProviderFailed).with_stage(ErrorStage::Provider)
             })?,
             Err(_) => {
+                provider_failure_log("auth_apply", "panicked");
                 return Err(
                     NetError::from(ErrorKind::ProviderFailed).with_stage(ErrorStage::Provider)
-                )
+                );
             }
         }
         auth_generation = context.credential_generation();
@@ -2294,7 +2322,7 @@ async fn receive_loop(
 ) {
     while let Some(job) = response_rx.recv().await {
         if let Err(error) = callback_tx.send(job).await {
-            crate::log_e!(crate::LogType::HTTP; "receive_loop", "error", "callback_queue_closed");
+            crate::log_e!(crate::LogType::HTTP; "http.receive_loop", "error|response_rx|callback_tx", "callback_queue_closed", "provided", "provided");
             run_callback(error.0).await;
         }
     }
@@ -2372,14 +2400,14 @@ async fn callback_loop(mut callback_rx: mpsc::Receiver<CallbackJob>) {
             },
             completed = callbacks.join_next(), if !callbacks.is_empty() => {
                 if let Some(Err(_)) = completed {
-                    crate::log_e!(crate::LogType::HTTP; "callback_loop", "error", "callback_task_failed");
+                    crate::log_e!(crate::LogType::HTTP; "http.callback_loop", "error|callback_rx", "callback_task_failed", "provided");
                 }
             }
         }
     }
     while let Some(callback) = callbacks.join_next().await {
         if callback.is_err() {
-            crate::log_e!(crate::LogType::HTTP; "callback_loop", "error", "callback_task_failed");
+            crate::log_e!(crate::LogType::HTTP; "http.callback_loop", "error|callback_rx", "callback_task_failed", "provided");
         }
     }
 }
@@ -2443,7 +2471,7 @@ async fn run_callback(job: CallbackJob) {
         .is_err()
         {
             callback_result = Err(callback_error());
-            crate::log_e!(crate::LogType::HTTP; "callback_loop", "error", "header_callback_panicked");
+            crate::log_e!(crate::LogType::HTTP; "http.run_callback", "error|job_request_id|job_completion_present", "header_callback_panicked", "<redacted>", completion.is_some());
         }
     }
     // Catch both synchronous future construction and asynchronous execution.
@@ -2453,7 +2481,7 @@ async fn run_callback(job: CallbackJob) {
         .is_err()
     {
         callback_result = Err(callback_error());
-        crate::log_e!(crate::LogType::HTTP; "callback_loop", "error", "callback_panicked");
+        crate::log_e!(crate::LogType::HTTP; "http.run_callback", "error|job_request_id|job_completion_present", "callback_panicked", "<redacted>", completion.is_some());
     }
     drop(permit);
     drop(registration);
@@ -3142,6 +3170,7 @@ mod tests {
                 admission_gate: Mutex::new(()),
                 shutdown_notify: Arc::new(Notify::new()),
                 shutdown_state: Arc::new(WorkerShutdown::new(Vec::new())),
+                observation_cleanup_reported: AtomicBool::new(false),
                 client: build_client(&config)?,
                 config,
                 registry: Arc::new(RequestRegistry::new()),

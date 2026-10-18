@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
@@ -466,5 +466,150 @@ async fn engine_receipt_waits_for_managed_fallback_completion_waker_to_return() 
         .join()
         .map_err(|_| "engine shutdown waiter panicked")?;
     assert_eq!(kind(waiting.await), ErrorKind::RuntimeUnavailable);
+    Ok(())
+}
+
+#[cfg(test)]
+fn diagnostic_listener(
+    id: u64,
+) -> TestResult<(crate::LogSubscription, mpsc::Receiver<crate::LogInfo>)> {
+    let (sent, received) = mpsc::channel();
+    let subscription = crate::OpenNetLogger::register_shared_log_listener(
+        Box::new(move |log| {
+            if log.tag.starts_with("http.managed.") {
+                if let Ok(fields) = serde_json::from_str::<serde_json::Value>(&log.content) {
+                    if fields["client_id"].as_u64() == Some(id) {
+                        let _ = sent.send((*log).clone());
+                    }
+                }
+            }
+        }),
+        crate::LogSubscriptionOptions::new(&[crate::LogType::HTTP])
+            .with_max_level(crate::LogLevel::Key),
+    )?;
+    Ok((subscription, received))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(test)]
+async fn lifecycle_diagnostics_follow_shared_commits_and_exclude_client_names() -> TestResult {
+    let net = engine()?;
+    let managed = net.managed_http("private-managed-name-sentinel", config()?)?;
+    let (_subscription, received) = diagnostic_listener(managed.inner.log_id)?;
+    let mut gate = CreationGate::install(&managed, false);
+    let mut first = Box::pin(managed.get());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    gate.entered.recv_timeout(WAIT)?;
+    let mut second = Box::pin(managed.get());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    gate.release();
+    let first = first.await?;
+    let second = second.await?;
+    assert!(Arc::ptr_eq(&first.inner, &second.inner));
+    for _ in 0..32 {
+        assert!(Arc::ptr_eq(&first.inner, &managed.get().await?.inner));
+    }
+    managed.shutdown().await?;
+    let mut logs = Vec::new();
+    loop {
+        let log = received.recv_timeout(WAIT)?;
+        let done = log.tag == "http.managed.finish_shutdown";
+        assert_eq!(log.level, crate::LogLevel::Key);
+        assert!(!log.content.contains("private-managed-name-sentinel"));
+        if log.tag == "http.managed.complete_creation" {
+            let fields: serde_json::Value = serde_json::from_str(&log.content)?;
+            assert_eq!(fields["event"], "ready");
+        }
+        logs.push(log.tag);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        logs,
+        [
+            "http.managed.get",
+            "http.managed.complete_creation",
+            "http.managed.begin_shutdown",
+            "http.managed.finish_shutdown"
+        ]
+    );
+    for _ in 0..32 {
+        managed.shutdown().await?;
+    }
+    crate::log_s!(crate::LogType::HTTP, crate::LogLevel::Key; "http.managed.lifecycle_diagnostics_follow_shared_commits_and_exclude_client_names", "client_id", managed.inner.log_id);
+    assert_eq!(
+        received.recv_timeout(WAIT)?.tag,
+        "http.managed.lifecycle_diagnostics_follow_shared_commits_and_exclude_client_names"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(test)]
+async fn closed_creation_reports_lost_failure_without_false_ready() -> TestResult {
+    let net = engine()?;
+    let managed = net.managed_http("close-failure-diagnostic", config()?)?;
+    let (_subscription, received) = diagnostic_listener(managed.inner.log_id)?;
+    let mut gate = CreationGate::install(&managed, true);
+    let mut get = Box::pin(managed.get());
+    assert!(futures::poll!(get.as_mut()).is_pending());
+    gate.entered.recv_timeout(WAIT)?;
+    managed.begin_shutdown();
+    assert_eq!(kind(get.await), ErrorKind::Closed);
+    gate.release();
+    managed.shutdown().await?;
+    let mut failures = 0;
+    loop {
+        let log = received.recv_timeout(WAIT)?;
+        let fields: serde_json::Value = serde_json::from_str(&log.content)?;
+        if log.tag == "http.managed.complete_creation" {
+            assert_ne!(fields["event"], "ready");
+        }
+        if log.tag == "http.managed.complete_creation" && fields["event"] == "creation_overridden" {
+            failures += 1;
+            assert_eq!(log.level, crate::LogLevel::Error);
+            assert_eq!(fields["error_kind"], "RuntimeUnavailable");
+            assert_eq!(fields["stage"], "Some(Runtime)");
+        }
+        if log.tag == "http.managed.finish_shutdown" {
+            break;
+        }
+    }
+    assert_eq!(failures, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg(test)]
+fn recovered_state_poison_is_reported_once_per_instance() -> TestResult {
+    let net = engine()?;
+    for index in 0..2 {
+        let managed = net.managed_http(&format!("poison-{index}"), config()?)?;
+        let (_subscription, received) = diagnostic_listener(managed.inner.log_id)?;
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _held = managed.inner.state.lock().unwrap();
+            panic!("private-poison-sentinel");
+        }));
+        for _ in 0..16 {
+            assert_eq!(
+                kind(managed.inner.get_registered()),
+                ErrorKind::ConnectionClosing
+            );
+        }
+        crate::log_s!(crate::LogType::HTTP, crate::LogLevel::Key; "http.managed.recovered_state_poison_is_reported_once_per_instance", "client_id", managed.inner.log_id);
+        let log = received.recv_timeout(WAIT)?;
+        assert_eq!(log.tag, "http.managed.report_once");
+        assert!(!log.content.contains("private-poison-sentinel"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&log.content)?["reason"],
+            "state_poisoned"
+        );
+        assert_eq!(
+            received.recv_timeout(WAIT)?.tag,
+            "http.managed.recovered_state_poison_is_reported_once_per_instance"
+        );
+        futures::executor::block_on(managed.shutdown())?;
+    }
     Ok(())
 }

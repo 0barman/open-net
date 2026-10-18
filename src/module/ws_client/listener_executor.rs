@@ -67,7 +67,7 @@ impl ListenerExecutor {
         }
         let mut pending = VecDeque::new();
         pending.try_reserve(queue_capacity).map_err(|error| {
-            crate::log_e!(LogType::WSC; "listener_executor", "queue_allocation_error", error.to_string());
+            crate::log_e!(LogType::WSC; "ws.listener_executor.new_with_threads", "name|workers|queue_capacity|arg_threads_present|error", name, workers, queue_capacity, true, "queue_allocation_failed");
             NetError::with_source(crate::error::ErrorKind::ResourceExhausted, error)
         })?;
         let shared = Arc::new(ExecutorShared {
@@ -142,7 +142,7 @@ impl ListenerExecutor {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     self.rollback_startup(&cancelled, handles);
-                    crate::log_e!(LogType::WSC; "listener_executor", "thread_start_error", error.to_string());
+                    crate::log_e!(LogType::WSC; "ws.listener_executor.ensure_started_with_spawner", "arg_spawn_present|thread_start_error_kind", true, format!("{:?}", error.kind()));
                     return Err(NetError::with_source(
                         crate::error::ErrorKind::RuntimeUnavailable,
                         error,
@@ -178,6 +178,7 @@ impl ListenerExecutor {
     }
 
     fn rollback_startup(&self, cancelled: &AtomicBool, handles: Vec<ThreadHandle>) {
+        let arg_handles_count = handles.len();
         {
             // Coordinate with the wait predicate so cancellation cannot miss a
             // worker about to sleep. No user job is admitted before ready=true.
@@ -191,7 +192,7 @@ impl ListenerExecutor {
         self.shared.changed.notify_all();
         for handle in handles {
             if handle.join().is_err() {
-                crate::log_e!(LogType::WSC; "listener_executor", "startup_rollback_error", "worker_unwound");
+                crate::log_e!(LogType::WSC; "ws.listener_executor.rollback_startup", "arg_cancelled_present|arg_handles_count|startup_rollback_error", true, arg_handles_count, "worker_unwound");
             }
         }
     }
@@ -279,12 +280,12 @@ impl ExecutorShared {
             match self.next_job(cancelled) {
                 Ok(Some(job)) => {
                     if catch_unwind(AssertUnwindSafe(job)).is_err() {
-                        crate::log_e!(LogType::WSC; "listener_executor", "error", "user_callback_unwound");
+                        crate::log_e!(LogType::WSC; "ws.listener_executor.run_worker", "arg_cancelled_present|error", true, "user_callback_unwound");
                     }
                 }
                 Ok(None) => return,
                 Err(error) => {
-                    crate::log_e!(LogType::WSC; "listener_executor", "worker_error", error.to_string());
+                    crate::log_e!(LogType::WSC; "ws.listener_executor.run_worker", "arg_cancelled_present|kind|stage", true, format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
                     return;
                 }
             }

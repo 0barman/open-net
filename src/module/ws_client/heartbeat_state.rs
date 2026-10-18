@@ -127,7 +127,7 @@ impl HeartbeatState {
             phase: ProbePhase::Sending,
         });
         drop(inner);
-        crate::log_s!(LogType::WSC; "start_recovery_probe", "generation|payload_bytes", self.generation, payload.len());
+        crate::log_s!(LogType::WSC; "ws.heartbeat_state.start_recovery_probe", "now|pong_timeout|generation|payload_bytes", format!("{now:?}"), pong_timeout, self.generation, payload.len());
         Some(payload)
     }
 
