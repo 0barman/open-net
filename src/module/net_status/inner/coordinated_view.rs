@@ -13,6 +13,7 @@ use crate::subscription::{
 use tokio::sync::{watch, Semaphore};
 
 use super::network_view::NetworkView;
+use crate::module::net_status::logging::Transition;
 
 pub(super) struct CoordinatedView {
     pub(super) view: NetworkView,
@@ -33,6 +34,7 @@ pub(super) struct CoordinatedView {
 /// remain here until the source and all outer lifecycle locks have been released.
 #[must_use]
 pub(super) struct ViewPublication {
+    pub(super) transition: Option<Transition>,
     pub(super) state: Option<StatePublication<NetworkSnapshot>>,
     terminal: Option<StatePublication<NetworkSnapshot>>,
     pub(super) events: Vec<EventPublication<NetworkEvent>>,
@@ -47,6 +49,7 @@ pub(super) struct ViewPublication {
 impl ViewPublication {
     pub(super) fn empty() -> Self {
         Self {
+            transition: None,
             state: None,
             terminal: None,
             events: Vec::new(),
@@ -68,7 +71,8 @@ impl ViewPublication {
         }
     }
     pub(super) fn is_empty(&self) -> bool {
-        self.state.is_none()
+        self.transition.is_none()
+            && self.state.is_none()
             && self.terminal.is_none()
             && self.events.is_empty()
             && self.retired.is_empty()
@@ -126,6 +130,9 @@ impl ViewPublication {
             }
         }
         drop((self.retired, self.owner));
+        if let Some(transition) = self.transition {
+            transition.emit();
+        }
     }
 }
 
@@ -255,6 +262,7 @@ impl CoordinatedView {
         }
         publication.track(&self.engine);
         self.invalidate(publication);
+        publication.transition = Transition::closed(self.view.generation, &self.view.snapshot);
         self.failure = Some(error.clone());
         self.view.active = false;
         self.view.snapshot.state = MonitorState::Closed;

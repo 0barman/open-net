@@ -89,7 +89,9 @@ impl OpenNetInner {
             // An error is not proof that internal cleanup completed. Keep the
             // Closing reservation and report failure, even if its waiter left.
             if let Err(error) = &result {
-                crate::log_e!(crate::common::log::log_def::LogType::Engine; "net_status_destroy_cleanup", "error", crate::common::log::summary::error(error));
+                crate::log_e!(crate::common::log::log_def::LogType::Engine; "net_status.destroy_net_status_client",
+                    "event|thread_name|error_kind|stage", "cleanup_failed", name,
+                    format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
             }
             let _ = completed.send(result);
         });

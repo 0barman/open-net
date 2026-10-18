@@ -546,7 +546,7 @@ impl Drop for NetworkObservationOwner {
     }
 }
 fn log_error(event: &str, error: &NetError) {
-    crate::log_e!(crate::common::log::log_def::LogType::Engine; event, "error", crate::common::log::summary::error(error));
+    crate::log_e!(crate::common::log::log_def::LogType::Engine; "net_status.log_error", "event|kind|stage", event, format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
 }
 
 #[cfg(test)]

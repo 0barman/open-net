@@ -4,7 +4,8 @@
 # Each unsafe operation is justified by its adjacent SAFETY comment.
 # The complete token fingerprint detects body changes; only exact unsafe rows
 # below are allowed. Panic/unwrap operations are never exempted.
-fingerprint	src/module/net_status/inner/platform/windows.rs	bc4762a6584f13f2
+# Reviewed cleanup log tag/fields only; native operations and allowances are unchanged.
+fingerprint	src/module/net_status/inner/platform/windows.rs	3739567b46e52dc9
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoUninitialize() };
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }.map_err(monitor_io)?;

@@ -48,8 +48,8 @@ impl PlatformNetworkMonitor {
                 // Native events are supplementary hints. Keep netwatch and
                 // its existing status semantics alive if this source fails.
                 crate::log_e!(crate::common::log::log_def::LogType::Engine;
-                    "network_status_native_monitor_start", "error",
-                    crate::common::log::summary::error(&error));
+                    "net_status.from_native", "native_error_kind|changes",
+                    format!("{:?}", error.kind()), "provided");
                 None
             }
         };

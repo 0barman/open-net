@@ -111,26 +111,26 @@ impl WSClientWorker {
     /// - `ready_tx`：向客户端创建流程报告工作线程是否完成运行时初始化的同步通道。
     pub(crate) fn run(self, ready_tx: std::sync::mpsc::Sender<Result<(), NetError>>) {
         let _scope = crate::common::retirement::ExecutionScope::enter();
-        crate::log_t!(LogType::WSC; "run", "generation", self.generation);
+        crate::log_t!(LogType::WSC; "ws.worker.run", "arg_ready_tx_present|generation", true, self.generation);
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                crate::log_e!(LogType::WSC; "run", "stage|error", "runtime_build", crate::common::log::summary::error(&error));
+                crate::log_e!(LogType::WSC; "ws.worker.run", "stage|error", "runtime_build", crate::common::log::summary::error(&error));
                 let _ = ready_tx.send(Err(NetError::from(
                     crate::error::ErrorKind::RuntimeUnavailable,
                 )));
                 return;
             }
         };
-        crate::log_s!(LogType::WSC; "run", "state", "runtime_ready");
+        crate::log_s!(LogType::WSC; "ws.worker.run", "state", "runtime_ready");
         if ready_tx.send(Ok(())).is_err() {
-            crate::log_s!(LogType::WSC; "run", "state", "ready_receiver_dropped");
+            crate::log_s!(LogType::WSC; "ws.worker.run", "state", "ready_receiver_dropped");
         }
         runtime.block_on(self.run_async());
-        crate::log_s!(LogType::WSC; "run", "state", "worker_exited");
+        crate::log_s!(LogType::WSC; "ws.worker.run", "state", "worker_exited");
     }
 
     /// 运行主事件循环，并在退出前统一清理连接、队列和待处理请求。
@@ -143,10 +143,10 @@ impl WSClientWorker {
     /// 数据回调 lane 会在 response grace 的原截止时间前尝试排空；到期后不再等待，
     /// 剩余回调任务随 runtime 退出。
     async fn run_async(mut self) {
-        crate::log_t!(LogType::WSC; "run_async", "generation", self.generation);
+        crate::log_t!(LogType::WSC; "ws.worker.run_async", "generation", self.generation);
         if let Some(lease) = &self.network_lease {
             if let Err(error) = lease.ensure_started() {
-                crate::log_e!(LogType::WSC; "network_monitor_start", "error", format!("{error:?}"));
+                crate::log_e!(LogType::WSC; "ws.worker.run_async", "event|error", "network_monitor_start", format!("{:?}/{:?}", error.kind(), error.context().stage));
             }
         }
         if let Some(callback_rx) = self.data_callback_rx.take() {
@@ -186,7 +186,7 @@ impl WSClientWorker {
                         let now = Instant::now();
                         let deadline = now.checked_add(self.config.close_timeout).map_or(now, |deadline| deadline);
                         if let Err(error) = self.close_target_session(session, None, deadline).await {
-                            crate::log_e!(LogType::WSC; "cancel_session", "error", format!("{error:?}"));
+                            crate::log_e!(LogType::WSC; "ws.worker.run_async", "event|error", "cancel_session", format!("{:?}/{:?}", error.kind(), error.context().stage));
                         }
                     }
                 }
@@ -202,12 +202,12 @@ impl WSClientWorker {
                                 if let Err(error) = self.close_target_session(
                                     session, request.frame, request.deadline,
                                 ).await {
-                                    crate::log_e!(LogType::WSC; "close_session", "error", format!("{error:?}"));
+                                    crate::log_e!(LogType::WSC; "ws.worker.run_async", "event|error", "close_session", format!("{:?}/{:?}", error.kind(), error.context().stage));
                                 }
                             }
                             Ok(None) => { session.request_cancel(); },
                             Err(error) => {
-                                crate::log_e!(LogType::WSC; "close_session", "error", format!("{error:?}"));
+                                crate::log_e!(LogType::WSC; "ws.worker.run_async", "event|error", "close_session", format!("{:?}/{:?}", error.kind(), error.context().stage));
                                 session.request_cancel();
                             }
                         }
@@ -221,7 +221,7 @@ impl WSClientWorker {
                                 .await;
                         }
                         None => {
-                            crate::log_s!(LogType::WSC; "run_async", "state", "command_channel_closed");
+                            crate::log_s!(LogType::WSC; "ws.worker.run_async", "state", "command_channel_closed");
                             should_exit = true;
                         },
                     }
@@ -283,7 +283,7 @@ impl WSClientWorker {
         self.task_observers.close_executor();
         if let Some(lease) = self.network_lease.take() {
             if let Err(error) = lease.release().wait().await {
-                crate::log_e!(LogType::WSC; "network_monitor_release", "error", format!("{error:?}"));
+                crate::log_e!(LogType::WSC; "ws.worker.run_async", "event|error", "network_monitor_release", format!("{:?}/{:?}", error.kind(), error.context().stage));
             }
         }
         self.shutdown_complete.cancel();
@@ -309,7 +309,7 @@ impl WSClientWorker {
         command: ClientCommand,
         terminal_response_deadline: &mut Option<Instant>,
     ) -> bool {
-        crate::log_t!(LogType::WSC; "handle_command", "command|terminal_response_deadline", match &command { ClientCommand::Connect { .. } => "start_session", ClientCommand::CloseSession { .. } => "close_session", ClientCommand::Shutdown => "shutdown" }, terminal_response_deadline.is_some());
+        crate::log_t!(LogType::WSC; "ws.worker.handle_command", "arg_command_kind|terminal_response_deadline", match &command { ClientCommand::Connect { .. } => "start_session", ClientCommand::CloseSession { .. } => "close_session", ClientCommand::Shutdown => "shutdown" }, format!("{terminal_response_deadline:?}"));
         match command {
             ClientCommand::Connect {
                 options,
@@ -370,7 +370,7 @@ impl WSClientWorker {
                             false,
                         )),
                     ) {
-                        crate::log_e!(LogType::WSC; "connect_with_context", "stage|error", "admission_event", format!("{delivery_error:?}"));
+                        crate::log_e!(LogType::WSC; "ws.worker.handle_command", "stage|error", "admission_event", format!("{:?}/{:?}", delivery_error.kind(), delivery_error.context().stage));
                     }
                     let _ = reply.send(Err(error));
                     return false;
@@ -401,7 +401,7 @@ impl WSClientWorker {
                 deadline,
             } => {
                 if let Err(error) = self.close_target_session(session, frame, deadline).await {
-                    crate::log_e!(LogType::WSC; "close_session", "error", format!("{error:?}"));
+                    crate::log_e!(LogType::WSC; "ws.worker.handle_command", "event|error", "close_session", format!("{:?}/{:?}", error.kind(), error.context().stage));
                 }
             }
             ClientCommand::Shutdown => {
@@ -457,7 +457,7 @@ impl WSClientWorker {
             return;
         }
         self.reconcile_network_status().await;
-        crate::log_t!(LogType::WSC; "handle_io_event", "event|generation", match &event { IoEvent::ConnectSucceeded { .. } => "connect_succeeded", IoEvent::ConnectFailed { .. } => "connect_failed", IoEvent::ReadEnded { .. } => "read_ended", IoEvent::WriteEnded { .. } => "write_ended", IoEvent::ContextAttemptStarted { .. } => "context_attempt_started", IoEvent::ContextPrepared { .. } => "context_prepared", IoEvent::ContextAttemptFailed { .. } => "context_attempt_failed", IoEvent::CallbackDispatchFailed { .. } => "callback_dispatch_failed" }, self.generation);
+        crate::log_t!(LogType::WSC; "ws.worker.handle_io_event", "event|generation", match &event { IoEvent::ConnectSucceeded { .. } => "connect_succeeded", IoEvent::ConnectFailed { .. } => "connect_failed", IoEvent::ReadEnded { .. } => "read_ended", IoEvent::WriteEnded { .. } => "write_ended", IoEvent::ContextAttemptStarted { .. } => "context_attempt_started", IoEvent::ContextPrepared { .. } => "context_prepared", IoEvent::ContextAttemptFailed { .. } => "context_attempt_failed", IoEvent::CallbackDispatchFailed { .. } => "callback_dispatch_failed" }, self.generation);
         match event {
             IoEvent::ContextAttemptStarted {
                 deadline,
@@ -516,7 +516,7 @@ impl WSClientWorker {
                 network_loss_epoch,
                 accepted,
             } => {
-                crate::log_s!(LogType::WSC; "handle_io_event", "event|generation", "connect_succeeded", generation);
+                crate::log_s!(LogType::WSC; "ws.worker.handle_io_event", "event|generation", "connect_succeeded", generation);
                 if self.shutdown.is_cancelled()
                     || generation != self.generation
                     || !matches!(
@@ -524,7 +524,7 @@ impl WSClientWorker {
                         ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
                     )
                 {
-                    crate::log_s!(LogType::WSC; "handle_io_event", "state|event_generation|current_generation", "stale_connection_event_ignored", generation, self.generation);
+                    crate::log_s!(LogType::WSC; "ws.worker.handle_io_event", "state|event_generation|current_generation", "stale_connection_event_ignored", generation, self.generation);
                     let _ = accepted.send(Err(NetError::from(crate::error::ErrorKind::Cancelled)));
                     return;
                 }
@@ -538,7 +538,7 @@ impl WSClientWorker {
                         session.prepare_established(generation, attempt_id)
                     });
                     if let Err(error) = &result {
-                        crate::log_e!(LogType::WSC; "handle_io_event", "stage|error", "publish_established", format!("{error:?}"));
+                        crate::log_e!(LogType::WSC; "ws.worker.handle_io_event", "stage|error", "publish_established", format!("{:?}/{:?}", error.kind(), error.context().stage));
                         if !matches!(
                             error.kind(),
                             crate::error::ErrorKind::TimedOut
@@ -638,7 +638,7 @@ impl WSClientWorker {
                 {
                     if let Some(session) = self.context_session() {
                         if let Err(error) = session.commit_established(generation, attempt_id) {
-                            crate::log_e!(LogType::WSC; "handle_io_event", "stage|error", "commit_established", format!("{error:?}"));
+                            crate::log_e!(LogType::WSC; "ws.worker.handle_io_event", "stage|error", "commit_established", format!("{:?}/{:?}", error.kind(), error.context().stage));
                             session.request_cancel();
                         }
                     }
@@ -660,14 +660,14 @@ impl WSClientWorker {
                 } else {
                     None
                 };
-                crate::log_e!(LogType::WSC; "handle_io_event", "event|generation|error|http_status", "connect_failed", generation, format!("{error:?}"), http_status);
+                crate::log_e!(LogType::WSC; "ws.worker.handle_io_event", "event|generation|error|http_status", "connect_failed", generation, format!("{:?}/{:?}", error.kind(), error.context().stage), http_status);
                 if generation != self.generation
                     || !matches!(
                         self.current_status(),
                         ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
                     )
                 {
-                    crate::log_s!(LogType::WSC; "handle_io_event", "state|event_generation|current_generation", "stale_connection_event_ignored", generation, self.generation);
+                    crate::log_s!(LogType::WSC; "ws.worker.handle_io_event", "state|event_generation|current_generation", "stale_connection_event_ignored", generation, self.generation);
                     return;
                 }
                 self.connect_cancel.take();
@@ -688,7 +688,7 @@ impl WSClientWorker {
                     .is_some_and(|runtime| runtime.id == session_id)
                     || self.current_status() != ConnectionStatus::Connected
                 {
-                    crate::log_s!(LogType::WSC; "handle_io_event", "state|event_generation|current_generation", "stale_callback_failure_ignored", session_id.as_u64(), self.generation);
+                    crate::log_s!(LogType::WSC; "ws.worker.handle_io_event", "state|event_generation|current_generation", "stale_callback_failure_ignored", session_id.as_u64(), self.generation);
                     return;
                 }
                 self.connection_lost_at_stage(
@@ -709,11 +709,11 @@ impl WSClientWorker {
                 error,
                 kind,
             } => {
-                crate::log_s!(LogType::WSC; "handle_io_event", "event|generation|error", "io_ended", generation, format!("{error:?}"));
+                crate::log_s!(LogType::WSC; "ws.worker.handle_io_event", "event|generation|error", "io_ended", generation, format!("{:?}/{:?}", error.kind(), error.context().stage));
                 if generation != self.generation
                     || self.current_status() != ConnectionStatus::Connected
                 {
-                    crate::log_s!(LogType::WSC; "handle_io_event", "state|event_generation|current_generation", "stale_io_event_ignored", generation, self.generation);
+                    crate::log_s!(LogType::WSC; "ws.worker.handle_io_event", "state|event_generation|current_generation", "stale_io_event_ignored", generation, self.generation);
                     return;
                 }
                 self.connection_lost_at_stage(
@@ -772,6 +772,7 @@ impl WSClientWorker {
         stage: ConnectStage,
         io_end_kind: Option<IoEndKind>,
     ) {
+        let arg_reason = reason;
         let peer_close = self.stop_active_io(false).await;
         let normal_peer_close = io_end_kind == Some(IoEndKind::PeerClose)
             && peer_close
@@ -804,7 +805,7 @@ impl WSClientWorker {
                 },
                 next_cycle,
             ) {
-                crate::log_e!(LogType::WSC; "handle_io_event", "stage|error", "publish_connection_terminated", format!("{event_error:?}"));
+                crate::log_e!(LogType::WSC; "ws.worker.connection_lost_at_stage", "event|error_kind|error_stage|reason|stage|io_end_kind|event_error_kind", "publish_connection_terminated", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{arg_reason:?}"), format!("{stage:?}"), format!("{io_end_kind:?}"), format!("{:?}", event_error.kind()));
                 session.request_cancel();
             }
         }
@@ -812,7 +813,7 @@ impl WSClientWorker {
             if let Err(failure) = runtime
                 .connection_ended(ConnectionId::from_allocated(self.generation), error.clone())
             {
-                crate::log_e!(LogType::WSC; "session_connection_ended", "error", format!("{failure:?}"));
+                crate::log_e!(LogType::WSC; "ws.worker.connection_lost_at_stage", "event|error_kind|error_stage|reason|stage|io_end_kind|cleanup_error_kind", "session_connection_ended", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{arg_reason:?}"), format!("{stage:?}"), format!("{io_end_kind:?}"), format!("{:?}", failure.kind()));
                 runtime.lifecycle.request_cancel();
             }
         }
@@ -896,7 +897,7 @@ impl WSClientWorker {
         accepted: oneshot::Sender<Result<(), NetError>>,
     ) {
         if let Err(error) = &result {
-            crate::log_e!(LogType::WSC; "acknowledge_context_event", "error", format!("{error:?}"));
+            crate::log_e!(LogType::WSC; "ws.worker.acknowledge_context_event", "arg_result_kind|arg_result_stage|arg_accepted_present", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), true);
             // Stale events must not revoke a later session. Other internal publication failures
             // fail closed, and the worker cancellation branch performs cleanup.
             if !matches!(
@@ -951,9 +952,12 @@ impl WSClientWorker {
         failure: Option<ConnectionFailure>,
         details: ConnectionTerminationDetails,
     ) {
+        let failure_stage = failure.as_ref().map(ConnectionFailure::stage);
+        let details_io_end_kind = details.io_end_kind;
+        let details_peer_close_code = details.peer_close.as_ref().and_then(|close| close.code);
         if let Some(session) = self.context_session() {
             if let Err(error) = session.terminate_with_details(reason, failure, details) {
-                crate::log_e!(LogType::WSC; "finish_context_session", "error", format!("{error:?}"));
+                crate::log_e!(LogType::WSC; "ws.worker.finish_context_session_with_details", "reason|arg_failure_stage|arg_details_io_end_kind|arg_details_peer_close_code|error_kind|error_stage", format!("{reason:?}"), format!("{failure_stage:?}"), format!("{details_io_end_kind:?}"), details_peer_close_code, format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
             }
         }
     }
@@ -1094,7 +1098,7 @@ impl WSClientWorker {
     async fn stop_active_io(&mut self, graceful: bool) -> Option<PeerClose> {
         let stopped = self.stop_active_io_with_close(graceful, None, None).await;
         if let Err(error) = stopped.result {
-            crate::log_e!(LogType::WSC; "stop_active_io", "error", format!("{error:?}"));
+            crate::log_e!(LogType::WSC; "ws.worker.stop_active_io", "graceful|error_kind|error_stage", graceful, format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
         }
         stopped.peer_close
     }
@@ -1105,9 +1109,9 @@ impl WSClientWorker {
         frame: Option<crate::ws::CloseFrame>,
         requested_deadline: Option<Instant>,
     ) -> StoppedIo {
-        crate::log_t!(LogType::WSC; "stop_active_io", "graceful|generation", graceful, self.generation);
+        crate::log_t!(LogType::WSC; "ws.worker.stop_active_io_with_close", "graceful|arg_frame_code|requested_deadline|generation", graceful, frame.as_ref().map(crate::ws::CloseFrame::code), format!("{requested_deadline:?}"), self.generation);
         let Some(active) = self.active_io.take() else {
-            crate::log_s!(LogType::WSC; "stop_active_io", "state", "no_active_io");
+            crate::log_s!(LogType::WSC; "ws.worker.stop_active_io_with_close", "state", "no_active_io");
             return StoppedIo {
                 peer_close: None,
                 result: Ok(()),
@@ -1168,14 +1172,14 @@ impl WSClientWorker {
             .await;
             match graceful_result {
                 Ok(Ok(())) => {
-                    crate::log_s!(LogType::WSC; "stop_active_io", "state|generation", "close_write_acknowledged", generation)
+                    crate::log_s!(LogType::WSC; "ws.worker.stop_active_io_with_close", "state|generation", "close_write_acknowledged", generation)
                 }
                 Ok(Err(error)) => {
-                    crate::log_s!(LogType::WSC; "stop_active_io", "state|generation|error", "close_write_failed", generation, format!("{error:?}"));
+                    crate::log_s!(LogType::WSC; "ws.worker.stop_active_io_with_close", "state|generation|error", "close_write_failed", generation, format!("{:?}/{:?}", error.kind(), error.context().stage));
                     result = Err(error);
                 }
                 Err(_) => {
-                    crate::log_s!(LogType::WSC; "stop_active_io", "state|generation", "graceful_close_timed_out", generation);
+                    crate::log_s!(LogType::WSC; "ws.worker.stop_active_io_with_close", "state|generation", "graceful_close_timed_out", generation);
                     result = Err(NetError::from(crate::error::ErrorKind::TimedOut)
                         .with_stage(crate::error::ErrorStage::Close));
                 }
@@ -1189,12 +1193,12 @@ impl WSClientWorker {
         let joined = tokio::time::timeout_at(deadline, async {
             let (read_result, write_result) = tokio::join!(&mut read_handle, &mut write_handle);
             if let Err(error) = read_result {
-                crate::log_e!(LogType::WSC; "stop_active_io", "task|error", "read", crate::common::log::summary::error(&error));
+                crate::log_e!(LogType::WSC; "ws.worker.stop_active_io_with_close", "task|error", "read", crate::common::log::summary::error(&error));
                 return Err(NetError::with_source(crate::error::ErrorKind::Internal, error)
                     .with_stage(crate::error::ErrorStage::Close));
             }
             if let Err(error) = write_result {
-                crate::log_e!(LogType::WSC; "stop_active_io", "task|error", "write", crate::common::log::summary::error(&error));
+                crate::log_e!(LogType::WSC; "ws.worker.stop_active_io_with_close", "task|error", "write", crate::common::log::summary::error(&error));
                 return Err(NetError::with_source(crate::error::ErrorKind::Internal, error)
                     .with_stage(crate::error::ErrorStage::Close));
             }
@@ -1202,7 +1206,7 @@ impl WSClientWorker {
         })
         .await;
         if joined.is_err() {
-            crate::log_s!(LogType::WSC; "stop_active_io", "state|generation", "cooperative_stop_timed_out_aborting_io", generation);
+            crate::log_s!(LogType::WSC; "ws.worker.stop_active_io_with_close", "state|generation", "cooperative_stop_timed_out_aborting_io", generation);
             read_handle.abort();
             write_handle.abort();
             let _ = tokio::join!(read_handle, write_handle);
@@ -1239,11 +1243,11 @@ impl WSClientWorker {
 
     /// Breaks listener/client reference cycles once the client reaches terminal shutdown.
     fn clear_listeners(&self) {
-        crate::log_t!(LogType::WSC; "clear_listeners");
+        crate::log_t!(LogType::WSC; "ws.worker.clear_listeners");
         if let Err(error) = self.listeners.clear() {
-            crate::log_e!(LogType::WSC; "clear_listeners", "error", format!("{error:?}"));
+            crate::log_e!(LogType::WSC; "ws.worker.clear_listeners", "error", format!("{:?}/{:?}", error.kind(), error.context().stage));
         }
-        crate::log_s!(LogType::WSC; "clear_listeners", "state", "terminal_listener_cleanup_finished");
+        crate::log_s!(LogType::WSC; "ws.worker.clear_listeners", "state", "terminal_listener_cleanup_finished");
     }
 
     /// 返回终态响应分发宽限的绝对截止时间；零宽限或不可表示的 deadline 不等待。
@@ -1261,7 +1265,7 @@ impl WSClientWorker {
     /// 若通道满、listener 永久阻塞或 lane 已停止，等待最多持续到原 response grace
     /// deadline，超时后由 runtime 退出负责丢弃剩余事件。零宽限不会入队或等待 barrier。
     async fn drain_data_callbacks_until(&self, deadline: Option<Instant>) {
-        crate::log_t!(LogType::WSC; "drain_data_callbacks_until", "deadline_present", deadline.is_some());
+        crate::log_t!(LogType::WSC; "ws.worker.drain_data_callbacks_until", "deadline|deadline_present", format!("{deadline:?}"), deadline.is_some());
         let Some(deadline) = deadline else {
             return;
         };
@@ -1279,9 +1283,9 @@ impl WSClientWorker {
             }
         };
         if tokio::time::timeout_at(deadline, drain).await.is_err() {
-            crate::log_s!(LogType::WSC; "drain_data_callbacks_until", "state", "response_grace_expired");
+            crate::log_s!(LogType::WSC; "ws.worker.drain_data_callbacks_until", "state", "response_grace_expired");
         } else {
-            crate::log_s!(LogType::WSC; "drain_data_callbacks_until", "state", "data_lane_drain_finished");
+            crate::log_s!(LogType::WSC; "ws.worker.drain_data_callbacks_until", "state", "data_lane_drain_finished");
         }
     }
 
@@ -1430,7 +1434,7 @@ async fn data_callback_loop_with_session_dispatch<D, F>(
     D: FnMut(crate::ws::SessionId, Box<dyn FnOnce() + Send>) -> std::io::Result<F>,
     F: std::future::Future<Output = ()> + Send,
 {
-    crate::log_t!(LogType::WSC; "data_callback_loop", "max_concurrency", max_concurrency);
+    crate::log_t!(LogType::WSC; "ws.worker.data_callback_loop_with_session_dispatch", "arg_callback_rx_present|max_concurrency|arg_io_event_tx_present|arg_shutdown_present|arg_dispatch_present", true, max_concurrency, true, true, true);
     let mut in_flight = FuturesUnordered::new();
     loop {
         let event = if in_flight.len() >= max_concurrency {
@@ -1472,13 +1476,13 @@ async fn report_callback_dispatch_failure(
     session_id: crate::ws::SessionId,
     error: std::io::Error,
 ) {
-    crate::log_e!(LogType::WSC; "data_callback_loop", "stage|session|error", "subscription_dispatch_failed", session_id.as_u64(), crate::common::log::summary::error(&error));
+    crate::log_e!(LogType::WSC; "ws.worker.report_callback_dispatch_failure", "stage|arg_events_present|arg_shutdown_present|session_id|error_kind", "subscription_dispatch_failed", true, true, session_id.as_u64(), format!("{:?}", error.kind()));
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => {}
         sent = events.send(IoEvent::CallbackDispatchFailed { session_id }) => {
             if sent.is_err() {
-                crate::log_e!(LogType::WSC; "data_callback_loop", "error", "callback_failure_receiver_closed");
+                crate::log_e!(LogType::WSC; "ws.worker.report_callback_dispatch_failure", "error", "callback_failure_receiver_closed");
             }
         }
     }
@@ -1547,13 +1551,13 @@ fn configure_tcp_socket(
     send_buffer_size: Option<usize>,
     config: Option<&crate::ws::TcpKeepaliveConfig>,
 ) {
-    crate::log_t!(LogType::WSC; "configure_tcp_socket", "send_buffer_size|keepalive_enabled", send_buffer_size, config.is_some());
+    crate::log_t!(LogType::WSC; "ws.worker.configure_tcp_socket", "arg_stream_present|send_buffer_size|arg_config_idle|arg_config_interval|keepalive_enabled", true, send_buffer_size, config.map(|config| config.idle), config.map(|config| config.interval), config.is_some());
     let socket = SockRef::from(stream.get_ref().get_ref());
     if let Some(send_buffer_size) = send_buffer_size {
         if let Err(error) = socket.set_send_buffer_size(send_buffer_size) {
-            crate::log_e!(LogType::WSC; "configure_tcp_socket", "option|requested_size|error", "send_buffer_size", send_buffer_size, crate::common::log::summary::error(&error));
+            crate::log_e!(LogType::WSC; "ws.worker.configure_tcp_socket", "option|requested_size|error", "send_buffer_size", send_buffer_size, crate::common::log::summary::error(&error));
         } else {
-            crate::log_s!(LogType::WSC; "configure_tcp_socket", "option|state", "send_buffer_size", "applied");
+            crate::log_s!(LogType::WSC; "ws.worker.configure_tcp_socket", "option|state", "send_buffer_size", "applied");
         }
     }
     if let Some(config) = config {
@@ -1561,9 +1565,9 @@ fn configure_tcp_socket(
             .with_time(config.idle)
             .with_interval(config.interval);
         if let Err(error) = socket.set_tcp_keepalive(&keepalive) {
-            crate::log_e!(LogType::WSC; "configure_tcp_socket", "option|error", "tcp_keepalive", crate::common::log::summary::error(&error));
+            crate::log_e!(LogType::WSC; "ws.worker.configure_tcp_socket", "option|error", "tcp_keepalive", crate::common::log::summary::error(&error));
         } else {
-            crate::log_s!(LogType::WSC; "configure_tcp_socket", "option|state", "tcp_keepalive", "applied");
+            crate::log_s!(LogType::WSC; "ws.worker.configure_tcp_socket", "option|state", "tcp_keepalive", "applied");
         }
     }
 }
@@ -1587,7 +1591,7 @@ fn retry_allowed(policy: &crate::ws::ReconnectPolicy, attempt: usize, elapsed: D
     let crate::ws::ReconnectPolicy::Backoff(policy) = policy else {
         return false;
     };
-    crate::log_t!(LogType::WSC; "retry_allowed", "attempt|elapsed_seconds|max_retries", attempt, elapsed.as_secs_f64(), policy.max_retries);
+    crate::log_t!(LogType::WSC; "ws.worker.retry_allowed", "attempt|elapsed|arg_policy_max_retries|arg_policy_max_elapsed", attempt, elapsed, policy.max_retries, policy.max_elapsed);
     if attempt >= policy.max_retries {
         return false;
     }
@@ -1616,7 +1620,7 @@ fn full_jitter_delay(policy: &crate::ws::ReconnectPolicy, attempt: usize) -> Dur
     let crate::ws::ReconnectPolicy::Backoff(policy) = policy else {
         return Duration::ZERO;
     };
-    crate::log_t!(LogType::WSC; "full_jitter_delay", "attempt|max_delay_seconds", attempt, policy.max_delay.as_secs_f64());
+    crate::log_t!(LogType::WSC; "ws.worker.full_jitter_delay", "attempt|arg_policy_initial_delay|arg_policy_max_delay", attempt, policy.initial_delay, policy.max_delay);
     let shift = (attempt.saturating_sub(1)).min(31) as u32;
     let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
     let cap = policy

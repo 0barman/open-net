@@ -202,6 +202,10 @@ impl Session {
     /// cancellation or delivery-unknown outcome.
     pub fn cancel(&self) -> bool {
         let requested = self.runtime.lifecycle.request_cancel();
+        if requested {
+            crate::log_t!(crate::LogType::WSC; "ws.session.cancel",
+                "client_id|session_id", self.client_id().as_u64(), self.id().as_u64());
+        }
         if self.runtime.lifecycle.completion_token().is_cancelled() {
             self.runtime.end(
                 NetError::from(ErrorKind::Cancelled),
@@ -212,6 +216,8 @@ impl Session {
     }
     /// Gracefully closes the session using the protocol's default close frame.
     pub async fn close(&self) -> Result<SessionEnd> {
+        crate::log_t!(crate::LogType::WSC; "ws.session.close",
+            "client_id|session_id|with_frame", self.client_id().as_u64(), self.id().as_u64(), false);
         self.inner.close_session(&self.runtime, None).await
     }
     /// Gracefully closes the session with an application-supplied close frame.
@@ -219,6 +225,8 @@ impl Session {
     /// The returned value describes session termination; it does not guarantee
     /// that a peer has processed the close frame.
     pub async fn close_with(&self, frame: CloseFrame) -> Result<SessionEnd> {
+        crate::log_t!(crate::LogType::WSC; "ws.session.close_with",
+            "client_id|session_id|with_frame|close_code", self.client_id().as_u64(), self.id().as_u64(), true, frame.code());
         self.inner.close_session(&self.runtime, Some(frame)).await
     }
 }

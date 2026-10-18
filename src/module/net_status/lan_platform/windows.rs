@@ -149,6 +149,7 @@ pub(crate) fn collect(ifaces: &[if_addrs::Interface]) -> PlatformSnapshot {
     let routes = match default_routes() {
         Ok(routes) => Some(routes),
         Err(error) => {
+            snapshot.failure_classes |= 4;
             snapshot.diagnostics.push(error);
             None
         }
@@ -169,6 +170,7 @@ pub(crate) fn collect(ifaces: &[if_addrs::Interface]) -> PlatformSnapshot {
             if result == NO_ERROR {
                 metadata = row_metadata(&row);
             } else {
+                snapshot.failure_classes |= 8;
                 snapshot
                     .diagnostics
                     .push(format!("GetIfEntry2({index}) failed: {}", result.0));

@@ -440,7 +440,7 @@ impl TaskEventReservation {
         let mut failure = None;
         for delivery in self.deliveries {
             if let Err(error) = delivery.publish(event.clone(), self.payload_bytes.max(1)) {
-                crate::log_e!(LogType::WSC; "native_task_delivery", "kind", format!("{:?}", error.kind()));
+                crate::log_e!(LogType::WSC; "ws.task_event_reservation.publish", "arg_event_session_id|arg_event_operation_id|arg_event_lane|kind|stage", event.session_id.as_u64(), event.operation_id.as_u64(), format!("{:?}", event.lane), format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
                 if failure.is_none() {
                     failure = Some(error);
                 }
@@ -505,6 +505,9 @@ impl Registration {
 
 impl ReservedDelivery {
     fn publish(self, event: TaskEvent, payload_bytes: usize) -> Result<()> {
+        let arg_event_session_id = event.session_id.as_u64();
+        let arg_event_operation_id = event.operation_id.as_u64();
+        let arg_event_lane = event.lane;
         let registration = self.registration.clone();
         let (publication, finish) = {
             let mut state = lock(&registration.state);
@@ -538,7 +541,7 @@ impl ReservedDelivery {
                 return Ok(());
             }
             if let Err(delivery_error) = registration.publisher.fail(error.clone()) {
-                crate::log_e!(LogType::WSC; "native_task_delivery_failure", "kind", format!("{:?}", delivery_error.kind()));
+                crate::log_e!(LogType::WSC; "ws.reserved_delivery.publish", "arg_event_session_id|arg_event_operation_id|arg_event_lane|payload_bytes|kind|stage", arg_event_session_id, arg_event_operation_id, format!("{arg_event_lane:?}"), payload_bytes, format!("{:?}", delivery_error.kind()), delivery_error.context().stage.map(|stage| format!("{stage:?}")));
             }
             return Err(error);
         }
@@ -622,7 +625,7 @@ fn internal_error() -> NetError {
 fn finish_publisher(publisher: &EventPublisher<TaskEvent>) {
     if let Err(error) = publisher.finish() {
         if error.kind() != ErrorKind::Closed || publisher.is_active() {
-            crate::log_e!(LogType::WSC; "native_task_finish", "kind", format!("{:?}", error.kind()));
+            crate::log_e!(LogType::WSC; "ws.native_task_observer.finish_publisher", "arg_publisher_present|kind|stage", true, format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
         }
     }
 }
@@ -631,7 +634,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(state) => state,
         Err(poisoned) => {
-            crate::log_e!(LogType::WSC; "native_task_observer", "error", "lock_poisoned_recovered");
+            crate::log_e!(LogType::WSC; "ws.native_task_observer.lock", "arg_mutex_present|error", true, "lock_poisoned_recovered");
             poisoned.into_inner()
         }
     }

@@ -7,11 +7,18 @@ use crate::error::{ErrorKind, ErrorStage, NetError};
 use crate::net_status::NetworkStatusContext;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::sync::watch;
 
 type Registry = Mutex<HashMap<String, HttpClientSlot>>;
 type Outcome<T> = Result<T, NetError>;
+
+static NEXT_LOG_ID: AtomicU64 = AtomicU64::new(1);
+
+const STATE_POISONED: u8 = 1;
+const REGISTRY_POISONED: u8 = 2;
+const CANCELLATION_FAILED: u8 = 4;
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -38,7 +45,7 @@ impl<T: Clone> Completion<T> {
         }
     }
 
-    fn finish(&self, result: Outcome<T>) {
+    fn finish(&self, result: Outcome<T>) -> bool {
         self.result.send_if_modified(|stored| {
             if stored.is_some() {
                 false
@@ -46,7 +53,7 @@ impl<T: Clone> Completion<T> {
                 *stored = Some(result.clone());
                 true
             }
-        });
+        })
     }
 
     async fn wait(&self) -> Outcome<T> {
@@ -74,6 +81,8 @@ struct State {
 }
 
 pub(crate) struct ManagedHttpClientInner {
+    log_id: u64,
+    reported_failures: AtomicU8,
     name: String,
     config: HttpClientConfig,
     engine: Weak<CommonEngine>,
@@ -97,6 +106,8 @@ impl OpenNetInner {
     ) -> Outcome<ManagedHttpClient> {
         config.validate()?;
         let inner = Arc::new(ManagedHttpClientInner {
+            log_id: NEXT_LOG_ID.fetch_add(1, Ordering::Relaxed),
+            reported_failures: AtomicU8::new(0),
             name: name.clone(),
             config,
             engine: Arc::downgrade(&self.common_engine),
@@ -125,13 +136,44 @@ impl OpenNetInner {
 }
 
 impl ManagedHttpClientInner {
+    fn report_once(&self, bit: u8, reason: &'static str) {
+        if crate::OpenNetLogger::is_enabled_for(crate::LogType::HTTP, crate::LogLevel::Error)
+            && self.reported_failures.fetch_or(bit, Ordering::Relaxed) & bit == 0
+        {
+            crate::log_e!(crate::LogType::HTTP; "http.managed.report_once", "client_id|bit|reason", self.log_id, bit, reason);
+        }
+    }
+
+    fn with_state<T>(&self, operation: impl FnOnce(&mut State) -> T) -> T {
+        let (mut state, recovered) = match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        let result = operation(&mut state);
+        drop(state);
+        if recovered {
+            self.report_once(STATE_POISONED, "state_poisoned");
+        }
+        result
+    }
+
+    fn signal_close(&self, client: &HttpClient) {
+        client.inner.request_shutdown();
+        if client.inner.cancel_all().is_err() {
+            self.report_once(CANCELLATION_FAILED, "cancel_all_failed");
+        }
+    }
+
     pub(crate) async fn get(self: &Arc<Self>) -> Outcome<HttpClient> {
+        enum Action {
+            Ready(HttpClient),
+            Wait(Arc<Completion<HttpClient>>, Option<Creation>),
+        }
         if self.context.is_closed() {
             self.begin_shutdown();
             return Err(closed());
         }
-        let (round, start) = {
-            let mut state = locked(&self.state);
+        let action = self.with_state(|state| {
             if state.closed {
                 return Err(closed());
             }
@@ -140,10 +182,10 @@ impl ManagedHttpClientInner {
                     return if client.inner.is_shutdown_requested() {
                         Err(closed())
                     } else {
-                        Ok(client.clone())
+                        Ok(Action::Ready(client.clone()))
                     };
                 }
-                Phase::Creating(round) => (round.clone(), None),
+                Phase::Creating(round) => Ok(Action::Wait(round.clone(), None)),
                 Phase::Idle => {
                     let engine = self.engine.upgrade().ok_or_else(closed)?;
                     let round = Arc::new(Completion::new());
@@ -154,12 +196,17 @@ impl ManagedHttpClientInner {
                         engine,
                         armed: true,
                     };
-                    (round, Some(work))
+                    Ok(Action::Wait(round, Some(work)))
                 }
                 Phase::Closing(_) | Phase::Closed => return Err(closed()),
             }
+        })?;
+        let (round, start) = match action {
+            Action::Ready(client) => return Ok(client),
+            Action::Wait(round, start) => (round, start),
         };
         if let Some(work) = start {
+            crate::log_s!(crate::LogType::HTTP, crate::LogLevel::Key; "http.managed.get", "client_id", self.log_id);
             // The closure owns the guard before its first poll/run. Abandoning
             // this get future cannot strand a reservation or cancel creation.
             let runtime = work.engine.runtime_handle();
@@ -168,24 +215,26 @@ impl ManagedHttpClientInner {
         let client = round.wait().await?;
         // A successful round can have completed immediately before shutdown.
         // Never hand its cached result out as a newly available client afterward.
-        let state = locked(&self.state);
-        if state.closed || client.inner.is_shutdown_requested() || self.context.is_closed() {
-            Err(closed())
-        } else {
-            Ok(client)
-        }
+        self.with_state(|state| {
+            if state.closed || client.inner.is_shutdown_requested() || self.context.is_closed() {
+                Err(closed())
+            } else {
+                Ok(client)
+            }
+        })
     }
 
     pub(super) fn get_registered(&self) -> Outcome<HttpClient> {
-        let state = locked(&self.state);
-        if !state.closed && !self.context.is_closed() {
-            if let Phase::Ready(client) = &state.phase {
-                if !client.inner.is_shutdown_requested() {
-                    return Ok(client.clone());
+        self.with_state(|state| {
+            if !state.closed && !self.context.is_closed() {
+                if let Phase::Ready(client) = &state.phase {
+                    if !client.inner.is_shutdown_requested() {
+                        return Ok(client.clone());
+                    }
                 }
             }
-        }
-        Err(NetError::from(ErrorKind::ConnectionClosing))
+            Err(NetError::from(ErrorKind::ConnectionClosing))
+        })
     }
 
     pub(crate) fn begin_shutdown(self: &Arc<Self>) {
@@ -196,10 +245,10 @@ impl ManagedHttpClientInner {
             Signal(HttpClient),
             None,
         }
-        let action = {
-            let mut state = locked(&self.state);
+        let (action, first_close) = self.with_state(|state| {
+            let first_close = !state.closed;
             state.closed = true;
-            match &state.phase {
+            let action = match &state.phase {
                 Phase::Idle => {
                     state.phase = Phase::Closed;
                     Action::Complete
@@ -212,14 +261,20 @@ impl ManagedHttpClientInner {
                 }
                 Phase::Closing(client) => Action::Signal(client.clone()),
                 Phase::Closed => Action::None,
-            }
-        };
+            };
+            (action, first_close)
+        });
+        if first_close {
+            crate::log_s!(crate::LogType::HTTP, crate::LogLevel::Key; "http.managed.begin_shutdown", "client_id", self.log_id);
+        }
         // Notify outside the lifecycle lock: waking callers may run user wakers.
         match action {
             Action::Complete => self.finish_shutdown(Ok(()), true),
-            Action::Creating(round) => round.finish(Err(closed())),
+            Action::Creating(round) => {
+                round.finish(Err(closed()));
+            }
             Action::Start(client) => self.start_cleanup(client, self.engine.upgrade()),
-            Action::Signal(client) => signal_close(&client),
+            Action::Signal(client) => self.signal_close(&client),
             Action::None => {}
         }
     }
@@ -234,33 +289,51 @@ impl ManagedHttpClientInner {
         round: &Arc<Completion<HttpClient>>,
         engine: &Arc<CommonEngine>,
         result: Outcome<HttpClient>,
+        failure: Option<&'static str>,
     ) {
-        let (result, cleanup, finish) = {
-            let mut state = locked(&self.state);
+        // Preserve only safe input metadata before ownership moves into state.
+        let result_ok = result.is_ok();
+        let result_error = result
+            .as_ref()
+            .err()
+            .map(|error| (error.kind(), error.context().stage));
+        let completed = self.with_state(|state| {
             if !matches!(&state.phase, Phase::Creating(current) if Arc::ptr_eq(current, round)) {
-                return;
+                return None;
             }
             state.closed |= self.context.is_closed();
-            match result {
+            Some(match result {
                 Ok(client) if state.closed => {
                     state.phase = Phase::Closing(client.clone());
-                    (Err(closed()), Some(client), false)
+                    (Err(closed()), Some(client), false, None)
                 }
                 Ok(client) => {
                     state.phase = Phase::Ready(client.clone());
-                    (Ok(client), None, false)
+                    (Ok(client), None, false, None)
                 }
                 Err(error) if state.closed => {
                     state.phase = Phase::Closed;
-                    let _ = error;
-                    (Err(closed()), None, true)
+                    let hidden = (error.kind() != ErrorKind::Closed)
+                        .then_some((error.kind(), error.context().stage));
+                    (Err(closed()), None, true, hidden)
                 }
                 Err(error) => {
                     state.phase = Phase::Idle;
-                    (Err(error), None, false)
+                    (Err(error), None, false, None)
                 }
-            }
+            })
+        });
+        let Some((result, cleanup, finish, hidden)) = completed else {
+            return;
         };
+        if result.is_ok() {
+            crate::log_s!(crate::LogType::HTTP, crate::LogLevel::Key; "http.managed.complete_creation", "event|client_id|round|engine|result_ok|failure", "ready", self.log_id, "provided", "provided", result_ok, failure);
+        }
+        if let Some(reason) = failure {
+            crate::log_e!(crate::LogType::HTTP; "http.managed.complete_creation", "event|client_id|round|engine|result_ok|result_error_kind|result_error_stage|failure|reason", "creation_failed", self.log_id, "provided", "provided", result_ok, result_error.map(|(kind, _)| format!("{:?}", kind)), result_error.map(|(_, stage)| format!("{:?}", stage)), failure, reason);
+        } else if let Some((kind, stage)) = hidden {
+            crate::log_e!(crate::LogType::HTTP; "http.managed.complete_creation", "event|client_id|round|engine|result_ok|failure|error_kind|stage", "creation_overridden", self.log_id, "provided", "provided", result_ok, failure, format!("{:?}", kind), format!("{:?}", stage));
+        }
         if let Some(client) = cleanup {
             self.start_cleanup(client, Some(engine.clone()));
         }
@@ -273,7 +346,7 @@ impl ManagedHttpClientInner {
     fn start_cleanup(self: &Arc<Self>, client: HttpClient, engine: Option<Arc<CommonEngine>>) {
         // Keep the raw handle in Closing so every concurrent begin_shutdown
         // caller closes it before returning, even if this caller is preempted.
-        signal_close(&client);
+        self.signal_close(&client);
         let Some(engine) = engine else {
             self.finish_shutdown(Err(runtime_failed()), false);
             return;
@@ -294,24 +367,29 @@ impl ManagedHttpClientInner {
 
     fn finish_shutdown(self: &Arc<Self>, result: Outcome<()>, retired: bool) {
         if retired {
-            locked(&self.state).phase = Phase::Closed;
+            self.with_state(|state| state.phase = Phase::Closed);
             if let Some(registry) = self.registry.upgrade() {
-                let mut registry = locked(&registry);
+                let (mut registry, recovered) = match registry.lock() {
+                    Ok(registry) => (registry, false),
+                    Err(poisoned) => (poisoned.into_inner(), true),
+                };
                 if matches!(registry.get(&self.name), Some(HttpClientSlot::Managed(current)) if Arc::ptr_eq(current, self))
                 {
                     registry.remove(&self.name);
+                }
+                drop(registry);
+                if recovered {
+                    self.report_once(REGISTRY_POISONED, "registry_poisoned");
                 }
             }
         }
         // A failure without confirmed worker retirement is observable, but does
         // not release the name for a potentially overlapping new client.
-        self.finished.finish(result);
+        let succeeded = result.is_ok();
+        if self.finished.finish(result) {
+            crate::log_s!(crate::LogType::HTTP, crate::LogLevel::Key; "http.managed.finish_shutdown", "client_id|retired|succeeded", self.log_id, retired, succeeded);
+        }
     }
-}
-
-fn signal_close(client: &HttpClient) {
-    client.inner.request_shutdown();
-    let _ = client.inner.cancel_all();
 }
 
 struct Creation {
@@ -323,13 +401,14 @@ struct Creation {
 
 impl Creation {
     fn run(mut self) {
+        let mut failure = None;
         let result = catch_unwind(AssertUnwindSafe(|| {
             #[cfg(test)]
             if let Some(hook) = locked(&self.owner.creation_hook).clone() {
                 hook()?;
             }
             // Shutdown before this job began must not create otherwise unused workers.
-            if locked(&self.owner.state).closed || self.owner.context.is_closed() {
+            if self.owner.with_state(|state| state.closed) || self.owner.context.is_closed() {
                 return Err(closed());
             }
             let client = crate::module::http::http_client_inner::create_http_client(
@@ -346,9 +425,12 @@ impl Creation {
             }
             Ok(client)
         }))
-        .unwrap_or_else(|_| Err(runtime_failed()));
+        .unwrap_or_else(|_| {
+            failure = Some("panicked");
+            Err(runtime_failed())
+        });
         self.owner
-            .complete_creation(&self.round, &self.engine, result);
+            .complete_creation(&self.round, &self.engine, result, failure);
         self.armed = false;
     }
 }
@@ -356,8 +438,12 @@ impl Creation {
 impl Drop for Creation {
     fn drop(&mut self) {
         if self.armed {
-            self.owner
-                .complete_creation(&self.round, &self.engine, Err(runtime_failed()));
+            self.owner.complete_creation(
+                &self.round,
+                &self.engine,
+                Err(runtime_failed()),
+                Some("task_dropped"),
+            );
         }
     }
 }
@@ -373,6 +459,10 @@ impl CleanupWork {
     async fn clean(&self) -> Outcome<()> {
         self.client.inner.request_shutdown();
         let cancellation = self.client.inner.cancel_all();
+        if cancellation.is_err() {
+            self.owner
+                .report_once(CANCELLATION_FAILED, "cancel_all_failed");
+        }
         let joined = self.client.inner.shutdown_and_join().await;
         cancellation.and(joined)
     }
@@ -384,6 +474,7 @@ impl CleanupWork {
 
     fn fallback(self) {
         let _scope = crate::common::retirement::ExecutionScope::enter();
+        crate::log_e!(crate::LogType::HTTP; "http.managed.fallback", "event|client_id|reason", "cleanup_fallback", self.owner.log_id, "cleanup_task_dropped");
         // A cancelled SDK task must not lose the completion result or release
         // its name early. An ordinary thread can wait on the retained runtime
         // without occupying that runtime's bounded blocking pool itself.
@@ -398,14 +489,17 @@ impl CleanupWork {
                 work.engine.runtime_handle().block_on(work.clean())
             }))
             .unwrap_or_else(|payload| {
+                crate::log_e!(crate::LogType::HTTP; "http.managed.fallback", "event|client_id|reason", "cleanup_failed", work.owner.log_id, "panicked");
                 crate::common::retirement::discard_panic_payload(payload);
                 Err(runtime_failed())
             });
             work.finish(result.and(Err(runtime_failed())));
         });
         if spawned.is_err() {
-            if let Some(work) = locked(&pending).take() {
-                signal_close(&work.client);
+            let work = locked(&pending).take();
+            if let Some(work) = work {
+                crate::log_e!(crate::LogType::HTTP; "http.managed.fallback", "event|client_id|reason", "cleanup_failed", work.owner.log_id, "thread_launch_failed");
+                work.owner.signal_close(&work.client);
                 work.owner.finish_shutdown(Err(runtime_failed()), false);
             }
         }

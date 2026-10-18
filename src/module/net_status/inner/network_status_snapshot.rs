@@ -9,6 +9,7 @@ use super::network_view::NetworkView;
 use crate::common::log::log_def::LogType;
 use crate::common::retirement::{ExecutionScope, WorkLease, WorkTracker};
 use crate::error::{ErrorKind, NetError};
+use crate::module::net_status::logging::Transition;
 use crate::net_status::{
     IpStack, MonitorState, NetworkEvent, NetworkEventKind, NetworkEventOptions, NetworkSnapshot,
     NetworkStatus,
@@ -134,6 +135,7 @@ impl NetworkRefreshTarget {
 /// after releasing the originating lifecycle/monitor lock, including for no-ops.
 #[must_use]
 pub(super) struct NetworkPublication {
+    transition: Option<Transition>,
     state: Option<StatePublication<NetworkSnapshot>>,
     terminal: Option<StatePublication<NetworkSnapshot>>,
     retired: Option<Arc<NetworkSnapshot>>,
@@ -145,6 +147,7 @@ pub(super) struct NetworkPublication {
 impl NetworkPublication {
     fn empty() -> Self {
         Self {
+            transition: None,
             state: None,
             terminal: None,
             retired: None,
@@ -160,6 +163,7 @@ impl NetworkPublication {
     pub(super) fn dispatch(self) -> Result<(), NetError> {
         let _scope = ExecutionScope::enter();
         let Self {
+            transition,
             state,
             terminal,
             retired,
@@ -178,6 +182,9 @@ impl NetworkPublication {
         }
         for view in views {
             view.dispatch_from_monitor();
+        }
+        if let Some(transition) = transition {
+            transition.emit();
         }
         result
     }
@@ -379,6 +386,8 @@ impl NetworkStatusSource {
             // notification. Retire it only after the originating outer lock is released.
             return Ok(self.fail_publication(state, error, Some(publication)));
         }
+        let transition =
+            Transition::capture("source", state.generation, &state.snapshot, &next, false);
         state.revision = next.revision;
         state.loss_epoch = next.loss_epoch;
         let retired = std::mem::replace(&mut state.snapshot, next);
@@ -389,6 +398,7 @@ impl NetworkStatusSource {
             self.sender.send_replace(gating);
         }
         let mut prepared = NetworkPublication {
+            transition,
             state: Some(publication),
             terminal: None,
             retired: Some(retired),
@@ -429,6 +439,7 @@ impl NetworkStatusSource {
             self.sender.send_replace(state.gating);
         }
         let mut prepared = NetworkPublication {
+            transition: None,
             state: original,
             terminal: Some(terminal),
             retired: None,
@@ -673,6 +684,13 @@ impl NetworkViewHandle {
         view.view.activate((*source.snapshot).clone())?;
         view.source_revision = source.revision;
         view.prepare(&previous, &mut publication, true);
+        publication.transition = Transition::capture(
+            "view",
+            view.view.generation,
+            &previous,
+            &view.view.snapshot,
+            true,
+        );
         Ok((view.view.generation, publication))
     }
     pub(super) fn retire(
@@ -698,6 +716,13 @@ impl NetworkViewHandle {
             Ok(false) => {}
             Err(error) => view.fail(error, &mut publication),
         }
+        publication.transition = Transition::capture(
+            "view",
+            view.view.generation,
+            &previous,
+            &view.view.snapshot,
+            true,
+        );
         Ok(publication)
     }
     /// Compatibility refresh for passive HTTP cached reads. It is not a new
@@ -979,7 +1004,7 @@ impl Drop for NetworkStatusMonitorGuard {
             .prepare_finish(MonitorState::Stopped)
             .and_then(NetworkPublication::dispatch);
         if let Err(error) = result {
-            crate::log_e!(LogType::Engine; "network_status_observation_stop", "error", crate::common::log::summary::error(&error));
+            crate::log_e!(LogType::Engine; "net_status.drop", "event|kind|stage", "network_status_observation_stop", format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
         }
     }
 }
@@ -1021,7 +1046,7 @@ impl Drop for TestNetworkStatusSource {
             .prepare_finish(MonitorState::Stopped)
             .and_then(NetworkPublication::dispatch);
         if let Err(error) = result {
-            crate::log_e!(LogType::Engine; "test_network_status_source_stop", "error", crate::common::log::summary::error(&error));
+            crate::log_e!(LogType::Engine; "net_status.drop", "event|kind|stage", "test_network_status_source_stop", format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
         }
     }
 }
@@ -1045,3 +1070,7 @@ mod event_tests;
 #[cfg(test)]
 #[path = "network_status_snapshot_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "logging_tests.rs"]
+mod logging_tests;

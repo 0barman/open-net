@@ -156,7 +156,7 @@ impl Drop for HttpNetworkObservation {
 }
 
 fn log_error(event: &str, error: &NetError) {
-    crate::log_e!(crate::LogType::HTTP; event, "error", crate::common::log::summary::error(error));
+    crate::log_e!(crate::LogType::HTTP; "http.network_observation.log_error", "event|error_kind|error_stage", event, format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
 }
 
 #[cfg(test)]

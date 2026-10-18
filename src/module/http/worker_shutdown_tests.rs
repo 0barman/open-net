@@ -113,6 +113,7 @@ fn cleanup_survives_cancelled_waiter_and_caller_runtime_drop() {
 }
 
 #[test]
+#[cfg(test)]
 fn worker_panics_do_not_skip_remaining_joins_or_report_retirement_early() {
     struct HostilePayload;
     impl Drop for HostilePayload {
@@ -130,6 +131,21 @@ fn worker_panics_do_not_skip_remaining_joins_or_report_retirement_early() {
         });
         let (worker, release) = gated_worker();
         let shutdown = Arc::new(WorkerShutdown::new(vec![panicking, worker]));
+        let group_id = shutdown.log_id;
+        let (sent, received) = mpsc::channel();
+        let _subscription = crate::OpenNetLogger::register_log_listener(
+            Box::new(move |log| {
+                if log.tag == "http.worker_cleanup.join_workers" {
+                    if let Ok(fields) = serde_json::from_str::<serde_json::Value>(&log.content) {
+                        if fields["worker_group_id"].as_u64() == Some(group_id) {
+                            let _ = sent.send(log);
+                        }
+                    }
+                }
+            }),
+            &[crate::LogType::HTTP],
+        )
+        .expect("diagnostic subscription failed");
         shutdown.start().expect("cleanup launch failed");
         futures::executor::block_on(async {
             let mut waiting = Box::pin(shutdown.wait());
@@ -141,6 +157,15 @@ fn worker_panics_do_not_skip_remaining_joins_or_report_retirement_early() {
             .expect("remaining worker stopped before release");
         let error = wait_from_plain_thread(shutdown.clone()).expect_err("panic was ignored");
         assert_eq!(error.kind(), ErrorKind::Internal);
+        let log = received
+            .recv_timeout(WAIT)
+            .expect("worker failure diagnostic missing");
+        assert!(!log.content.contains("injected"));
+        let fields: serde_json::Value =
+            serde_json::from_str(&log.content).expect("invalid diagnostic");
+        assert_eq!(fields["failure_class"], "worker_panicked");
+        assert_eq!(fields["worker_panics"], 1);
+        assert_eq!(fields["join_panics"], 0);
         assert!(shutdown.workers_joined());
         assert_eq!(
             wait_from_plain_thread(shutdown)
@@ -233,4 +258,61 @@ fn engine_receipt_waits_for_http_cleanup_completion_waker_to_return(
         .map_err(|_| "engine shutdown waiter panicked")?;
     futures::executor::block_on(waiting)?;
     Ok(())
+}
+
+#[test]
+#[cfg(test)]
+fn launch_failure_logs_are_bounded_per_worker_group_and_recover_once() {
+    for _ in 0..2 {
+        let (worker, release) = gated_worker();
+        let shutdown = Arc::new(WorkerShutdown::new(vec![worker]));
+        let id = shutdown.log_id;
+        let (sent, received) = mpsc::channel();
+        let _subscription = crate::OpenNetLogger::register_log_listener(
+            Box::new(move |log| {
+                if log.tag.starts_with("http.worker_cleanup.") {
+                    if let Ok(fields) = serde_json::from_str::<serde_json::Value>(&log.content) {
+                        if fields["worker_group_id"].as_u64() == Some(id) {
+                            let _ = sent.send(log);
+                        }
+                    }
+                }
+            }),
+            &[crate::LogType::HTTP],
+        )
+        .expect("diagnostic subscription failed");
+        for _ in 0..32 {
+            let error = shutdown
+                .start_with(|_| Err(io::Error::other("private-launch-sentinel")))
+                .expect_err("launch failure changed result");
+            assert_eq!(error.kind(), ErrorKind::RuntimeUnavailable);
+            assert!(!shutdown.workers_joined());
+        }
+        let log = received.recv_timeout(WAIT).expect("first failure missing");
+        assert_eq!(log.tag, "http.worker_cleanup.start_with");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&log.content).expect("invalid diagnostic")
+                ["event"],
+            "failed"
+        );
+        assert_eq!(log.level, crate::LogLevel::Error);
+        assert!(!log.content.contains("private-launch-sentinel"));
+        shutdown.start().expect("retry failed");
+        let log = received.recv_timeout(WAIT).expect("recovery missing");
+        assert_eq!(log.tag, "http.worker_cleanup.start_with");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&log.content).expect("invalid diagnostic")
+                ["event"],
+            "recovered"
+        );
+        assert_eq!(log.level, crate::LogLevel::Key);
+        shutdown.start().expect("repeated launch failed");
+        crate::log_s!(crate::LogType::HTTP; "http.worker_cleanup.launch_failure_logs_are_bounded_per_worker_group_and_recover_once", "worker_group_id", id);
+        assert_eq!(
+            received.recv_timeout(WAIT).expect("barrier missing").tag,
+            "http.worker_cleanup.launch_failure_logs_are_bounded_per_worker_group_and_recover_once"
+        );
+        release.send(()).expect("worker already stopped");
+        wait_from_plain_thread(shutdown).expect("worker cleanup failed");
+    }
 }

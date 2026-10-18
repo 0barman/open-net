@@ -147,8 +147,8 @@ impl Drop for ManagedChild {
     fn drop(&mut self) {
         if let Err(error) = self.terminate() {
             crate::log_e!(crate::common::log::log_def::LogType::Engine;
-                "network_status_query_child_cleanup", "error",
-                crate::common::log::summary::error(&error));
+                "net_status.drop", "event|error", "network_status_query_child_cleanup",
+                format!("{:?}", error.kind()));
         }
     }
 }

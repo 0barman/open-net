@@ -84,6 +84,78 @@ fn macros_skip_disabled_arguments_and_evaluate_enabled_arguments_once() {
 }
 
 #[test]
+fn explicit_state_levels_preserve_legacy_syntax_and_lazy_evaluation() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let types = AtomicUsize::new(0);
+    let levels = AtomicUsize::new(0);
+    let payloads = AtomicUsize::new(0);
+    let emit = |origin, level| {
+        log_s!(
+            { types.fetch_add(1, AtomicOrdering::SeqCst); origin },
+            { levels.fetch_add(1, AtomicOrdering::SeqCst); level };
+            { payloads.fetch_add(1, AtomicOrdering::SeqCst); "explicit_state" },
+            { payloads.fetch_add(1, AtomicOrdering::SeqCst); "value" },
+            { payloads.fetch_add(1, AtomicOrdering::SeqCst); 42 },
+        );
+    };
+    emit(LogType::WSC, LogLevel::Key);
+    assert_eq!(types.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(levels.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(payloads.load(AtomicOrdering::SeqCst), 0);
+
+    let (sender, records) = mpsc::channel();
+    let subscription = OpenNetLogger::register_shared_log_listener(
+        Box::new(move |record| {
+            let _ = sender.send(record);
+        }),
+        open_net::LogSubscriptionOptions::new(&[LogType::WSC]).with_max_level(LogLevel::Key),
+    )
+    .unwrap();
+    emit(LogType::HTTP, LogLevel::Key);
+    assert_eq!(levels.load(AtomicOrdering::SeqCst), 0);
+    emit(LogType::WSC, LogLevel::Debug);
+    assert_eq!(levels.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(payloads.load(AtomicOrdering::SeqCst), 0);
+    emit(LogType::WSC, LogLevel::Key);
+    assert_eq!(types.load(AtomicOrdering::SeqCst), 4);
+    assert_eq!(levels.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(payloads.load(AtomicOrdering::SeqCst), 3);
+    let record = records.recv_timeout(WAIT).unwrap();
+    assert_eq!(record.level, LogLevel::Key);
+    assert_eq!(record.content, r#"{"value":42}"#);
+    log_s!(LogType::WSC, LogLevel::Key; "key_without_fields",);
+    assert_eq!(records.recv_timeout(WAIT).unwrap().content, "{}");
+    log_e!(LogType::WSC; "error_is_included",);
+    assert_eq!(records.recv_timeout(WAIT).unwrap().level, LogLevel::Error);
+    log_s!(LogType::WSC; "debug_is_filtered",);
+    assert!(records.try_recv().is_err());
+    drop(subscription);
+
+    let (_legacy, records) = subscribe(&[LogType::WSC, LogType::Engine]);
+    log_s!("legacy_without_fields",);
+    log_s!("legacy_with_fields", "value", 7,);
+    log_s!(LogType::WSC; "typed_without_fields",);
+    log_s!(LogType::WSC; "typed_with_fields", "value", 8,);
+    for (tag, origin, content) in [
+        ("legacy_without_fields", LogType::Engine, "{}"),
+        ("legacy_with_fields", LogType::Engine, r#"{"value":7}"#),
+        ("typed_without_fields", LogType::WSC, "{}"),
+        ("typed_with_fields", LogType::WSC, r#"{"value":8}"#),
+    ] {
+        let record = receive(&records);
+        assert_eq!(
+            (
+                record.tag.as_str(),
+                record.log_type,
+                record.level,
+                record.content.as_str()
+            ),
+            (tag, origin, LogLevel::Debug, content)
+        );
+    }
+}
+
+#[test]
 fn subscriptions_are_independent_and_dropping_releases_idle_callback() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (first, first_records) = subscribe(&[LogType::WSC]);

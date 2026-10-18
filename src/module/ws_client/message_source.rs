@@ -376,7 +376,7 @@ impl MessageSource {
                 None => registration.publisher.prepare_finish(),
             };
             if let Err(error) = publication.dispatch() {
-                crate::log_e!(LogType::WSC; "message_source_close", "kind", format!("{:?}", error.kind()));
+                crate::log_e!(LogType::WSC; "ws.message_source.close", "arg_failure_kind|arg_failure_stage|kind|stage", failure.as_ref().map(|failure| format!("{:?}", failure.kind())), failure.as_ref().and_then(|failure| failure.context().stage).map(|stage| format!("{stage:?}")), format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
             }
         }
     }
@@ -455,7 +455,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(state) => state,
         Err(poisoned) => {
-            crate::log_e!(LogType::WSC; "message_source", "error", "lock_poisoned_recovered");
+            crate::log_e!(LogType::WSC; "ws.message_source.lock", "arg_mutex_present|error", true, "lock_poisoned_recovered");
             poisoned.into_inner()
         }
     }

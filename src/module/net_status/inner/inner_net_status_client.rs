@@ -16,6 +16,7 @@ use super::network_status_snapshot::{
 use super::platform::PlatformNetworkMonitor;
 use super::refresh_trigger::{request_refresh_or_stop, RefreshWorkOutcome};
 use crate::error::NetError;
+use crate::module::net_status::logging::{Fault, FaultCycle};
 use crate::module::net_status::{IpStack, NetworkStatus};
 use crate::net_status::{MonitorState as PublicMonitorState, NetworkSnapshot};
 use crate::subscription::common_executor::CommonCallbackExecutor;
@@ -120,7 +121,7 @@ impl Drop for MonitorTaskCompletion {
         });
         // User wakes and captures may synchronously wait for destroy. Signal completion first.
         if let Err(error) = publication.and_then(NetworkPublication::dispatch) {
-            crate::log_e!(LogType::Engine; "network_status_monitor_exit", "error", crate::common::log::summary::error(&error));
+            crate::log_e!(LogType::Engine; "net_status.drop", "event|kind|stage", "network_status_monitor_exit", format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
         }
     }
 }
@@ -274,11 +275,11 @@ impl InnerNetStatusClient {
                                 match self.observations.fail(error.clone()) {
                                     Ok(publication) => {
                                         if let Err(dispatch_error) = publication.dispatch() {
-                                            crate::log_e!(LogType::Engine; "network_status_start_failure", "error", crate::common::log::summary::error(&dispatch_error));
+                                            crate::log_e!(LogType::Engine; "net_status.start", "event|kind|stage", "network_status_start_failure", format!("{:?}", dispatch_error.kind()), format!("{:?}", dispatch_error.context().stage));
                                         }
                                     }
                                     Err(failure_error) => {
-                                        crate::log_e!(LogType::Engine; "network_status_start_failure", "error", crate::common::log::summary::error(&failure_error));
+                                        crate::log_e!(LogType::Engine; "net_status.start", "event|kind|stage", "network_status_start_failure", format!("{:?}", failure_error.kind()), format!("{:?}", failure_error.context().stage));
                                     }
                                 }
                                 return Err(error);
@@ -310,7 +311,7 @@ impl InnerNetStatusClient {
             drop(task);
             if let Some(publication) = publication {
                 if let Err(dispatch_error) = publication.dispatch() {
-                    crate::log_e!(LogType::Engine; "network_status_start", "error", crate::common::log::summary::error(&dispatch_error));
+                    crate::log_e!(LogType::Engine; "net_status.start", "event|kind|stage", "network_status_start", format!("{:?}", dispatch_error.kind()), format!("{:?}", dispatch_error.context().stage));
                 }
             }
             return Err(error);
@@ -449,7 +450,7 @@ impl InnerNetStatusClient {
             if let Err(error) = spawned {
                 // The rejected closure already dropped its unpolled guard;
                 // initialization waiters receive RuntimeUnavailable.
-                crate::log_e!(LogType::Engine; "network_status_provider_thread", "error", crate::common::log::summary::error(&error));
+                crate::log_e!(LogType::Engine; "net_status.prepare_monitor_task", "kind|stage", format!("{:?}", error.kind()), "NetworkMonitor");
             }
             // Cancelling CommonEngine's task cancels the provider future, but
             // the independent thread retains ownership of its real exit guard.
@@ -508,7 +509,7 @@ impl InnerNetStatusClient {
         };
         drop(retired);
         if let Err(publication_error) = publication.and_then(NetworkPublication::dispatch) {
-            crate::log_e!(LogType::Engine; "network_status_stop", "error", crate::common::log::summary::error(&publication_error));
+            crate::log_e!(LogType::Engine; "net_status.request_stop", "permanent|kind|stage", permanent, format!("{:?}", publication_error.kind()), format!("{:?}", publication_error.context().stage));
             error = Some(publication_error);
         }
         (finished, error)
@@ -696,6 +697,9 @@ impl InnerNetStatusClient {
         };
         let mut interface_state = monitor.interface_state();
 
+        let mut refresh_faults = FaultCycle::default();
+        #[cfg(target_os = "windows")]
+        let mut reachability_faults = FaultCycle::default();
         let initial = interface_state.get();
         if !Self::observe_or_stop(
             &state,
@@ -703,6 +707,8 @@ impl InnerNetStatusClient {
             &mut stop_receiver,
             #[cfg(target_os = "windows")]
             &windows_reachability_sampler,
+            #[cfg(target_os = "windows")]
+            &mut reachability_faults,
         )
         .await?
         {
@@ -730,6 +736,7 @@ impl InnerNetStatusClient {
                             Ok(new_state) => {
                                 if !Self::resample_or_stop(&state, &new_state, &mut stop_receiver,
                                     #[cfg(target_os = "windows")] &windows_reachability_sampler,
+                                    #[cfg(target_os = "windows")] &mut reachability_faults,
                                 ).await? {
                                     break;
                                 }
@@ -744,7 +751,8 @@ impl InnerNetStatusClient {
                                 || monitor.network_change(),
                             ).await {
                                 RefreshWorkOutcome::Stopped => break,
-                                RefreshWorkOutcome::Requested | RefreshWorkOutcome::RequestFailed => {}
+                                RefreshWorkOutcome::Requested => refresh_faults.recovered("refresh_request"),
+                                RefreshWorkOutcome::RequestFailed => refresh_faults.failure("refresh_request", Fault::RefreshRequest),
                             }
                         }
                     }
@@ -758,11 +766,13 @@ impl InnerNetStatusClient {
                             || monitor.network_change(),
                         ).await {
                             RefreshWorkOutcome::Stopped => break,
-                            RefreshWorkOutcome::Requested | RefreshWorkOutcome::RequestFailed => {}
+                            RefreshWorkOutcome::Requested => refresh_faults.recovered("refresh_request"),
+                            RefreshWorkOutcome::RequestFailed => refresh_faults.failure("refresh_request", Fault::RefreshRequest),
                         }
                         let snapshot = interface_state.get();
                         if !Self::resample_or_stop(&state, &snapshot, &mut stop_receiver,
                             #[cfg(target_os = "windows")] &windows_reachability_sampler,
+                            #[cfg(target_os = "windows")] &mut reachability_faults,
                         ).await? {
                             break;
                         }
@@ -805,7 +815,7 @@ impl InnerNetStatusClient {
             return factory().await;
         }
         netwatch::netmon::Monitor::new().await.map_err(|error| {
-            crate::log_e!(LogType::Engine; "network_status_monitor_start", "error", format!("{error:?}"));
+            crate::log_e!(LogType::Engine; "net_status.create_monitor", "reason", "monitor_creation_failed");
             NetError::with_source(crate::error::ErrorKind::RuntimeUnavailable, error)
                 .with_stage(crate::error::ErrorStage::NetworkMonitor)
         })
@@ -819,6 +829,7 @@ impl InnerNetStatusClient {
         snapshot: &netwatch::netmon::State,
         stop: &mut oneshot::Receiver<()>,
         #[cfg(target_os = "windows")] sampler: &super::refresh::WindowsSampler,
+        #[cfg(target_os = "windows")] faults: &mut FaultCycle,
     ) -> Result<bool, NetError> {
         Self::observe_with_policy(
             state,
@@ -827,6 +838,8 @@ impl InnerNetStatusClient {
             false,
             #[cfg(target_os = "windows")]
             sampler,
+            #[cfg(target_os = "windows")]
+            faults,
         )
         .await
     }
@@ -838,6 +851,7 @@ impl InnerNetStatusClient {
         snapshot: &netwatch::netmon::State,
         stop: &mut oneshot::Receiver<()>,
         #[cfg(target_os = "windows")] sampler: &super::refresh::WindowsSampler,
+        #[cfg(target_os = "windows")] faults: &mut FaultCycle,
     ) -> Result<bool, NetError> {
         Self::observe_with_policy(
             state,
@@ -846,6 +860,8 @@ impl InnerNetStatusClient {
             true,
             #[cfg(target_os = "windows")]
             sampler,
+            #[cfg(target_os = "windows")]
+            faults,
         )
         .await
     }
@@ -856,6 +872,7 @@ impl InnerNetStatusClient {
         stop: &mut oneshot::Receiver<()>,
         _retry_transient: bool,
         #[cfg(target_os = "windows")] sampler: &super::refresh::WindowsSampler,
+        #[cfg(target_os = "windows")] faults: &mut FaultCycle,
     ) -> Result<bool, NetError> {
         #[cfg(not(target_os = "windows"))]
         {
@@ -871,18 +888,24 @@ impl InnerNetStatusClient {
             let sampled = tokio::select! {
                 biased;
                 _ = &mut *stop => return Ok(false),
-                result = Self::complete_windows_sample(async {
+                result = async {
                     tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
                         sampler.sample_background(deadline, cancel.flag.clone()),
                     ).await.map_err(|_| NetError::from(crate::error::ErrorKind::TimedOut))?
-                }, _retry_transient) => result?,
+                } => result,
             };
+            let failure = sampled.as_ref().err().map(Fault::from_error);
+            let sampled = Self::classify_windows_sample(sampled, _retry_transient)?;
             let Some(sampled) = sampled else {
+                if let Some(failure) = failure {
+                    faults.failure("reachability_sample", failure);
+                }
                 // No observation was collected or committed. The existing
                 // Running snapshot and its timestamp remain unchanged.
                 return Ok(true);
             };
+            let mut commit_fault = None;
             let (keep_running, publication) = Self::prepare_windows_sample(
                 state,
                 &cancel,
@@ -890,18 +913,25 @@ impl InnerNetStatusClient {
                 _retry_transient,
                 sampled,
                 Self::ip_stack_from_state(snapshot),
+                &mut commit_fault,
             )?;
             if !keep_running {
                 return Ok(false);
             }
+            if let Some(failure) = commit_fault {
+                faults.failure("reachability_sample", failure);
+            }
             if let Some(publication) = publication {
                 publication.dispatch()?;
+                if commit_fault.is_none() {
+                    faults.recovered("reachability_sample");
+                }
             }
         }
         Ok(true)
     }
 
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(test)]
     async fn complete_windows_sample<T>(
         sample: impl std::future::Future<Output = Result<T, NetError>>,
         retry_transient: bool,
@@ -917,6 +947,7 @@ impl InnerNetStatusClient {
         retry_transient: bool,
         sampled: super::refresh::CompletedSample,
         ip_stack: IpStack,
+        fault: &mut Option<Fault>,
     ) -> Result<(bool, Option<NetworkPublication>), NetError> {
         let monitor = state.lock().map_err(NetError::from_poison)?;
         if !monitor.active.load(Ordering::Acquire) {
@@ -924,7 +955,10 @@ impl InnerNetStatusClient {
         }
         // Waiting for the monitor lock is part of the sample's deadline. An
         // established monitor retries an expired sample without committing it.
-        if Self::classify_windows_sample(cancel.check(deadline), retry_transient)?.is_none() {
+        let validity = cancel.check(deadline);
+        let failure = validity.as_ref().err().map(Fault::from_error);
+        if Self::classify_windows_sample(validity, retry_transient)?.is_none() {
+            *fault = failure;
             return Ok((true, None));
         }
         let publication = match &monitor.observation {
@@ -942,8 +976,13 @@ impl InnerNetStatusClient {
                 },
                 sampled.sampled_at,
                 || {
-                    Self::classify_windows_sample(cancel.check(deadline), retry_transient)
-                        .map(|sample| sample.is_some())
+                    let validity = cancel.check(deadline);
+                    let failure = validity.as_ref().err().map(Fault::from_error);
+                    let valid = Self::classify_windows_sample(validity, retry_transient)?.is_some();
+                    if !valid {
+                        *fault = failure;
+                    }
+                    Ok(valid)
                 },
             )?,
             None => None,
@@ -958,6 +997,8 @@ impl InnerNetStatusClient {
     ) -> Result<(), NetError> {
         let mut interval = time::interval(Duration::from_secs(2));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut faults = FaultCycle::default();
+        let mut fallback_faults = FaultCycle::default();
         loop {
             interval.tick().await;
             if !state
@@ -980,11 +1021,20 @@ impl InnerNetStatusClient {
                 Ok(Err(error)) => {
                     // A name-query fault does not invalidate successful Internet
                     // reachability; retain the last name and retry next period.
-                    crate::log_e!(LogType::Engine; "network_status_name_query", "error", crate::common::log::summary::error(&error));
+                    faults.failure("name_sample", Fault::from_error(&error));
                     continue;
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    faults.failure("name_sample", Fault::Timeout);
+                    continue;
+                }
             };
+            if sampled.observation.name_diagnostics.is_empty() {
+                fallback_faults.recovered("name_fallback");
+            } else {
+                fallback_faults.failure("name_fallback", Fault::NameFallback);
+            }
+            let mut commit_fault = None;
             let publication = {
                 let monitor = state.lock().map_err(NetError::from_poison)?;
                 if !monitor.active.load(Ordering::Acquire) {
@@ -1004,6 +1054,7 @@ impl InnerNetStatusClient {
                                         | crate::error::ErrorKind::Cancelled
                                 ) =>
                             {
+                                commit_fault = Some(Fault::from_error(&error));
                                 Ok(false)
                             }
                             Err(error) => Err(error),
@@ -1012,8 +1063,14 @@ impl InnerNetStatusClient {
                     None => None,
                 }
             };
+            if let Some(failure) = commit_fault {
+                faults.failure("name_sample", failure);
+            }
             if let Some(publication) = publication {
                 publication.dispatch()?;
+                if commit_fault.is_none() {
+                    faults.recovered("name_sample");
+                }
             }
         }
     }

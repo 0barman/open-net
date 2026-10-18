@@ -72,6 +72,7 @@ fn deadline_expired_before_commit_keeps_running_and_never_publishes() {
     }));
     let cancel = super::super::refresh::Cancellation::new();
     let expired = std::time::Instant::now();
+    let mut fault = None;
     let (keep_running, publication) = InnerNetStatusClient::prepare_windows_sample(
         &state,
         &cancel,
@@ -79,10 +80,12 @@ fn deadline_expired_before_commit_keeps_running_and_never_publishes() {
         true,
         sample(1),
         IpStack::V4Only,
+        &mut fault,
     )
     .unwrap();
     assert!(keep_running);
     assert!(publication.is_none());
+    assert!(matches!(fault, Some(Fault::Timeout)));
     let after = source.snapshot().unwrap();
     assert_eq!(after.revision, before.revision);
     assert_eq!(after.reachability, before.reachability);
@@ -97,6 +100,7 @@ fn deadline_expired_before_commit_keeps_running_and_never_publishes() {
         false,
         sample(2),
         IpStack::V4Only,
+        &mut None,
     );
     assert!(matches!(startup, Err(error) if error.kind() == ErrorKind::TimedOut));
 
@@ -108,6 +112,7 @@ fn deadline_expired_before_commit_keeps_running_and_never_publishes() {
         true,
         sample(3),
         IpStack::V4Only,
+        &mut None,
     );
     assert!(matches!(failed_commit, Err(error) if error.kind() == ErrorKind::Internal));
 }

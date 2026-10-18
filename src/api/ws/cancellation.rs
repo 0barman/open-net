@@ -280,7 +280,7 @@ pub(crate) fn lock_recover<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     match lock.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            crate::log_e!(LogType::WSC; "cancel_domain", "error", "lock_poisoned_recovered");
+            crate::log_e!(LogType::WSC; "ws.cancellation.lock_recover", "arg_lock_present|error", true, "lock_poisoned_recovered");
             poisoned.into_inner()
         }
     }

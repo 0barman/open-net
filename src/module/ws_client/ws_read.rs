@@ -31,11 +31,11 @@ async fn send_read_end_classified(
     } else {
         error
     };
-    crate::log_t!(LogType::WSC; "send_read_end", "generation|error", generation, format!("{error:?}"));
+    crate::log_t!(LogType::WSC; "ws.read.send_read_end_classified", "arg_io_event_tx_present|generation|error_kind|error_stage|kind", true, generation, format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{kind:?}"));
     if matches!(error.kind(), ErrorKind::Closed | ErrorKind::Cancelled) {
-        crate::log_s!(LogType::WSC; "send_read_end", "state|generation|error", "read_ended", generation, format!("{error:?}"));
+        crate::log_s!(LogType::WSC; "ws.read.send_read_end_classified", "state|generation|error_kind", "read_ended", generation, format!("{:?}", error.kind()));
     } else {
-        crate::log_e!(LogType::WSC; "send_read_end", "generation|error", generation, format!("{error:?}"));
+        crate::log_e!(LogType::WSC; "ws.read.send_read_end_classified", "arg_io_event_tx_present|generation|error_kind|error_stage|kind", true, generation, format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{kind:?}"));
     }
     if io_event_tx
         .send(IoEvent::ReadEnded {
@@ -46,7 +46,7 @@ async fn send_read_end_classified(
         .await
         .is_err()
     {
-        crate::log_s!(LogType::WSC; "send_read_end", "state|generation", "worker_event_receiver_closed", generation);
+        crate::log_s!(LogType::WSC; "ws.read.send_read_end_classified", "state|generation", "worker_event_receiver_closed", generation);
     }
 }
 
@@ -67,18 +67,18 @@ where
     } = context;
     let connection = ConnectionId::from_allocated(generation);
     let origin = IncomingOrigin::new(runtime.client_id, runtime.id, connection);
-    crate::log_t!(LogType::WSC; "run_read_loop", "generation|session", generation, runtime.id.as_u64());
+    crate::log_t!(LogType::WSC; "ws.read.run_read_loop", "arg_read_present|arg_context_generation|arg_context_session", true, generation, runtime.id.as_u64());
     loop {
         let next = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                crate::log_s!(LogType::WSC; "run_read_loop", "state|generation", "read_cancelled", generation);
+                crate::log_s!(LogType::WSC; "ws.read.run_read_loop", "state|generation", "read_cancelled", generation);
                 return;
             },
             next = read.next() => next,
         };
         let Some(next) = next else {
-            crate::log_s!(LogType::WSC; "run_read_loop", "state|generation", "stream_ended", generation);
+            crate::log_s!(LogType::WSC; "ws.read.run_read_loop", "state|generation", "stream_ended", generation);
             fail_read(
                 &runtime,
                 &io_event_tx,
@@ -92,14 +92,14 @@ where
         let message = match next {
             Ok(message) => message,
             Err(error) => {
-                crate::log_e!(LogType::WSC; "run_read_loop", "generation|error", generation, crate::common::log::summary::error(&error));
+                crate::log_e!(LogType::WSC; "ws.read.run_read_loop", "generation|error", generation, crate::common::log::summary::error(&error));
                 let kind = classify_io_error(&error);
                 fail_read(&runtime, &io_event_tx, generation, error.into(), kind).await;
                 return;
             }
         };
         let received_at = SystemTime::now();
-        crate::log_s!(LogType::WSC; "run_read_loop", "state|generation|message_type|message_bytes", "message_received", generation, match &message { Message::Text(_) => "text", Message::Binary(_) => "binary", Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", Message::Frame(_) => "frame" }, message.len());
+        crate::log_s!(LogType::WSC; "ws.read.run_read_loop", "state|generation|message_type|message_bytes", "message_received", generation, match &message { Message::Text(_) => "text", Message::Binary(_) => "binary", Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", Message::Frame(_) => "frame" }, message.len());
         match message {
             Message::Text(text) => {
                 let incoming = IncomingMessage::new(
@@ -127,7 +127,7 @@ where
             }
             Message::Ping(payload) => {
                 if let Err(error) = send_control(&control_tx, ControlMessage::FlushAutomatic) {
-                    crate::log_e!(LogType::WSC; "run_read_loop", "stage|generation", "automatic_pong_control_failed", generation);
+                    crate::log_e!(LogType::WSC; "ws.read.run_read_loop", "stage|generation", "automatic_pong_control_failed", generation);
                     fail_read(&runtime, &io_event_tx, generation, error, IoEndKind::Other).await;
                     return;
                 }
@@ -140,7 +140,7 @@ where
             }
             Message::Pong(payload) => {
                 let matched = heartbeat.acknowledge_pong(payload.as_ref());
-                crate::log_s!(LogType::WSC; "run_read_loop", "state|generation|matched", "pong_received", generation, matched);
+                crate::log_s!(LogType::WSC; "ws.read.run_read_loop", "state|generation|matched", "pong_received", generation, matched);
                 let incoming =
                     IncomingMessage::new(origin, IncomingPayload::Pong(payload), received_at);
                 if let Err(error) = runtime.messages.publish(incoming) {
@@ -161,7 +161,7 @@ where
                 let _ = peer_close.set(close.clone());
                 let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                 if let Err(error) = send_control(&control_tx, ControlMessage::PeerClose(done_tx)) {
-                    crate::log_e!(LogType::WSC; "run_read_loop", "stage|generation", "peer_close_control_failed", generation);
+                    crate::log_e!(LogType::WSC; "ws.read.run_read_loop", "stage|generation", "peer_close_control_failed", generation);
                     fail_read(&runtime, &io_event_tx, generation, error, IoEndKind::Other).await;
                     return;
                 }
@@ -174,7 +174,7 @@ where
                 ));
                 let reply = tokio::select! {
                     _ = cancel.cancelled() => {
-                        crate::log_s!(LogType::WSC; "run_read_loop", "state|generation", "read_cancelled", generation);
+                        crate::log_s!(LogType::WSC; "ws.read.run_read_loop", "state|generation", "read_cancelled", generation);
                         return;
                     },
                     result = done_rx => result,
@@ -212,7 +212,7 @@ where
                 return;
             }
             Message::Frame(_) => {
-                crate::log_s!(LogType::WSC; "run_read_loop", "state|generation", "raw_frame_ignored", generation);
+                crate::log_s!(LogType::WSC; "ws.read.run_read_loop", "state|generation", "raw_frame_ignored", generation);
             }
         }
     }
@@ -276,7 +276,7 @@ async fn fail_read(
     }
     let error = error.with_context(context);
     if let Err(cleanup) = runtime.connection_ended(connection, error.clone()) {
-        crate::log_e!(LogType::WSC; "run_read_loop", "stage|generation|error", "pending_connection_cleanup_failed", generation, format!("{cleanup:?}"));
+        crate::log_e!(LogType::WSC; "ws.read.fail_read", "stage|arg_runtime_session|arg_events_present|generation|error_kind|error_stage|kind|cleanup_kind", "pending_connection_cleanup_failed", runtime.id.as_u64(), true, generation, format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{kind:?}"), format!("{:?}", cleanup.kind()));
     }
     if kind == IoEndKind::Other {
         send_read_end(events, generation, error).await;

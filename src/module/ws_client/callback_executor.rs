@@ -22,19 +22,19 @@ where
     F: FnOnce() + Send + 'static,
     S: FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
 {
-    crate::log_t!(LogType::WSC; "start_user_callback", "thread_name|callback", thread_name, std::any::type_name::<F>());
+    crate::log_t!(LogType::WSC; "ws.callback_executor.try_start_user_callback_with", "thread_name|arg_callback_present|arg_spawn_present", thread_name, true, true);
     let completed = CancellationToken::new();
     // Create before spawn so rejection and callback unwinding also release waiters.
     let completion_guard = completed.clone().drop_guard();
     let task = Box::new(move || {
         let _completion_guard = completion_guard;
         if catch_unwind(AssertUnwindSafe(callback)).is_err() {
-            crate::log_e!(LogType::WSC; "start_user_callback", "thread_name|error", thread_name, "user_callback_panicked");
+            crate::log_e!(LogType::WSC; "ws.callback_executor.try_start_user_callback_with", "thread_name|error", thread_name, "user_callback_panicked");
         }
-        crate::log_s!(LogType::WSC; "start_user_callback", "thread_name|state", thread_name, "callback_finished");
+        crate::log_s!(LogType::WSC; "ws.callback_executor.try_start_user_callback_with", "thread_name|state", thread_name, "callback_finished");
     });
     if let Err(error) = spawn(task) {
-        crate::log_e!(LogType::WSC; "start_user_callback", "thread_name|error", thread_name, crate::common::log::summary::error(&error));
+        crate::log_e!(LogType::WSC; "ws.callback_executor.try_start_user_callback_with", "thread_name|kind", thread_name, format!("{:?}", error.kind()));
         return Err(error);
     }
     Ok(async move { completed.cancelled().await })

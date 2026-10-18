@@ -16,6 +16,11 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+pub(super) fn log_invariant(control: &OperationControl, reason: &'static str) {
+    crate::log_e!(crate::LogType::WSC; "ws.request.log_invariant",
+        "session_id|operation_id|reason", control.session_id().as_u64(), control.id().as_u64(), reason);
+}
+
 /// Internal credential for a prepared operation. It commits a reservation or
 /// cancels the uncommitted operation when dropped.
 pub(super) struct Admission {
@@ -37,8 +42,10 @@ impl Admission {
             ErrorKind::Closed | ErrorKind::NotConnected => super::TaskEndCause::Disconnected,
             _ => super::TaskEndCause::Failed,
         };
+        let arg_error_kind = error.kind();
+        let arg_error_stage = error.context().stage;
         if let Err(failure) = self.control.terminate(error, cause) {
-            crate::log_e!(crate::common::log::log_def::LogType::WSC;"admission_failure","error",format!("{failure:?}"));
+            crate::log_e!(crate::common::log::log_def::LogType::WSC;"ws.request.fail", "arg_error_kind|arg_error_stage|kind|stage", format!("{arg_error_kind:?}"), arg_error_stage.map(|stage| format!("{stage:?}")), format!("{:?}", failure.kind()), failure.context().stage.map(|stage| format!("{stage:?}")));
         }
     }
     pub(super) fn commit(&mut self) -> Result<()> {
@@ -231,6 +238,7 @@ pub(super) async fn prepare(
                 )
                 .await?;
             let TaskSource::Request(request) = source else {
+                log_invariant(&control, "request_source_missing");
                 return Err(NetError::from(ErrorKind::Internal));
             };
             admission.request = Some(runtime.pending.register(
@@ -306,6 +314,7 @@ pub(super) fn try_prepare(
             ))?;
             let slot = runtime.pending.try_reserve_slot()?;
             let TaskSource::Request(request) = source else {
+                log_invariant(&control, "request_source_missing");
                 return Err(NetError::from(ErrorKind::Internal));
             };
             admission.request = Some(runtime.pending.register(

@@ -32,7 +32,7 @@ impl WSClientInner {
                 if let Err(failure) = session.terminate(TerminationReason::EngineDropped,
                     Some(ConnectionFailure::new(error.clone(), ConnectStage::EventDelivery, None, false))) {
                     crate::log_e!(crate::common::log::log_def::LogType::WSC;
-                        "session_engine_loss", "error", format!("{failure:?}"));
+                        "ws.client_inner.wait_session_closed", "arg_runtime_session_id|kind|stage", runtime.id.as_u64(), format!("{:?}", failure.kind()), failure.context().stage.map(|stage| format!("{stage:?}")));
                 }
                 Err(error)
             }
@@ -46,7 +46,7 @@ impl WSClientInner {
             Ok(admission) => admission,
             Err(error) => {
                 crate::log_e!(crate::common::log::log_def::LogType::WSC;
-                    "session_admission_recovery", "error", "lock_poisoned_recovered");
+                    "ws.client_inner.seal_current_session", "arg_session_present|error", true, "lock_poisoned_recovered");
                 error.into_inner()
             }
         };
@@ -87,7 +87,7 @@ impl WSClientInner {
                     )),
                 ) {
                     crate::log_e!(crate::common::log::log_def::LogType::WSC;
-                        "session_state_recovery", "error", format!("{terminal:?}"));
+                        "ws.client_inner.recover_session_state", "arg_runtime_session_id|arg_error_kind|arg_error_stage|kind|stage", runtime.id.as_u64(), format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")), format!("{:?}", terminal.kind()), terminal.context().stage.map(|stage| format!("{stage:?}")));
                 }
             }
         }

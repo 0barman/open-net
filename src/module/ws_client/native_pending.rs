@@ -527,7 +527,7 @@ impl NativePending {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
-                crate::log_e!(LogType::WSC; "pending_retirement", "error", "lock_poisoned_recovered");
+                crate::log_e!(LogType::WSC; "ws.native_pending.prepare_termination", "arg_id_len|token|arg_error_kind|arg_error_stage|cause|arg_original_present|error", id.as_str().len(), token, format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")), format!("{cause:?}"), original.is_some(), "lock_poisoned_recovered");
                 poisoned.into_inner()
             }
         };
@@ -1196,7 +1196,7 @@ impl NativePending {
                     if let Err(error) =
                         owner.close(NetError::from(ErrorKind::Closed), TaskEndCause::Shutdown)
                     {
-                        crate::log_e!(LogType::WSC; "native_pending_shutdown", "error", format!("{error:?}"));
+                        crate::log_e!(LogType::WSC; "ws.native_pending.run_timers", "arg_pending_present|arg_shutdown_present|event|kind|stage", true, true, "shutdown_failed", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
                     }
                     return;
                 }
@@ -1206,7 +1206,7 @@ impl NativePending {
                 let (closed, deadline) = match next {
                     Ok(next) => next,
                     Err(error) => {
-                        crate::log_e!(LogType::WSC; "native_pending_timer", "error", format!("{error:?}"));
+                        crate::log_e!(LogType::WSC; "ws.native_pending.run_timers", "arg_pending_present|arg_shutdown_present|event|kind|stage", true, true, "timer_failed", format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
                         return;
                     }
                 };
@@ -1303,7 +1303,7 @@ fn grace_deadline(
     let response_deadline = match entry.timing.deadline() {
         Ok(deadline) => deadline,
         Err(error) => {
-            crate::log_e!(LogType::WSC; "native_pending_grace", "error", format!("{error:?}"));
+            crate::log_e!(LogType::WSC; "ws.native_pending.grace_deadline", "arg_entry_operation_id|arg_dispatches_count|at|grace|disconnected|kind|stage", entry.core.id().as_u64(), dispatches.len(), format!("{at:?}"), grace, disconnected, format!("{:?}", error.kind()), error.context().stage.map(|stage| format!("{stage:?}")));
             return None;
         }
     };

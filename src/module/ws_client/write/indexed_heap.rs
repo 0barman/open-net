@@ -55,7 +55,7 @@ impl IndexedHeap {
             || self.items.try_reserve(additional).is_err()
             || self.positions.try_reserve(additional).is_err()
         {
-            crate::log_e!(LogType::WSC; "indexed_heap_push", "error", "duplicate_dispatch_or_allocation_failed");
+            crate::log_e!(LogType::WSC; "ws.indexed_heap.push", "arg_request_bytes|arg_request_attempt|arg_request_sequence|error", request.message.len(), request.attempt, request.sequence, "duplicate_dispatch_or_allocation_failed");
             return Err(request);
         }
         let index = self.items.len();
@@ -74,7 +74,7 @@ impl IndexedHeap {
             .get(index)
             .is_some_and(|item| item.dispatch_cancel == *token)
         {
-            crate::log_e!(LogType::WSC; "indexed_heap_remove", "error", "invalid_dispatch_index");
+            crate::log_e!(LogType::WSC; "ws.indexed_heap.remove", "arg_token_present|error", true, "invalid_dispatch_index");
             return None;
         }
         let last_index = self.items.len().checked_sub(1)?;
@@ -86,7 +86,7 @@ impl IndexedHeap {
         let Some(slot) = self.items.get_mut(index) else {
             // 防御性恢复：即使内部索引失配也不丢弃请求或在持锁时触发请求析构。
             self.items.push(last);
-            crate::log_e!(LogType::WSC; "indexed_heap_remove", "error", "missing_replacement_slot");
+            crate::log_e!(LogType::WSC; "ws.indexed_heap.remove", "arg_token_present|error", true, "missing_replacement_slot");
             return None;
         };
         let removed = std::mem::replace(slot, last);
@@ -96,7 +96,7 @@ impl IndexedHeap {
         } else {
             // 由当前节点重建唯一的受影响索引，避免继续携带错误位置。
             self.positions.insert(slot.dispatch_cancel.clone(), index);
-            crate::log_e!(LogType::WSC; "indexed_heap_remove", "error", "replacement_index_recovered");
+            crate::log_e!(LogType::WSC; "ws.indexed_heap.remove", "arg_token_present|error", true, "replacement_index_recovered");
         }
         if index
             .checked_sub(1)
@@ -130,7 +130,7 @@ impl IndexedHeap {
         match (self.items.get(left), self.items.get(right)) {
             (Some(left), Some(right)) => left > right,
             _ => {
-                crate::log_e!(LogType::WSC; "indexed_heap_compare", "error", "invalid_node_index");
+                crate::log_e!(LogType::WSC; "ws.indexed_heap.greater", "left|right|error", left, right, "invalid_node_index");
                 false
             }
         }
@@ -142,7 +142,7 @@ impl IndexedHeap {
             return true;
         }
         let Ok([left_item, right_item]) = self.items.get_disjoint_mut([left, right]) else {
-            crate::log_e!(LogType::WSC; "indexed_heap_swap", "error", "invalid_swap_indices");
+            crate::log_e!(LogType::WSC; "ws.indexed_heap.swap", "left|right|error", left, right, "invalid_swap_indices");
             return false;
         };
         std::mem::swap(left_item, right_item);

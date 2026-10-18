@@ -21,7 +21,6 @@ pub struct NetStatusClient {
 
 impl NetStatusClient {
     pub(crate) fn new(context: NetworkStatusContext) -> Result<Self> {
-        crate::log_s!(LogType::Engine; "NetStatusClient-new");
         Ok(Self {
             inner: NetworkObservationOwner::new(context)?,
         })
@@ -30,20 +29,20 @@ impl NetStatusClient {
     /// Start monitoring and await the first coherent observation.
     /// Repeated calls share the active monitor and its initialization result.
     pub async fn start(&self) -> Result<NetworkSnapshot> {
-        crate::log_s!(LogType::Engine; "NetStatusClient-start");
+        crate::log_t!(LogType::Engine; "net_status.start");
         self.inner.start().await
     }
 
     /// Stop monitoring while keeping subscriptions alive for a later restart.
     pub async fn stop(&self) -> Result<()> {
-        crate::log_s!(LogType::Engine; "NetStatusClient-stop");
+        crate::log_t!(LogType::Engine; "net_status.stop");
         self.inner.request_stop()?;
         self.inner.wait_cleanup().await
     }
 
     /// Permanently close monitoring and publish its final Closed snapshot.
     pub async fn shutdown(&self) -> Result<()> {
-        crate::log_s!(LogType::Engine; "NetStatusClient-shutdown");
+        crate::log_t!(LogType::Engine; "net_status.shutdown");
         self.inner.request_close();
         self.inner.wait_cleanup().await
     }
@@ -73,6 +72,7 @@ impl NetStatusClient {
 
     /// Subscribe to the current snapshot and later changes across stop/restart.
     pub fn subscribe(&self) -> Result<StateReceiver<NetworkSnapshot>> {
+        crate::log_t!(LogType::Engine; "net_status.subscribe");
         self.inner.subscribe_terminal()
     }
 
@@ -93,6 +93,8 @@ impl NetStatusClient {
         &self,
         options: NetworkEventOptions,
     ) -> Result<EventReceiver<NetworkEvent>> {
+        crate::log_t!(LogType::Engine; "net_status.subscribe_events",
+            "capacity|max_bytes", options.capacity, options.max_bytes);
         self.inner.subscribe_events(options)
     }
 
@@ -131,6 +133,8 @@ impl NetStatusClient {
     where
         F: Fn(CallbackContext, Result<NetworkObservation>) + Send + Sync + 'static,
     {
+        crate::log_t!(LogType::Engine; "net_status.on_recoverable_event",
+            "capacity|max_bytes|callback", options.capacity, options.max_bytes, "provided");
         self.inner.on_recoverable_event(options, callback)
     }
 
@@ -144,6 +148,7 @@ impl NetStatusClient {
     /// scheduling and lock contention can delay return beyond the timeout.
     /// Success does not wait for subscription callbacks to finish.
     pub async fn refresh(&self, timeout: Duration) -> Result<NetworkRefreshResult> {
+        crate::log_t!(LogType::Engine; "net_status.refresh", "timeout", timeout);
         crate::module::net_status::inner::refresh::refresh(self.inner.clone(), timeout).await
     }
 
@@ -158,6 +163,7 @@ impl NetStatusClient {
     /// As with [`Self::refresh`], the timeout is a result-validity budget, not a
     /// hard real-time return deadline; success does not await observer callbacks.
     pub async fn refresh_reachability(&self, timeout: Duration) -> Result<NetworkRefreshResult> {
+        crate::log_t!(LogType::Engine; "net_status.refresh_reachability", "timeout", timeout);
         crate::module::net_status::inner::refresh::refresh_reachability(self.inner.clone(), timeout)
             .await
     }
@@ -181,6 +187,7 @@ impl NetStatusClient {
     /// `NetworkMonitor`, and field `network_status.refresh_blocking.context`.
     /// Entering an SDK runtime context alone does not trigger this rejection.
     pub fn refresh_blocking(&self, timeout: Duration) -> Result<NetworkRefreshResult> {
+        crate::log_t!(LogType::Engine; "net_status.refresh_blocking", "timeout", timeout);
         crate::module::net_status::inner::refresh::refresh_blocking(self.inner.clone(), timeout)
     }
 
@@ -206,6 +213,7 @@ impl NetStatusClient {
     /// }
     /// ```
     pub fn refresh_reachability_blocking(&self, timeout: Duration) -> Result<NetworkRefreshResult> {
+        crate::log_t!(LogType::Engine; "net_status.refresh_reachability_blocking", "timeout", timeout);
         crate::module::net_status::inner::refresh::refresh_reachability_blocking(
             self.inner.clone(),
             timeout,
@@ -217,7 +225,6 @@ impl NetStatusClient {
     }
 
     pub(crate) async fn destroy(&self) -> Result<()> {
-        crate::log_s!(LogType::Engine; "NetStatusClient-destroy");
         self.inner.request_close();
         self.inner.wait_cleanup().await
     }

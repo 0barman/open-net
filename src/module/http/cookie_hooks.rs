@@ -70,7 +70,14 @@ pub(super) fn apply_cookie_header(
         {
             return Err(header_limit(request_id));
         }
-        Ok(Err(_)) | Err(_) => return Err(provider_failure(request_id)),
+        Ok(Err(_)) => {
+            provider_failure_log("cookie_request", "returned_error");
+            return Err(provider_failure(request_id));
+        }
+        Err(_) => {
+            provider_failure_log("cookie_request", "panicked");
+            return Err(provider_failure(request_id));
+        }
     };
     if let Some(mut value) = value {
         if value.as_bytes().len() > limits.max_cookie_header_bytes {
@@ -113,6 +120,11 @@ pub(super) fn update_response_cookies(
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         store.set_response_cookies(response.url(), &headers)
     }));
+    match &result {
+        Ok(Err(_)) => provider_failure_log("cookie_response", "returned_error"),
+        Err(_) => provider_failure_log("cookie_response", "panicked"),
+        Ok(Ok(())) => {}
+    }
     // A store is synchronous and cannot be preempted. Check the lifecycle
     // immediately after it returns, including its failure path.
     check_cancelled(control, request_id)?;

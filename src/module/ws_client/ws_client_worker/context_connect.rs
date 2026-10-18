@@ -312,6 +312,8 @@ impl ContextConnectTask {
     }
 
     async fn report_terminal(&self, failure: ConnectionFailure, reason: TerminationReason) {
+        let failure_stage = failure.stage();
+        let failure_http_status = failure.http_status();
         if self
             .event_tx
             .send(IoEvent::ConnectFailed {
@@ -322,7 +324,7 @@ impl ContextConnectTask {
             .await
             .is_err()
         {
-            crate::log_e!(LogType::WSC; "context_connect", "error", "worker_event_receiver_closed");
+            crate::log_e!(LogType::WSC; "ws.worker.context_connect.report_terminal", "error|arg_failure_stage|arg_failure_http_status|reason", "worker_event_receiver_closed", format!("{failure_stage:?}"), failure_http_status, format!("{reason:?}"));
         }
     }
 }

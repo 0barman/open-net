@@ -476,12 +476,22 @@ impl RetryObserverHandle {
 
     /// Deliver an event while isolating observer failures.
     pub fn notify(&self, event: RetryEvent) {
+        // The report can contain caller-owned error text. Retain only fixed
+        // variants and counters before the event is moved into the callback.
+        let (event_kind, event_attempts, event_last_error_present) = match &event {
+            RetryEvent::AttemptStarted { attempt } => ("attempt_started", *attempt, false),
+            RetryEvent::AttemptFinished { attempt, .. } => ("attempt_finished", *attempt, false),
+            RetryEvent::RetryScheduled { attempt, .. } => ("retry_scheduled", *attempt, false),
+            RetryEvent::Completed(report) => {
+                ("completed", report.attempts, report.last_error.is_some())
+            }
+        };
         let observer = Arc::clone(&self.0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             observer.observe(&event);
         }));
         if result.is_err() {
-            crate::log_e!(crate::LogType::HTTP; "retry_observer", "error", "observer_failed");
+            crate::log_e!(crate::LogType::HTTP; "http.retry_observer.notify", "error|event_kind|event_attempts|event_last_error_present", "observer_failed", event_kind, event_attempts, event_last_error_present);
         }
     }
 }

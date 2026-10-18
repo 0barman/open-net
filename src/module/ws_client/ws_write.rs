@@ -206,7 +206,7 @@ pub(crate) async fn run_write_loop<W>(
 ) where
     W: Sink<Message, Error = WsError> + Unpin + Send + 'static,
 {
-    crate::log_t!(LogType::WSC; "run_write_loop", "generation|data_frame_payload_size", context.generation, context.data_frame_payload_size);
+    crate::log_t!(LogType::WSC; "ws.write.run_write_loop", "arg_write_present|arg_context_generation|arg_context_data_frame_payload_size|arg_context_control_write_timeout|arg_context_data_frame_write_timeout|arg_context_heartbeat_enabled|arg_write_retirement_present", true, context.generation, context.data_frame_payload_size, context.control_write_timeout, context.data_frame_write_timeout, context.heartbeat_config.is_some(), true);
     let mut write = ClassifiedSink::new(write);
     let WriteLoopContext {
         cancel_domain_gate,
@@ -241,7 +241,7 @@ pub(crate) async fn run_write_loop<W>(
         // branch continuously ready. Re-check before every selection so a Ping flood
         // cannot starve the independent matching-Pong deadline indefinitely.
         if cancel.is_cancelled() {
-            crate::log_s!(LogType::WSC; "run_write_loop", "state|generation", "write_cancelled", generation);
+            crate::log_s!(LogType::WSC; "ws.write.run_write_loop", "state|generation", "write_cancelled", generation);
             return;
         }
         if recovery.is_active()
@@ -391,7 +391,7 @@ pub(crate) async fn run_write_loop<W>(
         };
         match event {
             WriteLoopEvent::Cancelled => {
-                crate::log_s!(LogType::WSC; "run_write_loop", "state|generation", "write_cancelled", generation);
+                crate::log_s!(LogType::WSC; "ws.write.run_write_loop", "state|generation", "write_cancelled", generation);
                 return;
             }
             WriteLoopEvent::Control(Some(control)) => {
@@ -414,7 +414,7 @@ pub(crate) async fn run_write_loop<W>(
                 }
             }
             WriteLoopEvent::Control(None) => {
-                crate::log_s!(LogType::WSC; "run_write_loop", "state|generation", "control_channel_closed", generation);
+                crate::log_s!(LogType::WSC; "ws.write.run_write_loop", "state|generation", "control_channel_closed", generation);
                 return;
             }
             WriteLoopEvent::HeartbeatTimedOut => {
@@ -549,7 +549,7 @@ pub(crate) async fn run_write_loop<W>(
             // 两个队列只在客户端永久关闭时关闭；任何一个返回 `None` 都意味着
             // 当前 writer 不应再从本连接继续取任务。
             WriteLoopEvent::Request(None, _, _) => {
-                crate::log_s!(LogType::WSC; "run_write_loop", "state|generation", "request_queue_closed", generation);
+                crate::log_s!(LogType::WSC; "ws.write.run_write_loop", "state|generation", "request_queue_closed", generation);
                 return;
             }
         }
@@ -566,7 +566,7 @@ async fn try_handle_ready_control<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "try_handle_ready_control", "timeout_seconds|cancelled", timeout.as_secs_f64(), cancel.is_cancelled());
+    crate::log_t!(LogType::WSC; "ws.write.try_handle_ready_control", "arg_write_present|arg_control_rx_present|timeout|arg_cancel_present|cancelled", true, true, timeout, true, cancel.is_cancelled());
     match control_rx.try_recv() {
         Ok(control) => Some(handle_control_message(write, control, timeout, cancel).await),
         Err(mpsc::error::TryRecvError::Empty) => None,
@@ -618,14 +618,14 @@ struct RequestWriteFailure {
 
 impl RequestWriteFailure {
     fn connection(error: NetError, data_started: bool) -> Self {
-        crate::log_t!(LogType::WSC; "connection", "error|data_started", format!("{error:?}"), data_started);
+        crate::log_t!(LogType::WSC; "ws.write.connection", "error|data_started", format!("{:?}/{:?}", error.kind(), error.context().stage), data_started);
         if matches!(
             error.kind(),
             crate::error::ErrorKind::Cancelled | crate::error::ErrorKind::Closed
         ) {
-            crate::log_s!(LogType::WSC; "connection", "error|data_started", format!("{error:?}"), data_started);
+            crate::log_s!(LogType::WSC; "ws.write.connection", "error|data_started", format!("{:?}/{:?}", error.kind(), error.context().stage), data_started);
         } else {
-            crate::log_e!(LogType::WSC; "connection", "error|data_started", format!("{error:?}"), data_started);
+            crate::log_e!(LogType::WSC; "ws.write.connection", "error|data_started", format!("{:?}/{:?}", error.kind(), error.context().stage), data_started);
         }
         let request_error =
             if data_started && error.kind() != crate::error::ErrorKind::DeliveryUnknown {
@@ -674,7 +674,7 @@ impl RequestWriteFailure {
     }
 
     fn local_close(data_started: bool, error: Option<NetError>) -> Self {
-        crate::log_t!(LogType::WSC; "local_close", "data_started|error", data_started, format!("{error:?}"));
+        crate::log_t!(LogType::WSC; "ws.write.local_close", "data_started|error_kind|error_stage", data_started, format!("{:?}", error.as_ref().map(NetError::kind)), format!("{:?}", error.as_ref().and_then(|error| error.context().stage)));
         Self {
             request_error: NetError::from(crate::error::ErrorKind::Cancelled),
             connection_action: match error {
@@ -932,7 +932,7 @@ async fn handle_control_message<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "handle_control_message", "control|timeout_seconds", match &control { ControlMessage::FlushAutomatic => "flush_automatic", ControlMessage::PeerClose(_) => "peer_close", ControlMessage::CloseWith { .. } => "local_close" }, timeout.as_secs_f64());
+    crate::log_t!(LogType::WSC; "ws.write.handle_control_message", "arg_write_present|arg_control_kind|timeout|arg_cancel_present", true, match &control { ControlMessage::FlushAutomatic => "flush_automatic", ControlMessage::PeerClose(_) => "peer_close", ControlMessage::CloseWith { .. } => "local_close" }, timeout, true);
     match control {
         ControlMessage::FlushAutomatic => match flush_sink(write, timeout, cancel).await {
             Ok(()) => ControlAction::Continue,
@@ -942,7 +942,7 @@ where
             },
         },
         ControlMessage::PeerClose(done_tx) => {
-            crate::log_s!(LogType::WSC; "handle_control_message", "state", "peer_close_reply_flush_started");
+            crate::log_s!(LogType::WSC; "ws.write.handle_control_message", "state", "peer_close_reply_flush_started");
             let result = flush_sink(write, timeout, cancel).await;
             let _ = done_tx.send(result.clone());
             match result {
@@ -1027,24 +1027,24 @@ async fn flush_sink<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "flush_sink", "timeout_seconds|cancelled", timeout.as_secs_f64(), cancel.is_cancelled());
+    crate::log_t!(LogType::WSC; "ws.write.flush_sink", "arg_write_present|timeout|arg_cancel_present|cancelled", true, timeout, true, cancel.is_cancelled());
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        crate::log_e!(LogType::WSC; "flush_sink", "error", "unrepresentable_deadline");
+        crate::log_e!(LogType::WSC; "ws.write.flush_sink", "error", "unrepresentable_deadline");
         NetError::from(crate::error::ErrorKind::InvalidConfig)
     })?;
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            crate::log_s!(LogType::WSC; "flush_sink", "state", "cancelled");
+            crate::log_s!(LogType::WSC; "ws.write.flush_sink", "state", "cancelled");
             Err(NetError::from(crate::error::ErrorKind::Cancelled))
         },
         result = tokio::time::timeout_at(deadline, write.flush()) => match result {
             Ok(Ok(())) => {
-                crate::log_s!(LogType::WSC; "flush_sink", "state", "sink_operation_completed");
+                crate::log_s!(LogType::WSC; "ws.write.flush_sink", "state", "sink_operation_completed");
                 Ok(())
             },
             Ok(Err(error)) => {
-                crate::log_e!(LogType::WSC; "flush_sink", "error", crate::common::log::summary::error(&error));
+                crate::log_e!(LogType::WSC; "ws.write.flush_sink", "error", crate::common::log::summary::error(&error));
                 let io_end = classify_io_error(&error);
                 let error = NetError::from(error);
                 let mut context = error.context().clone();
@@ -1052,7 +1052,7 @@ where
                 Err(error.with_context(context))
             },
             Err(_) => {
-                crate::log_e!(LogType::WSC; "flush_sink", "error|delivery", "sink_operation_timeout", "unknown");
+                crate::log_e!(LogType::WSC; "ws.write.flush_sink", "error|delivery", "sink_operation_timeout", "unknown");
                 Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
             },
         },
@@ -1075,13 +1075,13 @@ async fn drain_ready_controls_with_recovery<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "drain_ready_controls", "timeout_seconds|remaining_controls|deadline_elapsed", timeout.as_secs_f64(), *remaining_controls, Instant::now() >= request_deadline);
+    crate::log_t!(LogType::WSC; "ws.write.drain_ready_controls_with_recovery", "arg_write_present|arg_control_rx_present|timeout|arg_cancel_present|arg_heartbeat_present|arg_heartbeat_state_present|arg_recovery_active|request_deadline|remaining_controls|deadline_elapsed", true, true, timeout, true, true, true, recovery.active, format!("{request_deadline:?}"), *remaining_controls, Instant::now() >= request_deadline);
     loop {
         // A burst of ready controls may itself consume multiple write deadlines.
         // Re-check between every control so request expiry is not delayed by the whole burst.
         let now = Instant::now();
         if now >= request_deadline {
-            crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "TimeoutError");
+            crate::log_e!(LogType::WSC; "ws.write.drain_ready_controls_with_recovery", "error", "TimeoutError");
             return Err(NetError::from(crate::error::ErrorKind::TimedOut));
         }
         service_due_heartbeat_work(
@@ -1135,7 +1135,7 @@ where
                 if let Some(pong_timeout) = heartbeat.tick().now_or_never() {
                     let now = Instant::now();
                     if now >= request_deadline {
-                        crate::log_e!(LogType::WSC; "drain_ready_controls", "error", "TimeoutError");
+                        crate::log_e!(LogType::WSC; "ws.write.drain_ready_controls_with_recovery", "error", "TimeoutError");
                         return Err(NetError::from(crate::error::ErrorKind::TimedOut));
                     }
                     handle_heartbeat_tick_with_recovery(
@@ -1204,7 +1204,7 @@ async fn handle_heartbeat_tick_with_recovery<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "handle_heartbeat_tick", "pong_timeout_seconds|control_write_timeout_seconds", pong_timeout.as_secs_f64(), control_write_timeout.as_secs_f64());
+    crate::log_t!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "arg_write_present|arg_heartbeat_state_present|arg_recovery_active|pong_timeout|control_write_timeout|arg_cancel_present", true, true, recovery.active, pong_timeout, control_write_timeout, true);
     if recovery.is_active() {
         if !heartbeat_state.has_outstanding_probe() && recovery.awaiting_pong() {
             recovery.finish();
@@ -1224,7 +1224,7 @@ where
     }
     let payload = match heartbeat_state.on_tick(Instant::now(), pong_timeout) {
         HeartbeatTick::Waiting => {
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state", "probe_already_outstanding");
+            crate::log_s!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "state", "probe_already_outstanding");
             return Ok(());
         }
         HeartbeatTick::TimedOut => {
@@ -1238,7 +1238,7 @@ where
             .await;
         }
         HeartbeatTick::SendProbe(payload) => {
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|payload_bytes", "ping_write_started", payload.len());
+            crate::log_s!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "state|payload_bytes", "ping_write_started", payload.len());
             payload
         }
     };
@@ -1254,17 +1254,17 @@ where
             // If the matching Pong raced ahead of `send` completion, the reader
             // has already cleared this payload and `mark_sent` intentionally does nothing.
             let awaiting_pong = heartbeat_state.mark_sent(payload.as_ref(), Instant::now());
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|awaiting_pong", "ping_written", awaiting_pong);
+            crate::log_s!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "state|awaiting_pong", "ping_written", awaiting_pong);
             Ok(())
         }
         ControlWriteOutcome::Retryable(error) if recovery.config.ping_write_retries > 0 => {
             recovery.schedule_normal_retry(payload.clone(), Instant::now())?;
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|error", "ping_write_retry_scheduled", format!("{error:?}"));
+            crate::log_s!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "state|error", "ping_write_retry_scheduled", format!("{:?}/{:?}", error.kind(), error.context().stage));
             Ok(())
         }
         ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => {
             heartbeat_state.abandon_probe(payload.as_ref());
-            crate::log_s!(LogType::WSC; "handle_heartbeat_tick", "state|error", "probe_abandoned", format!("{error:?}"));
+            crate::log_s!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "state|error", "probe_abandoned", format!("{:?}/{:?}", error.kind(), error.context().stage));
             Err(error)
         }
     }
@@ -1342,7 +1342,7 @@ where
                 recovery.awaiting_pong = false;
                 recovery.recovery_flush_pending = true;
                 recovery.arm_wait(Instant::now())?;
-                crate::log_s!(LogType::WSC; "drive_heartbeat_recovery", "state|error", "retryable_probe_write", format!("{error:?}"));
+                crate::log_s!(LogType::WSC; "ws.write.drive_heartbeat_recovery", "state|error_kind|error_stage|arg_write_present|arg_heartbeat_state_present|arg_recovery_active|control_write_timeout|arg_cancel_present", "retryable_probe_write", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), true, true, recovery.active, control_write_timeout, true);
                 Ok(())
             }
             ControlWriteOutcome::Failed(error) => {
@@ -1405,7 +1405,7 @@ where
                 < recovery.config.ping_write_retries.saturating_add(1) =>
         {
             recovery.advance_normal_retry(Instant::now())?;
-            crate::log_s!(LogType::WSC; "drive_normal_ping_retry", "state|error", "retryable_ping_write", format!("{error:?}"));
+            crate::log_s!(LogType::WSC; "ws.write.drive_normal_ping_retry", "state|error_kind|error_stage|arg_write_present|arg_heartbeat_state_present|arg_recovery_active|control_write_timeout|request_deadline|arg_cancel_present", "retryable_ping_write", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), true, true, recovery.active, control_write_timeout, format!("{request_deadline:?}"), true);
             Ok(())
         }
         ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => {
@@ -1516,7 +1516,7 @@ async fn send_request_message_with_phase<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "send_request_message", "message_type|message_bytes|data_frame_payload_size|control_budget", match &message { Message::Text(_) => "text", Message::Binary(_) => "binary", Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", Message::Frame(_) => "frame" }, message.len(), data_frame_payload_size, first_frame_control_budget);
+    crate::log_t!(LogType::WSC; "ws.write.send_request_message_with_phase", "arg_write_present|arg_message_type|arg_message_bytes|data_frame_payload_size|first_frame_control_budget|write_deadline|arg_control_rx_present|control_write_timeout|data_frame_write_timeout|arg_heartbeat_present|arg_heartbeat_state_present|arg_recovery_active|arg_connection_cancel_present|arg_dispatch_cancel_present|arg_dispatch_phase_present", true, match &message { Message::Text(_) => "text", Message::Binary(_) => "binary", Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", Message::Frame(_) => "frame" }, message.len(), data_frame_payload_size, first_frame_control_budget, format!("{write_deadline:?}"), true, control_write_timeout, data_frame_write_timeout, true, true, recovery.active, true, true, true);
     let mut frames = OutgoingMessageFrames::new(message, data_frame_payload_size).peekable();
     let mut wrote_frame = false;
     let mut next_control_budget = first_frame_control_budget.min(MAX_READY_CONTROLS_PER_BOUNDARY);
@@ -1650,7 +1650,7 @@ fn classify_boundary_failure(
     data_started: bool,
     request_deadline: Instant,
 ) -> RequestWriteFailure {
-    crate::log_t!(LogType::WSC; "classify_boundary_failure", "error|data_started|deadline_elapsed", format!("{error:?}"), data_started, Instant::now() >= request_deadline);
+    crate::log_t!(LogType::WSC; "ws.write.classify_boundary_failure", "error_kind|error_stage|data_started|request_deadline|deadline_elapsed", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), data_started, format!("{request_deadline:?}"), Instant::now() >= request_deadline);
     if error.kind() == crate::error::ErrorKind::TimedOut
         && error.context().stage != Some(crate::error::ErrorStage::Heartbeat)
     {
@@ -1672,7 +1672,7 @@ fn classify_control_failure(
     data_started: bool,
     request_deadline: Instant,
 ) -> RequestWriteFailure {
-    crate::log_t!(LogType::WSC; "classify_control_failure", "error|origin|data_started|deadline_elapsed", format!("{error:?}"), format!("{origin:?}"), data_started, Instant::now() >= request_deadline);
+    crate::log_t!(LogType::WSC; "ws.write.classify_control_failure", "error_kind|error_stage|origin|data_started|request_deadline|deadline_elapsed", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{origin:?}"), data_started, format!("{request_deadline:?}"), Instant::now() >= request_deadline);
     if origin == ControlOrigin::LocalClose {
         RequestWriteFailure::local_close(data_started, Some(error))
     } else {
@@ -1697,7 +1697,7 @@ async fn send_data_frame_with_phase<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "send_data_frame", "frame_bytes|frame_write_timeout_seconds|deadline_elapsed", frame.len(), frame_write_timeout.as_secs_f64(), Instant::now() >= request_deadline);
+    crate::log_t!(LogType::WSC; "ws.write.send_data_frame_with_phase", "arg_write_present|arg_frame_bytes|data_started|request_deadline|frame_write_timeout|arg_connection_cancel_present|arg_dispatch_cancel_present|arg_dispatch_phase_present|deadline_elapsed", true, frame.len(), data_started, format!("{request_deadline:?}"), frame_write_timeout, true, true, true, Instant::now() >= request_deadline);
     let now = Instant::now();
     if dispatch_cancel.is_cancelled() {
         return Err(RequestWriteFailure::cancelled(data_started));
@@ -1723,7 +1723,7 @@ where
             match Pin::new(&mut *write).poll_ready(cx) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
                 std::task::Poll::Ready(Err(error)) => {
-                    crate::log_e!(LogType::WSC; "send_data_frame", "error|stage", crate::common::log::summary::error(&error), "readiness");
+                    crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|stage", crate::common::log::summary::error(&error), "readiness");
                     return std::task::Poll::Ready(Err(RequestWriteFailure::connection(error.into(), data_started || dispatch_phase.data_write_started())));
                 }
                 std::task::Poll::Ready(Ok(())) => {}
@@ -1747,19 +1747,19 @@ where
                 return std::task::Poll::Ready(Err(RequestWriteFailure::cancelled(data_started || dispatch_phase.data_write_started())));
             }
             let Some(frame) = frame.take() else {
-                crate::log_e!(LogType::WSC; "send_data_frame", "error", "data_frame_already_consumed");
+                crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error", "data_frame_already_consumed");
                 return std::task::Poll::Ready(Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::Internal), true)));
             };
             // No await separates this CAS from start_send. Cancellation that wins
             // the same atomic state prevents this request from entering the sink.
             std::task::Poll::Ready(Pin::new(&mut *write).start_send(frame).map_err(|error| {
-                crate::log_e!(LogType::WSC; "send_data_frame", "error|delivery", crate::common::log::summary::error(&error), "unknown");
+                crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", crate::common::log::summary::error(&error), "unknown");
                 RequestWriteFailure::connection(NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error)
                     .with_stage(crate::error::ErrorStage::Write), true)
             }))
         }).await?;
         write.flush().await.map_err(|error| {
-            crate::log_e!(LogType::WSC; "send_data_frame", "error|delivery", crate::common::log::summary::error(&error), "unknown");
+            crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", crate::common::log::summary::error(&error), "unknown");
             RequestWriteFailure::connection(NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error)
                 .with_stage(crate::error::ErrorStage::Write), true)
         })
@@ -1769,7 +1769,7 @@ where
         _ = dispatch_cancel.cancelled() => Err(RequestWriteFailure::cancelled(data_started || dispatch_phase.data_write_started())),
         result = tokio::time::timeout_at(deadline, send) => match result {
             Ok(Ok(())) => {
-                crate::log_s!(LogType::WSC; "send_data_frame", "state", "frame_written");
+                crate::log_s!(LogType::WSC; "ws.write.send_data_frame_with_phase", "state", "frame_written");
                 Ok(())
             },
             Ok(Err(failure)) => Err(failure),
@@ -1777,7 +1777,7 @@ where
                 Err(RequestWriteFailure::deadline(data_started || dispatch_phase.data_write_started(), true))
             }
             Err(_) => {
-                crate::log_e!(LogType::WSC; "send_data_frame", "error|delivery", "frame_write_timeout", "unknown");
+                crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", "frame_write_timeout", "unknown");
                 Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::DeliveryUnknown), data_started || dispatch_phase.data_write_started()))
             },
         },
@@ -1944,7 +1944,7 @@ async fn send_control_frame<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    crate::log_t!(LogType::WSC; "send_control_frame", "frame_type|frame_bytes|timeout_seconds", match &frame { Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", _ => "data" }, frame.len(), timeout.as_secs_f64());
+    crate::log_t!(LogType::WSC; "ws.write.send_control_frame", "arg_write_present|arg_frame_type|arg_frame_bytes|timeout|arg_cancel_present", true, match &frame { Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", _ => "data" }, frame.len(), timeout, true);
     match send_control_frame_outcome(write, frame, timeout, cancel).await {
         ControlWriteOutcome::Complete => Ok(()),
         ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => Err(error),
@@ -2072,23 +2072,23 @@ async fn send_write_end(
     } else {
         error
     };
-    crate::log_t!(LogType::WSC; "send_write_end", "generation|error|cancelled", generation, format!("{error:?}"), cancel.is_cancelled());
+    crate::log_t!(LogType::WSC; "ws.write.send_write_end", "arg_io_event_tx_present|generation|error_kind|error_stage|kind|arg_cancel_present|cancelled", true, generation, format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{kind:?}"), true, cancel.is_cancelled());
     if matches!(
         error.kind(),
         crate::error::ErrorKind::Cancelled | crate::error::ErrorKind::Closed
     ) {
-        crate::log_s!(LogType::WSC; "send_write_end", "state|generation|error", "write_ended", generation, format!("{error:?}"));
+        crate::log_s!(LogType::WSC; "ws.write.send_write_end", "state|generation|error", "write_ended", generation, format!("{:?}/{:?}", error.kind(), error.context().stage));
     } else {
-        crate::log_e!(LogType::WSC; "send_write_end", "generation|error", generation, format!("{error:?}"));
+        crate::log_e!(LogType::WSC; "ws.write.send_write_end", "generation|error", generation, format!("{:?}/{:?}", error.kind(), error.context().stage));
     }
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            crate::log_s!(LogType::WSC; "send_write_end", "state|generation", "end_notification_cancelled", generation);
+            crate::log_s!(LogType::WSC; "ws.write.send_write_end", "state|generation", "end_notification_cancelled", generation);
         }
         result = io_event_tx.send(IoEvent::WriteEnded { generation, error, kind }) => {
             if result.is_err() {
-                crate::log_s!(LogType::WSC; "send_write_end", "state|generation", "worker_event_receiver_closed", generation);
+                crate::log_s!(LogType::WSC; "ws.write.send_write_end", "state|generation", "worker_event_receiver_closed", generation);
             }
         }
     }

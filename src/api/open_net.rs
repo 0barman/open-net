@@ -239,7 +239,13 @@ impl OpenNet {
         config: WebSocketClientConfig,
         network_config: crate::network::NetworkConfig,
     ) -> Result<WebSocketClient, NetError> {
-        crate::log_t!(LogType::WSC; "create_ws_client_with_network_config", "thread_name|config", thread_name, format!("{config:?}"));
+        crate::log_t!(LogType::WSC; "ws.create_ws_client_with_network_config",
+            "thread_name|config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_config_proxy_direct|network_config_proxy_authenticated|network_config_status_policy|network_config_tls_root_mode|network_config_tls_custom_root_count|network_config_tls_identity_present|network_config_tls_provider_present",
+            thread_name, config.close_timeout, config.queues.commands, config.heartbeat.is_some(),
+            network_config.proxy().is_direct(), network_config.proxy().is_authenticated(),
+            format!("{:?}", network_config.network_status_policy()), format!("{:?}", network_config.tls().root_mode()),
+            network_config.tls().custom_root_count(), network_config.tls().client_identity().is_some(),
+            network_config.tls().crypto_provider().is_some());
         let result: Result<WebSocketClient, NetError> = async {
             let thread_name = thread_name.trim();
             if thread_name.is_empty() {
@@ -251,7 +257,7 @@ impl OpenNet {
         }
         .await;
         result.inspect_err(|error| {
-            crate::log_e!(LogType::WSC; "create_ws_client_with_network_config", "error|error_kind", format!("{error:?}"), format!("{:?}", error.kind()));
+            crate::log_e!(LogType::WSC; "ws.create_ws_client_with_network_config", "error_kind|stage", format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
         })
     }
 
@@ -363,7 +369,7 @@ impl OpenNet {
         thread_name: &str,
     ) -> Result<NetStatusClient, NetError> {
         let thread_name = thread_name.trim();
-        crate::log_s!(LogType::Engine; "create_net_status_client", "thread_name", thread_name);
+        crate::log_t!(LogType::Engine; "net_status.create_net_status_client", "thread_name", thread_name);
         if thread_name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
@@ -385,7 +391,7 @@ impl OpenNet {
     /// reserved until cleanup completes. Use `NetStatusClient::stop` to pause instead.
     pub async fn destroy_net_status_client(&self, thread_name: &str) -> Result<(), NetError> {
         let thread_name = thread_name.trim();
-        crate::log_s!(LogType::Engine; "destroy_net_status_client", "thread_name", thread_name);
+        crate::log_t!(LogType::Engine; "net_status.destroy_net_status_client", "thread_name", thread_name);
         if thread_name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
