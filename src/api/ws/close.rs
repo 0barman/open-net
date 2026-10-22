@@ -3,12 +3,24 @@ use crate::{NetError, Result};
 use std::fmt;
 
 /// Validated outbound close frame with a UTF-8 reason of at most 123 bytes.
-#[derive(Clone, Debug)]
+///
+/// `Debug` reports the close code and reason byte count without exposing the reason text.
+#[derive(Clone)]
 pub struct CloseFrame {
     /// WebSocket wire close code validated by the constructor.
     code: u16,
     /// Reason text sent with the close frame; may be empty.
     reason: String,
+}
+
+impl fmt::Debug for CloseFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CloseFrame")
+            .field("code", &self.code)
+            .field("reason_len", &self.reason.len())
+            .finish()
+    }
 }
 
 impl CloseFrame {

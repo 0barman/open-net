@@ -39,6 +39,7 @@ pub(crate) mod native_task_observer;
 
 pub(crate) mod native_pending;
 pub(crate) mod operation_control;
+pub(crate) mod timeout_budget;
 
 pub(crate) mod message_source;
 

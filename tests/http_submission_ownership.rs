@@ -1,5 +1,7 @@
 #![cfg(feature = "http-client")]
 
+use open_net::api::retry::{Backoff, RetrySchedule, RetrySetting};
+
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use open_net::api::error::{ErrorKind, ErrorStage};
 use open_net::api::http::{
     HttpCancelOutcome, HttpClient, HttpClientConfig, HttpCompletion, HttpRequestHandle,
     HttpRequestId, HttpRequestMethod, HttpRequestOptions, HttpRequestTrait, HttpResponseResult,
-    HttpTimeouts, RetryPolicy, TimeoutPhase,
+    HttpRetryPolicy, HttpTimeouts, TimeoutPhase,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -146,7 +148,7 @@ struct Probe<C = ()> {
     method: HttpRequestMethod,
     body: Bytes,
     explicit_body: bool,
-    policy: RetryPolicy,
+    policy: HttpRetryPolicy,
     callback: Option<Box<dyn FnOnce(&Arc<C>, HttpResponseResult) + Send>>,
     release_callback: Option<oneshot::Receiver<()>>,
     #[cfg(feature = "http-client-cookies")]
@@ -169,7 +171,7 @@ impl<C> Probe<C> {
             method: HttpRequestMethod::POST,
             body: Bytes::from_static(b"\0\xffraw bytes"),
             explicit_body: true,
-            policy: RetryPolicy::no_retry(),
+            policy: HttpRetryPolicy::no_retry(),
             callback: None,
             release_callback: None,
             #[cfg(feature = "http-client-cookies")]
@@ -207,8 +209,8 @@ impl<C: Send + Sync + 'static> HttpRequestTrait for Probe<C> {
     fn has_req_body(&self) -> bool {
         self.explicit_body
     }
-    fn retry_policy(&self) -> RetryPolicy {
-        self.policy.clone()
+    fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> {
+        RetrySetting::Policy(self.policy.clone())
     }
     fn headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -462,23 +464,18 @@ async fn closed_duplicate_and_invalid_options_return_original_values_without_dis
     drop(rejected);
     assert_eq!(counts.drops.load(Ordering::SeqCst), 1);
 
-    // RetryPolicy's builder validates nonzero durations; admission must also reject
-    // a deadline that cannot fit the monotonic clock before taking request ownership.
-    let policy = RetryPolicy::builder()
-        .total_deadline(Duration::MAX)
-        .build()?;
+    // Invalid timeout overrides fail before the caller gives up request ownership.
     let counts = Arc::new(Counts::default());
-    let request = Probe::new(&counts);
+    let request = Probe::<()>::new(&counts);
     let identity = request.identity();
-    let rejected = client
-        .send_with_options(request, HttpRequestOptions::new().with_retry_policy(policy))
-        .expect_err("overflowing timeout must be rejected");
-    assert!(matches!(
-        rejected.error().kind(),
-        ErrorKind::InvalidConfig | ErrorKind::InvalidInput
-    ));
-    assert_returned(rejected.value(), identity, &counts);
-    drop(rejected);
+    let invalid = HttpRequestOptions::new()
+        .with_timeouts(HttpTimeouts::new().with_total_timeout(Duration::MAX));
+    if !matches!(invalid, Err(ref error) if matches!(error.kind(), ErrorKind::InvalidConfig | ErrorKind::InvalidInput))
+    {
+        return Err(std::io::Error::other("overflowing timeout was accepted").into());
+    }
+    assert_returned(&request, identity, &counts);
+    drop(request);
 
     observed.respond(200);
     finished(&active).await?.callback?;
@@ -743,7 +740,24 @@ async fn boxed_explicit_empty_body_and_retry_policy_are_forwarded() -> TestResul
     // GET does not otherwise synthesize Content-Length: 0, so this verifies
     // has_req_body forwarding instead of relying on POST's default framing.
     request.method = HttpRequestMethod::GET;
-    request.policy = RetryPolicy::new(1).with_non_idempotent(true);
+    request.policy = HttpRetryPolicy::builder()
+        .schedule(
+            RetrySchedule::builder()
+                .max_attempts(2)
+                .backoff(Backoff::exponential(
+                    Duration::from_millis(50).min(Duration::from_secs(30)),
+                    2.0,
+                    Duration::from_secs(30),
+                ))
+                .build()?,
+        )
+        .retry_on(open_net::api::http::RetryOn::standard())
+        .safety(if true {
+            open_net::api::http::RequestSafety::IdempotentByContract
+        } else {
+            open_net::api::http::RequestSafety::Automatic
+        })
+        .build()?;
     let request: Box<dyn HttpRequestTrait> = Box::new(request);
     let handle = client
         .send_wait(Box::new(request))
@@ -770,7 +784,24 @@ async fn boxed_explicit_empty_body_and_retry_policy_are_forwarded() -> TestResul
     // it must not reapply a request's retry override.
     let counts = Arc::new(Counts::default());
     let mut request = Probe::<()>::new(&counts);
-    request.policy = RetryPolicy::new(1).with_non_idempotent(true);
+    request.policy = HttpRetryPolicy::builder()
+        .schedule(
+            RetrySchedule::builder()
+                .max_attempts(2)
+                .backoff(Backoff::exponential(
+                    Duration::from_millis(50).min(Duration::from_secs(30)),
+                    2.0,
+                    Duration::from_secs(30),
+                ))
+                .build()?,
+        )
+        .retry_on(open_net::api::http::RetryOn::standard())
+        .safety(if true {
+            open_net::api::http::RequestSafety::IdempotentByContract
+        } else {
+            open_net::api::http::RequestSafety::Automatic
+        })
+        .build()?;
     let handle = client
         .send_with_options(Box::new(request), HttpRequestOptions::new())
         .map_err(|error| error.into_error())?;

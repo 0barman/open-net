@@ -4,7 +4,7 @@ Required feature: `http-client-auth` (includes `http-client`). Manually setting 
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client-auth"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client-auth"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -24,7 +24,7 @@ using open-net should accept the host's choice rather than install its own globa
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
 precedence and complete examples of both approaches.
 
-Adjust the local path from your consumer project to this checkout. Authentication types are re-exported through `open_net::api::http`. Import the re-exported `open_net::async_trait` when implementing asynchronous provider traits; it supplies the object-safe asynchronous trait plumbing. Provider methods borrow `&self`, so shared mutable application state needs synchronization.
+Authentication types are re-exported through `open_net::api::http`. Import the re-exported `open_net::async_trait` when implementing asynchronous provider traits; it supplies the object-safe asynchronous trait plumbing. Provider methods borrow `&self`, so shared mutable application state needs synchronization.
 
 ## Static Basic and Bearer authentication
 
@@ -138,16 +138,16 @@ The provider rejects already expired fetched tokens. Concurrent loads/refreshes 
 
 Recovery after a refresh failure needs an explicit policy. Later 401 responses for the same rejected credential generation fail without calling `refresh` again, even after the identity service recovers. A cached token with `expires_at: None` never expires locally, so that failure can remain latched indefinitely. Cloning `BearerAuth`, wrapping the same provider in another `Arc`, or installing that same provider in another client shares the latch and does not reset it. To recover, the source can perform bounded retries within its original five-second source call; or the application can replace the affected client with one configured with a **new** `BearerAuth::new(source)` after restoring the source. For expiring tokens, a later successful `load` after local expiry advances the generation and clears the failure; expiry alone does not guarantee recovery if `load` keeps failing or returns an expired token. Shut down the replaced client separately. There is no public cache-reset or force-refresh method. The example below deliberately uses `None`, so changing its environment variable alone cannot clear a refresh failure already recorded by an existing provider.
 
-An eligible 401 allows **one** credential-refresh replay per logical operation, independently of the transient retry count. A second 401 or `DoNotRetry` blocks further 401/application replay in that operation. Replay still requires the request's safety policy and replayable body. `Automatic` safety permits HTTP idempotent methods; an ordinary unsafe POST is not automatically made replayable by installing auth. See [retry](retry.md) before declaring an endpoint safe. `RequestSafety::Never` blocks refresh replay. Streaming authentication happens before the stream is returned; a delivered stream is never replayed.
+An eligible 401 allows **one** credential-refresh replay per logical operation, consuming the same attempt budget as transient retries. Disabled retry or max_attempts equal to one leaves no replay budget. A classifier returning Stop vetoes the replay. A second 401 or `DoNotRetry` blocks further 401/application replay in that operation. Replay still requires the request's safety policy and replayable body. `Automatic` safety permits HTTP idempotent methods; an ordinary unsafe POST is not automatically made replayable by installing auth. See [retry](retry.md) before declaring an endpoint safe. `RequestSafety::Never` blocks refresh replay. Streaming authentication happens before the stream is returned; a delivered stream is never replayed.
 
 ### Example
 
-This complete program uses two tokens supplied by your application through environment variables. Set `AUTH_BASE_URL`, `ACCESS_TOKEN` and `REFRESHED_ACCESS_TOKEN`; the server must expose `/account`, reject the old token with 401 when testing refresh, and accept the refreshed token. The example's source reads a pre-obtained replacement; a production source would call your identity service in `refresh` using an independent client. No OAuth protocol is provided by this trait itself.
+This complete program uses two tokens supplied by your application through environment variables. Set `AUTH_BASE_URL` to an HTTPS origin and supply `ACCESS_TOKEN` and `REFRESHED_ACCESS_TOKEN` without committing or logging their values. The configuration enforces `HttpsOnly`, rejecting an HTTP base URL before a request can send credentials. The server must expose `/account`, reject the old token with 401 when testing refresh, and accept the refreshed token. The example's source reads a pre-obtained replacement; a production source would call your identity service in `refresh` using an independent HTTPS client. No OAuth protocol is provided by this trait itself.
 
 ```rust
 use open_net::api::http::{
     AccessToken, AuthResult, BearerAuth, BearerTokenSource,
-    HttpClient, HttpClientConfig, RefreshReason,
+    HttpClient, HttpClientConfig, HttpTransportSecurity, RefreshReason,
 };
 use open_net::{async_trait, NetError};
 use open_net::error::ErrorKind;
@@ -176,7 +176,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!token.is_expired(SystemTime::now()));
     let base = std::env::var("AUTH_BASE_URL")?;
     let auth = BearerAuth::new(Arc::new(EnvironmentTokens));
-    let config = HttpClientConfig::new(base)?.with_auth(auth);
+    let config = HttpClientConfig::new(base)?
+        .with_transport_security(HttpTransportSecurity::HttpsOnly)?
+        .with_auth(auth);
     let client = HttpClient::new(config, "auth-example")?;
     let result = client.get("/account").await;
     client.shutdown().await?;
@@ -242,7 +244,7 @@ Implement both methods, inspect the read-only context, set only your authenticat
 
 `set_header` rejects every `proxy-*` name plus `host`, `connection`, `content-length`, `transfer-encoding`, `upgrade`, `te`, `trailer`, and `keep-alive`, with `InvalidInput/Provider`. The worker catches unwinding provider panics and strips arbitrary provider errors. Async provider execution consumes the operation's request budgets; custom `HttpAuth` does not automatically acquire the built-in token source's five-second guard.
 
-Same-origin redirects reapply credentials for the destination path. A cross-origin hop strips sensitive headers and disables auth for the remainder of that redirect chain, including if it later returns to the original origin. Redirects remain bounded to ten followed hops. Authentication providers operate on both concrete and callback requests. Middleware, if enabled, surrounds the logical request, while auth is reevaluated inside attempts.
+Same-origin redirects reapply credentials for the destination path. The [redirect policy](redirects.md) permits only the original origin by default and blocks HTTPS-to-HTTP redirects in every HTTP version mode. An explicitly allowed cross-origin hop strips sensitive headers and disables auth for the remainder of that redirect chain, including if it later returns to the original origin. An origin allowlist does not authorize sending source credentials to that origin. Redirects default to at most ten followed hops; configure the limit independently. Authentication providers operate on both concrete and callback requests. Middleware, if enabled, surrounds the logical request, while auth is reevaluated inside attempts. Installing a provider does not change the redirect policy or implementation.
 
 ### Example
 

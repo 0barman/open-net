@@ -38,55 +38,8 @@ struct SourceState {
     publication_error: Option<NetError>,
     views: Vec<Weak<Mutex<CoordinatedView>>>,
     last_sample_id: u64,
-    last_name_sample_id: u64,
 }
 
-/// Reachability-only sampling must preserve the name at commit time, including
-/// a newer name committed while the OS reachability query was in flight.
-pub(crate) enum NetworkNameUpdate {
-    Replace(Option<String>),
-    Preserve,
-}
-
-impl From<Option<String>> for NetworkNameUpdate {
-    fn from(value: Option<String>) -> Self {
-        Self::Replace(value)
-    }
-}
-
-impl SourceState {
-    fn sample_is_newer(&self, sample_id: u64, name: &NetworkNameUpdate) -> bool {
-        sample_id > self.last_sample_id
-            || (matches!(name, NetworkNameUpdate::Replace(_))
-                && sample_id > self.last_name_sample_id)
-    }
-
-    fn merge_sample(
-        &mut self,
-        sample_id: u64,
-        reachability: NetworkStatus,
-        ip_stack: Option<IpStack>,
-        name: NetworkNameUpdate,
-    ) -> (NetworkStatus, Option<IpStack>, Option<String>) {
-        let (reachability, ip_stack) = if sample_id > self.last_sample_id {
-            self.last_sample_id = sample_id;
-            (reachability, ip_stack)
-        } else {
-            (
-                self.snapshot.reachability.unwrap_or(reachability),
-                self.snapshot.ip_stack,
-            )
-        };
-        let name = match name {
-            NetworkNameUpdate::Replace(name) if sample_id > self.last_name_sample_id => {
-                self.last_name_sample_id = sample_id;
-                name
-            }
-            _ => self.snapshot.network_name.clone(),
-        };
-        (reachability, ip_stack, name)
-    }
-}
 #[derive(Clone)]
 pub(super) struct NetworkStatusSource {
     state: Arc<Mutex<SourceState>>,
@@ -114,7 +67,6 @@ pub(super) struct NetworkViewHandle {
 pub(crate) struct NetworkRefreshTarget {
     pub(crate) owner_generation: u64,
     pub(crate) source_generation: u64,
-    pub(crate) ip_stack: Option<IpStack>,
     invalidation_epoch: u64,
     invalidated: watch::Receiver<u64>,
 }
@@ -219,7 +171,6 @@ impl NetworkStatusSource {
                 publication_error: None,
                 views: Vec::new(),
                 last_sample_id: 0,
-                last_name_sample_id: 0,
             })),
             sender,
             facts,
@@ -304,7 +255,7 @@ impl NetworkStatusSource {
             return Err(NetError::from(ErrorKind::Closed));
         }
         let generation = increment(state.generation)?;
-        let next = next_snapshot(&state, MonitorState::Starting, None, None, None, None)?;
+        let next = next_snapshot(&state, MonitorState::Starting, None, None, None)?;
         let previous_generation = state.generation;
         state.generation = generation;
         let publication = self.commit(&mut state, next, false)?;
@@ -344,7 +295,7 @@ impl NetworkStatusSource {
         } else {
             MonitorState::Stopped
         };
-        let next = match next_snapshot(&state, target, None, None, None, None) {
+        let next = match next_snapshot(&state, target, None, None, None) {
             Ok(next) => next,
             Err(error) => return Ok(self.fail_publication(&mut state, error, None)),
         };
@@ -509,7 +460,6 @@ impl NetworkStatusPublisher {
         &self,
         reachability: NetworkStatus,
         ip_stack: Option<IpStack>,
-        network_name: Option<String>,
     ) -> Result<NetworkPublication, NetError> {
         let mut state = self.source.state.lock().map_err(NetError::from_poison)?;
         if state.generation != self.generation
@@ -521,7 +471,6 @@ impl NetworkStatusPublisher {
         if matches!(state.snapshot.state, MonitorState::Running)
             && state.snapshot.reachability == Some(reachability)
             && state.snapshot.ip_stack == ip_stack
-            && state.snapshot.network_name == network_name
         {
             return Ok(NetworkPublication::empty());
         }
@@ -531,7 +480,6 @@ impl NetworkStatusPublisher {
             Some(reachability),
             ip_stack,
             Some(SystemTime::now()),
-            network_name,
         ) {
             Ok(next) => next,
             Err(error) => return Ok(self.source.fail_publication(&mut state, error, None)),
@@ -544,16 +492,14 @@ impl NetworkStatusPublisher {
         sample_id: u64,
         reachability: NetworkStatus,
         ip_stack: Option<IpStack>,
-        network_name: impl Into<NetworkNameUpdate>,
         observed_at: SystemTime,
         validate: impl FnOnce() -> Result<bool, NetError>,
     ) -> Result<Option<NetworkPublication>, NetError> {
         let mut state = self.source.state.lock().map_err(NetError::from_poison)?;
-        let network_name = network_name.into();
         if state.generation != self.generation
             || !state.active
             || matches!(state.snapshot.state, MonitorState::Closed)
-            || !state.sample_is_newer(sample_id, &network_name)
+            || sample_id <= state.last_sample_id
         {
             return Ok(None);
         }
@@ -562,9 +508,8 @@ impl NetworkStatusPublisher {
         if !validate()? {
             return Ok(None);
         }
-        let (reachability, ip_stack, network_name) =
-            state.merge_sample(sample_id, reachability, ip_stack, network_name);
-        if same_observation(&state.snapshot, reachability, ip_stack, &network_name) {
+        state.last_sample_id = sample_id;
+        if same_observation(&state.snapshot, reachability, ip_stack) {
             return Ok(Some(NetworkPublication::empty()));
         }
         let next = next_snapshot(
@@ -573,46 +518,10 @@ impl NetworkStatusPublisher {
             Some(reachability),
             ip_stack,
             Some(observed_at),
-            network_name,
         )?;
         self.source.commit(&mut state, next, false).map(Some)
     }
 
-    /// Background name work has its own freshness watermark. A slow name may
-    /// complete after a newer reachability query, without rolling its status or
-    /// IP stack back or being perpetually starved by frequent status samples.
-    pub(super) fn prepare_sampled_name_observation(
-        &self,
-        sample_id: u64,
-        network_name: Option<String>,
-        observed_at: SystemTime,
-        validate: impl FnOnce() -> Result<bool, NetError>,
-    ) -> Result<Option<NetworkPublication>, NetError> {
-        let mut state = self.source.state.lock().map_err(NetError::from_poison)?;
-        if state.generation != self.generation
-            || !state.active
-            || !matches!(state.snapshot.state, MonitorState::Running)
-            || sample_id <= state.last_name_sample_id
-        {
-            return Ok(None);
-        }
-        if !validate()? {
-            return Ok(None);
-        }
-        state.last_name_sample_id = sample_id;
-        if state.snapshot.network_name == network_name {
-            return Ok(Some(NetworkPublication::empty()));
-        }
-        let next = next_snapshot(
-            &state,
-            MonitorState::Running,
-            state.snapshot.reachability,
-            state.snapshot.ip_stack,
-            Some(observed_at),
-            network_name,
-        )?;
-        self.source.commit(&mut state, next, false).map(Some)
-    }
     pub(super) fn prepare_finish(
         &self,
         target: MonitorState,
@@ -636,7 +545,7 @@ impl NetworkStatusPublisher {
         {
             return Ok(deferred);
         }
-        let result = next_snapshot(&state, target, None, None, None, None)
+        let result = next_snapshot(&state, target, None, None, None)
             .and_then(|next| self.source.commit(&mut state, next, false));
         match result {
             Ok(mut publication) => {
@@ -855,7 +764,6 @@ impl NetworkViewHandle {
         Ok(NetworkRefreshTarget {
             owner_generation: view.view.generation,
             source_generation: source.generation,
-            ip_stack: view.view.snapshot.ip_stack,
             invalidation_epoch: view.invalidation_epoch,
             invalidated: view.invalidated.subscribe(),
         })
@@ -867,12 +775,10 @@ impl NetworkViewHandle {
         sample_id: u64,
         reachability: NetworkStatus,
         _ip_stack: Option<IpStack>,
-        network_name: impl Into<NetworkNameUpdate>,
         observed_at: SystemTime,
         validate: impl FnOnce() -> Result<(), NetError>,
     ) -> Result<(Result<NetworkSnapshot, NetError>, NetworkPublication), NetError> {
         let mut source = self.source.state.lock().map_err(NetError::from_poison)?;
-        let network_name = network_name.into();
         {
             let view = self.view.lock().map_err(NetError::from_poison)?;
             if let Some(error) = &view.failure {
@@ -887,32 +793,26 @@ impl NetworkViewHandle {
                 || !source.active
                 || !matches!(view.view.snapshot.state, MonitorState::Running)
                 || !matches!(source.snapshot.state, MonitorState::Running)
-                || match network_name {
-                    NetworkNameUpdate::Preserve => sample_id <= source.last_sample_id,
-                    NetworkNameUpdate::Replace(_) => sample_id <= source.last_name_sample_id,
-                }
+                || sample_id <= source.last_sample_id
             {
                 return Err(ErrorKind::Cancelled.into());
             }
         }
         validate()?;
         let ip_stack = source.snapshot.ip_stack;
-        let (reachability, ip_stack, network_name) =
-            source.merge_sample(sample_id, reachability, ip_stack, network_name);
-        let publication =
-            if same_observation(&source.snapshot, reachability, ip_stack, &network_name) {
-                NetworkPublication::empty()
-            } else {
-                let next = next_snapshot(
-                    &source,
-                    MonitorState::Running,
-                    Some(reachability),
-                    ip_stack,
-                    Some(observed_at),
-                    network_name,
-                )?;
-                self.source.commit(&mut source, next, false)?
-            };
+        source.last_sample_id = sample_id;
+        let publication = if same_observation(&source.snapshot, reachability, ip_stack) {
+            NetworkPublication::empty()
+        } else {
+            let next = next_snapshot(
+                &source,
+                MonitorState::Running,
+                Some(reachability),
+                ip_stack,
+                Some(observed_at),
+            )?;
+            self.source.commit(&mut source, next, false)?
+        };
         // Shared publication may succeed while this named projection fails.
         // Preserve every prepared notification even on a target-view failure;
         // the caller must dispatch it outside all locks before returning the
@@ -956,12 +856,11 @@ fn same_observation(
     snapshot: &NetworkSnapshot,
     reachability: NetworkStatus,
     ip_stack: Option<IpStack>,
-    network_name: &Option<String>,
 ) -> bool {
     matches!(snapshot.state, MonitorState::Running)
         && snapshot.reachability == Some(reachability)
         && snapshot.ip_stack == ip_stack
-        && &snapshot.network_name == network_name
+        && snapshot.network_name.is_none()
 }
 fn increment(value: u64) -> Result<u64, NetError> {
     value
@@ -974,7 +873,6 @@ fn next_snapshot(
     reachability: Option<NetworkStatus>,
     ip_stack: Option<IpStack>,
     observed_at: Option<SystemTime>,
-    network_name: Option<String>,
 ) -> Result<NetworkSnapshot, NetError> {
     let revision = increment(state.revision)?;
     let loss_epoch = if reachability == Some(NetworkStatus::Unavailable)
@@ -991,7 +889,7 @@ fn next_snapshot(
         reachability,
         ip_stack,
         observed_at,
-        network_name,
+        network_name: None,
     })
 }
 
@@ -1029,10 +927,9 @@ pub(crate) struct TestNetworkStatusSource {
 impl TestNetworkStatusSource {
     pub(crate) fn publish(&self, status: Option<NetworkStatus>) -> Result<(), NetError> {
         let publication = match status {
-            Some(status) => {
-                self.publisher
-                    .prepare_observation(status, Some(IpStack::None), None)?
-            }
+            Some(status) => self
+                .publisher
+                .prepare_observation(status, Some(IpStack::None))?,
             None => self.publisher.prepare_finish(MonitorState::Stopped)?,
         };
         publication.dispatch()

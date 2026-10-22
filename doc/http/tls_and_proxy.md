@@ -8,7 +8,7 @@ See [TLS providers](../tls.md) for platform setup and dependency choices.
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 ```
 
@@ -27,9 +27,9 @@ using open-net should accept the host's choice rather than install its own globa
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
 precedence and complete examples of both approaches.
 
-The local path assumes your consumer project is beside this checkout's `open-net` directory; adjust it. The examples validate configuration offline. Fallible `with_*` methods that take `self` consume the input configuration on both success and error; `Err(NetError)` does not return the original object. Clone first if you need to retain a previous configuration for another attempt. A real request also needs a reachable server, a valid hostname/certificate chain and, when configured, a working proxy.
+The examples validate configuration offline. Fallible `with_*` methods that take `self` consume the input configuration on both success and error; `Err(NetError)` does not return the original object. Clone first if you need to retain a previous configuration for another attempt. A real request also needs a reachable server, a valid hostname/certificate chain and, when configured, a working proxy.
 
-TLS configuration validates HTTPS peers; it does not by itself prohibit an HTTP redirect target. With the optional `http-client-http2` feature, [`HttpVersionPolicy::Http2Only`](http2.md) requires HTTPS for both the initial URL and followed redirect targets, preventing a connection to a downgraded target or request-body replay there. `Auto` and `Http1Only` do not impose that restriction. This is a request-target policy, so an explicitly configured HTTP proxy can still tunnel an HTTPS request through CONNECT.
+TLS configuration validates HTTPS peers. The separate [transport security and redirect policies](redirects.md) prevent HTTPS-to-HTTP redirects in every HTTP version mode, including builds without the HTTP/2 feature. Redirects are same-origin by default; another origin must be explicitly allowed. These checks run before connecting to a redirect target or replaying its request body. Initial HTTP URLs remain supported under the default transport policy; opt into HTTPS-only when all targets must use HTTPS. [`HttpVersionPolicy::Http2Only`](http2.md) also requires HTTPS. These are request-target policies, so an explicitly configured HTTP proxy can still tunnel an HTTPS request through CONNECT.
 
 ## Cryptographic provider
 
@@ -292,7 +292,7 @@ HttpClientConfig::with_environment_proxy(self, enabled: bool) -> Self
 
 ### Steps
 
-Choose an explicit proxy endpoint and optional Basic credentials, or opt into process proxy settings. Apply configuration before creating a client. A normal default client ignores environment proxies.
+Choose an unauthenticated explicit proxy endpoint, or opt into process proxy settings. Apply configuration before creating a client. A normal default client ignores environment proxies. Review the transport boundary below before using proxy credentials.
 
 ### Parameters
 
@@ -316,6 +316,16 @@ Proxy construction/auth return `Ok(HttpProxyConfig)` or `Err(NetError)`. Client 
 
 Invalid endpoints return `InvalidConfig` for `proxy.url`; invalid credential lengths return `InvalidConfig` for `proxy.credentials`. This explicit API accepts neither HTTPS proxy URLs nor SOCKS endpoints. Credentials are kept out of `Debug`; origin Basic/Bearer authentication is configured separately.
 
+An HTTP proxy connection has no TLS protection between this client and the
+proxy. `with_basic_auth` sends reversible Basic credentials on that connection,
+including during CONNECT for an HTTPS destination. TLS to the destination does
+not protect that earlier proxy authentication exchange. `HttpsOnly` applies to
+request targets and does not secure an HTTP proxy hop. This HTTP proxy API has
+no HTTPS-proxy constructor or WebSocket-style `RequireTls` policy; do not assume
+the [WebSocket proxy guarantees](../ws_proxy_migration.md) apply here. Keep
+credentials off this connection unless the application has separately secured
+and accepted its deployment boundary. The example below supplies no credentials.
+
 With this crate's minimal `http-client` dependency features, automatic discovery reads environment proxy settings; it does not include native operating-system proxy discovery. The cached transport enables native macOS/Windows discovery only when the unified dependency graph enables `hyper-util/client-proxy-system` (for example through `reqwest/system-proxy`). Therefore `with_environment_proxy(true)` is not a promise to use operating-system network settings.
 
 `with_proxy` replaces the explicit proxy. `with_environment_proxy(false)` suppresses implicit proxies but does not disable an explicit proxy. The explicit proxy is installed after the environment setting and disables the underlying transport's automatic proxy discovery, so it takes precedence even if `environment_proxy` is true. To remove an explicit proxy before constructing a client, set the public `config.proxy = None`. Actual connection, CONNECT authentication, DNS and TLS failures occur during requests and return transport `NetError`s. The dedicated connect timeout covers proxy setup too.
@@ -327,8 +337,7 @@ use open_net::api::http::{HttpClientConfig, HttpProxyConfig};
 use open_net::NetError;
 
 fn main() -> Result<(), NetError> {
-    let proxy = HttpProxyConfig::http("http://127.0.0.1:8080")?
-        .with_basic_auth("demo-user", "demo-password")?;
+    let proxy = HttpProxyConfig::http("http://127.0.0.1:8080")?;
     let config = HttpClientConfig::new("https://example.com/")?
         .with_proxy(proxy).with_environment_proxy(false);
     config.validate()?;
@@ -644,7 +653,9 @@ HttpProxyConfig::with_basic_auth(self, username: impl Into<String>, password: im
 
 ### Steps
 
-Parse a proxy endpoint first, attach proxy credentials, and install the returned proxy configuration.
+Review the [HTTP proxy transport boundary](#explicit-and-environment-proxies)
+before attaching credentials. Parsing a proxy endpoint and attaching credentials
+does not establish an encrypted connection.
 
 ### Parameters
 
@@ -660,11 +671,24 @@ None.
 
 ### Errors and behavior
 
-Invalid lengths return `InvalidConfig` for `proxy.credentials`, consuming the original configuration. Credentials are omitted from Debug. This configures proxy authentication independently of origin Basic/Bearer auth; success does not prove the proxy will accept them.
+Invalid lengths return `InvalidConfig` for `proxy.credentials`, consuming the original configuration. Credentials are omitted from Debug. This configures proxy authentication independently of origin Basic/Bearer auth; success does not prove the proxy will accept them or protect their transmission. The explicit proxy connection uses unencrypted HTTP, even when the request destination uses HTTPS.
 
 ### Example
 
-See the [complete proxy program](#explicit-and-environment-proxies), which calls `.with_basic_auth("demo-user", "demo-password")`.
+This configuration-only example uses demonstration values and sends no request.
+It demonstrates the setter, not a secure credential transport. The
+[complete proxy program](#explicit-and-environment-proxies) uses no credentials.
+
+```rust
+use open_net::api::http::HttpProxyConfig;
+use open_net::NetError;
+
+fn main() -> Result<(), NetError> {
+    let _configuration = HttpProxyConfig::http("http://proxy.example.com:8080")?
+        .with_basic_auth("demo-user", "demo-password")?;
+    Ok(())
+}
+```
 
 ## `HttpClientConfig::with_proxy()`
 

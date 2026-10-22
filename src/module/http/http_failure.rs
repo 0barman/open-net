@@ -5,7 +5,7 @@
 
 use super::connect_timeout::ConnectTimedOut;
 use crate::api::error::{ErrorContext, ErrorKind, ErrorStage, NetError};
-use crate::api::http::{RetryReason, TimeoutPhase, TransportErrorKind};
+use crate::api::http::{HttpRedirectError, RetryReason, TimeoutPhase, TransportErrorKind};
 use std::error::Error;
 use std::fmt;
 
@@ -58,6 +58,8 @@ struct Causes {
 }
 
 impl Causes {
+    /// Recognize a transport failure while reading an already received response.
+    /// These causes alone do not distinguish request writes from response reads.
     fn http_transfer(&self) -> bool {
         // A decoder can produce UnexpectedEof even when HTTP framing completed.
         // Require the HTTP transport boundary before enabling body replay.
@@ -65,8 +67,26 @@ impl Causes {
     }
 }
 
-fn is_response_transport_boundary(causes: &Causes, response_boundary: bool) -> bool {
-    response_boundary && causes.http_transfer()
+/// Evidence supplied by the call site, independently of dependency error causes.
+/// `Execute` spans connection setup, request writes, and waiting for a response;
+/// it supplies neither a read/write stage nor proof of request delivery.
+#[derive(Clone, Copy)]
+enum FailureBoundary {
+    Local(ErrorStage),
+    Execute,
+    ResponseBody,
+}
+
+impl FailureBoundary {
+    /// Return only a stage established by the SDK call site, not a guessed
+    /// direction for the combined request/response execution future.
+    fn stage(self) -> Option<ErrorStage> {
+        match self {
+            Self::Local(stage) => Some(stage),
+            Self::Execute => None,
+            Self::ResponseBody => Some(ErrorStage::Receive),
+        }
+    }
 }
 
 /// Walk both standard sources and io's retained inner error. The latter is not
@@ -183,27 +203,30 @@ fn inspect_causes(error: &(dyn Error + 'static)) -> Causes {
     causes
 }
 
+/// Map local configuration/request-building failures at a known SDK stage.
+/// HTTP dispatch failures must use `map_execute_error`: a caller-supplied stage
+/// is not evidence that request bytes were (or were not) sent.
 pub(crate) fn map_reqwest_error(error: reqwest::Error, stage: ErrorStage) -> NetError {
-    classify(error, stage, false, false)
+    classify(error, FailureBoundary::Local(stage))
 }
 
-/// Map an error returned while waiting for `Client::execute` to produce a
-/// response.  `execute` reports peer disconnects before response headers as a
-/// request error, but the request has already crossed the transport boundary;
-/// callers need the response receive stage for retry and observer decisions.
-pub(crate) fn map_response_error(error: reqwest::Error) -> NetError {
-    // `Client::execute` can fail while writing a request body.  Keep that
-    // failure at Write unless hyper proves that the HTTP transport boundary
-    // was reached and the peer closed while a response was pending.
+/// Map every `Client::execute` failure, including redirects and stream opening.
+/// Before a response is returned, reqwest does not reliably distinguish request
+/// writes from waiting for headers. Unlocated I/O failures and timeouts therefore
+/// retain their cause kind but use DeliveryUnknown and no stage. Typed DNS,
+/// connect, TLS, proxy and protocol evidence still takes precedence. In
+/// particular, hyper's user-body-abort predicate is not a network-write predicate,
+/// and a keepalive timeout does not prove that the request was never sent.
+pub(crate) fn map_execute_error(error: reqwest::Error) -> NetError {
     let causes = inspect_causes(&error);
     let is_request = error.is_request();
     let is_body = error.is_body();
-    let mapped = classify(error, ErrorStage::Write, false, true);
+    let mapped = classify(error, FailureBoundary::Execute);
     // Keep the diagnostic event structured and bounded; reqwest's Debug output
     // may contain the request URL and transport details.
     crate::log_e!(
         crate::LogType::HTTP;
-        "map_response_error",
+        "map_execute_error",
         "error_kind|stage|body_write_aborted|hyper|transport|http_transfer|request|body|protocol",
         format!("{:?}", mapped.kind()),
         format!("{:?}", mapped.context().stage),
@@ -218,8 +241,11 @@ pub(crate) fn map_response_error(error: reqwest::Error) -> NetError {
     mapped
 }
 
+/// Map errors reading a response body after response headers were obtained.
+/// Only this call site provides the response evidence needed for BodyRead;
+/// malformed payloads without a transport failure remain protocol failures.
 pub(crate) fn map_body_error(error: reqwest::Error) -> NetError {
-    classify(error, ErrorStage::Receive, true, false)
+    classify(error, FailureBoundary::ResponseBody)
 }
 
 /// Only SDK-owned connector timers carry this marker. Generic reqwest or I/O
@@ -228,48 +254,60 @@ pub(crate) fn connect_timeout_deadline(error: &NetError) -> Option<tokio::time::
     inspect_causes(error).connect_timeout
 }
 
-fn classify(
-    error: reqwest::Error,
-    stage: ErrorStage,
-    body: bool,
-    response_boundary: bool,
-) -> NetError {
+/// Preserve typed causes and the call site's actual evidence in one classification.
+/// ErrorStage describes where a failure was observed, not remote delivery state.
+/// Only SDK-owned timers set a timeout phase; dependency timeouts must not acquire
+/// an SDK budget or TimeoutBeforeSend merely from a stage or error message.
+fn classify(error: reqwest::Error, boundary: FailureBoundary) -> NetError {
     let causes = inspect_causes(&error);
+    let stage = boundary.stage();
     let (kind, stage, reason) = if causes.connect_timeout.is_some() {
         (
             ErrorKind::TimedOut,
-            ErrorStage::Write,
+            Some(ErrorStage::Write),
             RetryReason::Transport(TransportErrorKind::Connect),
         )
     } else if causes.boundary == Boundary::Dns {
         (
             ErrorKind::Dns,
-            ErrorStage::Dns,
+            Some(ErrorStage::Dns),
             RetryReason::Transport(TransportErrorKind::Dns),
         )
     } else if causes.boundary == Boundary::ProxyAuth {
         (
             ErrorKind::HttpStatus,
-            ErrorStage::Proxy,
+            Some(ErrorStage::Proxy),
             RetryReason::HttpStatus(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED),
         )
     } else if causes.tls {
         (
             ErrorKind::Tls,
-            ErrorStage::Tls,
+            Some(ErrorStage::Tls),
             RetryReason::Transport(TransportErrorKind::Tls),
         )
     } else if error.is_timeout() {
-        let reason = if stage == ErrorStage::Write {
-            TransportErrorKind::TimeoutBeforeSend
+        let (stage, reason) = if error.is_connect() {
+            (
+                Some(if causes.tunnel {
+                    ErrorStage::Proxy
+                } else {
+                    ErrorStage::Tcp
+                }),
+                TransportErrorKind::Connect,
+            )
+        } else if matches!(boundary, FailureBoundary::ResponseBody) {
+            // Preserve the existing response-body timeout policy. Delivery
+            // uncertainty here is reserved for execution before a response;
+            // SDK-owned body budgets are handled separately by timeout_phase.
+            (stage, TransportErrorKind::ReadReset)
         } else {
-            TransportErrorKind::ReadReset
+            (stage, TransportErrorKind::DeliveryUnknown)
         };
         (ErrorKind::TimedOut, stage, RetryReason::Transport(reason))
     } else if error.is_builder() {
         (
             ErrorKind::InvalidInput,
-            ErrorStage::RequestBuild,
+            Some(ErrorStage::RequestBuild),
             RetryReason::Application,
         )
     } else if error.is_redirect()
@@ -280,7 +318,7 @@ fn classify(
         // HTTPS-only policy rejection before the next connection is attempted.
         (
             ErrorKind::Protocol,
-            ErrorStage::Receive,
+            Some(ErrorStage::Receive),
             RetryReason::Transport(TransportErrorKind::Protocol),
         )
     } else if error.is_connect() {
@@ -291,23 +329,22 @@ fn classify(
         };
         (
             ErrorKind::Io,
-            stage,
+            Some(stage),
             RetryReason::Transport(TransportErrorKind::Connect),
         )
-    } else if body && causes.http_transfer() {
-        (ErrorKind::Io, ErrorStage::Receive, RetryReason::BodyRead)
-    } else if is_response_transport_boundary(&causes, response_boundary) {
+    } else if matches!(boundary, FailureBoundary::ResponseBody) && causes.http_transfer() {
         (
             ErrorKind::Io,
-            ErrorStage::Receive,
-            RetryReason::Transport(TransportErrorKind::ReadReset),
+            Some(ErrorStage::Receive),
+            RetryReason::BodyRead,
         )
     } else if causes.transport || error.is_request() || error.is_body() {
-        (
-            ErrorKind::Io,
-            stage,
-            RetryReason::Transport(TransportErrorKind::ReadReset),
-        )
+        let reason = if matches!(boundary, FailureBoundary::Execute) {
+            TransportErrorKind::DeliveryUnknown
+        } else {
+            TransportErrorKind::ReadReset
+        };
+        (ErrorKind::Io, stage, RetryReason::Transport(reason))
     } else {
         (
             ErrorKind::Protocol,
@@ -316,7 +353,7 @@ fn classify(
         )
     };
     let mut context = ErrorContext::default();
-    context.stage = Some(stage);
+    context.stage = stage;
     if causes.connect_timeout.is_some() {
         context.http_timeout_phase = Some(TimeoutPhase::Connect);
     }
@@ -334,6 +371,15 @@ fn classify(
 }
 
 pub(crate) fn trusted_retry_reason(error: &NetError) -> Option<RetryReason> {
+    // A local redirect decision is terminal even when callers opt in to retrying
+    // protocol transport failures. Re-sending the initial request cannot change
+    // the policy, and may repeat a side effect or sensitive upload.
+    if error
+        .source()
+        .is_some_and(|source| source.is::<HttpRedirectError>())
+    {
+        return Some(RetryReason::Application);
+    }
     // Preserve a caller-selected terminal boundary such as ProviderFailed or
     // Cancelled, even when its retained source happens to contain an HTTP error.
     if !matches!(
@@ -393,17 +439,16 @@ pub(crate) fn trusted_retry_reason(error: &NetError) -> Option<RetryReason> {
     }
 }
 
-/// Public error queries without execution evidence keep the legacy transport
-/// interpretation. In particular Receive alone cannot enable dedicated BodyRead.
+/// Interpret errors lacking saved execution evidence for internal policy queries.
+/// Retain legacy I/O categories, but never infer a pre-send timeout from Write:
+/// a stage is not delivery evidence. Receive alone cannot enable dedicated
+/// BodyRead either. Real HTTP execution errors use their saved reason instead.
 pub(crate) fn fallback_retry_reason(error: &NetError) -> Option<RetryReason> {
     let reason = match error.kind() {
         ErrorKind::Dns => TransportErrorKind::Dns,
         ErrorKind::Tls => TransportErrorKind::Tls,
         ErrorKind::DeliveryUnknown => TransportErrorKind::DeliveryUnknown,
-        ErrorKind::TimedOut => match error.context().stage {
-            Some(ErrorStage::Write) => TransportErrorKind::TimeoutBeforeSend,
-            _ => TransportErrorKind::ReadReset,
-        },
+        ErrorKind::TimedOut => TransportErrorKind::DeliveryUnknown,
         ErrorKind::Io => match error.context().stage {
             Some(ErrorStage::Dns) => TransportErrorKind::Dns,
             Some(ErrorStage::Tcp | ErrorStage::Proxy) => TransportErrorKind::Connect,
@@ -426,7 +471,8 @@ pub(crate) fn retry_reason_for_error(error: &NetError) -> RetryReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::http::{Backoff, RetryOn, RetryPolicy};
+    use crate::api::http::{HttpRetryPolicy, RetryOn};
+    use crate::api::retry::RetrySchedule;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower_service::Service;
@@ -439,6 +485,34 @@ mod tests {
         } else {
             Err(io::Error::other(message).into())
         }
+    }
+
+    #[test]
+    fn redirect_policy_rejections_are_terminal_even_with_protocol_retries() -> TestResult {
+        let policy = HttpRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(3).build()?)
+            .retry_on(RetryOn::none().with_transport([TransportErrorKind::Protocol]))
+            .build()?;
+        check(
+            policy.should_retry_error(
+                &NetError::from(ErrorKind::Protocol).with_stage(ErrorStage::Receive),
+            ),
+            "protocol transport opt-in stopped working",
+        )?;
+        for reason in [
+            HttpRedirectError::InsecureTarget,
+            HttpRedirectError::OriginNotAllowed,
+            HttpRedirectError::TooManyRedirects,
+            HttpRedirectError::InvalidLocation,
+        ] {
+            let error = NetError::protocol(reason).with_stage(ErrorStage::Receive);
+            check(
+                !policy.should_retry_error(&error)
+                    && retry_reason_for_error(&error) == RetryReason::Application,
+                "redirect policy rejection was classified as a retriable transport failure",
+            )?;
+        }
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -565,12 +639,12 @@ mod tests {
 
     #[test]
     fn queries_without_execution_metadata_preserve_transport_fallback() -> TestResult {
-        let body_only = RetryPolicy::builder()
-            .max_attempts(2)
+        let body_only = HttpRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
             .retry_on(RetryOn::none().with_body_read(true))
             .build()?;
-        let legacy = RetryPolicy::builder()
-            .max_attempts(2)
+        let legacy = HttpRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
             .retry_on(RetryOn::none().with_transport([TransportErrorKind::BodyRead]))
             .build()?;
         for stage in [ErrorStage::Receive, ErrorStage::Response] {
@@ -601,12 +675,12 @@ mod tests {
             (
                 ErrorKind::TimedOut,
                 ErrorStage::Write,
-                TransportErrorKind::TimeoutBeforeSend,
+                TransportErrorKind::DeliveryUnknown,
             ),
             (
                 ErrorKind::TimedOut,
                 ErrorStage::Receive,
-                TransportErrorKind::ReadReset,
+                TransportErrorKind::DeliveryUnknown,
             ),
             (ErrorKind::Tls, ErrorStage::Tls, TransportErrorKind::Tls),
             (
@@ -615,9 +689,8 @@ mod tests {
                 TransportErrorKind::Protocol,
             ),
         ] {
-            let selected = RetryPolicy::builder()
-                .max_attempts(2)
-                .backoff(Backoff::None)
+            let selected = HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(2).build()?)
                 .retry_on(RetryOn::none().with_transport([reason]))
                 .build()?;
             check(
@@ -709,28 +782,22 @@ mod tests {
     }
 
     #[test]
-    fn response_boundary_only_promotes_http_transport_errors() -> TestResult {
-        let http_transport = Causes {
-            hyper: true,
-            transport: true,
-            ..Causes::default()
-        };
-        check(
-            is_response_transport_boundary(&http_transport, true),
-            "HTTP incomplete transport was not recognized at the response boundary",
-        )?;
-        check(
-            !is_response_transport_boundary(&http_transport, false),
-            "request-side mapping acquired response-boundary semantics",
-        )?;
-        let request_transport = Causes {
-            transport: true,
-            ..Causes::default()
-        };
-        check(
-            !is_response_transport_boundary(&request_transport, true),
-            "generic request transport error was promoted to Receive",
-        )
+    fn timeout_fallback_never_infers_unsent_delivery_from_a_stage() -> TestResult {
+        let pre_send = HttpRetryPolicy::builder()
+            .retry_on(RetryOn::none().with_transport([TransportErrorKind::TimeoutBeforeSend]))
+            .build()?;
+        for stage in [None, Some(ErrorStage::Write), Some(ErrorStage::Receive)] {
+            let mut context = ErrorContext::default();
+            context.stage = stage;
+            let error = NetError::from(ErrorKind::TimedOut).with_context(context);
+            check(
+                !pre_send.should_retry_error(&error)
+                    && retry_reason_for_error(&error)
+                        == RetryReason::Transport(TransportErrorKind::DeliveryUnknown),
+                "a timeout without execution evidence acquired pre-send semantics",
+            )?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -744,11 +811,14 @@ mod tests {
         )
         .with_stage(ErrorStage::Receive);
         check(
-            !RetryPolicy::standard().should_retry_error(&error),
+            !HttpRetryPolicy::builder()
+                .retry_on(RetryOn::standard())
+                .build()?
+                .should_retry_error(&error),
             "default query retried typed certificate error",
         )?;
-        let explicit = RetryPolicy::builder()
-            .max_attempts(2)
+        let explicit = HttpRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
             .retry_on(RetryOn::none().with_transport([TransportErrorKind::Tls]))
             .build()?;
         check(
@@ -759,8 +829,8 @@ mod tests {
 
     #[test]
     fn query_preserves_explicit_provider_and_cancelled_boundaries() -> TestResult {
-        let policy = RetryPolicy::builder()
-            .max_attempts(2)
+        let policy = HttpRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
             .retry_on(RetryOn::none().with_transport([TransportErrorKind::Tls]))
             .build()?;
         for kind in [
@@ -783,51 +853,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_setter_orders_preserve_independent_reason_sets() -> TestResult {
-        for (toggles, expected) in [
-            (&[false][..], false),
-            (&[true][..], true),
-            (&[false, true][..], true),
-            (&[true, false][..], false),
-            (&[false, false][..], false),
-            (&[true, true][..], true),
-            (&[false, true, false][..], false),
-        ] {
-            let mut policy = RetryPolicy::standard();
-            for enabled in toggles {
-                policy = policy.with_transport_errors(*enabled);
-            }
-            check(
-                policy.should_retry_reason(RetryReason::Transport(TransportErrorKind::BodyRead))
-                    == expected,
-                "legacy toggle order changed transport set",
-            )?;
-            if toggles.contains(&false) {
-                check(
-                    !policy.retry_on().retries_body_read(),
-                    "legacy enable reset body flag",
-                )?;
-            }
-            check(
-                policy.should_retry_status(http::StatusCode::SERVICE_UNAVAILABLE),
-                "transport toggle changed statuses",
-            )?;
-        }
-        let tls = RetryPolicy::builder()
-            .max_attempts(2)
-            .retry_on(RetryOn::none().with_transport([TransportErrorKind::Tls]))
-            .build()?
-            .with_transport_errors(true);
+    fn reason_sets_can_be_replaced_independently() -> TestResult {
+        let selected = RetryOn::standard()
+            .with_transport([TransportErrorKind::Tls])
+            .with_body_read(false);
+        let policy = HttpRetryPolicy::builder().retry_on(selected).build()?;
         check(
-            tls.retry_on().transport() == [TransportErrorKind::Tls],
-            "legacy enable overwrote explicit set",
+            policy.retry_on().transport() == [TransportErrorKind::Tls],
+            "transport replacement lost explicit TLS",
         )?;
         check(
-            RetryPolicy::no_retry()
-                .with_transport_errors(true)
-                .max_attempts()
-                == 1,
-            "legacy enable altered attempt budget",
+            !policy.retry_on().retries_body_read(),
+            "transport replacement changed body setting",
+        )?;
+        check(
+            policy.should_retry_status(http::StatusCode::SERVICE_UNAVAILABLE),
+            "transport replacement changed status setting",
+        )?;
+        check(
+            policy.schedule().max_attempts() == 1,
+            "reason selection altered attempt budget",
         )
     }
 }

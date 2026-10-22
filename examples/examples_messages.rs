@@ -1,6 +1,7 @@
 //! Run against a WebSocket echo server: cargo run --example examples_messages -- ws://host/echo
 use open_net::{
     network::{NetworkConfig, TlsConfig},
+    ws::Message,
     BoxError, OpenNet,
 };
 use std::sync::Arc;
@@ -20,7 +21,15 @@ async fn main() -> Result<(), BoxError> {
 
     session.sender().send("hello").await?;
     if let Some(incoming) = messages.recv().await? {
-        println!("{:?}", incoming.message());
+        if let Some(message) = incoming.message() {
+            let kind = match message {
+                Message::Text(_) => "text",
+                Message::Binary(_) => "binary",
+            };
+            println!("received message: kind={kind} bytes={}", message.len());
+        } else {
+            println!("received protocol control frame");
+        }
     }
 
     session.close().await?;

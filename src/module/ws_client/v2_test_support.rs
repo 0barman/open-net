@@ -117,6 +117,7 @@ pub(crate) fn unconnected(
             config.queues.urgent.max_bytes,
         )?,
         CancellationToken::new(),
+        Arc::new(config.clone()),
     );
     Ok((runtime, journal))
 }
@@ -173,6 +174,7 @@ pub(crate) fn queued(sequence: u64, options: SendOptions) -> Result<QueuedReques
     let core = operation(&options, false, sequence)?;
     core.enqueue()?;
     Ok(QueuedRequest {
+        ready_at: None,
         registration: None,
         message: tokio_tungstenite::tungstenite::Message::Text(sequence.to_string().into()),
         config: options,

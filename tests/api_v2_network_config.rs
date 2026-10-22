@@ -1,8 +1,8 @@
 #![cfg(feature = "ws-client")]
 
 use open_net::network::{
-    ClientIdentity, NetworkConfig, NetworkStatusPolicy, ProxyBasicAuth, ProxyConfig,
-    RootCertificateMode, TlsConfig,
+    ClientIdentity, NetworkConfig, NetworkStatusPolicy, ProxyAuthTransportPolicy, ProxyBasicAuth,
+    ProxyConfig, RootCertificateMode, TlsConfig,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -34,6 +34,10 @@ fn defaults_are_observable_and_validate_without_changing_policy() -> TestResult 
         "direct proxy has no authentication",
     )?;
     check(
+        config.proxy().proxy_tls().is_none() && config.proxy().auth_transport_policy().is_none(),
+        "direct proxy has no TLS or authentication transport policy",
+    )?;
+    check(
         config.tls().root_mode() == RootCertificateMode::Append,
         "default TLS must retain WebPKI roots",
     )?;
@@ -62,12 +66,21 @@ fn proxy_endpoint_is_normalized_owned_and_separate_from_credentials() -> TestRes
         let url = String::from("http://Proxy.Example:0080/");
         let username = String::from("network-api-user");
         let password = String::from("network-api-password");
-        ProxyConfig::http_connect(&url, Some(ProxyBasicAuth::new(&username, &password)?))?
+        ProxyConfig::http_connect_with_auth_policy(
+            &url,
+            Some(ProxyBasicAuth::new(&username, &password)?),
+            ProxyAuthTransportPolicy::AllowPlaintext,
+        )?
     };
     check(!proxy.is_direct(), "HTTP CONNECT proxy must not be direct")?;
     check(
         proxy.is_authenticated(),
         "authentication must remain configured",
+    )?;
+    check(
+        proxy.auth_transport_policy() == Some(ProxyAuthTransportPolicy::AllowPlaintext)
+            && proxy.proxy_tls().is_none(),
+        "explicit plaintext exception must remain observable",
     )?;
     check(
         proxy.endpoint() == Some("http://proxy.example:80"),
@@ -211,9 +224,10 @@ fn observing_configuration_does_not_change_secret_redaction() -> TestResult {
     let auth = ProxyBasicAuth::new("network-api-user", "network-api-password")?;
     let identity = ClientIdentity::from_pem(CLIENT, CLIENT_KEY)?;
     let config = NetworkConfig::default()
-        .with_proxy(ProxyConfig::http_connect(
+        .with_proxy(ProxyConfig::http_connect_with_auth_policy(
             "http://private-proxy.example:8080",
             Some(auth.clone()),
+            ProxyAuthTransportPolicy::AllowPlaintext,
         )?)
         .with_tls(TlsConfig::default().with_client_identity(identity.clone()));
     config.validate()?;
@@ -285,6 +299,200 @@ fn invalid_network_configuration_reports_fields_without_exposing_input() -> Test
         )?;
     }
     Ok(())
+}
+
+#[test]
+fn plaintext_proxy_authentication_requires_explicit_exception() -> TestResult {
+    check(
+        ProxyAuthTransportPolicy::default() == ProxyAuthTransportPolicy::RequireTls,
+        "authentication transport policy must default to TLS",
+    )?;
+    let auth = ProxyBasicAuth::new("network-api-user", "network-api-password")?;
+    for url in [
+        "http://proxy.example",
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://[::1]",
+        "http://192.168.1.1",
+    ] {
+        for rejected in [
+            ProxyConfig::http_connect(url, Some(auth.clone())),
+            ProxyConfig::http_connect_with_auth_policy(
+                url,
+                Some(auth.clone()),
+                ProxyAuthTransportPolicy::RequireTls,
+            ),
+        ] {
+            let error = rejected
+                .err()
+                .ok_or_else(|| std::io::Error::other("plaintext authentication was accepted"))?;
+            check(
+                error.kind() == open_net::error::ErrorKind::InvalidConfig
+                    && error
+                        .config_error()
+                        .is_some_and(|detail| detail.field() == "proxy.auth_transport_policy"),
+                "plaintext credentials must fail with an actionable policy field",
+            )?;
+            let rendered = format!("{error} {error:?}");
+            check(
+                !rendered.contains("network-api-user")
+                    && !rendered.contains("network-api-password"),
+                "policy errors must not expose credentials",
+            )?;
+        }
+        let proxy = ProxyConfig::http_connect_with_auth_policy(
+            url,
+            Some(auth.clone()),
+            ProxyAuthTransportPolicy::AllowPlaintext,
+        )?;
+        NetworkConfig::default().with_proxy(proxy).validate()?;
+        let unauthenticated = ProxyConfig::http_connect(url, None)?;
+        check(
+            unauthenticated.auth_transport_policy() == Some(ProxyAuthTransportPolicy::RequireTls),
+            "unauthenticated HTTP must preserve the safe default policy",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn https_proxy_urls_are_normalized_and_enforce_their_scheme() -> TestResult {
+    let auth = ProxyBasicAuth::new("network-api-user", "network-api-password")?;
+    for (url, expected) in [
+        ("https://Proxy.Example", "https://proxy.example:443"),
+        ("https://Proxy.Example:00443/", "https://proxy.example:443"),
+        ("https://[::1]:8443/", "https://[::1]:8443"),
+    ] {
+        let proxy = ProxyConfig::https_connect(url, Some(auth.clone()), TlsConfig::default())?;
+        check(
+            proxy.endpoint() == Some(expected)
+                && proxy.is_authenticated()
+                && proxy.proxy_tls().is_some()
+                && proxy.auth_transport_policy() == Some(ProxyAuthTransportPolicy::RequireTls),
+            "HTTPS proxy must normalize its endpoint and retain its independent TLS policy",
+        )?;
+        NetworkConfig::default().with_proxy(proxy).validate()?;
+    }
+    for url in [
+        "http://proxy.example",
+        "https://user:secret@proxy.example",
+        "https://proxy.example:0",
+        "https://proxy.example:65536",
+        "https://proxy.example:",
+        "https://proxy.example:not-a-port",
+        "https://proxy.example/path",
+        "https://proxy.example?query",
+        "https://proxy.example/#fragment",
+        "https://[not-ipv6]",
+    ] {
+        let error = ProxyConfig::https_connect(url, None, TlsConfig::default())
+            .err()
+            .ok_or_else(|| std::io::Error::other("invalid HTTPS proxy URL succeeded"))?;
+        check(
+            error
+                .config_error()
+                .is_some_and(|detail| detail.field() == "proxy.url"),
+            "HTTPS URL restrictions must identify proxy.url",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn proxy_and_target_tls_getters_preserve_independent_configuration() -> TestResult {
+    use std::sync::Arc;
+
+    let proxy_provider = Arc::new(rustls_openssl::default_provider());
+    let target_provider = Arc::new(rustls_openssl::default_provider());
+    let proxy_tls = TlsConfig::default()
+        .with_crypto_provider(Arc::clone(&proxy_provider))
+        .with_root_certificates([CA, OTHER_CA].concat(), RootCertificateMode::Replace)?;
+    let target_tls = TlsConfig::default()
+        .with_crypto_provider(Arc::clone(&target_provider))
+        .with_root_certificates(CA, RootCertificateMode::Append)?
+        .with_client_identity(ClientIdentity::from_pem(CLIENT, CLIENT_KEY)?);
+    let config = NetworkConfig::default()
+        .with_proxy(ProxyConfig::https_connect(
+            "https://private-proxy.example:8443",
+            Some(ProxyBasicAuth::new(
+                "network-api-user",
+                "network-api-password",
+            )?),
+            proxy_tls,
+        )?)
+        .with_tls(target_tls);
+    config.validate()?;
+    let proxy_tls = config
+        .proxy()
+        .proxy_tls()
+        .ok_or_else(|| std::io::Error::other("HTTPS proxy TLS configuration missing"))?;
+    check(
+        proxy_tls.custom_root_count() == 2
+            && proxy_tls.root_mode() == RootCertificateMode::Replace
+            && proxy_tls.client_identity().is_none()
+            && proxy_tls
+                .crypto_provider()
+                .is_some_and(|provider| Arc::ptr_eq(provider, &proxy_provider)),
+        "proxy roots, identity, and provider must be independent from target TLS",
+    )?;
+    check(
+        config.tls().custom_root_count() == 1
+            && config.tls().root_mode() == RootCertificateMode::Append
+            && config.tls().client_identity().is_some()
+            && config
+                .tls()
+                .crypto_provider()
+                .is_some_and(|provider| Arc::ptr_eq(provider, &target_provider)),
+        "target TLS must retain its separate trust, identity, and provider",
+    )?;
+    let replaced = config.clone().with_tls(TlsConfig::default());
+    check(
+        replaced
+            .proxy()
+            .proxy_tls()
+            .is_some_and(|tls| tls.custom_root_count() == 2)
+            && replaced.tls().custom_root_count() == 0,
+        "replacing target TLS must preserve the proxy's TLS policy",
+    )?;
+    let debug = format!("{config:?}");
+    for sensitive in [
+        "private-proxy.example",
+        "network-api-user",
+        "network-api-password",
+        "PRIVATE KEY",
+        "BEGIN CERTIFICATE",
+    ] {
+        check(
+            !debug.contains(sensitive),
+            "HTTPS proxy Debug must redact credentials, endpoint, and certificate material",
+        )?;
+    }
+    check(
+        debug.contains("HttpsConnect"),
+        "Debug must distinguish HTTPS CONNECT",
+    )
+}
+
+#[test]
+fn proxy_identity_validation_reports_proxy_tls_role() -> TestResult {
+    let mismatch =
+        ClientIdentity::from_pem(CLIENT, include_bytes!("fixtures/network/server-key.pem"))?;
+    let proxy = ProxyConfig::https_connect(
+        "https://proxy.example",
+        None,
+        TlsConfig::default().with_client_identity(mismatch),
+    )?;
+    let error = NetworkConfig::default()
+        .with_proxy(proxy)
+        .validate()
+        .err()
+        .ok_or_else(|| std::io::Error::other("mismatched proxy identity succeeded"))?;
+    check(
+        error
+            .config_error()
+            .is_some_and(|detail| detail.field() == "proxy.tls.client_identity.private_key"),
+        "proxy identity error must identify the proxy TLS role",
+    )
 }
 
 #[path = "support/crypto_provider.rs"]

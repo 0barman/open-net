@@ -1,7 +1,6 @@
 //! Independently inherited HTTP timeout settings.
 
 use crate::api::error::NetError;
-use crate::api::http::retry::RetryPolicy;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -170,15 +169,11 @@ impl HttpTimeouts {
         &self,
         request: &Self,
         legacy_timeout: Duration,
-        policy: &RetryPolicy,
     ) -> Result<ResolvedTimeouts, NetError> {
         self.validate()?;
         request.validate_request()?;
         validate_duration(legacy_timeout, "http.timeout", false)?;
-        let legacy_attempt = match policy.attempt_timeout() {
-            Some(timeout) => Some(legacy_timeout.min(timeout)),
-            None => Some(legacy_timeout),
-        };
+        let legacy_attempt = Some(legacy_timeout);
         let resolved = ResolvedTimeouts {
             admission: request
                 .admission
@@ -186,7 +181,7 @@ impl HttpTimeouts {
             headers: request.headers.resolve(self.headers, None),
             idle_read: request.idle_read.resolve(self.idle_read, None),
             attempt: request.attempt.resolve(self.attempt, legacy_attempt),
-            total: request.total.resolve(self.total, policy.total_deadline()),
+            total: request.total.resolve(self.total, None),
         };
         resolved.as_overrides().validate()?;
         Ok(resolved)
@@ -251,15 +246,12 @@ mod tests {
 
     #[test]
     fn inheritance_is_per_field_and_explicit_disable_replaces_legacy() -> TestResult {
-        let policy = RetryPolicy::builder()
-            .attempt_timeout(Duration::from_secs(7))
-            .total_deadline(Duration::from_secs(60))
-            .build()?;
         let client = HttpTimeouts::new()
+            .with_attempt_timeout(Duration::from_secs(7))
             .with_headers_timeout(Duration::from_secs(5))
             .with_total_timeout(Duration::from_secs(30));
         let request = HttpTimeouts::new().with_total_timeout(Duration::from_secs(8));
-        let resolved = client.resolve(&request, Duration::from_secs(30), &policy)?;
+        let resolved = client.resolve(&request, Duration::from_secs(30))?;
         check(
             resolved
                 == ResolvedTimeouts {
@@ -276,7 +268,6 @@ mod tests {
                 .without_attempt_timeout()
                 .without_total_timeout(),
             Duration::from_secs(30),
-            &policy,
         )?;
         check(
             disabled.attempt.is_none()
@@ -286,11 +277,7 @@ mod tests {
         )?;
         let frozen = HttpTimeouts::new()
             .with_admission_timeout(Duration::from_secs(1))
-            .resolve(
-                &resolved.as_overrides(),
-                Duration::from_secs(2),
-                &RetryPolicy::no_retry(),
-            )?;
+            .resolve(&resolved.as_overrides(), Duration::from_secs(2))?;
         check(
             frozen == resolved,
             "resolved overrides must freeze inherited and disabled values",
@@ -303,11 +290,9 @@ mod tests {
             let client = HttpClientConfig::new("http://127.0.0.1")?
                 .with_timeout(attempt)?
                 .with_timeouts(HttpTimeouts::new().with_headers_timeout(Duration::from_secs(2)))?;
-            let resolved = client.timeouts().resolve(
-                &HttpTimeouts::new(),
-                client.timeout,
-                &RetryPolicy::no_retry(),
-            )?;
+            let resolved = client
+                .timeouts()
+                .resolve(&HttpTimeouts::new(), client.timeout)?;
             check(
                 resolved.admission == Some(Duration::from_secs(30))
                     && resolved.attempt == Some(attempt),
@@ -328,8 +313,7 @@ mod tests {
             ),
             (HttpTimeouts::new().without_admission_timeout(), None),
         ] {
-            let resolved =
-                client.resolve(&request, Duration::from_secs(8), &RetryPolicy::no_retry())?;
+            let resolved = client.resolve(&request, Duration::from_secs(8))?;
             check(
                 resolved.admission == expected,
                 "request admission override must take precedence over client settings",
@@ -343,11 +327,7 @@ mod tests {
         let client = HttpTimeouts::new()
             .without_admission_timeout()
             .with_total_timeout(Duration::from_secs(2));
-        let inherited = client.resolve(
-            &HttpTimeouts::new(),
-            Duration::from_secs(8),
-            &RetryPolicy::no_retry(),
-        )?;
+        let inherited = client.resolve(&HttpTimeouts::new(), Duration::from_secs(8))?;
         check(
             inherited.admission.is_none() && inherited.total == Some(Duration::from_secs(2)),
             "disabling admission must bypass its fallback without disabling total",
@@ -355,7 +335,6 @@ mod tests {
         let explicit = client.resolve(
             &HttpTimeouts::new().with_admission_timeout(Duration::from_secs(1)),
             Duration::from_secs(8),
-            &RetryPolicy::no_retry(),
         )?;
         check(
             explicit.admission == Some(Duration::from_secs(1)),
@@ -365,18 +344,10 @@ mod tests {
 
     #[test]
     fn resolved_admission_fallback_can_be_frozen_without_reinheriting() -> TestResult {
-        let resolved = HttpTimeouts::new().resolve(
-            &HttpTimeouts::new(),
-            Duration::from_secs(8),
-            &RetryPolicy::no_retry(),
-        )?;
+        let resolved = HttpTimeouts::new().resolve(&HttpTimeouts::new(), Duration::from_secs(8))?;
         let frozen = HttpTimeouts::new()
             .with_admission_timeout(Duration::from_secs(90))
-            .resolve(
-                &resolved.as_overrides(),
-                Duration::from_secs(8),
-                &RetryPolicy::no_retry(),
-            )?;
+            .resolve(&resolved.as_overrides(), Duration::from_secs(8))?;
         check(
             resolved.admission == Some(Duration::from_secs(30)) && frozen == resolved,
             "freezing resolved timeout overrides must retain the default admission budget",
@@ -404,16 +375,11 @@ mod tests {
 
     #[test]
     fn legacy_fallback_and_repeated_installation_are_order_independent() -> TestResult {
-        let policy = RetryPolicy::builder()
-            .attempt_timeout(Duration::from_secs(50))
-            .total_deadline(Duration::from_secs(60))
-            .build()?;
         let inherited =
-            HttpTimeouts::new().resolve(&HttpTimeouts::new(), Duration::from_secs(30), &policy)?;
+            HttpTimeouts::new().resolve(&HttpTimeouts::new(), Duration::from_secs(30))?;
         check(
-            inherited.attempt == Some(Duration::from_secs(30))
-                && inherited.total == Some(Duration::from_secs(60)),
-            "legacy attempt must be the minimum of client and policy limits",
+            inherited.attempt == Some(Duration::from_secs(30)) && inherited.total.is_none(),
+            "client timeout is the only legacy fallback and does not create a total limit",
         )?;
         let client = HttpClientConfig::new("http://127.0.0.1")?
             .with_timeouts(HttpTimeouts::new().with_headers_timeout(Duration::from_secs(1)))?
@@ -421,7 +387,7 @@ mod tests {
             .with_timeout(Duration::from_secs(2))?;
         let resolved = client
             .timeouts()
-            .resolve(&HttpTimeouts::new(), client.timeout, &policy)?;
+            .resolve(&HttpTimeouts::new(), client.timeout)?;
         check(
             resolved.headers.is_none() && resolved.attempt.is_none(),
             "installing a replacement must reset other fields and override later legacy changes",
@@ -434,7 +400,7 @@ mod tests {
         let options = HttpRequestOptions::new()
             .with_timeouts(HttpTimeouts::new().without_attempt_timeout())?
             .with_timeouts(HttpTimeouts::new())?;
-        let resolved = HttpTimeouts::new().resolve(request.timeouts(), client.timeout, &policy)?;
+        let resolved = HttpTimeouts::new().resolve(request.timeouts(), client.timeout)?;
         check(
             resolved.headers.is_none(),
             "request replacement must not merge old fields",
@@ -447,7 +413,7 @@ mod tests {
             .with_total_timeout(Duration::from_secs(1))
             .without_total_timeout()
             .with_total_timeout(Duration::from_secs(4))
-            .resolve(&HttpTimeouts::new(), Duration::from_secs(2), &policy)?;
+            .resolve(&HttpTimeouts::new(), Duration::from_secs(2))?;
         check(
             repeated.total == Some(Duration::from_secs(4)),
             "last setting must win",

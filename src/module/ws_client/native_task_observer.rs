@@ -429,6 +429,15 @@ impl TaskObserverSnapshot {
 }
 
 impl TaskEventReservation {
+    /// Internal attempts use the logical operation's terminal reservation.
+    pub(crate) fn unobserved(payload_bytes: usize, lane: MessageLane) -> Self {
+        Self {
+            deliveries: Vec::new(),
+            payload_bytes,
+            lane,
+        }
+    }
+
     /// Call only after selecting the terminal winner and releasing operation locks.
     pub(crate) fn publish(self, event: TaskEvent) -> Result<()> {
         if event.lane != self.lane || event.source.payload_bytes()? > self.payload_bytes {

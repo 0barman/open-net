@@ -1,7 +1,10 @@
 use bytes::Bytes;
+use std::fmt;
 
 /// Owned business payload; protocol control frames use dedicated APIs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Debug` reports the payload variant and byte count without exposing its contents.
+#[derive(Clone, Eq, PartialEq)]
 pub enum Message {
     /// UTF-8 text payload.
     Text(
@@ -13,6 +16,19 @@ pub enum Message {
         /// Binary body whose backing storage can be shared by clones.
         Bytes,
     ),
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Text(_) => "Text",
+            Self::Binary(_) => "Binary",
+        };
+        formatter
+            .debug_struct(variant)
+            .field("bytes", &self.len())
+            .finish()
+    }
 }
 
 impl Message {

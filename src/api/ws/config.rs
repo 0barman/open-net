@@ -12,6 +12,10 @@ const MAX_HEARTBEAT_PING_WRITE_RETRIES: usize = 1024;
 /// Shared resource limits, transport parameters, and heartbeat configuration for WebSocket clients.
 #[derive(Clone, Debug)]
 pub struct WebSocketClientConfig {
+    /// Default replay policy for untracked message writes. Initially disabled.
+    pub default_send_retry_policy: super::WsSendRetryPolicy,
+    /// Default policy for factory-backed logical requests. Initially disabled.
+    pub default_request_retry_policy: super::WsRequestRetryPolicy,
     /// Capacity of command, I/O event, and normal and emergency send queues.
     pub queues: QueueLimits,
     /// Resource caps for receiving messages, subscribing to distribution, callback execution, and blocking handshake tasks.
@@ -32,6 +36,8 @@ pub struct WebSocketClientConfig {
 impl Default for WebSocketClientConfig {
     fn default() -> Self {
         Self {
+            default_send_retry_policy: super::WsSendRetryPolicy::no_retry(),
+            default_request_retry_policy: super::WsRequestRetryPolicy::no_retry(),
             queues: QueueLimits::default(),
             dispatch: DispatchLimits::default(),
             requests: RequestLimits::default(),
@@ -44,6 +50,17 @@ impl Default for WebSocketClientConfig {
 }
 
 impl WebSocketClientConfig {
+    pub fn with_default_send_retry_policy(mut self, policy: super::WsSendRetryPolicy) -> Self {
+        self.default_send_retry_policy = policy;
+        self
+    }
+    pub fn with_default_request_retry_policy(
+        mut self,
+        policy: super::WsRequestRetryPolicy,
+    ) -> Self {
+        self.default_request_retry_policy = policy;
+        self
+    }
     /// Validates all nested limits and transport settings before client creation.
     pub fn validate(&self) -> Result<()> {
         self.queues.validate()?;

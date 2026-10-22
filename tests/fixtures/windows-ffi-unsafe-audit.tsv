@@ -4,8 +4,9 @@
 # Each unsafe operation is justified by its adjacent SAFETY comment.
 # The complete token fingerprint detects body changes; only exact unsafe rows
 # below are allowed. Panic/unwrap operations are never exempted.
-# Reviewed cleanup log tag/fields only; native operations and allowances are unchanged.
-fingerprint	src/module/net_status/inner/platform/windows.rs	3739567b46e52dc9
+# Reviewed T06 split: connectivity and explicit name queries use separate COM entry points.
+# GetSystemDirectoryW selects netsh.exe without trusting PATH or the working directory.
+fingerprint	src/module/net_status/inner/platform/windows.rs	60f7cb628f0326b2
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoUninitialize() };
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }.map_err(monitor_io)?;
@@ -14,3 +15,4 @@ fingerprint	src/module/net_status/inner/platform/windows.rs	3739567b46e52dc9
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { networks.Next(&mut items, Some(&mut fetched)) }.map_err(monitor_io)?;
 1	src/module/net_status/inner/platform/windows.rs	unsafe	let name = unsafe { network.GetName() }
 1	src/module/net_status/inner/platform/windows.rs	unsafe	let peeked = unsafe {
+1	src/module/net_status/inner/platform/windows.rs	unsafe	let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) } as usize;

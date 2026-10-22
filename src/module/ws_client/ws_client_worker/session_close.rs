@@ -19,7 +19,8 @@ impl WSClientWorker {
         }
 
         let cancellation = NetError::from(crate::error::ErrorKind::Cancelled);
-        self.end_runtime(cancellation.clone(), TaskEndCause::Cancelled);
+        self.end_runtime(cancellation.clone(), TaskEndCause::Cancelled)
+            .await;
         self.begin_session_closing();
         self.set_status(ConnectionStatus::Closing).await;
         self.cancel_connect();

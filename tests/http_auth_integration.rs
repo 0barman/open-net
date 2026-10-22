@@ -1,11 +1,14 @@
 #![cfg(feature = "http-client-auth")]
 
+use open_net::api::retry::{Backoff, RetrySchedule};
+
 use async_trait::async_trait;
 use http::{header, HeaderValue, Method, StatusCode};
 use open_net::api::http::{
     AccessToken, AuthAction, AuthRequestContext, AuthResponseContext, BasicAuth, BearerAuth,
     BearerTokenSource, HttpAuth, HttpClientConfig, HttpRequest, HttpRequestMethod,
-    HttpRequestOptions, HttpRequestTrait, HttpResponseResult, RefreshReason, RetryPolicy,
+    HttpRequestOptions, HttpRequestTrait, HttpResponseResult, HttpRetryPolicy, RedirectPolicy,
+    RefreshReason,
 };
 use open_net::OpenNet;
 use std::io::{Read, Write};
@@ -40,6 +43,13 @@ struct ScriptServer {
 impl ScriptServer {
     fn start(responses: Vec<ScriptResponse>) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
+        Self::from_listener(listener, responses)
+    }
+
+    fn from_listener(
+        listener: TcpListener,
+        responses: Vec<ScriptResponse>,
+    ) -> Result<Self, std::io::Error> {
         let address = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -266,7 +276,13 @@ async fn second_unauthorized_does_not_refresh_or_send_a_third_attempt() -> TestR
     let source = std::sync::Arc::new(RotatingSource {
         refreshes: AtomicUsize::new(0),
     });
-    let config = HttpClientConfig::new(&server.url)?.with_auth(BearerAuth::new(source.clone()));
+    let config = HttpClientConfig::new(&server.url)?
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(3).build()?)
+                .build()?,
+        )
+        .with_auth(BearerAuth::new(source.clone()));
     let net = OpenNet::new()?;
     let client = net
         .create_http_client_with_config("auth-double-401", config)
@@ -287,7 +303,7 @@ async fn second_unauthorized_does_not_refresh_or_send_a_third_attempt() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auth_retry_does_not_consume_the_transient_retry_budget() -> TestResult {
+async fn auth_and_transient_retries_share_the_attempt_budget() -> TestResult {
     let server = ScriptServer::start(vec![
         ScriptResponse {
             status: StatusCode::UNAUTHORIZED,
@@ -309,24 +325,38 @@ async fn auth_retry_does_not_consume_the_transient_retry_budget() -> TestResult 
         refreshes: AtomicUsize::new(0),
     });
     let config = HttpClientConfig::new(&server.url)?
-        .with_default_retry_policy(RetryPolicy::new(1))
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(
+                    RetrySchedule::builder()
+                        .max_attempts(2)
+                        .backoff(Backoff::exponential(
+                            Duration::from_millis(50).min(Duration::from_secs(30)),
+                            2.0,
+                            Duration::from_secs(30),
+                        ))
+                        .build()?,
+                )
+                .retry_on(open_net::api::http::RetryOn::standard())
+                .build()?,
+        )
         .with_auth(BearerAuth::new(source));
     let net = OpenNet::new()?;
     let client = net
-        .create_http_client_with_config("auth-budget-independent", config)
+        .create_http_client_with_config("auth-budget-shared", config)
         .await?;
     let response = client.get("/budget").await?;
     check(
-        response.status() == StatusCode::OK,
-        "ordinary retry was consumed by auth retry",
+        response.status() == StatusCode::SERVICE_UNAVAILABLE,
+        "shared attempt limit was ignored",
     )?;
     check(
-        response.attempts() == 3,
-        "expected auth plus transient retry",
+        response.attempts() == 2,
+        "auth replay did not consume the second attempt",
     )?;
-    net.destroy_http_client("auth-budget-independent").await?;
+    net.destroy_http_client("auth-budget-shared").await?;
     let requests = server.finish()?;
-    check(requests.len() == 3, "unexpected request count")
+    check(requests.len() == 2, "unexpected request count")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -336,9 +366,15 @@ async fn do_not_retry_blocks_application_retry_after_unauthorized() -> TestResul
         location: None,
         body: b"unauthorized",
     }])?;
-    let policy = RetryPolicy::builder()
-        .max_attempts(2)
-        .application_predicate(|_| true)
+    let policy = HttpRetryPolicy::builder()
+        .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+        .classifier(move |context| {
+            if context.outcome.is_ok_and(|_| true) {
+                open_net::api::retry::RetryDecision::Retry
+            } else {
+                open_net::api::retry::RetryDecision::Default
+            }
+        })
         .build()?;
     let config = HttpClientConfig::new(&server.url)?
         .with_default_retry_policy(policy)
@@ -380,6 +416,11 @@ async fn provider_timeout_is_classified_without_hanging_the_request() -> TestRes
         body: b"unauthorized",
     }])?;
     let config = HttpClientConfig::new(&server.url)?
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+                .build()?,
+        )
         .with_timeout(Duration::from_millis(20))?
         .with_auth(HangingAuth);
     let net = OpenNet::new()?;
@@ -459,7 +500,13 @@ async fn stream_unauthorized_refreshes_before_returning_the_stream() -> TestResu
     let source = std::sync::Arc::new(RotatingSource {
         refreshes: AtomicUsize::new(0),
     });
-    let config = HttpClientConfig::new(&server.url)?.with_auth(BearerAuth::new(source.clone()));
+    let config = HttpClientConfig::new(&server.url)?
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+                .build()?,
+        )
+        .with_auth(BearerAuth::new(source.clone()));
     let net = OpenNet::new()?;
     let client = net
         .create_http_client_with_config("auth-stream-refresh", config)
@@ -558,8 +605,9 @@ async fn cross_origin_redirect_drops_provider_credentials() -> TestResult {
             body: b"redirect",
         }])?;
         let name = format!("auth-cross-origin-redirect-{index}");
-        let config =
-            HttpClientConfig::new(&source.url)?.with_auth(BearerAuth::from_static("source-token")?);
+        let config = HttpClientConfig::new(&source.url)?
+            .with_redirect_policy(RedirectPolicy::allow_origins([&target.url])?)
+            .with_auth(BearerAuth::from_static("source-token")?);
         let client = net.create_http_client_with_config(&name, config).await?;
         let response = client.get("/cross-origin-start").await;
         net.destroy_http_client(&name).await?;
@@ -585,6 +633,85 @@ async fn cross_origin_redirect_drops_provider_credentials() -> TestResult {
         )?;
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returning_to_original_origin_does_not_restore_provider_credentials() -> TestResult {
+    // Reserve both ports before constructing the A -> B -> A response chain.
+    let source_listener = TcpListener::bind("127.0.0.1:0")?;
+    let target_listener = TcpListener::bind("127.0.0.1:0")?;
+    let source_url = format!("http://{}", source_listener.local_addr()?);
+    let target_url = format!("http://{}", target_listener.local_addr()?);
+    let source = ScriptServer::from_listener(
+        source_listener,
+        vec![
+            ScriptResponse {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                location: Some(format!("{target_url}/middle")),
+                body: b"redirect",
+            },
+            ScriptResponse {
+                status: StatusCode::OK,
+                location: None,
+                body: b"returned",
+            },
+        ],
+    )?;
+    let target = ScriptServer::from_listener(
+        target_listener,
+        vec![ScriptResponse {
+            status: StatusCode::PERMANENT_REDIRECT,
+            location: Some(format!("{source_url}/returned")),
+            body: b"redirect",
+        }],
+    )?;
+    let applies = std::sync::Arc::new(AtomicUsize::new(0));
+    let config = HttpClientConfig::new(&source.url)?
+        // The original origin is authorized implicitly and must remain reachable.
+        .with_redirect_policy(RedirectPolicy::allow_origins([&target.url])?)
+        .with_auth(CountingAuth {
+            applies: std::sync::Arc::clone(&applies),
+        });
+    let net = OpenNet::new()?;
+    let client = net
+        .create_http_client_with_config("auth-return-to-origin", config)
+        .await?;
+    let response = client.get("/first").await;
+    net.destroy_http_client("auth-return-to-origin").await?;
+    let source_requests = source.finish()?;
+    let target_requests = target.finish()?;
+    check(
+        response?.status() == StatusCode::OK,
+        "allowlisted return to original origin failed",
+    )?;
+    check(
+        source_requests.len() == 2 && target_requests.len() == 1,
+        "return redirect did not execute the expected three hops",
+    )?;
+    let initial = source_requests
+        .first()
+        .ok_or_else(|| std::io::Error::other("initial request missing"))?;
+    check(
+        initial.contains("authorization: Bearer hop-1"),
+        "initial request lost provider credentials",
+    )?;
+    let returned = source_requests
+        .get(1)
+        .ok_or_else(|| std::io::Error::other("returned request missing"))?;
+    check(
+        returned.starts_with("GET /returned "),
+        "redirect did not return to the original origin",
+    )?;
+    for request in target_requests.iter().chain(std::iter::once(returned)) {
+        check(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "redirect restored provider credentials after crossing origins",
+        )?;
+    }
+    check(
+        applies.load(Ordering::SeqCst) == 1,
+        "returning to the original origin reenabled the auth provider",
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -644,3 +771,46 @@ async fn basic_auth_injects_a_redacted_static_credential() -> TestResult {
 
 #[path = "support/crypto_provider.rs"]
 mod crypto_provider;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classifier_stop_prevents_auth_refresh_and_401_replay() -> TestResult {
+    let server = ScriptServer::start(vec![ScriptResponse {
+        status: StatusCode::UNAUTHORIZED,
+        location: None,
+        body: b"unauthorized",
+    }])?;
+    let source = std::sync::Arc::new(RotatingSource {
+        refreshes: AtomicUsize::new(0),
+    });
+    let policy = HttpRetryPolicy::builder()
+        .schedule(RetrySchedule::builder().max_attempts(3).build()?)
+        .classifier(|_| open_net::api::retry::RetryDecision::Stop)
+        .build()?;
+    let config = HttpClientConfig::new(&server.url)?
+        .with_default_retry_policy(policy)
+        .with_auth(BearerAuth::new(source.clone()));
+    let net = OpenNet::new()?;
+    let client = net
+        .create_http_client_with_config("auth-classifier-stop", config)
+        .await?;
+    let response = client.get("/stop401").await?;
+    check(
+        response.status() == StatusCode::UNAUTHORIZED && response.attempts() == 1,
+        "Stop did not keep original 401 response",
+    )?;
+    check(
+        source.refreshes.load(Ordering::SeqCst) == 0,
+        "Stop allowed an auth refresh",
+    )?;
+    check(
+        response.retry_report().is_some_and(|report| {
+            report.stop_reason == Some(open_net::api::retry::RetryStopReason::ClassifierStopped)
+        }),
+        "Stop report missing",
+    )?;
+    net.destroy_http_client("auth-classifier-stop").await?;
+    check(
+        server.finish()?.len() == 1,
+        "Stop allowed another transport send",
+    )
+}

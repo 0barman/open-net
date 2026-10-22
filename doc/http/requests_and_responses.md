@@ -6,12 +6,11 @@
 
 Every example on this page uses `http-client`, which also enables `net-status`.
 Use Rust 1.89 or later. Create a consumer crate with `cargo new http-example`,
-then add the following to its `Cargo.toml`. Replace `/path/to/open-net` with
-the library directory containing `Cargo.toml` in your checkout.
+then use the following dependency configuration.
 
 ```toml
 [dependencies]
-open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 serde_json = "1"
@@ -51,15 +50,20 @@ With base URL `http://127.0.0.1:8080/api/`, `items?limit=2` resolves to
 `/api/items?limit=2`, whereas `/items` resolves from the origin root. Paths are
 trimmed and must be nonempty. Absolute URLs (even the same origin), `//host`,
 backslashes, fragments and control characters are rejected. The resolved scheme,
-host and effective port must match the base URL. These are initial request-path
-rules, not a promise about redirects: server redirects may lead to another origin.
-With [`Http2Only`](http2.md), the initial URL and followed redirect targets must
-use HTTPS. The client never follows a redirect to an HTTP target or replays its
-request body there. A rejected follow attempt returns an error; a redirect that
-cannot be followed for another reason can remain an unfollowed 3xx response, as
-described in the HTTP/2 guide. HTTPS redirects can still cross origins, subject
-to the target's certificate and HTTP/2 support. `Auto` and `Http1Only` do not
-impose this HTTPS-only restriction.
+host and effective port must match the base URL. Redirects have an independent
+[policy](redirects.md): by default they stay on the original origin, follow at
+most ten hops, and never move from HTTPS to HTTP. Another origin requires an
+explicit allowlist, which also authorizes any body replay permitted by the
+redirect status and replayability setting. The security check runs before
+connecting to the target. All HTTP versions and provider configurations use
+the same SDK handler. Initial HTTP URLs remain supported by the default
+transport policy; opt into HTTPS-only for clients that require it.
+[`Http2Only`](http2.md) requires HTTPS independently.
+
+A policy rejection returns an error. Disabling redirects, a missing `Location`,
+or an unreplayable body can leave an unfollowed 3xx response; inspect its status.
+See [redirect method and body rules](redirects.md#methods-and-bodies) before
+allowing redirects for endpoints that accept request bodies.
 
 Request headers replace all common-header values with the same name; repeated
 request values retain their order. Transport-controlled headers are rejected:
@@ -119,7 +123,7 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HttpRequest, Method};
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -180,7 +184,7 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -240,7 +244,7 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HeaderMap, HeaderValue};
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -302,7 +306,7 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -363,7 +367,7 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HeaderMap, HeaderValue};
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -422,7 +426,7 @@ use open_net::api::http::{HttpClient, HttpClientConfig};
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -482,7 +486,7 @@ use open_net::api::http::{HttpClient, HttpClientConfig, HeaderMap};
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "http-example",
     )?;
@@ -514,8 +518,7 @@ arguments shown are required. There are no callbacks. Start with
 | `headers(self, headers: HeaderMap) -> Self` | Replace the entire request-specific map. |
 | `header(self, name: impl TryInto<HeaderName>, value: impl TryInto<HeaderValue>) -> Result<Self, NetError>` | Insert/replace one header; invalid conversions return `InvalidInput`. The method consumes the builder even on error. HeaderName is available at the crate root. |
 | `body(self, body: Bytes) -> Self` | Set buffered, owned bytes; no automatic media type. Bytes is available at the crate root. |
-| `retry_policy(self, policy: RetryPolicy) -> Self` | Explicit policy, including no retries. |
-| `retry_setting(self, setting: RetrySetting) -> Self` | Inherit, disable, or replace retries; see [retry](retry.md). |
+| `retry_setting(self, setting: RetrySetting<HttpRetryPolicy>) -> Self` | Inherit, disable, or replace retries; see [retry](retry.md). |
 | `timeouts(self, timeouts: HttpTimeouts) -> Self` | Replace request timeout overrides; see [timeouts](timeouts_and_admission.md). |
 | `admission_policy(self, policy: HttpAdmissionPolicy) -> Self` | Override client Wait/FailFast policy before admission; last call wins. |
 | `build(self) -> Result<HttpRequest, NetError>` | Validate nonempty path and timeout values. Success owns the request; errors report invalid input/configuration. |
@@ -523,11 +526,10 @@ arguments shown are required. There are no callbacks. Start with
 | `HttpRequest::admission_policy_override(&self) -> Option<HttpAdmissionPolicy>` | Explicit override; None inherits the client. |
 
 Public request fields are `method: Method`, `path: String`, `headers: HeaderMap`,
-`body: Bytes`, and `retry_policy: RetryPolicy`. Other state is private; use the
+`body: Bytes`. Retry selection and other state are private; use the
 builder instead of a struct literal. A concrete HttpRequest is cloneable but does
 not implement HttpRequestTrait. Use `request()` for it, not `send()`.
-Directly replacing `retry_policy` does not reset a stored explicit
-`RetrySetting::None`; prefer the builder to avoid inconsistent settings.
+Use `retry_setting()` to inspect the single authoritative retry selection.
 
 `query`, `json`, `form` and `multipart` are covered in [request codecs](request_codecs.md).
 `cookie_context` is covered in [cookies](cookies.md). Those optional methods are
@@ -540,21 +542,23 @@ Build a request before submitting it. This example exercises construction withou
 contacting a server. Header parsing and build errors are propagated with `?`.
 
 ```rust
-use open_net::api::http::{HttpAdmissionPolicy, HttpRequest, HttpTimeouts, Method, RetryPolicy, RetrySetting};
+use open_net::api::http::{HttpAdmissionPolicy, HttpRequest, HttpTimeouts, Method};
 use open_net::Bytes;
+use open_net::api::retry::RetrySetting;
 
 fn main() -> Result<(), open_net::NetError> {
     let request = HttpRequest::builder()
         .method(Method::PATCH).path("/items/1")
         .headers(open_net::HeaderMap::new())
-        .retry_policy(RetryPolicy::no_retry())
         .header("content-type", "application/json")?
         .body(Bytes::from_static(br#"{"active":true}"#))
-        .retry_setting(RetrySetting::None)
+        .retry_setting(RetrySetting::Disabled)
         .timeouts(HttpTimeouts::new())
         .admission_policy(HttpAdmissionPolicy::Wait)
         .build()?;
-    assert_eq!(request.admission_policy_override(), Some(HttpAdmissionPolicy::Wait));
+    if request.admission_policy_override() != Some(HttpAdmissionPolicy::Wait) {
+        return Err(open_net::NetError::protocol("admission override missing"));
+    }
     println!("{:?}", request.timeouts());
     Ok(())
 }
@@ -731,7 +735,7 @@ use std::error::Error;
 async fn main() -> open_net::Result<()> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let config = HttpClientConfig::new("http://127.0.0.1:8080")?
         .with_max_response_bytes(16)?;
     let client = HttpClient::new(config, "response-head")?;
@@ -1018,8 +1022,12 @@ the guides that explain their interaction with client defaults:
 - [HttpRequest::admission_policy_override](timeouts_and_admission.md#httprequestadmission_policy_override)
 - [HttpRequestBuilder::timeouts](timeouts_and_admission.md#httprequestbuildertimeouts)
 - [HttpRequestBuilder::admission_policy](timeouts_and_admission.md#httprequestbuilderadmission_policy)
-- [HttpRequestBuilder::retry_policy](retry.md#httprequestbuilderretry_policy)
+- [HttpRequest::retry_setting](retry.md#httprequestretry_setting)
 - [HttpRequestBuilder::retry_setting](retry.md#httprequestbuilderretry_setting)
+
+See [HttpResponse::retry_report](retry.md#httpresponseretry_report) for the final
+common retry report and [NetError::retry_report](../retry.md#neterrorretry_report)
+for failed operations.
 
 ## `HttpResponse::new()`
 
@@ -1896,8 +1904,9 @@ dependencies listed above.
 ```rust
 use open_net::api::http::{
     HttpAdmissionPolicy, HttpClient, HttpClientConfig, HttpRequest, HttpResponse,
-    HttpTimeouts, RetryPolicy,
+    HttpTimeouts,
 };
+use open_net::api::retry::RetrySetting;
 use std::time::Duration;
 
 async fn post_json(
@@ -1911,7 +1920,7 @@ async fn post_json(
         .header("content-type", "application/json")?
         .body(body.into_bytes().into())
         .admission_policy(HttpAdmissionPolicy::Wait)
-        .retry_policy(RetryPolicy::no_retry())
+        .retry_setting(RetrySetting::Disabled)
         .timeouts(
             HttpTimeouts::new()
                 .with_total_timeout(remaining)
@@ -1925,7 +1934,7 @@ async fn post_json(
 async fn main() -> open_net::Result<()> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "async-response",
     )?;

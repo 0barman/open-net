@@ -1,15 +1,9 @@
-//! One redirect and response-header lifecycle for auth and Cookie providers.
+//! One redirect policy and response-header lifecycle for every HTTP client.
 use super::*;
+use crate::api::http::HttpRedirectError;
+#[cfg(feature = "http-client-http2")]
+use crate::api::http::HttpTransportSecurity;
 use http::{header, HeaderMap, StatusCode};
-
-pub(super) fn uses_worker_redirects(config: &HttpClientConfig) -> bool {
-    let enabled = false;
-    #[cfg(feature = "http-client-auth")]
-    let enabled = enabled || config.auth().is_some();
-    #[cfg(feature = "http-client-cookies")]
-    let enabled = enabled || config.cookie_store().is_some();
-    enabled
-}
 
 pub(super) struct ResponseHops<'a> {
     pub(super) request_headers: &'a HeaderMap,
@@ -32,9 +26,6 @@ pub(super) async fn follow_response_hops(
     config: &HttpClientConfig,
     client: &Client,
 ) -> Result<(Response, u64, bool), NetError> {
-    if !uses_worker_redirects(config) {
-        return Ok((response, hops.initial_generation, false));
-    }
     run_budget(
         hops.budget,
         hops.control,
@@ -69,63 +60,58 @@ async fn follow(
     let mut headers = config.merge_headers(hops.request_headers)?;
     let mut method = hops.method.clone();
     let mut body_present = hops.body_present;
-    // Ten followed redirects allow eleven observed responses. Each response,
-    // including an unfollowable redirect or the last hop, updates the store once.
-    for followed in 0..=10 {
+    let original_url = response.url().clone();
+    let policy = config.redirect_policy();
+    let security = config.transport_security();
+    #[cfg(feature = "http-client-http2")]
+    let security = if config.http_version_policy() == HttpVersionPolicy::Http2Only {
+        HttpTransportSecurity::HttpsOnly
+    } else {
+        security
+    };
+    // Each response, including an unfollowable redirect or the final hop,
+    // updates the store exactly once within the original headers budget.
+    for followed in 0..=policy.max_redirects() {
         check_stream_start(hops.budget, hops.control)?;
         #[cfg(feature = "http-client-cookies")]
         update_response_cookies(&mut response, config, hops.request_id, hops.control)?;
         check_stream_start(hops.budget, hops.control)?;
         let status = response.status();
-        if !matches!(
-            status,
-            StatusCode::MOVED_PERMANENTLY
-                | StatusCode::FOUND
-                | StatusCode::SEE_OTHER
-                | StatusCode::TEMPORARY_REDIRECT
-                | StatusCode::PERMANENT_REDIRECT
-        ) {
+        if !policy.is_enabled()
+            || !matches!(
+                status,
+                StatusCode::MOVED_PERMANENTLY
+                    | StatusCode::FOUND
+                    | StatusCode::SEE_OTHER
+                    | StatusCode::TEMPORARY_REDIRECT
+                    | StatusCode::PERMANENT_REDIRECT
+            )
+        {
             return Ok((response, generation, auth_allowed));
         }
         let Some(location) = response.headers().get(header::LOCATION) else {
             return Ok((response, generation, auth_allowed));
         };
-        let location = match location.to_str() {
-            Ok(location) => location,
-            Err(_) => return Ok((response, generation, auth_allowed)),
-        };
+        let location = location
+            .to_str()
+            .map_err(|_| redirect_error(HttpRedirectError::InvalidLocation))?;
         let mut next_url = response
             .url()
             .join(location)
-            .map_err(|_| redirect_error())?;
-        if !matches!(next_url.scheme(), "http" | "https")
-            || next_url.host_str().is_none()
-            || !next_url.username().is_empty()
-            || next_url.password().is_some()
-        {
-            return Err(redirect_error());
-        }
+            .map_err(|_| redirect_error(HttpRedirectError::InvalidLocation))?;
         next_url.set_fragment(None);
-        #[cfg(feature = "http-client-http2")]
-        if config.http_version_policy() == HttpVersionPolicy::Http2Only
-            && next_url.scheme() != "https"
-        {
-            return Err(redirect_error());
-        }
-        let preserve_body = matches!(
-            status,
-            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
-        );
+        // Authorize the complete target before invoking providers, constructing
+        // another request, or opening a connection. Replayability alone does not
+        // authorize sending the body to a different origin.
+        policy
+            .check_redirect(&original_url, response.url(), &next_url, followed, security)
+            .map_err(redirect_error)?;
+        let (next_method, preserve_body) = redirect_method(status, &method);
         if preserve_body && body_present && !hops.replayable_body {
             return Ok((response, generation, auth_allowed));
         }
-        if followed == 10 {
-            return Err(redirect_error());
-        }
+        method = next_method;
         if !preserve_body {
-            if !matches!(method, Method::GET | Method::HEAD) {
-                method = Method::GET;
-            }
             body_present = false;
             headers.remove(header::CONTENT_LENGTH);
             headers.remove(header::CONTENT_TYPE);
@@ -143,7 +129,9 @@ async fn follow(
         // Keep only caller headers between hops. Providers are re-evaluated
         // into a temporary map for every URL; generated Cookie headers never
         // become explicit headers on later hops.
-        let mut next_headers = headers.clone();
+        let next_headers = headers.clone();
+        #[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
+        let mut next_headers = next_headers;
         #[cfg(feature = "http-client-auth")]
         if auth_allowed {
             if let Some(auth) = &auth {
@@ -202,16 +190,34 @@ async fn follow(
             .build()
             .map_err(|error| map_reqwest_error(error, ErrorStage::RequestBuild))?;
         drop(response);
-        response = client
-            .execute(request)
-            .await
-            .map_err(|error| map_reqwest_error(error, ErrorStage::Receive))?;
+        hops.control.record_transport_send()?;
+        response = client.execute(request).await.map_err(map_execute_error)?;
     }
-    Err(redirect_error())
+    Err(redirect_error(HttpRedirectError::TooManyRedirects))
 }
 
-fn redirect_error() -> NetError {
-    NetError::from(ErrorKind::Protocol).with_stage(ErrorStage::Receive)
+fn redirect_error(reason: HttpRedirectError) -> NetError {
+    NetError::protocol(reason).with_stage(ErrorStage::Receive)
+}
+
+/// Match the transport's established method semantics independently of optional
+/// providers. In particular, 301/302 preserve PUT/PATCH bodies, while 303 drops
+/// every body and retains HEAD as HEAD.
+fn redirect_method(status: StatusCode, method: &Method) -> (Method, bool) {
+    match status {
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if *method == Method::POST => {
+            (Method::GET, false)
+        }
+        StatusCode::SEE_OTHER => (
+            if *method == Method::HEAD {
+                Method::HEAD
+            } else {
+                Method::GET
+            },
+            false,
+        ),
+        _ => (method.clone(), true),
+    }
 }
 
 fn strip_sensitive_headers(headers: &mut HeaderMap) {

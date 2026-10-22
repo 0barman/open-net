@@ -7,7 +7,7 @@ use super::write::priority_write_queue::PriorityWriteQueue;
 use crate::error::ErrorKind;
 use crate::ws::{
     ClientId, ConnectionId, ConnectionState, DisconnectedPolicy, OperationId, ResponseRouting,
-    SessionId, TaskEndCause,
+    SessionId, TaskEndCause, WebSocketClientConfig,
 };
 use crate::{NetError, Result};
 use std::collections::HashMap;
@@ -17,10 +17,15 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+#[cfg(test)]
+type RequestResultCheckHook = Box<dyn FnOnce(&crate::ws::RequestHandle) -> Result<()> + Send>;
 
 /// All authorities captured before the worker is allowed to begin networking.
 /// Shared senders retain this identity; receipts retain only OperationControl.
 pub(crate) struct SessionRuntime {
+    pub(crate) config: Arc<WebSocketClientConfig>,
     pub(crate) client_id: ClientId,
     pub(crate) id: SessionId,
     pub(crate) lifecycle: Arc<ConnectionSession>,
@@ -33,10 +38,17 @@ pub(crate) struct SessionRuntime {
     pub(crate) shutdown: CancellationToken,
     worker_runtime: OnceLock<tokio::runtime::Handle>,
     closed: CancellationToken,
+    /// Unlike a natural disconnect, explicit retirement also stops publication
+    /// of results already selected by a request. This signal is never reset.
+    forced_closed: CancellationToken,
     connection: Mutex<Option<(ConnectionId, CancellationToken)>>,
     next_operation: AtomicU64,
     operations: Mutex<HashMap<OperationId, Weak<OperationControl>>>,
     changed: Arc<Notify>,
+    request_jobs: TaskTracker,
+    request_gate: Mutex<bool>,
+    #[cfg(test)]
+    before_request_result_check: Mutex<Option<RequestResultCheckHook>>,
 }
 impl SessionRuntime {
     #[allow(clippy::too_many_arguments)]
@@ -51,8 +63,10 @@ impl SessionRuntime {
         queue: Arc<PriorityWriteQueue>,
         urgent_queue: Arc<PriorityWriteQueue>,
         shutdown: CancellationToken,
+        config: Arc<WebSocketClientConfig>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            config,
             client_id,
             id,
             lifecycle,
@@ -65,20 +79,61 @@ impl SessionRuntime {
             shutdown,
             worker_runtime: OnceLock::new(),
             closed: CancellationToken::new(),
+            forced_closed: CancellationToken::new(),
             connection: Mutex::new(None),
             next_operation: AtomicU64::new(0),
             operations: Mutex::new(HashMap::new()),
             changed: Arc::new(Notify::new()),
+            request_jobs: TaskTracker::new(),
+            request_gate: Mutex::new(false),
+            #[cfg(test)]
+            before_request_result_check: Mutex::new(None),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn set_before_request_result_check_for_test(
+        &self,
+        hook: impl FnOnce(&crate::ws::RequestHandle) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        *self
+            .before_request_result_check
+            .lock()
+            .map_err(NetError::from_poison)? = Some(Box::new(hook));
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn before_request_result_check_for_test(
+        &self,
+        request: &crate::ws::RequestHandle,
+    ) -> Result<()> {
+        let hook = self
+            .before_request_result_check
+            .lock()
+            .map_err(NetError::from_poison)?
+            .take();
+        if let Some(hook) = hook {
+            hook(request)?;
+        }
+        Ok(())
     }
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.is_cancelled()
+            || self.forced_closed.is_cancelled()
             || self.shutdown.is_cancelled()
             || self.lifecycle.cancel_token().is_cancelled()
             || self.lifecycle.completion_token().is_cancelled()
     }
     pub(crate) fn closed_token(&self) -> CancellationToken {
         self.closed.clone()
+    }
+    pub(crate) fn forced_closed_token(&self) -> CancellationToken {
+        self.forced_closed.clone()
+    }
+    pub(crate) fn preserves_selected_result(&self) -> bool {
+        self.closed.is_cancelled()
+            && !self.forced_closed.is_cancelled()
+            && !self.shutdown.is_cancelled()
+            && !self.lifecycle.cancel_token().is_cancelled()
     }
     /// Spawns a future on the already-running worker runtime.
     ///
@@ -94,6 +149,27 @@ impl SessionRuntime {
                 .with_stage(crate::error::ErrorStage::Runtime)
         })?;
         Ok(runtime.spawn(future))
+    }
+    /// Admit an owned request task under the same gate used by session retirement.
+    pub(crate) fn spawn_request<F>(&self, future: F) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let retired = self.request_gate.lock().map_err(NetError::from_poison)?;
+        if *retired || self.is_closed() {
+            return Err(NetError::from(ErrorKind::Closed));
+        }
+        let runtime = self.worker_runtime.get().ok_or_else(|| {
+            NetError::from(ErrorKind::RuntimeUnavailable)
+                .with_stage(crate::error::ErrorStage::Runtime)
+        })?;
+        self.request_jobs.spawn_on(future, runtime);
+        drop(retired);
+        Ok(())
+    }
+    /// Called only after end() closes task admission and signals all waits.
+    pub(crate) async fn wait_requests(&self) {
+        self.request_jobs.wait().await;
     }
     /// Bind the already-running, timer-enabled client worker before exposing
     /// the session. Caller executors and callback threads need no Tokio context.
@@ -214,7 +290,20 @@ impl SessionRuntime {
         Ok(())
     }
     pub(crate) fn end(&self, error: NetError, cause: TaskEndCause) {
+        // Publish the stronger boundary before closed wakes any request. A
+        // later natural-disconnect notification cannot undo explicit shutdown.
+        if cause != TaskEndCause::Disconnected {
+            self.forced_closed.cancel();
+        }
+        let mut retired = match self.request_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *retired = true;
+        self.request_jobs.close();
+        drop(retired);
         let mut preserve_responses = cause == TaskEndCause::Disconnected
+            && !self.forced_closed.is_cancelled()
             && !self.shutdown.is_cancelled()
             && !self.lifecycle.cancel_token().is_cancelled();
         self.closed.cancel();

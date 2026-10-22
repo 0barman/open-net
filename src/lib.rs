@@ -2,6 +2,10 @@
 #[path = "../libs/common/src/mod.rs"]
 pub(crate) mod common;
 
+// Share validated retry logic across transports while publishing one crate.
+#[path = "../libs/retry/src/mod.rs"]
+pub(crate) mod retry_core;
+
 pub mod api;
 
 // Unit-test clients use an application-owned provider, just like downstream
@@ -23,11 +27,12 @@ pub(crate) mod module;
 // Keep existing import paths as re-exports of the canonical API modules.
 #[cfg(any(feature = "ws-client", feature = "http-client"))]
 pub use api::tls;
-pub use api::{config, error, network, subscription};
+pub use api::{config, error, network, retry, subscription};
 #[cfg(feature = "net-status")]
 pub use api::{
     net_status, IpStack, MonitorState, NetStatusClient, NetworkEvent, NetworkEventKind,
-    NetworkEventOptions, NetworkIpStackSource, NetworkNameSource, NetworkObservation,
+    NetworkEventOptions, NetworkIpStackSource, NetworkNameObserver, NetworkNameOptions,
+    NetworkNameSnapshot, NetworkNameSource, NetworkNameState, NetworkObservation,
     NetworkRefreshResult, NetworkSnapshot, NetworkStatus,
 };
 #[cfg(feature = "ws-client")]

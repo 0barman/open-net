@@ -88,7 +88,15 @@ pub struct HttpResponseSummary {
 /// hook and handler execution; it does not represent application-level success.
 #[derive(Clone, Debug)]
 pub struct HttpCompletion {
+    pub retry_report: crate::api::retry::RetryReport,
     pub request_id: HttpRequestId,
     pub response: Result<HttpResponseSummary, NetError>,
     pub callback: Result<(), NetError>,
+}
+
+impl HttpCompletion {
+    /// Final statistics for the accepted operation, including zero-attempt termination.
+    pub fn retry_report(&self) -> &crate::api::retry::RetryReport {
+        &self.retry_report
+    }
 }

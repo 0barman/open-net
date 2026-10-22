@@ -1,5 +1,7 @@
 #![cfg(feature = "http-client")]
 
+use open_net::api::retry::{Backoff, RetrySchedule, RetrySetting};
+
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 #[cfg(feature = "http-client-auth")]
@@ -9,7 +11,7 @@ use open_net::api::http::{
 };
 use open_net::api::http::{
     HttpClientConfig, HttpRequestId, HttpRequestMethod, HttpRequestTrait, HttpResponseResult,
-    RetryPolicy,
+    HttpRetryPolicy,
 };
 use open_net::OpenNet;
 use std::io::{Read, Write};
@@ -110,7 +112,13 @@ async fn unauthorized_refreshes_once_and_reapplies_current_token() -> TestResult
     let source = std::sync::Arc::new(RotatingTokenSource {
         refreshes: AtomicUsize::new(0),
     });
-    let config = HttpClientConfig::new(&server.url)?.with_auth(BearerAuth::new(source.clone()));
+    let config = HttpClientConfig::new(&server.url)?
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+                .build()?,
+        )
+        .with_auth(BearerAuth::new(source.clone()));
     let net = OpenNet::new()?;
     let client = net
         .create_http_client_with_config("http-auth-refresh", config)
@@ -159,7 +167,21 @@ async fn auth_provider_runs_for_each_transient_retry_attempt() -> TestResult {
     ])?;
     let auth = BearerAuth::from_static("static-token")?;
     let config = HttpClientConfig::new(&server.url)?
-        .with_default_retry_policy(RetryPolicy::new(1))
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(
+                    RetrySchedule::builder()
+                        .max_attempts(2)
+                        .backoff(Backoff::exponential(
+                            Duration::from_millis(50).min(Duration::from_secs(30)),
+                            2.0,
+                            Duration::from_secs(30),
+                        ))
+                        .build()?,
+                )
+                .retry_on(open_net::api::http::RetryOn::standard())
+                .build()?,
+        )
         .with_auth(auth);
     let net = OpenNet::new()?;
     let client = net
@@ -208,7 +230,13 @@ async fn concurrent_unauthorized_requests_share_one_refresh() -> TestResult {
     let source = std::sync::Arc::new(SlowRotatingTokenSource {
         refreshes: AtomicUsize::new(0),
     });
-    let config = HttpClientConfig::new(&server.url)?.with_auth(BearerAuth::new(source.clone()));
+    let config = HttpClientConfig::new(&server.url)?
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+                .build()?,
+        )
+        .with_auth(BearerAuth::new(source.clone()));
     let net = OpenNet::new()?;
     let client = net
         .create_http_client_with_config("http-auth-single-flight", config)
@@ -276,7 +304,7 @@ struct CallbackRecord {
 struct TestRequest {
     path: String,
     headers: HeaderMap,
-    retry_policy: RetryPolicy,
+    retry_policy: HttpRetryPolicy,
     callback_tx: Sender<CallbackRecord>,
 }
 
@@ -284,7 +312,7 @@ struct FlexibleRequest {
     path: String,
     method: Method,
     body: String,
-    retry_policy: RetryPolicy,
+    retry_policy: HttpRetryPolicy,
     callback_tx: Sender<CallbackRecord>,
 }
 
@@ -302,8 +330,8 @@ impl HttpRequestTrait for FlexibleRequest {
         self.body.clone()
     }
 
-    fn retry_policy(&self) -> RetryPolicy {
-        self.retry_policy.clone()
+    fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> {
+        RetrySetting::Policy(self.retry_policy.clone())
     }
 
     async fn deal_with_response(self: Box<Self>, result: HttpResponseResult) {
@@ -385,8 +413,8 @@ impl HttpRequestTrait for TestRequest {
         self.headers.clone()
     }
 
-    fn retry_policy(&self) -> RetryPolicy {
-        self.retry_policy.clone()
+    fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> {
+        RetrySetting::Policy(self.retry_policy.clone())
     }
 
     async fn deal_with_response(self: Box<Self>, result: HttpResponseResult) {
@@ -668,7 +696,7 @@ async fn sends_request_on_isolated_lanes_and_merges_common_headers() -> TestResu
     let request = TestRequest {
         path: "/health".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::no_retry(),
+        retry_policy: HttpRetryPolicy::no_retry(),
         callback_tx,
     };
     let request_id = client.send(request)?;
@@ -724,7 +752,19 @@ async fn retries_retryable_statuses_and_calls_back_once_after_final_attempt() ->
     let request = TestRequest {
         path: "/retry".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::new(2),
+        retry_policy: HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(3)
+                    .backoff(Backoff::exponential(
+                        Duration::from_millis(50).min(Duration::from_secs(30)),
+                        2.0,
+                        Duration::from_secs(30),
+                    ))
+                    .build()?,
+            )
+            .retry_on(open_net::api::http::RetryOn::standard())
+            .build()?,
         callback_tx,
     };
     client.send(request)?;
@@ -808,7 +848,7 @@ async fn enforces_response_body_limit_without_panicking() -> TestResult {
     client.send(TestRequest {
         path: "/large".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::no_retry(),
+        retry_policy: HttpRetryPolicy::no_retry(),
         callback_tx,
     })?;
     let callback = callback_rx
@@ -842,7 +882,19 @@ async fn retries_response_body_disconnect_before_callback() -> TestResult {
     client.send(TestRequest {
         path: "/disconnect".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::new(1),
+        retry_policy: HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::exponential(
+                        Duration::from_millis(50).min(Duration::from_secs(30)),
+                        2.0,
+                        Duration::from_secs(30),
+                    ))
+                    .build()?,
+            )
+            .retry_on(open_net::api::http::RetryOn::standard())
+            .build()?,
         callback_tx,
     })?;
     let callback = callback_rx
@@ -889,7 +941,19 @@ async fn final_retryable_status_calls_back_once_after_budget_exhaustion() -> Tes
     client.send(TestRequest {
         path: "/final".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::new(1),
+        retry_policy: HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::exponential(
+                        Duration::from_millis(50).min(Duration::from_secs(30)),
+                        2.0,
+                        Duration::from_secs(30),
+                    ))
+                    .build()?,
+            )
+            .retry_on(open_net::api::http::RetryOn::standard())
+            .build()?,
         callback_tx,
     })?;
     let callback = callback_rx
@@ -926,7 +990,19 @@ async fn non_retryable_400_calls_back_once() -> TestResult {
     client.send(TestRequest {
         path: "/bad".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::new(3),
+        retry_policy: HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(4)
+                    .backoff(Backoff::exponential(
+                        Duration::from_millis(50).min(Duration::from_secs(30)),
+                        2.0,
+                        Duration::from_secs(30),
+                    ))
+                    .build()?,
+            )
+            .retry_on(open_net::api::http::RetryOn::standard())
+            .build()?,
         callback_tx,
     })?;
     let callback = callback_rx
@@ -950,7 +1026,21 @@ async fn explicit_no_retry_overrides_client_default() -> TestResult {
         body: b"no retry",
     }])?;
     let (callback_tx, callback_rx) = callback_channel();
-    let config = HttpClientConfig::new(&server.url)?.with_default_retry_policy(RetryPolicy::new(3));
+    let config = HttpClientConfig::new(&server.url)?.with_default_retry_policy(
+        HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(4)
+                    .backoff(Backoff::exponential(
+                        Duration::from_millis(50).min(Duration::from_secs(30)),
+                        2.0,
+                        Duration::from_secs(30),
+                    ))
+                    .build()?,
+            )
+            .retry_on(open_net::api::http::RetryOn::standard())
+            .build()?,
+    );
     let net = OpenNet::new()?;
     let client = net
         .create_http_client_with_config("http-explicit-no-retry", config)
@@ -958,11 +1048,11 @@ async fn explicit_no_retry_overrides_client_default() -> TestResult {
     let request = TestRequest {
         path: "/no-retry".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::no_retry(),
+        retry_policy: HttpRetryPolicy::no_retry(),
         callback_tx,
     };
-    let options =
-        open_net::api::http::HttpRequestOptions::new().with_retry_policy(RetryPolicy::no_retry());
+    let options = open_net::api::http::HttpRequestOptions::new()
+        .with_retry_setting(RetrySetting::Policy(HttpRetryPolicy::no_retry()));
     client.send_with_options(request, options)?;
     let callback = callback_rx
         .recv_timeout(Duration::from_secs(5))
@@ -995,7 +1085,19 @@ async fn post_retry_requires_explicit_non_idempotent_opt_in() -> TestResult {
         path: "/post".to_owned(),
         method: Method::POST,
         body: "payload".to_owned(),
-        retry_policy: RetryPolicy::new(3),
+        retry_policy: HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(4)
+                    .backoff(Backoff::exponential(
+                        Duration::from_millis(50).min(Duration::from_secs(30)),
+                        2.0,
+                        Duration::from_secs(30),
+                    ))
+                    .build()?,
+            )
+            .retry_on(open_net::api::http::RetryOn::standard())
+            .build()?,
         callback_tx,
     })?;
     let callback = callback_rx
@@ -1049,7 +1151,7 @@ async fn blocking_callback_isolated_from_worker_lanes() -> TestResult {
     client.send(TestRequest {
         path: "/second".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::no_retry(),
+        retry_policy: HttpRetryPolicy::no_retry(),
         callback_tx,
     })?;
     let _ = release_tx.send(());
@@ -1085,7 +1187,7 @@ async fn shutdown_rejects_new_requests() -> TestResult {
     let result = client.send(TestRequest {
         path: "/closed".to_owned(),
         headers: HeaderMap::new(),
-        retry_policy: RetryPolicy::no_retry(),
+        retry_policy: HttpRetryPolicy::no_retry(),
         callback_tx,
     });
     check(result.is_err(), "send succeeded after shutdown")?;

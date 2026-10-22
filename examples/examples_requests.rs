@@ -45,7 +45,14 @@ async fn main() -> Result<(), BoxError> {
     // RequestId is local association metadata; encode it into your wire protocol explicitly.
     let body = Message::text(format!("{}|hello", id.as_str()));
     let response = session.requests()?.execute(Request::new(id, body)).await?;
-    println!("{:?}", response.message());
+    let kind = match response.message() {
+        Message::Text(_) => "text",
+        Message::Binary(_) => "binary",
+    };
+    println!(
+        "request completed: response_kind={kind} response_bytes={}",
+        response.message().len()
+    );
 
     session.close().await?;
     net.destroy_ws_client("requests").await?;

@@ -67,9 +67,14 @@ pub use operation::{
 };
 
 mod options;
+pub(crate) mod retry;
 pub use options::{
     DisconnectedPolicy, MessageLane, Priority, RequestOptions, ResponseTimeoutOrigin, SendOptions,
-    SendRetryPolicy,
+};
+pub use retry::{
+    WsReplaySafety, WsRequestRetryContext, WsRequestRetryOn, WsRequestRetryPolicy,
+    WsRequestRetryPolicyBuilder, WsSendRetryContext, WsSendRetryOn, WsSendRetryPolicy,
+    WsSendRetryPolicyBuilder, WsTimeoutPhase,
 };
 
 mod task;
@@ -90,9 +95,17 @@ pub type MessageReceiver = crate::subscription::EventReceiver<IncomingMessage>;
 mod dispatch;
 mod send;
 pub use send::{MessageBuilder, MessageReceipt, PreparedMessage, Sender};
+mod request_operation;
+pub use request_operation::{
+    RequestAttemptContext, WsRequestOperationBuilder, WsRequestOperationHandle,
+    WsRequestOperationOptions, WsRequestOperationReceipt,
+};
 mod request_client;
 pub use request_client::{PreparedRequest, RequestBuilder, RequestClient, RequestReceipt};
 mod client;
 pub use client::WebSocketClient;
 mod session;
 pub use session::Session;
+
+#[cfg(test)]
+mod debug_privacy_tests;

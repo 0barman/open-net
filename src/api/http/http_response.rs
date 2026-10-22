@@ -48,6 +48,7 @@ impl fmt::Debug for HttpResponseHead {
 /// is known.
 #[derive(Clone)]
 pub struct HttpResponse {
+    retry_report: Option<crate::api::retry::RetryReport>,
     /// Response status code returned by the peer.
     pub status: StatusCode,
     /// Response headers, including values supplied by the peer.
@@ -63,6 +64,15 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    /// Final retry statistics, absent only on manually constructed responses.
+    pub fn retry_report(&self) -> Option<&crate::api::retry::RetryReport> {
+        self.retry_report.as_ref()
+    }
+    pub(crate) fn with_retry_report(mut self, report: crate::api::retry::RetryReport) -> Self {
+        self.retry_report = Some(report);
+        self
+    }
+
     /// Return the UTF-8 `Content-Type` header value, if present and valid.
     pub fn content_type(&self) -> Option<&str> {
         self.headers.get(http::header::CONTENT_TYPE)?.to_str().ok()
@@ -89,6 +99,7 @@ impl HttpResponse {
         request_id: HttpRequestId,
     ) -> Self {
         Self {
+            retry_report: None,
             status,
             headers,
             body,

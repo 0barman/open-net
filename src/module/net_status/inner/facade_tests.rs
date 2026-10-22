@@ -384,11 +384,9 @@ async fn real_bridge_preserves_complete_facts_after_coalesced_disconnect_and_rec
     )?;
     bounded(async {
         loop {
-            if receiver
-                .recv()
-                .await?
-                .is_some_and(|snapshot| snapshot.network_name.as_deref() == Some("initial"))
-            {
+            if receiver.recv().await?.is_some_and(|snapshot| {
+                snapshot.ip_stack == Some(IpStack::DualStack) && snapshot.network_name.is_none()
+            }) {
                 return Ok::<(), NetError>(());
             }
         }
@@ -414,7 +412,7 @@ async fn real_bridge_preserves_complete_facts_after_coalesced_disconnect_and_rec
     let local = bounded(async {
         loop {
             if let Some(snapshot) = receiver.recv().await? {
-                if snapshot.network_name.as_deref() == Some("recovered") {
+                if snapshot.ip_stack == Some(IpStack::V6Only) && snapshot.network_name.is_none() {
                     return Ok::<NetworkSnapshot, NetError>(snapshot);
                 }
             }
@@ -563,7 +561,7 @@ async fn refresh_returns_target_projection_error_after_dispatching_healthy_views
         let (publisher, starting) = source.begin_generation()?;
         starting.dispatch()?;
         publisher
-            .prepare_observation(NetworkStatus::Available, None, None)?
+            .prepare_observation(NetworkStatus::Available, None)?
             .dispatch()?;
         let target = NetworkObservationOwner::new(service.context())?;
         let healthy = NetworkObservationOwner::new(service.context())?;
@@ -583,7 +581,6 @@ async fn refresh_returns_target_projection_error_after_dispatching_healthy_views
             captured,
             1,
             NetworkStatus::Unavailable,
-            None,
             None,
             std::time::SystemTime::now(),
             || Ok(()),

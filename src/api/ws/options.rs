@@ -1,11 +1,16 @@
 use super::config::deadline;
+use super::WsSendRetryPolicy;
 use super::{validate_metadata, CancellationGroup};
+use crate::api::retry::RetrySetting;
 use crate::{Metadata, NetError, Result};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 /// Scheduling, cancellation, retry, and per-stage deadline configuration for
 /// one outbound message.
-#[derive(Clone, Debug)]
+///
+/// `Debug` includes scheduling configuration but reports metadata only as an entry count.
+#[derive(Clone)]
 pub struct SendOptions {
     /// The normal or emergency sending channel used by the message. The default is the normal channel.
     pub lane: MessageLane,
@@ -21,7 +26,7 @@ pub struct SendOptions {
     /// The original absolute deadline covering all stages, including queuing and reconnection waiting; `None` means there is no overall deadline.
     pub deadline: Option<Instant>,
     /// Retry permission after delivery failure; no retry by default. When retrying is allowed, the application must ensure the safety of repeated delivery.
-    pub retry: SendRetryPolicy,
+    pub retry_setting: RetrySetting<WsSendRetryPolicy>,
     /// How to handle cases where the connection is not connected during admission or the connection is interrupted during waiting. The default is to reject the request.
     pub disconnected: DisconnectedPolicy,
     /// A cancellation group that can uniformly cancel a group of operations; `None` means not to join the cancellation group.
@@ -29,6 +34,23 @@ pub struct SendOptions {
     /// Local application metadata attached to the send operation; it is not
     /// automatically added to the wire message payload.
     pub metadata: Metadata,
+}
+
+impl fmt::Debug for SendOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SendOptions")
+            .field("lane", &self.lane)
+            .field("priority", &self.priority)
+            .field("enqueue_timeout", &self.enqueue_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("deadline", &self.deadline)
+            .field("retry_setting", &self.retry_setting)
+            .field("disconnected", &self.disconnected)
+            .field("cancellation", &self.cancellation)
+            .field("metadata_entries", &self.metadata.len())
+            .finish()
+    }
 }
 
 impl Default for SendOptions {
@@ -39,7 +61,7 @@ impl Default for SendOptions {
             enqueue_timeout: None,
             write_timeout: Duration::from_secs(10),
             deadline: None,
-            retry: SendRetryPolicy::default(),
+            retry_setting: RetrySetting::Inherit,
             disconnected: DisconnectedPolicy::default(),
             cancellation: None,
             metadata: Metadata::new(),
@@ -99,20 +121,6 @@ pub enum DisconnectedPolicy {
     /// Allow an unsent message to wait for session reconnection, subject to its
     /// cancellation and deadline limits.
     WaitForReconnect,
-}
-
-/// Retry strategy for business-message write failures, configured independently
-/// of the connection's own reconnect policy.
-#[derive(Clone, Debug, Default)]
-pub enum SendRetryPolicy {
-    /// Do not retry business messages that have already been attempted to be sent.
-    #[default]
-    Never,
-    /// The application declares that redelivery is safe and allows resends within the configurable scope.
-    Idempotent {
-        /// The maximum number of additional retries after the initial transmission; zero means no additional retries.
-        max_retries: u32,
-    },
 }
 
 /// The sending, registration, and response wait limits for a tracked request.

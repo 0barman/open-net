@@ -12,6 +12,7 @@ static NEXT_QUEUE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 struct QueueState {
     heap: IndexedHeap,
     prepared: HashMap<CancellationToken, QueuedRequest>,
+    delayed: HashMap<CancellationToken, QueuedRequest>,
     closed: bool,
 }
 pub(crate) struct QueuePermits {
@@ -38,6 +39,7 @@ impl PriorityWriteQueue {
             state: Mutex::new(QueueState {
                 heap: IndexedHeap::new(),
                 prepared: HashMap::new(),
+                delayed: HashMap::new(),
                 closed: false,
             }),
             notify: Notify::new(),
@@ -130,6 +132,7 @@ impl PriorityWriteQueue {
         }
         if state.heap.contains(&request.dispatch_cancel)
             || state.prepared.contains_key(&request.dispatch_cancel)
+            || state.delayed.contains_key(&request.dispatch_cancel)
         {
             return Err((request, NetError::from(ErrorKind::Internal)));
         }
@@ -142,6 +145,16 @@ impl PriorityWriteQueue {
             }
             state
                 .prepared
+                .insert(request.dispatch_cancel.clone(), request);
+        } else if request
+            .ready_at
+            .is_some_and(|ready| ready > std::time::Instant::now())
+        {
+            if state.delayed.try_reserve(1).is_err() {
+                return Err((request, NetError::from(ErrorKind::ResourceExhausted)));
+            }
+            state
+                .delayed
                 .insert(request.dispatch_cancel.clone(), request);
         } else {
             if let Err(request) = state.heap.push(request) {
@@ -228,7 +241,8 @@ impl PriorityWriteQueue {
             let mut removed = state
                 .prepared
                 .remove(token)
-                .or_else(|| state.heap.remove(token));
+                .or_else(|| state.heap.remove(token))
+                .or_else(|| state.delayed.remove(token));
             if let Some(request) = &mut removed {
                 request.prepare_retirement(&error);
             }
@@ -246,25 +260,58 @@ impl PriorityWriteQueue {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
+            let next_ready = {
                 let mut state = self.lock();
-                if let Some(request) = state.heap.pop() {
+                if let Some(request) = Self::pop_ready(&mut state) {
                     return Some(request);
                 }
                 if state.closed {
                     return None;
                 }
+                state.delayed.values().filter_map(Self::wake_at).min()
+            };
+            match next_ready {
+                Some(ready) => tokio::select! {
+                    _ = notified => {},
+                    _ = tokio::time::sleep_until(ready.into()) => {},
+                },
+                None => notified.await,
             }
-            notified.await;
         }
     }
     pub(crate) fn try_next(&self) -> Option<QueuedRequest> {
-        self.lock().heap.pop()
+        Self::pop_ready(&mut self.lock())
+    }
+    fn wake_at(request: &QueuedRequest) -> Option<std::time::Instant> {
+        crate::module::ws_client::operation_control::earliest(
+            request.ready_at,
+            request.dispatch_phase.deadline(),
+        )
+    }
+    fn pop_ready(state: &mut QueueState) -> Option<QueuedRequest> {
+        let now = std::time::Instant::now();
+        let delayed = state
+            .delayed
+            .iter()
+            .filter(|(_, request)| Self::wake_at(request).is_none_or(|ready| ready <= now))
+            .max_by(|(_, left), (_, right)| left.cmp(right));
+        let token = delayed.and_then(|(token, request)| {
+            if state.heap.peek().is_none_or(|ready| request > ready) {
+                Some(token.clone())
+            } else {
+                None
+            }
+        });
+        match token {
+            Some(token) => state.delayed.remove(&token),
+            None => state.heap.pop(),
+        }
     }
     pub(crate) fn drain_with_error(&self, error: NetError) -> Vec<QueuedRequest> {
         let mut state = self.lock();
         let mut requests = state.heap.drain();
         requests.extend(state.prepared.drain().map(|(_, request)| request));
+        requests.extend(state.delayed.drain().map(|(_, request)| request));
         for request in &mut requests {
             request.prepare_retirement(&error);
         }
@@ -306,6 +353,19 @@ impl PriorityWriteQueue {
             }
         }
         state.prepared = retained;
+        let mut delayed = HashMap::new();
+        for (token, mut request) in state.delayed.drain() {
+            if request.can_wait_for_reconnect()
+                && !request.dispatch_phase.is_finished()
+                && delayed.try_reserve(1).is_ok()
+            {
+                request.admission_cancel = None;
+                delayed.insert(token, request);
+            } else {
+                rejected.push(request);
+            }
+        }
+        state.delayed = delayed;
         for request in &mut rejected {
             request.prepare_retirement(&error);
         }
@@ -516,3 +576,147 @@ mod tests {
 #[cfg(test)]
 #[path = "retirement_race_tests.rs"]
 mod retirement_race_tests;
+
+#[cfg(test)]
+mod delayed_retry_tests {
+    use super::*;
+    use crate::api::retry::{RetrySchedule, RetrySetting, RetryStopReason};
+    use crate::module::ws_client::{
+        test_support::{check, check_eq, test_error, TestResult},
+        v2_test_support as fixture,
+    };
+    use crate::ws::{DisconnectedPolicy, Priority, SendOptions, WsReplaySafety, WsSendRetryPolicy};
+    use std::time::{Duration, Instant};
+
+    fn delayed(
+        queue: &Arc<PriorityWriteQueue>,
+        sequence: u64,
+        options: SendOptions,
+        ready_at: Instant,
+    ) -> TestResult<Arc<crate::module::ws_client::operation_control::OperationControl>> {
+        let mut request = fixture::queued(sequence, options)?;
+        let permits = queue.try_reserve(4)?;
+        request.slot_permit = Some(permits.item);
+        request.byte_permit = Some(permits.bytes);
+        request.ready_at = Some(ready_at);
+        let control = request.dispatch_phase.clone();
+        control.bind_queue(Arc::downgrade(queue));
+        queue.push_existing(request).map_err(|(_, error)| error)?;
+        Ok(control)
+    }
+
+    #[tokio::test]
+    async fn delayed_high_priority_does_not_block_ready_work_and_keeps_capacity() -> TestResult {
+        let queue = PriorityWriteQueue::new(2, 8)?;
+        let ready_at = Instant::now() + Duration::from_millis(30);
+        let control = delayed(
+            &queue,
+            1,
+            SendOptions {
+                priority: Priority::High,
+                ..Default::default()
+            },
+            ready_at,
+        )?;
+        delayed(&queue, 2, SendOptions::default(), Instant::now())?;
+        check_eq!(
+            queue.try_reserve(1).err().map(|error| error.kind()),
+            Some(ErrorKind::QueueFull)
+        )?;
+        let ready = queue
+            .try_next()
+            .ok_or_else(|| test_error("ready message blocked by retry"))?;
+        check_eq!(ready.sequence, 2)?;
+        ready.complete(Ok(()));
+        check_eq!(queue.task_slots.available_permits(), 1)?;
+        check!(queue.try_next().is_none())?;
+        let retried = fixture::bounded(queue.next())
+            .await?
+            .ok_or_else(|| test_error("retry not woken"))?;
+        check_eq!(retried.sequence, 1)?;
+        check!(Instant::now() >= ready_at)?;
+        retried.complete(Ok(()));
+        check_eq!(queue.task_slots.available_permits(), 2)?;
+        check_eq!(
+            control.retry_report().stop_reason,
+            Some(RetryStopReason::Completed)
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_delayed_send_releases_capacity_before_terminal_result() -> TestResult {
+        let queue = PriorityWriteQueue::new(1, 4)?;
+        let control = delayed(
+            &queue,
+            1,
+            SendOptions::default(),
+            Instant::now() + Duration::from_secs(60),
+        )?;
+        control.cancel()?;
+        check_eq!(queue.task_slots.available_permits(), 1)?;
+        check_eq!(queue.byte_slots.available_permits(), 4)?;
+        check!(queue.lock().delayed.is_empty())?;
+        let error = fixture::bounded(control.written())
+            .await?
+            .err()
+            .ok_or_else(|| test_error("cancelled write succeeded"))?;
+        check_eq!(
+            error.retry_report().map(|report| report.stop_reason),
+            Some(Some(RetryStopReason::Cancelled))
+        )?;
+        check!(queue.try_next().is_none())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_retains_explicit_replay_and_shutdown_drains_delayed() -> TestResult {
+        let queue = PriorityWriteQueue::new(2, 8)?;
+        let policy = WsSendRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .safety(WsReplaySafety::IdempotentByContract)
+            .build()?;
+        let mut request = fixture::queued(
+            1,
+            SendOptions {
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            },
+        )?;
+        let control = request.dispatch_phase.clone();
+        control.bind_queue(Arc::downgrade(&queue));
+        let permits = queue.try_reserve(4)?;
+        request.slot_permit = Some(permits.item);
+        request.byte_permit = Some(permits.bytes);
+        request.attempt = 1;
+        request.ready_at = Some(Instant::now() + Duration::from_secs(60));
+        queue.push_existing(request).map_err(|(_, error)| error)?;
+        let rejected = delayed(
+            &queue,
+            2,
+            SendOptions {
+                disconnected: DisconnectedPolicy::Reject,
+                ..Default::default()
+            },
+            Instant::now() + Duration::from_secs(60),
+        )?;
+        let removed =
+            queue.drain_rejected_on_disconnect_with_error(NetError::from(ErrorKind::Closed));
+        check_eq!(removed.len(), 1)?;
+        check!(rejected.is_finished())?;
+        check!(!control.is_finished())?;
+        check_eq!(queue.lock().delayed.len(), 1)?;
+        drop(removed);
+        queue.close();
+        let drained = queue.drain_with_error(NetError::from(ErrorKind::EngineDropped));
+        check_eq!(drained.len(), 1)?;
+        check_eq!(queue.task_slots.available_permits(), 2)?;
+        check_eq!(queue.byte_slots.available_permits(), 8)?;
+        check_eq!(
+            control.retry_report().stop_reason,
+            Some(RetryStopReason::Shutdown)
+        )?;
+        check!(queue.next().await.is_none())?;
+        Ok(())
+    }
+}

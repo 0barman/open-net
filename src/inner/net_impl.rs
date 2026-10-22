@@ -102,8 +102,8 @@ impl OpenNetInner {
         network_config: Option<crate::api::network_config::NetworkConfig>,
     ) -> Result<WebSocketClient, NetError> {
         crate::log_t!(LogType::WSC; "ws.create_ws_client",
-            "thread_name|config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_config_present",
-            thread_name, config.close_timeout, config.queues.commands, config.heartbeat.is_some(), network_config.is_some());
+            "config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_config_present",
+            config.close_timeout, config.queues.commands, config.heartbeat.is_some(), network_config.is_some());
         let result: Result<WebSocketClient, NetError> = async {
         self.clients
             .lock()
@@ -114,7 +114,7 @@ impl OpenNetInner {
                     return Err(NetError::from(crate::error::ErrorKind::ClientAlreadyExists));
                 }
                 clients.insert(thread_name.clone(), ClientSlot::Creating);
-                crate::log_s!(LogType::WSC; "create_ws_client", "thread_name|status", thread_name, "Creating");
+                crate::log_s!(LogType::WSC; "create_ws_client", "status", "Creating");
                 Ok(())
             })?;
 
@@ -160,7 +160,7 @@ impl OpenNetInner {
                         ).and_then(|result| result);
                         match stored {
                             Ok(()) => {
-                                crate::log_s!(LogType::WSC; "create_ws_client", "thread_name|status", thread_name, "Ready");
+                                crate::log_s!(LogType::WSC; "create_ws_client", "status", "Ready");
                                 clients_changed.notify_waiters();
                                 Ok(client)
                             },
@@ -199,7 +199,7 @@ impl OpenNetInner {
                     }
                 };
             if let Err(error) = &result {
-                crate::log_e!(LogType::WSC; "create_ws_client", "thread_name|stage|error", thread_name, "worker_create", format!("{error:?}"));
+                crate::log_e!(LogType::WSC; "create_ws_client", "stage|error", "worker_create", format!("{error:?}"));
             }
             if result_tx.send(result).is_err() {
                 crate::log_s!(LogType::WSC; "create_ws_client", "stage", "caller_stopped_waiting");
@@ -217,7 +217,7 @@ impl OpenNetInner {
     #[cfg(feature = "ws-client")]
     pub(crate) fn get_ws_client(&self, thread_name: &str) -> Result<WebSocketClient, NetError> {
         self.ensure_open()?;
-        crate::log_t!(LogType::WSC; "get_ws_client", "thread_name", thread_name);
+        crate::log_t!(LogType::WSC; "get_ws_client");
         let result: Result<WebSocketClient, NetError> = (|| {
             let clients = self
                 .clients
@@ -325,14 +325,14 @@ impl OpenNetInner {
     #[cfg(feature = "ws-client")]
     pub(crate) async fn destroy_ws_client(&self, thread_name: &str) -> Result<(), NetError> {
         self.ensure_open()?;
-        crate::log_t!(LogType::WSC; "destroy_ws_client", "thread_name", thread_name);
+        crate::log_t!(LogType::WSC; "destroy_ws_client");
         let result: Result<(), NetError> = async {
         let entry = {
             let mut clients = self.clients.lock().map_err(|_| NetError::from(crate::error::ErrorKind::Internal))?;
             match clients.remove(thread_name) {
                 Some(ClientSlot::Ready(entry)) => {
                     clients.insert(thread_name.to_string(), ClientSlot::Closing);
-                    crate::log_s!(LogType::WSC; "destroy_ws_client", "thread_name|status", thread_name, "Closing");
+                    crate::log_s!(LogType::WSC; "destroy_ws_client", "status", "Closing");
                     entry
                 }
                 Some(slot @ (ClientSlot::Creating | ClientSlot::Closing)) => {
@@ -366,7 +366,7 @@ impl OpenNetInner {
         thread_name: String,
         config: crate::api::http::http_config::HttpClientConfig,
     ) -> Result<HttpClient, NetError> {
-        crate::log_t!(LogType::HTTP; "create_http_client", "thread_name|config", thread_name, format!("{config:?}"));
+        crate::log_t!(LogType::HTTP; "create_http_client", "config", format!("{config:?}"));
         config.validate()?;
         self.http_clients
             .lock()
@@ -416,7 +416,7 @@ impl OpenNetInner {
                         });
                     match stored {
                         Ok(client) => {
-                            crate::log_r!(LogType::HTTP; "create_http_client", "thread_name|status", thread_name, "Ready");
+                            crate::log_r!(LogType::HTTP; "create_http_client", "status", "Ready");
                             Ok(client)
                         }
                         Err(error) => {
@@ -521,7 +521,7 @@ impl OpenNetInner {
                 }
             }
             if result_tx.send(result).is_err() {
-                crate::log_s!(LogType::HTTP; "http.destroy_http_client", "thread_name|stage", name, "caller_stopped_waiting");
+                crate::log_s!(LogType::HTTP; "http.destroy_http_client", "stage", "caller_stopped_waiting");
             }
         });
         result_rx.await.map_err(|error| {
@@ -556,8 +556,8 @@ impl DestroyClientGuard {
         entry: ClientEntry,
     ) -> Self {
         crate::log_t!(LogType::WSC; "ws.destroy_client_guard.new",
-            "engine|clients|clients_changed|thread_name|entry_client_id|entry_worker_present",
-            "provided", "provided", "provided", thread_name, entry.client.id().as_u64(), entry.worker_thread.is_some());
+            "engine|clients|clients_changed|entry_client_id|entry_worker_present",
+            "provided", "provided", "provided", entry.client.id().as_u64(), entry.worker_thread.is_some());
         Self {
             engine,
             clients,
@@ -633,14 +633,14 @@ fn release_closing_slot(
     thread_name: &str,
 ) {
     crate::log_t!(LogType::WSC; "ws.release_closing_slot",
-        "clients|clients_changed|thread_name", "provided", "provided", thread_name);
+        "clients|clients_changed", "provided", "provided");
     {
         let mut clients = clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if matches!(clients.get(thread_name), Some(ClientSlot::Closing)) {
             clients.remove(thread_name);
-            crate::log_s!(LogType::WSC; "release_closing_slot", "thread_name|stage", thread_name, "released");
+            crate::log_s!(LogType::WSC; "release_closing_slot", "stage", "released");
         }
     }
     clients_changed.notify_waiters();
@@ -654,8 +654,8 @@ fn create_client_worker(
     network_status: crate::net_status::NetworkStatusContext,
 ) -> Result<(WebSocketClient, ThreadHandle), NetError> {
     crate::log_t!(LogType::WSC; "ws.create_client_worker",
-        "thread_name|config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_status_policy|network_status",
-        thread_name, config.close_timeout, config.queues.commands, config.heartbeat.is_some(),
+        "config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_status_policy|network_status",
+        config.close_timeout, config.queues.commands, config.heartbeat.is_some(),
         format!("{:?}", network.network_status_policy()), "provided");
     let result: Result<(WebSocketClient, ThreadHandle), NetError> = (|| {
         if thread_name.contains('\0') {

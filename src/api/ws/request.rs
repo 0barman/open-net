@@ -1,8 +1,11 @@
 use super::{Message, RequestId};
 use crate::Metadata;
+use std::fmt;
 
 /// Business request to send, including an identifier, body, and metadata.
-#[derive(Clone, Debug)]
+///
+/// `Debug` summarizes the identifier, body, and metadata size without exposing their contents.
+#[derive(Clone)]
 pub struct Request {
     /// Identifier used to correlate the business response.
     id: RequestId,
@@ -10,6 +13,17 @@ pub struct Request {
     message: Message,
     /// Additional metadata; size validation occurs during send admission.
     metadata: Metadata,
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Request")
+            .field("id", &self.id)
+            .field("message", &self.message)
+            .field("metadata_entries", &self.metadata.len())
+            .finish()
+    }
 }
 
 impl Request {

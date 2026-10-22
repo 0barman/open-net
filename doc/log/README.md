@@ -17,12 +17,11 @@ individual [engine shutdown](../lifecycle.md).
 
 No Cargo feature, engine, TLS provider or async runtime is required. Use Rust
 1.89 or later, create a project with `cargo new logging-example`, and add this
-dependency to its `Cargo.toml`. Replace the path with your `open-net` package
-directory.
+dependency configuration to its `Cargo.toml`.
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net-test/open-net", default-features = false }
+open-net = { version = "0.3.3", default-features = false }
 ```
 
 Each Rust block is a complete, separate `src/main.rs`. Copy one block at a time
@@ -47,6 +46,11 @@ thread-safe shared handles into them instead of borrowing stack variables.
 
 ## Record fields and filters
 
+The omissions described in this section apply to open-net 0.3.3.
+Published 0.3.2 records can still contain raw HTTP request paths and
+caller-supplied client/thread names. Review and sanitize those records before
+forwarding them to a logger or telemetry service when integrating that release.
+
 | `LogInfo` field | Type | Meaning |
 | --- | --- | --- |
 | `log_type` | `LogType` | Explicit origin, independent of the tag text. |
@@ -59,6 +63,17 @@ thread-safe shared handles into them instead of borrowing stack variables.
 Tags keep the supplied operation unchanged for every origin, such as
 `start_session` or `send`. No origin, SDK prefix or severity suffix is added.
 Origin and severity are available in `log_type` and `level` respectively.
+
+Library-generated HTTP and client-lifecycle records omit raw request paths and
+caller-supplied client/thread names. Names remain available to the client
+creation, lookup and destruction APIs. Operation tags, status, error
+classification and other diagnostic fields remain available.
+
+Migration: consumers of these records must no longer expect `path` or
+caller-supplied `thread_name` fields. Records that previously contained only
+one of those fields now have `{}` content. The exported logging macros still
+serialize application-supplied arguments; this omission does not filter custom
+application records.
 
 Origins are `None`, `Database`, `Engine`, `WSS`, `WSC`, `Common` and `HTTP`.
 Only explicitly listed origins match. Choosing `WSC` observes matching WebSocket
@@ -78,6 +93,48 @@ arguments. Another listener, including an owned listener that accepts all
 levels, can still require that evaluation. Do not put application side effects
 inside log arguments; concurrent listener changes can also occur after the
 interest check.
+
+## Default Debug privacy boundary
+
+This is the open-net 0.3.3 contract. Published 0.3.2 has some
+redacted summaries, but not this complete boundary: `HttpRequest` is summarized
+only with `http-client-cookies` enabled, and several WebSocket values still use
+derived `Debug` output that can include their contents. Do not apply the table
+below to 0.3.2 or treat arbitrary `Debug` formatting as a general redaction tool.
+
+`HttpRequest` uses the same privacy boundary in every HTTP feature combination,
+including builds without `http-client-cookies`. Its `Debug` output reports the
+method, path/body byte lengths, header count and diagnostic settings. It omits
+the original path, header names and values, and body contents.
+
+WebSocket business values use summaries in both ordinary (`{:?}`) and alternate
+(`{:#?}`) `Debug` output:
+
+| Value | Summary |
+| --- | --- |
+| `Message` | Text/binary variant and byte length. |
+| `RequestId` | Business identifier byte length. |
+| `Request` | Identifier and message summaries, metadata entry count. |
+| `IncomingPayload` | Business message summary, Ping/Pong byte length, or close summary. |
+| `CloseFrame` / `PeerClose` | Close code and reason byte length. |
+| `SendOptions` | Sending policies, deadlines and metadata entry count. |
+| `RequestSnapshot` | SDK identifiers, timing and operation state, business identifier summary and metadata entry count. |
+
+These summaries also apply when these values appear inside responses, incoming
+messages, task events, request options, handles and builders. Metadata keys and
+values, business identifiers, message bodies, Ping/Pong contents and close
+reasons are omitted. SDK client, session, connection and operation identifiers
+remain available for correlation. The omission of these original values is
+the privacy contract; exact `Debug` text is not a stable serialization format.
+
+Migration: log consumers that parsed original values from `Debug` must use the
+summary fields for diagnostics. Existing fields and getters still expose the
+original data for protocol processing, and `RequestId::Display` still prints
+the original identifier. Explicitly formatting those fields, getters or
+`RequestId` with `{}` bypasses these summaries. Neither the `Debug`
+implementations nor the logging macros filter application-supplied strings.
+This boundary does not cover arbitrary error source chains; top-level error
+formatting and source traversal are separate behaviors.
 
 ## OpenNetLogger::register_log_listener()
 

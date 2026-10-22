@@ -66,7 +66,7 @@ impl Fixture {
         let (publisher, initial) = source.begin_generation()?;
         initial.dispatch()?;
         publisher
-            .prepare_observation(NetworkStatus::Available, None, None)?
+            .prepare_observation(NetworkStatus::Available, None)?
             .dispatch()?;
         let view = source.new_view(executor.clone(), None)?;
         view.activate()?.1.dispatch();
@@ -104,9 +104,7 @@ impl Fixture {
         )
     }
     fn publish(&self, status: NetworkStatus) -> Result<()> {
-        self.publisher
-            .prepare_observation(status, None, None)?
-            .dispatch()
+        self.publisher.prepare_observation(status, None)?.dispatch()
     }
 }
 
@@ -434,7 +432,7 @@ async fn rejected_and_abandoned_callback_jobs_end_without_attempting_error_callb
 
 #[tokio::test]
 #[cfg(test)]
-async fn oversized_later_event_is_terminal_and_does_not_resubscribe() -> TestResult {
+async fn connectivity_events_fit_a_single_snapshot_budget_without_recovery() -> TestResult {
     let fixture = Fixture::new()?;
     let calls = Arc::new(Mutex::new(Vec::new()));
     let captured = calls.clone();
@@ -448,14 +446,15 @@ async fn oversized_later_event_is_terminal_and_does_not_resubscribe() -> TestRes
     fixture.executor.run_one().await?;
     fixture
         .publisher
-        .prepare_observation(NetworkStatus::Unavailable, None, Some("x".repeat(256)))?
+        .prepare_observation(NetworkStatus::Unavailable, None)?
         .dispatch()?;
     fixture.executor.run_one().await?;
-    assert!(matches!(&lock(&calls)[1], Err(error) if error.kind() == ErrorKind::ItemTooLarge));
-    let error = bounded(subscription.close())
-        .await?
-        .expect_err("oversized event fault was lost");
-    assert_eq!(error.kind(), ErrorKind::ItemTooLarge);
+    assert!(
+        matches!(&lock(&calls)[1], Ok(NetworkObservation::Event(event))
+        if event.snapshot.reachability == Some(NetworkStatus::Unavailable)
+            && event.snapshot.network_name.is_none())
+    );
+    bounded(subscription.close()).await??;
     assert_eq!(fixture.replacements.load(Ordering::SeqCst), 0);
     Ok(())
 }
@@ -587,7 +586,7 @@ async fn root_drop_during_overflow_delivers_closed_and_releases_engine_with_hand
     let (publisher, initial) = source.begin_generation()?;
     initial.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, None, None)?
+        .prepare_observation(NetworkStatus::Available, None)?
         .dispatch()?;
     owner.activate_view_for_test()?;
     let (entered, started) = oneshot::channel();
@@ -606,7 +605,7 @@ async fn root_drop_during_overflow_delivers_closed_and_releases_engine_with_hand
     })?;
     bounded(started).await??;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, None, None)?
+        .prepare_observation(NetworkStatus::Unavailable, None)?
         .dispatch()?;
     // Root-service Drop closes the source while its final event cannot fit.
     // Drop the view owner too: recovery must not depend on upgrading that owner.

@@ -47,9 +47,6 @@ fn sample(id: u64) -> super::super::refresh::CompletedSample {
         sampled_at: std::time::SystemTime::now(),
         observation: super::super::refresh::SampleObservation {
             reachability: NetworkStatus::Unavailable,
-            network_name: Some("expired-sample".into()),
-            name_source: crate::net_status::NetworkNameSource::NetworkListManager,
-            name_diagnostics: Vec::new(),
         },
     }
 }
@@ -61,7 +58,7 @@ fn deadline_expired_before_commit_keeps_running_and_never_publishes() {
     let (publisher, starting) = source.begin_generation().unwrap();
     starting.dispatch().unwrap();
     publisher
-        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))
         .unwrap()
         .dispatch()
         .unwrap();

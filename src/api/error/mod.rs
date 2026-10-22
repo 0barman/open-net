@@ -117,6 +117,8 @@ pub enum ErrorStage {
     Tcp,
     /// Connecting through or authenticating with a proxy.
     Proxy,
+    /// Negotiating TLS with the proxy or a later alert from that TLS layer.
+    ProxyTls,
     /// Negotiating TLS or validating certificates.
     Tls,
     /// Performing the HTTP-to-WebSocket upgrade.
@@ -147,7 +149,9 @@ pub enum ErrorStage {
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct ErrorContext {
-    /// Processing stage at which the error was classified.
+    /// Processing stage at which the error was classified, when known.
+    /// HTTP execution failures can leave this unset when the transport does
+    /// not establish the send/receive phase. A stage is not delivery evidence.
     pub stage: Option<ErrorStage>,
     #[cfg(feature = "ws-client")]
     /// WebSocket client identifier associated with the failure, when available.
@@ -164,13 +168,18 @@ pub struct ErrorContext {
     #[cfg(feature = "ws-client")]
     /// Request identifier associated with the failure, when available.
     pub request_id: Option<crate::ws::RequestId>,
+    #[cfg(feature = "ws-client")]
+    /// Expired WebSocket operation budget, when classified by the SDK.
+    pub ws_timeout_phase: Option<crate::ws::WsTimeoutPhase>,
     /// HTTP status received from the peer, including protocol or body-read failures.
     pub http_status: Option<http::StatusCode>,
     #[cfg(feature = "http-client")]
     /// HTTP request identifier associated with the failure, when available.
     pub http_request_id: Option<crate::api::http::HttpRequestId>,
     #[cfg(feature = "http-client")]
-    /// Expired HTTP budget, when the SDK classified a timeout.
+    /// Expired SDK-owned HTTP budget, when identified.
+    /// A transport timeout such as HTTP/2 keepalive expiry can be `TimedOut`
+    /// while this remains `None`; the field does not describe send progress.
     pub http_timeout_phase: Option<crate::api::http::TimeoutPhase>,
     #[cfg(feature = "http-client")]
     /// HTTP attempt number starting at one; zero means no attempt has started.
@@ -203,6 +212,7 @@ impl fmt::Debug for ErrorContext {
             .field("session_id", &self.session_id)
             .field("connection_id", &self.connection_id)
             .field("attempt_id", &self.attempt_id)
+            .field("ws_timeout_phase", &self.ws_timeout_phase)
             .field(
                 "request_id_len",
                 &self.request_id.as_ref().map(|id| id.as_str().len()),
@@ -229,6 +239,7 @@ pub struct NetError {
     context: ErrorContext,
     config_error: Option<Arc<ConfigError>>,
     source: Option<Arc<dyn StdError + Send + Sync + 'static>>,
+    retry_report: Option<Arc<crate::api::retry::RetryReport>>,
     #[cfg(feature = "http-client")]
     http_response_head: Option<Arc<crate::api::http::HttpResponseHead>>,
 }
@@ -246,6 +257,7 @@ impl NetError {
             context: ErrorContext::default(),
             config_error: None,
             source: None,
+            retry_report: None,
             #[cfg(feature = "http-client")]
             http_response_head: None,
         }
@@ -294,6 +306,12 @@ impl NetError {
         self
     }
 
+    #[cfg(feature = "ws-client")]
+    pub(crate) fn with_ws_timeout_phase(mut self, phase: crate::ws::WsTimeoutPhase) -> Self {
+        self.context.ws_timeout_phase = Some(phase);
+        self
+    }
+
     pub(crate) fn input(field: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
             config_error: Some(Arc::new(ConfigError::new(field, reason))),
@@ -317,10 +335,36 @@ impl NetError {
         &self.context
     }
 
-    /// Returns the expired HTTP budget, or `None` for other failures.
+    /// Returns retry statistics for the logical operation that produced this error.
+    ///
+    /// Errors constructed outside a submitted operation have no report. Attaching
+    /// a report preserves the original classification, source and protocol context.
+    pub fn retry_report(&self) -> Option<&crate::api::retry::RetryReport> {
+        self.retry_report.as_deref()
+    }
+
+    pub(crate) fn with_retry_report(mut self, report: crate::api::retry::RetryReport) -> Self {
+        self.retry_report = Some(Arc::new(report));
+        self
+    }
+
+    /// Returns the expired SDK-owned HTTP budget, when identified.
+    ///
+    /// `None` does not rule out `ErrorKind::TimedOut`: transport timeouts such
+    /// as HTTP/2 keepalive expiry are not an SDK phase budget. This value does
+    /// not establish whether request bytes reached the peer.
     #[cfg(feature = "http-client")]
     pub fn timeout_phase(&self) -> Option<crate::api::http::TimeoutPhase> {
         self.context.http_timeout_phase
+    }
+
+    /// Returns the expired WebSocket operation budget, or `None` for other failures.
+    ///
+    /// `Attempt` is independent of the write and response timers; admission and
+    /// total timeouts always terminate the logical operation.
+    #[cfg(feature = "ws-client")]
+    pub fn ws_timeout_phase(&self) -> Option<crate::ws::WsTimeoutPhase> {
+        self.context.ws_timeout_phase
     }
 
     /// Returns the HTTP status associated with the failure, if one was recorded.
@@ -388,6 +432,7 @@ impl fmt::Debug for NetError {
             .field("context", &self.context)
             .field("config_error", &self.config_error)
             .field("has_source", &self.source.is_some())
+            .field("retry_report", &self.retry_report)
             .finish()
     }
 }
@@ -476,6 +521,17 @@ impl From<ConfigError> for NetError {
             config_error: Some(Arc::clone(&detail)),
             source: Some(detail),
             ..Self::new(ErrorKind::InvalidConfig).with_stage(ErrorStage::Configuration)
+        }
+    }
+}
+
+impl From<crate::api::retry::RetryConfigError> for NetError {
+    fn from(source: crate::api::retry::RetryConfigError) -> Self {
+        let detail = ConfigError::new(source.field(), source.reason());
+        Self {
+            config_error: Some(Arc::new(detail)),
+            ..Self::with_source(ErrorKind::InvalidConfig, source)
+                .with_stage(ErrorStage::Configuration)
         }
     }
 }
@@ -660,7 +716,14 @@ impl From<tokio_tungstenite::tungstenite::Error> for NetError {
         let mut context = ErrorContext::default();
         let kind = match &value {
             Error::ConnectionClosed | Error::AlreadyClosed => ErrorKind::Closed,
-            Error::Io(_) => ErrorKind::Io,
+            Error::Io(error) => {
+                context.stage = crate::module::transport::tls_error_stage(error);
+                if context.stage.is_some() {
+                    ErrorKind::Tls
+                } else {
+                    ErrorKind::Io
+                }
+            }
             Error::Tls(_) => {
                 context.stage = Some(ErrorStage::Tls);
                 ErrorKind::Tls
@@ -873,6 +936,119 @@ mod tests {
                     .copied()
                     == Some(source),
                 "original common source",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retry_report_preserves_error_identity_context_and_source() -> TestResult {
+        use crate::api::retry::{RetryReport, RetryStopReason};
+
+        let report = RetryReport {
+            attempts: 3,
+            retry_count: 2,
+            transport_sends: 4,
+            elapsed: std::time::Duration::from_millis(30),
+            stop_reason: Some(RetryStopReason::AttemptsExhausted),
+        };
+        let error = NetError::with_source(
+            ErrorKind::Io,
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "private-source"),
+        )
+        .with_context(ErrorContext {
+            stage: Some(ErrorStage::Receive),
+            http_status: Some(http::StatusCode::OK),
+            ..Default::default()
+        })
+        .with_retry_report(report);
+        let cloned = error.clone();
+        check(
+            cloned.kind() == ErrorKind::Io
+                && cloned.context().stage == Some(ErrorStage::Receive)
+                && cloned.context().http_status == Some(http::StatusCode::OK)
+                && cloned.io_kind() == Some(std::io::ErrorKind::ConnectionReset),
+            "attaching a report must preserve the failure and received status",
+        )?;
+        let attached = cloned
+            .retry_report()
+            .ok_or_else(|| std::io::Error::other("retry report missing after clone"))?;
+        check(
+            attached.attempts == 3
+                && attached.retry_count == 2
+                && attached.transport_sends == 4
+                && attached.stop_reason == Some(RetryStopReason::AttemptsExhausted),
+            "cloning an error must retain retry statistics",
+        )?;
+        check(
+            !format!("{error:?} {error}").contains("private-source"),
+            "retry reports must not expose source text in default formatting",
+        )
+    }
+
+    #[test]
+    fn retry_configuration_errors_support_question_mark_without_losing_details() -> TestResult {
+        fn configure() -> Result<()> {
+            crate::api::retry::RetrySchedule::builder()
+                .max_attempts(0)
+                .build()?;
+            Ok(())
+        }
+        let error = match configure() {
+            Err(error) => error,
+            Ok(()) => return Err(std::io::Error::other("invalid configuration accepted").into()),
+        };
+        check(
+            error.kind() == ErrorKind::InvalidConfig
+                && error.context().stage == Some(ErrorStage::Configuration)
+                && error.config_error().map(ConfigError::field) == Some("max_attempts"),
+            "retry config conversion must retain field and origin",
+        )?;
+        check(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<crate::api::retry::RetryConfigError>())
+                .is_some(),
+            "retry config conversion must retain the original structured source",
+        )
+    }
+
+    #[cfg(feature = "ws-client")]
+    #[test]
+    fn websocket_timeout_phase_survives_delivery_wrapping_clone_and_retry_report() -> TestResult {
+        use crate::ws::WsTimeoutPhase;
+        for phase in [
+            WsTimeoutPhase::Admission,
+            WsTimeoutPhase::Write,
+            WsTimeoutPhase::Response,
+            WsTimeoutPhase::Attempt,
+            WsTimeoutPhase::Total,
+        ] {
+            let source = NetError::from(ErrorKind::TimedOut)
+                .with_stage(ErrorStage::Write)
+                .with_ws_timeout_phase(phase);
+            let context = source.context().clone();
+            let error = NetError::with_source(ErrorKind::DeliveryUnknown, source)
+                .with_context(context)
+                .with_retry_report(crate::api::retry::RetryReport::new())
+                .clone();
+            check(
+                error.ws_timeout_phase() == Some(phase),
+                "delivery wrapper lost the WebSocket budget phase",
+            )?;
+            check(
+                error
+                    .source()
+                    .and_then(|source| source.downcast_ref::<NetError>())
+                    .is_some_and(|source| {
+                        source.kind() == ErrorKind::TimedOut
+                            && source.ws_timeout_phase() == Some(phase)
+                    }),
+                "original timeout cause lost its phase",
+            )?;
+            check(
+                error.retry_report().is_some(),
+                "timeout report lost during clone",
             )?;
         }
         Ok(())

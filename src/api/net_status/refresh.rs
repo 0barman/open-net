@@ -3,12 +3,12 @@ use std::time::SystemTime;
 use super::NetworkSnapshot;
 use crate::NetError;
 
-/// Provenance of the network name included in a refresh result.
+/// Provenance of an explicitly requested network name.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkNameSource {
-    /// The latest cached name, preserved without querying Windows for a name.
-    /// Used by `NetStatusClient::refresh_reachability`.
+    /// Legacy provenance retained for source compatibility. Connectivity
+    /// refreshes no longer preserve or return cached names.
     CachedObservation,
     /// An active Wi-Fi SSID.
     WifiSsid,
@@ -16,6 +16,8 @@ pub enum NetworkNameSource {
     NetworkListManager,
     /// The system queries completed without a connected network name.
     None,
+    /// No name query was requested. All connectivity refreshes return this value.
+    NotCollected,
 }
 
 /// Provenance of the IP-stack field included in a refresh result.
@@ -28,18 +30,15 @@ pub enum NetworkIpStackSource {
 
 /// A completed Windows sampling window and the associated client snapshot.
 ///
-/// `refresh` freshly queries reachability and network name;
-/// `refresh_reachability` queries only reachability and preserves the cached
-/// name, identified by `NetworkNameSource::CachedObservation`. The IP-stack
+/// All refresh methods query only reachability. Network names require a
+/// separate explicit name observer and never enter this result. The IP-stack
 /// field retains the latest background interface observation. These system calls
 /// form a sampling window, not an atomic Windows snapshot. A successful query
 /// with unchanged values preserves the snapshot's revision and observed_at.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct NetworkRefreshResult {
-    /// This client's latest snapshot after committing the sample. Each field
-    /// retains its newest observation: a full query whose name was slow may
-    /// preserve reachability from a later reachability-only query. Compare
+    /// This client's latest snapshot after committing the sample. Compare
     /// `sampled_reachability` for this sampling window's own system result.
     pub snapshot: NetworkSnapshot,
     /// Reachability returned by this sampling window's own Windows query.
@@ -54,10 +53,10 @@ pub struct NetworkRefreshResult {
     /// Wall-clock time immediately after the queries. Clock corrections can
     /// move wall time backwards; use sample_id for ordering.
     pub sampled_at: SystemTime,
-    /// Source of the network name, including a successful absence or a cached
-    /// value which was not queried by this sample.
+    /// Compatibility field; always `NetworkNameSource::NotCollected`.
     pub network_name_source: NetworkNameSource,
-    /// Query faults bypassed by a successful fresh NLM name fallback.
+    /// Compatibility field; always empty. Name failures belong to the explicit
+    /// name observation and cannot fail a connectivity refresh.
     pub network_name_diagnostics: Vec<NetError>,
     /// Explicitly identifies the IP-stack field as a background observation.
     pub ip_stack_source: NetworkIpStackSource,

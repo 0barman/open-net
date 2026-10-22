@@ -6,12 +6,9 @@ use std::sync::atomic::AtomicUsize;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-fn observation(status: NetworkStatus, name: Option<&str>) -> SampleObservation {
+fn observation(status: NetworkStatus) -> SampleObservation {
     SampleObservation {
         reachability: status,
-        network_name: name.map(str::to_owned),
-        name_source: NetworkNameSource::NetworkListManager,
-        name_diagnostics: vec![],
     }
 }
 
@@ -24,7 +21,6 @@ async fn running() -> Result<(Arc<SharedNetworkService>, Arc<NetworkObservationO
         .prepare_observation(
             NetworkStatus::Available,
             Some(crate::net_status::IpStack::DualStack),
-            None,
         )?
         .dispatch()?;
     owner.activate_view_for_test()?;
@@ -45,7 +41,7 @@ async fn refresh_commits_once_and_same_value_has_new_sampling_evidence() -> Test
     };
     let sampler = Arc::new(WindowsSampler::with_provider(Arc::new(move |_, _| {
         counted.fetch_add(1, Ordering::SeqCst);
-        Ok(observation(status, Some("fresh-name")))
+        Ok(observation(status))
     })));
     let first = refresh_with_sampler(
         owner.clone(),
@@ -55,7 +51,9 @@ async fn refresh_commits_once_and_same_value_has_new_sampling_evidence() -> Test
     )
     .await?;
     assert_eq!(first.snapshot.reachability, Some(status));
-    assert_eq!(first.snapshot.network_name.as_deref(), Some("fresh-name"));
+    assert!(first.snapshot.network_name.is_none());
+    assert_eq!(first.network_name_source, NetworkNameSource::NotCollected);
+    assert!(first.network_name_diagnostics.is_empty());
     assert_eq!(owner.snapshot()?.revision, first.snapshot.revision);
     assert!(matches!(
         events.recv().await?.ok_or("missing changed event")?.kind,
@@ -126,7 +124,7 @@ async fn timed_out_native_work_cannot_publish_and_queue_deadline_prevents_sampli
             .map_err(NetError::from_poison)?
             .recv()
             .map_err(|_| error(ErrorKind::Internal))?;
-        Ok(observation(NetworkStatus::Unavailable, Some("late")))
+        Ok(observation(NetworkStatus::Unavailable))
     })));
     let future = refresh_with_sampler(
         owner.clone(),
@@ -179,10 +177,7 @@ async fn stop_of_one_view_revokes_only_its_refresh_eligibility() -> TestResult {
     owner.activate_view_for_test()?;
     let before = owner.snapshot()?;
     let sampler = Arc::new(WindowsSampler::with_provider(Arc::new(|_, _| {
-        Ok(observation(
-            NetworkStatus::Unavailable,
-            Some("old-generation"),
-        ))
+        Ok(observation(NetworkStatus::Unavailable))
     })));
     let result = refresh_with_sampler(
         owner.clone(),
@@ -235,7 +230,7 @@ async fn stop_interrupts_refresh_without_waiting_for_native_return() -> TestResu
                 .recv()
                 .map_err(|_| error(ErrorKind::Internal))?;
             assert!(cancelled.load(Ordering::Acquire));
-            Ok(observation(NetworkStatus::Unavailable, Some("late")))
+            Ok(observation(NetworkStatus::Unavailable))
         },
     )));
     let refresh = tokio::spawn(refresh_with_sampler(
@@ -282,7 +277,7 @@ async fn dropping_refresh_future_revokes_late_commit() -> TestResult {
             if let Some(sender) = completed.lock().map_err(NetError::from_poison)?.take() {
                 let _ = sender.send(invalid);
             }
-            Ok(observation(NetworkStatus::Unavailable, Some("dropped")))
+            Ok(observation(NetworkStatus::Unavailable))
         },
     )));
     let refresh = tokio::spawn(refresh_with_sampler(
@@ -343,7 +338,7 @@ fn refresh_can_be_polled_without_a_caller_tokio_runtime() -> TestResult {
     futures::executor::block_on(async {
         let (service, owner) = running().await?;
         let sampler = Arc::new(WindowsSampler::with_provider(Arc::new(|_, _| {
-            Ok(observation(NetworkStatus::Available, None))
+            Ok(observation(NetworkStatus::Available))
         })));
         let result = refresh_with_sampler(
             owner.clone(),

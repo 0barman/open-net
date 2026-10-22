@@ -11,7 +11,8 @@ use crate::api::http::cookies::{CookieLimits, CookieStore};
 #[cfg(feature = "http-client-http2")]
 use crate::api::http::http2::{Http2Config, HttpVersionPolicy};
 use crate::api::http::http_timeouts::{validate_duration, HttpTimeouts};
-use crate::api::http::retry::RetryPolicy;
+use crate::api::http::redirect::{HttpTransportSecurity, RedirectPolicy};
+use crate::api::http::retry::HttpRetryPolicy;
 use crate::api::http::HttpAdmissionPolicy;
 #[cfg(feature = "http-client-middleware")]
 use crate::api::http::HttpMiddleware;
@@ -364,6 +365,8 @@ pub struct HttpClientConfig {
     connect_timeout: Option<Duration>,
     timeouts: HttpTimeouts,
     admission_policy: HttpAdmissionPolicy,
+    redirect_policy: RedirectPolicy,
+    transport_security: HttpTransportSecurity,
     /// Optional TCP keepalive interval applied to pooled connections.
     pub tcp_keepalive: Option<Duration>,
     /// Maximum response body size accepted by the receive lane. Defaults to 1024 MiB.
@@ -385,7 +388,7 @@ pub struct HttpClientConfig {
     /// this range return a structured configuration error.
     pub callback_queue_capacity: usize,
     /// Policy applied when a request does not provide its own policy.
-    pub default_retry_policy: RetryPolicy,
+    pub default_retry_policy: HttpRetryPolicy,
     /// TLS trust and client identity settings.
     pub tls: HttpTlsConfig,
     /// Optional explicit HTTP CONNECT proxy configuration.
@@ -434,13 +437,15 @@ impl HttpClientConfig {
             connect_timeout: None,
             timeouts: HttpTimeouts::new(),
             admission_policy: HttpAdmissionPolicy::default(),
+            redirect_policy: RedirectPolicy::default(),
+            transport_security: HttpTransportSecurity::default(),
             // reqwest defaults to a 15 second TCP keepalive.
             tcp_keepalive: Some(Duration::from_secs(15)),
             max_response_bytes: 1024 * 1024 * 1024,
             request_queue_capacity: 128,
             response_queue_capacity: 128,
             callback_queue_capacity: 128,
-            default_retry_policy: RetryPolicy::no_retry(),
+            default_retry_policy: HttpRetryPolicy::no_retry(),
             tls: HttpTlsConfig::default(),
             proxy: None,
             environment_proxy: false,
@@ -457,6 +462,45 @@ impl HttpClientConfig {
             #[cfg(feature = "http-client-middleware")]
             middlewares: Vec::new(),
         })
+    }
+
+    /// Replace the redirect authorization policy.
+    ///
+    /// The default follows at most 10 redirects within the original request's
+    /// origin. Cross-origin targets require an explicit origin allowlist. This
+    /// applies to buffered, callback, streaming, and SSE requests, regardless of
+    /// HTTP version or installed Auth/Cookie providers.
+    pub fn with_redirect_policy(mut self, policy: RedirectPolicy) -> Self {
+        self.redirect_policy = policy;
+        self
+    }
+
+    /// Return the redirect authorization policy.
+    pub fn redirect_policy(&self) -> &RedirectPolicy {
+        &self.redirect_policy
+    }
+
+    /// Select transport security independently of HTTP protocol versions.
+    ///
+    /// The default permits an explicitly configured HTTP base URL but rejects
+    /// HTTPS-to-HTTP redirects. `HttpsOnly` also rejects an HTTP base URL here
+    /// and during [`Self::validate`]. HTTP/2-only clients always require HTTPS.
+    pub fn with_transport_security(
+        mut self,
+        security: HttpTransportSecurity,
+    ) -> Result<Self, NetError> {
+        if security == HttpTransportSecurity::HttpsOnly && self.base_url.scheme() != "https" {
+            return Err(invalid_config("http.transport_security"));
+        }
+        self.transport_security = security;
+        Ok(self)
+    }
+
+    /// Return the configured transport requirement.
+    ///
+    /// HTTP/2-only mode independently adds its HTTPS requirement.
+    pub fn transport_security(&self) -> HttpTransportSecurity {
+        self.transport_security
     }
 
     /// Append a middleware to the concrete request and stream pipeline.
@@ -645,7 +689,7 @@ impl HttpClientConfig {
     }
 
     /// Set the default retry policy.
-    pub fn with_default_retry_policy(mut self, policy: RetryPolicy) -> Self {
+    pub fn with_default_retry_policy(mut self, policy: HttpRetryPolicy) -> Self {
         self.default_retry_policy = policy;
         self
     }
@@ -720,6 +764,9 @@ impl HttpClientConfig {
         {
             return Err(invalid_config("base_url"));
         }
+        if self.transport_security == HttpTransportSecurity::HttpsOnly && scheme != "https" {
+            return Err(invalid_config("http.transport_security"));
+        }
         validate_duration(self.timeout, "http.timeout", false)?;
         if let Some(timeout) = self.connect_timeout {
             validate_duration(timeout, "http.connect_timeout", false)?;
@@ -785,6 +832,8 @@ impl fmt::Debug for HttpClientConfig {
             .field("connect_timeout", &self.connect_timeout)
             .field("timeouts", &self.timeouts)
             .field("admission_policy", &self.admission_policy)
+            .field("redirect_policy", &self.redirect_policy)
+            .field("transport_security", &self.transport_security)
             .field("tcp_keepalive", &self.tcp_keepalive)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("request_queue_capacity", &self.request_queue_capacity)
@@ -1008,6 +1057,71 @@ mod tests {
         } else {
             Err(std::io::Error::other(message).into())
         }
+    }
+
+    #[test]
+    fn redirect_defaults_are_independent_of_http_version_and_private_in_debug() -> TestResult {
+        let config = HttpClientConfig::new("http://api.example")?;
+        check(
+            config.transport_security() == HttpTransportSecurity::PreventDowngrade
+                && config.redirect_policy().is_enabled()
+                && config.redirect_policy().max_redirects() == 10,
+            "HTTP clients must default to bounded same-origin redirects and no downgrade",
+        )?;
+        config.validate()?;
+        let configured = config
+            .with_redirect_policy(
+                RedirectPolicy::allow_origins(["https://private-customer.example"])?
+                    .with_max_redirects(3)?,
+            )
+            .clone();
+        check(
+            configured.redirect_policy().max_redirects() == 3,
+            "redirect policy must survive clone",
+        )?;
+        let debug = format!("{configured:?}");
+        check(
+            debug.contains("allowed_origin_count: 1")
+                && debug.contains("transport_security: PreventDowngrade")
+                && !debug.contains("private-customer.example"),
+            "configuration Debug must report policy without disclosing destination origins",
+        )?;
+        check(
+            !configured
+                .with_redirect_policy(RedirectPolicy::none())
+                .redirect_policy()
+                .is_enabled(),
+            "the last redirect policy must win",
+        )
+    }
+
+    #[test]
+    fn https_only_validates_initial_url_and_public_field_mutations() -> TestResult {
+        let error = HttpClientConfig::new("http://api.example")?
+            .with_transport_security(HttpTransportSecurity::HttpsOnly)
+            .expect_err("HTTPS-only must reject an HTTP base URL");
+        check(
+            error.kind() == ErrorKind::InvalidConfig
+                && error.config_error().map(|detail| detail.field())
+                    == Some("http.transport_security"),
+            "HTTPS-only must produce a structured configuration error",
+        )?;
+        let mut configured = HttpClientConfig::new("https://api.example")?
+            .with_transport_security(HttpTransportSecurity::HttpsOnly)?;
+        configured.validate()?;
+        check(
+            configured.transport_security() == HttpTransportSecurity::HttpsOnly,
+            "configured transport security must be observable",
+        )?;
+        configured.base_url = reqwest::Url::parse("http://api.example")?;
+        check(
+            configured.validate().is_err(),
+            "public base URL mutation must not bypass HTTPS-only",
+        )?;
+        configured
+            .with_transport_security(HttpTransportSecurity::PreventDowngrade)?
+            .validate()?;
+        Ok(())
     }
 
     #[test]

@@ -52,6 +52,32 @@ impl NetStatusClient {
         self.inner.snapshot()
     }
 
+    /// Explicitly observe Windows Wi-Fi SSID or NLM network display names.
+    ///
+    /// This is the only monitoring API that enables name collection. It does
+    /// not start connectivity monitoring or modify connectivity snapshots,
+    /// HTTP observations, or network events. The returned observer owns its
+    /// name demand and exposes a separate latest-value stream.
+    ///
+    /// A stopped connectivity client can observe names. `stop()` affects only
+    /// connectivity; client shutdown/destroy and engine shutdown close names
+    /// too. Drop requests cancellation; await the observer's `close()` to
+    /// confirm that cached/pending values and in-flight work have retired.
+    /// Already returned application-owned copies cannot be recalled.
+    ///
+    /// Invalid options are rejected before lifecycle checks. Closed clients
+    /// reject admission; other platforms return `Unsupported`. Creation on
+    /// Windows does not wait for an OS query. `recv()` starts with Pending
+    /// unless the observer has already closed; `snapshot()` reads the latest
+    /// state, which may already contain a result. Sampling errors are delivered
+    /// on the name stream.
+    pub fn observe_network_names(
+        &self,
+        options: crate::net_status::NetworkNameOptions,
+    ) -> Result<crate::net_status::NetworkNameObserver> {
+        self.inner.observe_network_names(options)
+    }
+
     /// Collect a fresh LAN IPv4 inventory using [`crate::network::lan_ipv4_snapshot`].
     ///
     /// Synchronous OS query: it blocks this caller and needs no caller runtime.
@@ -138,15 +164,10 @@ impl NetStatusClient {
         self.inner.on_recoverable_event(options, callback)
     }
 
-    /// Query fresh Windows reachability and network name and commit the result.
-    /// Requires this view to be Running. The positive timeout covers admission,
-    /// sampling and commit. Dropping the future invalidates uncommitted results.
-    /// A slow name query preserves any later reachability observation while
-    /// committing its fresh name; a newer name sample supersedes it with Cancelled.
-    /// After input and lifecycle validation, other platforms return Unsupported;
-    /// snapshot() remains a cheap cache read. Expired results cannot commit, but
-    /// scheduling and lock contention can delay return beyond the timeout.
-    /// Success does not wait for subscription callbacks to finish.
+    /// Compatibility alias for [`Self::refresh_reachability`].
+    ///
+    /// This method no longer queries, caches, or publishes network names.
+    #[deprecated(note = "use refresh_reachability; network names require observe_network_names")]
     pub async fn refresh(&self, timeout: Duration) -> Result<NetworkRefreshResult> {
         crate::log_t!(LogType::Engine; "net_status.refresh", "timeout", timeout);
         crate::module::net_status::inner::refresh::refresh(self.inner.clone(), timeout).await
@@ -154,8 +175,9 @@ impl NetStatusClient {
 
     /// Query and commit fresh Windows reachability without querying a name.
     /// Uses a separate bounded worker so a slow or failed network-name query
-    /// cannot block this query or background reachability monitoring. The name
-    /// and IP stack retain their latest cached values with explicit provenance.
+    /// cannot block this query or background reachability monitoring. The IP
+    /// stack retains its latest background value. The compatibility name field
+    /// is always None, with NotCollected provenance and no name diagnostics.
     /// Requires Running and a positive timeout covering admission, sampling and
     /// commit. Dropping this future invalidates uncommitted results. A newer
     /// committed reachability sample supersedes an older query with Cancelled.
@@ -168,9 +190,9 @@ impl NetStatusClient {
             .await
     }
 
-    /// Synchronously query and commit fresh Windows reachability and network name.
+    /// Compatibility alias for [`Self::refresh_reachability_blocking`].
     ///
-    /// This is the blocking counterpart of [`Self::refresh`], with the same
+    /// This no longer queries names. It has the same
     /// sampling, field provenance and lifecycle checks. A positive timeout is
     /// required; after input and lifecycle validation, other platforms return
     /// `Unsupported`. Errors never silently fall back to [`Self::snapshot`].
@@ -181,11 +203,14 @@ impl NetStatusClient {
     /// Blocks the calling thread. Ordinary threads, external Tokio runtimes,
     /// nested futures executors and the SDK's separate subscription callback
     /// pool are supported; the SDK drives its own timers and sampling workers.
-    /// Prefer [`Self::refresh`] in async code and avoid blocking a UI thread.
+    /// Prefer [`Self::refresh_reachability`] in async code and avoid blocking a UI thread.
     /// SDK management-runtime threads (including its blocking pool) and sampling
     /// threads are rejected before any query with `InvalidInput`, stage
     /// `NetworkMonitor`, and field `network_status.refresh_blocking.context`.
     /// Entering an SDK runtime context alone does not trigger this rejection.
+    #[deprecated(
+        note = "use refresh_reachability_blocking; network names require observe_network_names"
+    )]
     pub fn refresh_blocking(&self, timeout: Duration) -> Result<NetworkRefreshResult> {
         crate::log_t!(LogType::Engine; "net_status.refresh_blocking", "timeout", timeout);
         crate::module::net_status::inner::refresh::refresh_blocking(self.inner.clone(), timeout)
@@ -194,8 +219,8 @@ impl NetStatusClient {
     /// Synchronously query and commit fresh Windows reachability only.
     ///
     /// The blocking counterpart of [`Self::refresh_reachability`], using its
-    /// independent sampling lane. Network name and IP-stack values remain
-    /// cached, with their provenance preserved in the result. Requires Running
+    /// independent sampling lane. The IP-stack value remains cached; no name
+    /// is queried or returned. Requires Running
     /// and a positive timeout; other platforms return `Unsupported` after these
     /// checks. Never substitutes a cached snapshot for a failed fresh query.
     ///

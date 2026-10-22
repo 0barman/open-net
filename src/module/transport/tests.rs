@@ -8,6 +8,37 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
+#[tokio::test]
+async fn forbidden_plaintext_credentials_fail_before_a_socket_is_created() -> TestResult {
+    use crate::network::ProxyBasicAuth;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let credentials = ProxyBasicAuth::new("test-user", "test-password")?;
+    if ProxyConfig::http_connect(&url, Some(credentials.clone())).is_ok() {
+        return Err("constructor accepted plaintext authentication".into());
+    }
+    // Even an internal caller bypassing the public constructor is checked by
+    // compilation, before a worker or an attempt can acquire a socket.
+    let mut proxy = ProxyConfig::http_connect(&url, None)?;
+    proxy.endpoint.as_mut().ok_or("missing proxy")?.auth = Some(credentials);
+    let error = CompiledNetworkConfig::new(NetworkConfig::default().with_proxy(proxy))
+        .err()
+        .ok_or("compilation accepted plaintext authentication")?;
+    if error.kind() != crate::error::ErrorKind::InvalidConfig
+        || error.context().stage != Some(crate::error::ErrorStage::Configuration)
+        || error.config_error().map(|detail| detail.field()) != Some("proxy.auth_transport_policy")
+    {
+        return Err("plaintext authentication lost its configuration error context".into());
+    }
+    if tokio::time::timeout(Duration::from_millis(20), listener.accept())
+        .await
+        .is_ok()
+    {
+        return Err("rejected plaintext authentication created a socket".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[test]
 fn explicit_ws_providers_remain_isolated_and_preserve_protocol_policy() -> TestResult {
@@ -28,19 +59,22 @@ fn explicit_ws_providers_remain_isolated_and_preserve_protocol_policy() -> TestR
         NetworkConfig::default()
             .with_tls(TlsConfig::default().with_crypto_provider(Arc::clone(&unrestricted))),
     )?;
-    assert!(Arc::ptr_eq(first.tls.crypto_provider(), &restricted));
-    assert!(Arc::ptr_eq(second.tls.crypto_provider(), &unrestricted));
-    assert!(first.tls.alpn_protocols.is_empty());
-    assert!(!first.tls.enable_early_data);
-    assert!(first.tls.enable_sni);
+    assert!(Arc::ptr_eq(first.target_tls.crypto_provider(), &restricted));
+    assert!(Arc::ptr_eq(
+        second.target_tls.crypto_provider(),
+        &unrestricted
+    ));
+    assert!(first.target_tls.alpn_protocols.is_empty());
+    assert!(!first.target_tls.enable_early_data);
+    assert!(first.target_tls.enable_sni);
     assert!(first
-        .tls
+        .target_tls
         .crypto_provider()
         .cipher_suites
         .iter()
         .all(|suite| suite.tls13().is_some()));
     assert!(second
-        .tls
+        .target_tls
         .crypto_provider()
         .cipher_suites
         .iter()
@@ -81,7 +115,7 @@ fn ws_identity_is_loaded_by_final_provider_in_either_builder_order() -> TestResu
     );
     normal.validate()?;
     assert!(CompiledNetworkConfig::new(normal)?
-        .tls
+        .target_tls
         .client_auth_cert_resolver
         .has_certs());
     for tls in [
@@ -149,10 +183,10 @@ fn network_status_policy_builder_preserves_proxy_and_tls_configuration() -> Test
     }
     let compiled = CompiledNetworkConfig::new(configured)?;
     if compiled.network_status_policy() != NetworkStatusPolicy::PauseOnUnavailable
-        || compiled.proxy.endpoint.as_ref().map(|proxy| proxy.port) != Some(8080)
-        || !compiled.tls.enable_sni
-        || compiled.tls.enable_early_data
-        || !compiled.tls.alpn_protocols.is_empty()
+        || compiled.proxy.endpoint().map(|proxy| proxy.port) != Some(8080)
+        || !compiled.target_tls.enable_sni
+        || compiled.target_tls.enable_early_data
+        || !compiled.target_tls.alpn_protocols.is_empty()
     {
         return Err("compiling network status policy changed transport security".into());
     }
@@ -204,9 +238,9 @@ fn connection_reset_during_tls_is_still_a_transient_transport_failure() -> TestR
 #[test]
 fn compiled_tls_preserves_explicit_default_security_policy() -> TestResult {
     let config = CompiledNetworkConfig::new(NetworkConfig::default())?;
-    if !config.tls.alpn_protocols.is_empty()
-        || config.tls.enable_early_data
-        || !config.tls.enable_sni
+    if !config.target_tls.alpn_protocols.is_empty()
+        || config.target_tls.enable_early_data
+        || !config.target_tls.enable_sni
     {
         return Err("default TLS policy changed ALPN, SNI, or early data".into());
     }

@@ -4,7 +4,7 @@ Sources: [Cargo.toml](../../Cargo.toml) and the library crate's `Cargo.lock` in 
 In the Git repository, this lockfile is a local, Git-ignored resolution file.
 A fresh checkout may need Cargo to generate it and may resolve different exact versions.
 Required features: none to read this inventory; the tables describe feature and target conditions.
-Example dependencies: none; the review commands require Cargo and Python 3.11 or later.
+Example dependencies: none; the review commands require Cargo.
 
 The manifest contains **39 distinct direct dependency names**
 (41 declarations across normal/build/dev kinds). The lockfile contains
@@ -396,25 +396,23 @@ own license terms.
 
 ## Review commands
 
-These commands are for a source checkout of the full repository, run from its
-root. The `script/` tools are not included in the published library package.
-Use Python 3.11 or later. Generate a missing library lockfile with Cargo before
-running the inventory tool; the tool itself never updates the manifest or lockfile.
+These commands inspect the matching library source and its resolution snapshot.
+Generate a missing library lockfile with Cargo before reviewing the resolution.
 `--locked` refuses to change the resolution;
 `--offline` can be added when all required dependencies are cached. The tree
 commands help inspect conditions; the tables above remain a flat inventory.
 
+Run these commands from the matching library source directory containing its
+`Cargo.toml`. The inventory describes open-net 0.3.3 source and its
+resolution snapshot. Downstream consumers resolve their own dependency graph.
+
 ```bash
-# Regenerate the inventory from the local manifest and lockfile.
-python3 script/developer_dependency_inventory.py
-# Verify without rewriting it.
-python3 script/developer_dependency_inventory.py --check
-# Inspect normal and build dependencies for the local target and HTTP only.
-cargo tree --manifest-path open-net/Cargo.toml --locked --no-default-features --features http-client -e normal,build
+# Inspect normal and build dependencies for the current target and HTTP only.
+cargo tree --manifest-path Cargo.toml --locked --no-default-features --features http-client -e normal,build
 # Inspect all feature and target conditions, including test dependencies.
-cargo tree --manifest-path open-net/Cargo.toml --locked --all-features --target all -e normal,build,dev
+cargo tree --manifest-path Cargo.toml --locked --all-features --target all -e normal,build,dev
 # Inspect Cargo's machine-readable dependency declarations.
-cargo metadata --manifest-path open-net/Cargo.toml --locked --no-deps --format-version 1
+cargo metadata --manifest-path Cargo.toml --locked --no-deps --format-version 1
 ```
 
 Regenerate the inventory when dependency declarations or the local resolution change.

@@ -4,7 +4,7 @@ Required feature: `http-client-middleware` (includes `http-client`). Middleware 
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client-middleware"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client-middleware"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -24,7 +24,7 @@ using open-net should accept the host's choice rather than install its own globa
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
 precedence and complete examples of both approaches.
 
-Adjust the local path to your checkout. All middleware types are exported from `open_net::api::http`. Use `open_net::async_trait` for trait implementations. `.await` waits without blocking an asynchronous worker; a middleware must avoid blocking work because the request's cancellation and total timeout depend on the future making progress.
+All middleware types are exported from `open_net::api::http`. Use `open_net::async_trait` for trait implementations. `.await` waits without blocking an asynchronous worker; a middleware must avoid blocking work because the request's cancellation and total timeout depend on the future making progress.
 
 ## Register and execute a middleware chain
 

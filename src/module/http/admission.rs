@@ -164,32 +164,45 @@ impl HttpClientInner {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn admit_buffered_future(
         &self,
         request: &HttpRequest,
     ) -> Result<(Admission<SendCommand>, ResolvedTimeouts), NetError> {
-        let start = Instant::now();
+        self.admit_buffered_future_at(request, Instant::now()).await
+    }
+    pub(super) async fn admit_buffered_future_at(
+        &self,
+        request: &HttpRequest,
+        start: Instant,
+    ) -> Result<(Admission<SendCommand>, ResolvedTimeouts), NetError> {
         let policy = self.future_admission_policy(request);
-        let retry = request
-            .retry_setting()
-            .resolve(&self.config.default_retry_policy);
         let resolved = self
             .config
             .timeouts()
-            .resolve(request.timeouts(), self.config.timeout, &retry)
-            .map_err(|error| admission_error(error, None))?;
+            .resolve(request.timeouts(), self.config.timeout)
+            .map_err(|error| admission_report(admission_error(error, None), start))?;
         let admission = self
             .admit(&self.request_tx, policy, None, resolved, start)
-            .await?;
+            .await
+            .map_err(|error| admission_report(error, start))?;
         Ok((admission, resolved))
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_request<R: HttpRequestTrait>(
         &self,
         request: R,
-        mut options: HttpRequestOptions,
+        options: HttpRequestOptions,
     ) -> Result<HttpRequestHandle, EnqueueError<R>> {
-        let start = Instant::now();
+        self.submit_request_at(request, options, Instant::now())
+    }
+    pub(crate) fn submit_request_at<R: HttpRequestTrait>(
+        &self,
+        request: R,
+        mut options: HttpRequestOptions,
+        start: Instant,
+    ) -> Result<HttpRequestHandle, EnqueueError<R>> {
         let prepared = (|| {
             let resolved = self.resolve_timeouts(&options)?;
             options = options.clone().with_timeouts(resolved.as_overrides())?;
@@ -199,17 +212,26 @@ impl HttpClientInner {
             Ok(admission) => Ok(self.publish_buffered(request, options, admission)),
             Err(error) => Err(EnqueueError::new(
                 request,
-                admission_error(error, options.request_id),
+                admission_report(admission_error(error, options.request_id), start),
             )),
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn submit_request_wait<R: HttpRequestTrait>(
         &self,
         request: R,
-        mut options: HttpRequestOptions,
+        options: HttpRequestOptions,
     ) -> Result<HttpRequestHandle, EnqueueError<R>> {
-        let start = Instant::now();
+        self.submit_request_wait_at(request, options, Instant::now())
+            .await
+    }
+    pub(crate) async fn submit_request_wait_at<R: HttpRequestTrait>(
+        &self,
+        request: R,
+        mut options: HttpRequestOptions,
+        start: Instant,
+    ) -> Result<HttpRequestHandle, EnqueueError<R>> {
         let prepared = async {
             let resolved = self.resolve_timeouts(&options)?;
             options = options.clone().with_timeouts(resolved.as_overrides())?;
@@ -227,7 +249,7 @@ impl HttpClientInner {
             Ok(admission) => Ok(self.publish_buffered(request, options, admission)),
             Err(error) => Err(EnqueueError::new(
                 request,
-                admission_error(error, options.request_id),
+                admission_report(admission_error(error, options.request_id), start),
             )),
         }
     }
@@ -278,6 +300,9 @@ impl HttpClientInner {
         let request_id = registered.id;
         let control = registered.control;
         control.streaming.store(true, Ordering::Release);
+        if let Some(lifecycle) = owner.lifecycle.as_mut() {
+            lifecycle.control = Some(Arc::clone(&control));
+        }
         owner.supervisor_slot = Some(slot);
         owner.lease = Some(StreamRegistrationLease {
             registry: self.registry(),
@@ -288,4 +313,14 @@ impl HttpClientInner {
         registration.commit();
         Ok((request_id, control))
     }
+}
+
+fn admission_report(error: NetError, start: Instant) -> NetError {
+    let mut report = match error.retry_report() {
+        Some(report) => report.clone(),
+        None => RetryReport::new(),
+    };
+    report.elapsed = start.elapsed();
+    report.stop_reason = Some(stop_for_error(&error));
+    error.with_retry_report(report)
 }

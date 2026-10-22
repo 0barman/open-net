@@ -31,7 +31,7 @@ fn running() -> Result<
     let (publisher, starting) = source.begin_generation()?;
     starting.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?
         .dispatch()?;
     let view = source.new_view(Arc::new(TestCallbackExecutor), None)?;
     view.activate()?.1.dispatch();
@@ -49,10 +49,10 @@ fn rapid_commits_are_queued_before_dispatch_and_match_local_revisions() -> TestR
     let mut receiver = view.subscribe_events(options(8))?;
     let initial = next(&mut receiver)?;
     let disconnected =
-        publisher.prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?;
+        publisher.prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))?;
     let unavailable_revision = view.current()?.snapshot.revision;
     let connected =
-        publisher.prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?;
+        publisher.prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?;
     let current = view.current()?.snapshot;
     // Notification scheduling may run in reverse order; the queue must not.
     connected.dispatch()?;
@@ -107,10 +107,10 @@ fn overflow_preserves_initial_and_disconnects_only_the_slow_subscriber() -> Test
     let mut slow = view.subscribe_events(options(2))?;
     let mut fast = view.subscribe_events(options(8))?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, None, None)?
+        .prepare_observation(NetworkStatus::Unavailable, None)?
         .dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, None, None)?
+        .prepare_observation(NetworkStatus::Available, None)?
         .dispatch()?;
     check(
         next(&mut slow)?.kind == NetworkEventKind::Initial,
@@ -156,7 +156,7 @@ fn named_stop_restart_preserves_events_without_crossing_generations() -> TestRes
         "stop became a network loss",
     )?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, None, None)?
+        .prepare_observation(NetworkStatus::Unavailable, None)?
         .dispatch()?;
     check(
         matches!(events.try_recv(), Err(TryReceiveError::Empty)),
@@ -174,7 +174,7 @@ fn named_stop_restart_preserves_events_without_crossing_generations() -> TestRes
         "restart was not a fresh observation generation",
     )?;
     publisher
-        .prepare_observation(NetworkStatus::Available, None, None)?
+        .prepare_observation(NetworkStatus::Available, None)?
         .dispatch()?;
     check(
         matches!(
@@ -201,25 +201,17 @@ fn metadata_and_duplicate_samples_do_not_invent_reachability_events() -> TestRes
     let mut events = view.subscribe_events(options(8))?;
     let initial = next(&mut events)?;
     publisher
-        .prepare_observation(
-            NetworkStatus::Available,
-            Some(IpStack::V4Only),
-            Some("other-network".into()),
-        )?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only))?
         .dispatch()?;
     publisher
-        .prepare_observation(
-            NetworkStatus::Available,
-            Some(IpStack::V4Only),
-            Some("other-network".into()),
-        )?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only))?
         .dispatch()?;
     check(
         matches!(events.try_recv(), Err(TryReceiveError::Empty)),
         "metadata emitted a connectivity event",
     )?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, None, None)?
+        .prepare_observation(NetworkStatus::Unavailable, None)?
         .dispatch()?;
     check(
         next(&mut events)?.sequence == initial.sequence + 1,
@@ -243,10 +235,10 @@ fn atomic_subscribe_has_no_snapshot_future_gap() -> TestResult {
         };
         barrier.wait();
         publisher
-            .prepare_observation(NetworkStatus::Unavailable, None, None)?
+            .prepare_observation(NetworkStatus::Unavailable, None)?
             .dispatch()?;
         publisher
-            .prepare_observation(NetworkStatus::Available, None, None)?
+            .prepare_observation(NetworkStatus::Available, None)?
             .dispatch()?;
         let mut receiver = task.join().map_err(|_| "subscribe thread panicked")??;
         let initial = next(&mut receiver)?;
@@ -304,7 +296,7 @@ fn callbacks_are_serial_ordered_and_can_reenter_the_source() -> TestResult {
     let (publisher, starting) = source.begin_generation()?;
     starting.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, None, None)?
+        .prepare_observation(NetworkStatus::Available, None)?
         .dispatch()?;
     let view = source.new_view(executor.clone(), None)?;
     view.activate()?.1.dispatch();
@@ -321,10 +313,10 @@ fn callbacks_are_serial_ordered_and_can_reenter_the_source() -> TestResult {
         }
     })?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, None, None)?
+        .prepare_observation(NetworkStatus::Unavailable, None)?
         .dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, None, None)?
+        .prepare_observation(NetworkStatus::Available, None)?
         .dispatch()?;
     executor.run();
     let calls = calls.lock().map_err(NetError::from_poison)?;
@@ -345,7 +337,6 @@ fn refresh_rejects_cancelled_old_generation_and_out_of_order_samples() -> TestRe
         2,
         NetworkStatus::Unavailable,
         None,
-        None,
         SystemTime::now(),
         || Err(ErrorKind::Cancelled.into()),
     );
@@ -362,7 +353,6 @@ fn refresh_rejects_cancelled_old_generation_and_out_of_order_samples() -> TestRe
             3,
             NetworkStatus::Available,
             Some(IpStack::DualStack),
-            None,
             SystemTime::now(),
             || Ok(true),
         )?
@@ -372,7 +362,6 @@ fn refresh_rejects_cancelled_old_generation_and_out_of_order_samples() -> TestRe
         target.clone(),
         2,
         NetworkStatus::Unavailable,
-        None,
         None,
         SystemTime::now(),
         || Ok(()),
@@ -387,7 +376,6 @@ fn refresh_rejects_cancelled_old_generation_and_out_of_order_samples() -> TestRe
         target.clone(),
         4,
         NetworkStatus::Unavailable,
-        None,
         None,
         SystemTime::now(),
         || Ok(()),
@@ -409,7 +397,6 @@ fn successful_refresh_returns_the_same_projected_commit_and_fresh_equal_evidence
         1,
         NetworkStatus::Unavailable,
         None,
-        None,
         now,
         || Ok(()),
     )?;
@@ -425,7 +412,6 @@ fn successful_refresh_returns_the_same_projected_commit_and_fresh_equal_evidence
         target.clone(),
         2,
         NetworkStatus::Unavailable,
-        None,
         None,
         later,
         || Ok(()),
@@ -458,7 +444,6 @@ fn target_failure_during_refresh_is_isolated(exhaust_sequence: bool) -> TestResu
         target,
         1,
         NetworkStatus::Unavailable,
-        None,
         None,
         SystemTime::now(),
         || Ok(()),
@@ -546,8 +531,7 @@ fn event_quota_is_independent_and_drop_reclaims_a_slot_without_a_source_update()
 
 #[test]
 #[cfg(test)]
-fn oversized_initial_is_rejected_and_later_oversized_event_fails_only_its_subscriber() -> TestResult
-{
+fn initial_size_and_queued_byte_budgets_are_enforced_without_network_names() -> TestResult {
     let (_, publisher, view) = running()?;
     let minimum = std::mem::size_of::<NetworkEvent>();
     check(
@@ -559,20 +543,22 @@ fn oversized_initial_is_rejected_and_later_oversized_event_fails_only_its_subscr
         max_bytes: minimum * 2,
     })?;
     let _ = next(&mut receiver)?;
-    publisher
-        .prepare_observation(
-            NetworkStatus::Unavailable,
-            None,
-            Some("x".repeat(minimum * 3)),
-        )?
-        .dispatch()?;
+    for status in [
+        NetworkStatus::Unavailable,
+        NetworkStatus::Available,
+        NetworkStatus::Unavailable,
+    ] {
+        publisher.prepare_observation(status, None)?.dispatch()?;
+    }
+    assert!(next(&mut receiver)?.snapshot.network_name.is_none());
+    assert!(next(&mut receiver)?.snapshot.network_name.is_none());
     check(
-        matches!(receiver.try_recv(), Err(TryReceiveError::Failed(error)) if error.kind() == ErrorKind::ItemTooLarge),
-        "oversized event disappeared silently",
+        matches!(receiver.try_recv(), Err(TryReceiveError::Failed(error)) if error.kind() == ErrorKind::CallbackOverflow),
+        "queued event bytes exceeded the subscriber budget silently",
     )?;
     check(
         view.current()?.snapshot.reachability == Some(NetworkStatus::Unavailable),
-        "oversized subscriber event failed the view",
+        "subscriber byte overflow failed the view",
     )
 }
 
@@ -636,7 +622,7 @@ async fn named_event_waker_can_wait_for_the_producing_monitor_to_retire() -> Tes
     let (publisher, starting) = source.begin_generation()?;
     starting.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, None, None)?
+        .prepare_observation(NetworkStatus::Available, None)?
         .dispatch()?;
     let view = source.new_view(Arc::new(TestCallbackExecutor), Some(engine.clone()))?;
     view.activate()?.1.dispatch();
@@ -660,7 +646,7 @@ async fn named_event_waker_can_wait_for_the_producing_monitor_to_retire() -> Tes
     }
     let producer = engine.runtime_handle().spawn(async move {
         publisher
-            .prepare_observation(NetworkStatus::Unavailable, None, None)?
+            .prepare_observation(NetworkStatus::Unavailable, None)?
             .dispatch()?;
         let _ = retired.send(());
         Ok::<(), NetError>(())

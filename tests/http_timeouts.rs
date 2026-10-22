@@ -1,10 +1,11 @@
 #![cfg(feature = "http-client")]
 
+use open_net::api::retry::RetrySetting;
+
 use open_net::api::error::{ErrorKind, ErrorStage};
 use open_net::api::http::{
     HttpClient, HttpClientConfig, HttpRequest, HttpRequestId, HttpRequestMethod,
-    HttpRequestOptions, HttpRequestTrait, HttpResponseResult, HttpTimeouts, RetryPolicy,
-    TimeoutPhase,
+    HttpRequestOptions, HttpRequestTrait, HttpResponseResult, HttpTimeouts, TimeoutPhase,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -181,11 +182,7 @@ async fn disabling_attempt_overrides_both_legacy_limits_and_shutdown_reaps_unpol
     let client = HttpClient::new(config, "disabled-attempt")?;
     let request = HttpRequest::builder()
         .path("/")
-        .retry_policy(
-            RetryPolicy::builder()
-                .attempt_timeout(Duration::from_millis(50))
-                .build()?,
-        )
+        .retry_setting(RetrySetting::Disabled)
         .timeouts(
             HttpTimeouts::new()
                 .without_attempt_timeout()

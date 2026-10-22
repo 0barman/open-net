@@ -5,7 +5,9 @@ use std::str::FromStr;
 
 /// Business request identifier preserved exactly as supplied by the caller.
 /// It must contain a non-whitespace character and be at most 1024 UTF-8 bytes.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+///
+/// `Debug` reports only the byte count; `Display` and the accessors preserve the original value.
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RequestId(
     /// Original identifier after length and non-whitespace validation.
     String,
@@ -57,6 +59,15 @@ impl RequestId {
     /// Consumes the identifier and returns its string representation.
     pub fn into_string(self) -> String {
         self.0
+    }
+}
+
+impl fmt::Debug for RequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestId")
+            .field("bytes", &self.0.len())
+            .finish()
     }
 }
 

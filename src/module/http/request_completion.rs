@@ -54,19 +54,33 @@ impl Drop for CompletionLease {
             .with_stage(ErrorStage::Dispatch)
             .with_http_request_id(self.request_id)
             .with_http_attempt(self.control.attempt.load(Ordering::Acquire));
+        let mut report = match self.control.retry_report() {
+            Some(report) => report,
+            None => crate::api::retry::RetryReport::new(),
+        };
+        if report.stop_reason.is_none() {
+            report.stop_reason = Some(crate::api::retry::RetryStopReason::PolicyFailed);
+        }
         let result = HttpCompletion {
+            retry_report: report.clone(),
             request_id: self.request_id,
-            response: self
-                .response
-                .take()
-                .unwrap_or_else(|| Err(fallback.clone())),
-            callback: self.callback.take().unwrap_or_else(|| Err(fallback)),
+            response: match self.response.take() {
+                Some(result) => result,
+                None => Err(fallback.clone()),
+            }
+            .map_err(|error| error.with_retry_report(report.clone())),
+            callback: match self.callback.take() {
+                Some(result) => result,
+                None => Err(fallback),
+            }
+            .map_err(|error| error.with_retry_report(report.clone())),
         };
         // Finish by operation identity, so a stale handle cannot affect an ID
         // that a subsequent request reuses. No user object is retained here.
         drop(self.permit.take());
         self.registry.finish(self.request_id, &self.control);
         self.control.publish_completion(result);
+        self.control.emit_pending_observation(report);
         if let Some(reason) = missing {
             // Request IDs can be caller supplied, so they are not log fields.
             crate::log_e!(crate::LogType::HTTP; "http.completion.drop", "reason", reason);

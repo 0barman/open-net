@@ -35,6 +35,10 @@ impl IndexedHeap {
         self.items.len()
     }
 
+    pub(super) fn peek(&self) -> Option<&QueuedRequest> {
+        self.items.first()
+    }
+
     // 判断同一次 dispatch 是否仍在堆中，防止重复索引键覆盖其他节点。
     pub(super) fn contains(&self, token: &CancellationToken) -> bool {
         self.positions.contains_key(token)

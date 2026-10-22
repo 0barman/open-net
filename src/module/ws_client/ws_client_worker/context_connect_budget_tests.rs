@@ -50,7 +50,9 @@ async fn worker_rejects_success_after_the_connect_task_won_timeout() -> TestResu
     let client = client?;
     let (_server, _) = server?;
     let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        tokio_tungstenite::MaybeTlsStream::Plain(client),
+        tokio_tungstenite::MaybeTlsStream::Plain(crate::module::transport::stream::tunnel_io(
+            crate::module::transport::stream::ProxyIo::Plain(client),
+        )),
         Role::Client,
         None,
     )

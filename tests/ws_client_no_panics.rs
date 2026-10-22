@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-// 只识别完整绝对路径的直接函数调用；方法、别名、导入和更长路径的后缀均不豁免。
+// 只识别完整绝对路径的 watch Receiver/Sender 直接调用；
+// 方法、别名、导入和更长路径的后缀均不豁免。
 fn is_absolute_tokio_watch_borrow(tokens: &[TokenTree], index: usize) -> bool {
     const PATH: [&str; 15] = [
         ":", ":", "tokio", ":", ":", "sync", ":", ":", "watch", ":", ":", "Receiver", ":", ":",
@@ -21,11 +22,9 @@ fn is_absolute_tokio_watch_borrow(tokens: &[TokenTree], index: usize) -> bool {
     let Some(path) = tokens.get(start..=index) else {
         return false;
     };
-    if !path
-        .iter()
-        .zip(PATH)
-        .all(|(token, expected)| token.to_string() == expected)
-        || !matches!(tokens.get(index + 1), Some(TokenTree::Group(group))
+    if !path.iter().zip(PATH).all(|(token, expected)| {
+        token.to_string() == expected || (expected == "Receiver" && token.to_string() == "Sender")
+    }) || !matches!(tokens.get(index + 1), Some(TokenTree::Group(group))
             if group.delimiter() == proc_macro2::Delimiter::Parenthesis)
     {
         return false;
@@ -57,6 +56,28 @@ fn is_test_only_attribute(group: &proc_macro2::Group) -> bool {
             if condition.delimiter() == proc_macro2::Delimiter::Parenthesis
                 && condition.stream().to_string() == "test")
         && attribute.next().is_none()
+}
+
+fn has_test_only_file_attribute(tokens: &[TokenTree]) -> bool {
+    // A module-level inner attribute applies to the whole source file. Only
+    // inspect the leading attribute sequence; attributes inside a module,
+    // function or macro do not prove the enclosing source is test-only.
+    let mut remaining = tokens;
+    while let [TokenTree::Punct(hash), TokenTree::Punct(bang), TokenTree::Group(attribute), rest @ ..] =
+        remaining
+    {
+        if hash.as_char() != '#'
+            || bang.as_char() != '!'
+            || attribute.delimiter() != proc_macro2::Delimiter::Bracket
+        {
+            break;
+        }
+        if is_test_only_attribute(attribute) {
+            return true;
+        }
+        remaining = rest;
+    }
+    false
 }
 
 fn test_function_or_module_follows(tokens: &[TokenTree], start: usize) -> bool {
@@ -165,6 +186,23 @@ fn scan(source: &str) -> TestResult<Vec<String>> {
     let mut findings = Vec::new();
     forbidden_operations(stream, &mut findings, false);
     Ok(findings)
+}
+
+fn scan_guarded_source(manifest: &Path, file: &Path, source: &str) -> TestResult<Vec<String>> {
+    // Source files are visited independently, so a parent's #[cfg(test)] is not
+    // inherited by this scanner. An explicit #![cfg(test)] proves that the
+    // whole child module is absent from production, regardless of its filename.
+    // Integration tests intentionally remain guarded even when they use the
+    // same attribute: they execute in test builds and are part of this contract.
+    let production_source = file.starts_with(manifest.join("src"))
+        || file.starts_with(manifest.join("libs/common/src"));
+    if production_source {
+        let tokens: Vec<_> = source.parse::<TokenStream>()?.into_iter().collect();
+        if has_test_only_file_attribute(&tokens) {
+            return Ok(Vec::new());
+        }
+    }
+    scan(source)
 }
 
 type LegacyBaseline = BTreeMap<String, usize>;
@@ -708,7 +746,8 @@ fn ws_client_sources_do_not_contain_panicking_operations() -> TestResult {
             .unwrap_or(&file)
             .to_string_lossy()
             .replace('\\', "/");
-        let new_findings = remove_legacy_findings(&relative, &source, scan(&source)?, &baseline)?;
+        let scanned = scan_guarded_source(manifest, &file, &source)?;
+        let new_findings = remove_legacy_findings(&relative, &source, scanned, &baseline)?;
         for finding in remove_reviewed_ffi_findings(&relative, &source, new_findings, &ffi_audit)? {
             findings.push(format!("{}:{finding}", file.display()));
         }
@@ -766,6 +805,9 @@ fn scanner_accepts_only_absolute_tokio_watch_borrow_calls() -> TestResult {
         "let value = ::tokio::sync::watch::Receiver::borrow(&receiver);",
         "return ::tokio :: sync :: watch :: Receiver :: borrow(&receiver);",
         "tokio::select! { _ = ready => { ::tokio::sync::watch::Receiver::borrow(&receiver); } }",
+        "let value = ::tokio::sync::watch::Sender::borrow(&sender);",
+        "return ::tokio :: sync :: watch :: Sender :: borrow(&sender);",
+        "tokio::select! { _ = ready => { ::tokio::sync::watch::Sender::borrow(&sender); } }",
     ] {
         let findings = scan(source)?;
         if !findings.is_empty() {
@@ -787,6 +829,16 @@ fn scanner_accepts_only_absolute_tokio_watch_borrow_calls() -> TestResult {
         "use ::tokio::sync::watch::Receiver::borrow as renamed;",
         "::tokio::sync::watch::Receiver::borrow(&RefCell::borrow(&cell));",
         "::tokio::sync::watch::Receiver::borrow(&receiver); receiver.borrow();",
+        "let value = sender.borrow();",
+        "let value = tokio::sync::watch::Sender::borrow(&sender);",
+        "let value = other::tokio::sync::watch::Sender::borrow(&sender);",
+        "let value = ::other::tokio::sync::watch::Sender::borrow(&sender);",
+        "let value = crate::tokio::sync::watch::Sender::borrow(&sender);",
+        "let value = ::tokio::sync::watch::Sender::borrow_mut(&sender);",
+        "let function = ::tokio::sync::watch::Sender::borrow;",
+        "use ::tokio::sync::watch::Sender::borrow as renamed;",
+        "::tokio::sync::watch::Sender::borrow(&RefCell::borrow(&cell));",
+        "::tokio::sync::watch::Sender::borrow(&sender); sender.borrow();",
     ] {
         let findings = scan(source)?;
         if findings.len() != 1 {
@@ -858,6 +910,75 @@ fn scanner_excludes_only_explicit_test_items_and_keeps_production_violations() -
     }
     if findings.len() != 6 {
         return Err(format!("test-only code was misclassified: {findings:?}").into());
+    }
+    Ok(())
+}
+
+#[test]
+fn scanner_excludes_only_exact_leading_test_only_file_attributes() -> TestResult {
+    let manifest = Path::new("fixture");
+    for relative in ["src/arbitrary.rs", "libs/common/src/arbitrary.rs"] {
+        let file = manifest.join(relative);
+        for source in [
+            "#![cfg(test)] fn test_helper() { panic!(\"test\"); }",
+            "//! Test helpers.\n#![allow(dead_code)]\n#![cfg(test)]\nfn helper() { value.unwrap(); }",
+            "#![cfg( test )]\n#[allow(dead_code)] fn helper() { assert!(false); }",
+        ] {
+            let findings = scan_guarded_source(manifest, &file, source)?;
+            if !findings.is_empty() {
+                return Err(
+                    format!("test-only source was not recognized: {relative}: {findings:?}").into(),
+                );
+            }
+        }
+        for source in [
+            "#![cfg(not(test))] fn production() { panic!(\"production\"); }",
+            "#![cfg(any(test, feature = \"production\"))] fn shared() { value.unwrap(); }",
+            "#![cfg(all(test, feature = \"extra\"))] fn helper() { value.unwrap(); }",
+            "#![cfg_attr(test, cfg(test))] fn shared() { value.unwrap(); }",
+            "#![cfg(test,)] fn helper() { value.unwrap(); }",
+            "#![cfg(test) extra] fn helper() { value.unwrap(); }",
+            "mod child { #![cfg(test)] fn helper() { value.unwrap(); } }",
+            "macro_rules! production { () => { #![cfg(test)] value.unwrap() }; }",
+            "use std::fmt;\n#![cfg(test)] fn production() { value.unwrap(); }",
+            "#[cfg(test)] fn helper() {} fn production() { value.unwrap(); }",
+        ] {
+            let findings = scan_guarded_source(manifest, &file, source)?;
+            if findings.len() != 1 {
+                return Err(format!(
+                    "non-exact or misplaced attribute changed source coverage: {relative}: \
+                     {source}: {findings:?}"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_only_file_attributes_never_exempt_integration_tests() -> TestResult {
+    let manifest = Path::new("fixture");
+    for relative in [
+        "tests/ws_future.rs",
+        "tests/api_v2_future.rs",
+        "tests/net_status_future.rs",
+        "tests/support/session.rs",
+    ] {
+        let file = manifest.join(relative);
+        for source in [
+            "#![cfg(test)] fn regression() { value.unwrap(); }",
+            "//! Integration test.\n#![cfg(test)] fn regression() { assert_eq!(left, right); }",
+        ] {
+            let findings = scan_guarded_source(manifest, &file, source)?;
+            if findings.len() != 1 {
+                return Err(format!(
+                    "test-only file attribute hid an integration-test operation: \
+                     {relative}: {findings:?}"
+                )
+                .into());
+            }
+        }
     }
     Ok(())
 }

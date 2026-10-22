@@ -9,7 +9,8 @@ mod tls_support;
 
 use futures::StreamExt;
 use open_net::network::{
-    ClientIdentity, NetworkConfig, ProxyBasicAuth, ProxyConfig, RootCertificateMode, TlsConfig,
+    ClientIdentity, NetworkConfig, ProxyAuthTransportPolicy, ProxyBasicAuth, ProxyConfig,
+    RootCertificateMode, TlsConfig,
 };
 use open_net::NetError;
 
@@ -285,9 +286,10 @@ async fn connect_proxy_carries_mtls_and_separates_proxy_credentials() -> TestRes
         b"HTTP/1.1 201 Tunnel Ready\r\nContent-Length: 9000\r\nTransfer-Encoding: chunked\r\n\r\n",
     )
     .await?;
-    let config = trusted_config(true)?.with_proxy(ProxyConfig::http_connect(
+    let config = trusted_config(true)?.with_proxy(ProxyConfig::http_connect_with_auth_policy(
         &format!("http://{proxy}"),
         Some(ProxyBasicAuth::new("test-user", "test-password")?),
+        ProxyAuthTransportPolicy::AllowPlaintext,
     )?);
     let engine = OpenNet::new_with_network_config(config)?;
     let client = engine.create_ws_client("proxy-mtls").await?;
@@ -509,7 +511,11 @@ fn client_key_rejects_nested_pem_begin_markers() -> TestResult {
 #[test]
 fn config_debug_does_not_reveal_proxy_or_private_key_material() -> TestResult {
     let auth = ProxyBasicAuth::new("fixture-user-marker", "fixture-password-marker")?;
-    let proxy = ProxyConfig::http_connect("http://fixture-proxy-marker:8080", Some(auth.clone()))?;
+    let proxy = ProxyConfig::http_connect_with_auth_policy(
+        "http://fixture-proxy-marker:8080",
+        Some(auth.clone()),
+        ProxyAuthTransportPolicy::AllowPlaintext,
+    )?;
     let identity = ClientIdentity::from_pem(CLIENT, CLIENT_KEY)?;
     let config = NetworkConfig::default().with_proxy(proxy).with_tls(
         TlsConfig::default()
@@ -1007,9 +1013,10 @@ async fn connect_proxy_mtls_retry_fetches_updated_token_for_second_upgrade() -> 
         }),
     };
     let engine = OpenNet::new_with_network_config(trusted_config(true)?.with_proxy(
-        ProxyConfig::http_connect(
+        ProxyConfig::http_connect_with_auth_policy(
             &format!("http://{proxy}"),
             Some(ProxyBasicAuth::new("fixture", "fixture")?),
+            ProxyAuthTransportPolicy::AllowPlaintext,
         )?,
     ))?;
     let client = engine.create_ws_client("proxy-mtls-refresh").await?;

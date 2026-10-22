@@ -10,9 +10,13 @@ use tokio::sync::Semaphore;
 /// creation. [`crate::OpenNet::new_with_config`] validates them before creating
 /// channels or workers and reports invalid values as
 /// [`crate::error::ErrorKind::InvalidConfig`].
-/// When `ws-client` is enabled, configure a provider in the nested
-/// [`NetworkConfig`] before constructing [`crate::OpenNet`], unless the host
-/// application has already installed a process-wide rustls provider.
+#[cfg_attr(
+    feature = "ws-client",
+    doc = "
+When `ws-client` is enabled, configure a provider in the nested
+[`NetworkConfig`](crate::network::NetworkConfig) before constructing [`crate::OpenNet`],
+unless the host application has already installed a process-wide rustls provider."
+)]
 #[derive(Clone, Debug)]
 pub struct OpenNetConfig {
     pub(crate) runtime_worker_threads: Option<usize>,

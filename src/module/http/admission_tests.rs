@@ -1,6 +1,6 @@
 //! Deterministic tests for partial admission resources and commit arbitration.
 use super::*;
-use crate::api::http::{HttpAdmissionPolicy, HttpTimeouts, RetryPolicy};
+use crate::api::http::{HttpAdmissionPolicy, HttpRetryPolicy, HttpTimeouts};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -374,7 +374,7 @@ async fn supervisor_slot_is_part_of_stream_admission_and_uses_the_same_deadline(
     )?;
     let resolved = fixture.worker.resolve_timeouts(&options)?;
     let start = Instant::now();
-    let mut owner = StreamOwner::new(&RetryPolicy::no_retry(), start);
+    let mut owner = StreamOwner::new(&HttpRetryPolicy::no_retry(), start);
     let mut waiting = Box::pin(fixture.worker.admit_stream(
         HttpAdmissionPolicy::Wait,
         resolved,
@@ -424,7 +424,7 @@ async fn stream_supervisor_fail_fast_wait_drop_cancel_and_shutdown_reclaim_resou
         )?;
         let resolved = fixture.worker.resolve_timeouts(&options)?;
         let start = Instant::now();
-        let mut owner = StreamOwner::new(&RetryPolicy::no_retry(), start);
+        let mut owner = StreamOwner::new(&HttpRetryPolicy::no_retry(), start);
         let policy = if action == "fail-fast" {
             HttpAdmissionPolicy::FailFast
         } else {
@@ -646,7 +646,7 @@ async fn stream_owner_releases_capacity_before_waking_drain() -> TestResult {
         .worker
         .resolve_timeouts(&HttpRequestOptions::new())?;
     let start = Instant::now();
-    let mut owner = StreamOwner::new(&RetryPolicy::no_retry(), start);
+    let mut owner = StreamOwner::new(&HttpRetryPolicy::no_retry(), start);
     fixture
         .worker
         .admit_stream(HttpAdmissionPolicy::Wait, resolved, start, &mut owner)

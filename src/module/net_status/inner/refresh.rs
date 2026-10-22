@@ -86,20 +86,7 @@ pub(crate) async fn refresh(
     owner: Arc<NetworkObservationOwner>,
     timeout: Duration,
 ) -> Result<NetworkRefreshResult, NetError> {
-    let deadline = deadline(timeout)?;
-    let target = owner
-        .refresh_target()
-        .map_err(|error| error.with_stage(ErrorStage::NetworkMonitor))?;
-    #[cfg(target_os = "windows")]
-    {
-        let sampler = owner.context().windows_sampler()?;
-        refresh_with_sampler(owner, target, sampler, deadline).await
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (deadline, target);
-        Err(error(ErrorKind::Unsupported))
-    }
+    refresh_reachability(owner, timeout).await
 }
 
 pub(crate) async fn refresh_reachability(
@@ -175,9 +162,6 @@ fn check(deadline: Instant, cancelled: &AtomicBool) -> Result<(), NetError> {
 #[cfg(any(target_os = "windows", test))]
 pub(super) struct SampleObservation {
     pub(super) reachability: NetworkStatus,
-    pub(super) network_name: Option<String>,
-    pub(super) name_source: NetworkNameSource,
-    pub(super) name_diagnostics: Vec<NetError>,
 }
 #[cfg(any(target_os = "windows", test))]
 pub(super) struct CompletedSample {
@@ -197,8 +181,9 @@ struct Request {
 }
 
 /// One lazy ordinary thread per sampling lane, with a bounded waiting queue.
-/// Full queries and reachability-only queries have independent lanes; a stuck
-/// native call retains its slot and timed-out callers cannot spawn replacements.
+/// Explicit and background reachability share this lane; a stuck native call
+/// retains its slot and timed-out callers cannot spawn replacements. The lane
+/// has no access to the separate network-name provider.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) struct WindowsSampler {
     state: Arc<Mutex<SamplerState>>,
@@ -216,36 +201,25 @@ struct SamplerState {
 }
 #[cfg(any(target_os = "windows", test))]
 impl WindowsSampler {
-    pub(crate) fn pair(threads: Arc<ThreadRegistry>) -> (Arc<Self>, Arc<Self>) {
-        let next_id = Arc::new(AtomicU64::new(0));
-        (
-            Arc::new(Self::with_registry(
-                Self::provider(true),
-                next_id.clone(),
-                threads.clone(),
-            )),
-            Arc::new(Self::with_registry(Self::provider(false), next_id, threads)),
-        )
+    pub(crate) fn new(threads: Arc<ThreadRegistry>) -> Arc<Self> {
+        Arc::new(Self::with_registry(
+            Self::provider(),
+            Arc::new(AtomicU64::new(0)),
+            threads,
+        ))
     }
-    fn provider(include_name: bool) -> Arc<Provider> {
+    fn provider() -> Arc<Provider> {
         Arc::new(move |deadline, cancelled| {
             #[cfg(target_os = "windows")]
             {
-                let value = if include_name {
-                    super::platform::windows::sample(deadline, cancelled)
-                } else {
-                    super::platform::windows::sample_reachability(deadline, cancelled)
-                }?;
+                let value = super::platform::windows::sample_reachability(deadline, cancelled)?;
                 Ok(SampleObservation {
                     reachability: value.reachability,
-                    network_name: value.network_name,
-                    name_source: value.name_source,
-                    name_diagnostics: value.name_diagnostics,
                 })
             }
             #[cfg(not(target_os = "windows"))]
             {
-                let _ = (deadline, cancelled, include_name);
+                let _ = (deadline, cancelled);
                 Err(error(ErrorKind::Unsupported))
             }
         })
@@ -462,14 +436,6 @@ async fn refresh_with_sampler(
             sampled.id,
             observation.reachability,
             None,
-            if matches!(
-                observation.name_source,
-                NetworkNameSource::CachedObservation
-            ) {
-                super::network_status_snapshot::NetworkNameUpdate::Preserve
-            } else {
-                observation.network_name.into()
-            },
             sampled.sampled_at,
             || cancel.check(deadline),
         )
@@ -480,8 +446,8 @@ async fn refresh_with_sampler(
         sample_id: sampled.id,
         sample_started_at: sampled.started_at,
         sampled_at: sampled.sampled_at,
-        network_name_source: observation.name_source,
-        network_name_diagnostics: observation.name_diagnostics,
+        network_name_source: NetworkNameSource::NotCollected,
+        network_name_diagnostics: Vec::new(),
         ip_stack_source: NetworkIpStackSource::BackgroundObservation,
     })
 }

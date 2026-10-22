@@ -60,39 +60,22 @@ fn committed_source_and_independent_views_have_private_bounded_logs() -> TestRes
     starting.dispatch()?;
     first.activate()?.1.dispatch();
     second.activate()?.1.dispatch();
-    const SECRET: &str = "SSID_SENTINEL_TOKEN_192.0.2.44/private/path";
     publisher
-        .prepare_observation(
-            NetworkStatus::Available,
-            Some(IpStack::DualStack),
-            Some(SECRET.into()),
-        )?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?
         .dispatch()?;
     let before = source.snapshot()?;
     for _ in 0..100 {
         publisher
-            .prepare_observation(
-                NetworkStatus::Available,
-                Some(IpStack::DualStack),
-                Some(SECRET.into()),
-            )?
+            .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?
             .dispatch()?;
     }
     assert_eq!(source.snapshot()?.revision, before.revision);
     // Both shared facts are each logged once, irrespective of the two views.
     publisher
-        .prepare_observation(
-            NetworkStatus::Available,
-            Some(IpStack::V4Only),
-            Some(SECRET.into()),
-        )?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only))?
         .dispatch()?;
     publisher
-        .prepare_observation(
-            NetworkStatus::Available,
-            Some(IpStack::V4Only),
-            Some(format!("{SECRET}-changed")),
-        )?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only))?
         .dispatch()?;
     first.retire(false, None)?.dispatch();
     first.retire(false, None)?.dispatch();
@@ -118,7 +101,7 @@ fn committed_source_and_independent_views_have_private_bounded_logs() -> TestRes
         {
             break;
         }
-        assert!(!record.content.contains(SECRET));
+        assert!(!record.content.contains("\"name_changed\":true"));
         entries.push(record);
     }
     let transitions: Vec<_> = entries
@@ -134,8 +117,8 @@ fn committed_source_and_independent_views_have_private_bounded_logs() -> TestRes
         .collect();
     assert_eq!(
         source_entries.len(),
-        5,
-        "Starting, Running, IP stack, name, Stopped"
+        4,
+        "Starting, Running, IP stack, Stopped"
     );
     let view_entries: Vec<_> = transitions
         .iter()

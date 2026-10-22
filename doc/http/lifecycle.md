@@ -11,7 +11,7 @@ Add these dependencies, replacing the local library path.
 
 ```toml
 [dependencies]
-open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
@@ -44,6 +44,12 @@ last worker owner is dropped. An engine registry retains its registered client,
 so dropping application clones alone does not destroy the named client.
 A completion handle does not retain the client. Prefer explicit shutdown so
 that you can await callbacks, resource cleanup and worker exit.
+
+Once an HTTP network operation has a terminal result, final callback queueing and
+execution are outside `total_timeout` and retry-report `elapsed`. The terminal
+result does not expire while waiting in the callback queue. Completion handles
+still wait for the callback and SDK resource cleanup; a callback that never
+returns can therefore keep `finished()` pending.
 
 `shutdown()` and `shutdown_graceful()` can be awaited without a caller Tokio
 runtime. The SDK owns the cleanup thread: once cleanup is accepted, cancelling

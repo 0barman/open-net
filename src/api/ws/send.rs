@@ -227,9 +227,23 @@ impl Sender {
     ///             Ok(message) => {
     ///                 // thread_name: open-net-ws-data-callback, thread_id: ThreadId(20)
     ///                 let current_thread = thread::current();
-    ///                 println!("message_subscription->IncomingMessage: {:?}, thread_name: {}, thread_id: {:?}", message,
-    ///                          current_thread.name().map_or("unnamed", |name| name),
-    ///                          current_thread.id());
+    ///                 let kind = match message.message() {
+    ///                     Some(Message::Text(_)) => "text",
+    ///                     Some(Message::Binary(_)) => "binary",
+    ///                     None => "control",
+    ///                 };
+    ///                 // Log SDK identities and payload sizes; explicit body getters return original data.
+    ///                 println!(
+    ///                     "Message callback[{}]: client={} session={} connection={} kind={} message_bytes={:?}, thread_name: {}, thread_id: {:?}",
+    ///                     context.id(),
+    ///                     message.client_id(),
+    ///                     message.session_id(),
+    ///                     message.connection_id(),
+    ///                     kind,
+    ///                     message.message().map(Message::len),
+    ///                     current_thread.name().map_or("unnamed", |name| name),
+    ///                     current_thread.id()
+    ///                 );
     ///             }
     ///             Err(error) => {
     ///                 println!("message_subscription->error: {}", error);
@@ -302,8 +316,8 @@ impl Sender {
     ///                     );
     ///                     if let Some(close) = end.peer_close {
     ///                         println!(
-    ///                             "           Peer close information: code={:?} reason={}",
-    ///                             close.code, close.reason
+    ///                             "           Peer close information: code={:?} reason_len={}",
+    ///                             close.code, close.reason.len()
     ///                         );
     ///                     }
     ///                     if let Some(error) = end.error {
@@ -338,9 +352,18 @@ impl Sender {
     ///         Ok(event) => {
     ///             // thread_name: open-net-task-events-1-0, thread_id: ThreadId(23)
     ///             let current_thread = thread::current();
+    ///             // Phase, delivery evidence, cause, and result classify the operation without its original input.
+    ///             let result = event.result.as_ref().map_err(|error| error.kind());
     ///             println!(
-    ///                 "Task callback[{}]: {event:?}, thread_name: {}, thread_id: {:?}",
+    ///                 "Task callback[{}]: client={} session={} operation={} phase={:?} delivery={:?} cause={:?} result={:?}, thread_name: {}, thread_id: {:?}",
     ///                 context.id(),
+    ///                 event.client_id,
+    ///                 event.session_id,
+    ///                 event.operation_id,
+    ///                 event.phase,
+    ///                 event.delivery,
+    ///                 event.cause,
+    ///                 result,
     ///                 current_thread.name().map_or("unnamed", |name| name),
     ///                 current_thread.id()
     ///             );
@@ -754,6 +777,12 @@ pub struct MessageReceipt {
     core: Arc<OperationControl>,
 }
 impl MessageReceipt {
+    /// Snapshot of the raw message operation's attempts, transport writes and final stop reason.
+    /// The report remains stable after completion and is shared by receipt clones.
+    pub fn retry_report(&self) -> crate::api::retry::RetryReport {
+        self.core.retry_report()
+    }
+
     /// Returns this message operation's identifier, shared by receipt clones and retries of the operation.
     ///
     /// # Use cases

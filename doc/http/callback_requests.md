@@ -6,11 +6,10 @@
 
 Use Rust 1.89 or later and the `http-client` feature (it also enables `net-status`).
 Create a consumer with `cargo new http-example` and add these dependencies.
-Replace `/path/to/open-net` with the library directory containing Cargo.toml.
 
 ```toml
 [dependencies]
-open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
@@ -93,7 +92,7 @@ Implement HttpRequestTrait, start a server with /health, submit the request, the
 
 ### Errors and behavior
 
-Does not wait for capacity. Capacity exhaustion (for example QueueFull), duplicate custom IDs, invalid options and closed admission return EnqueueError with the input preserved. A trait retry policy with max_retries() > 0 overrides the client; otherwise it inherits the client default. retry_policy() runs before admission; a panic there unwinds on the submitting thread/future and is not an ownership-preserving returned error.
+Does not wait for capacity. Capacity exhaustion (for example QueueFull), duplicate custom IDs, invalid options and closed admission return EnqueueError with the input preserved. The trait retry setting explicitly selects Inherit, Disabled, or Policy; Inherit uses the client default. retry_setting() runs before admission; a panic there unwinds on the submitting thread/future and is not an ownership-preserving returned error.
 
 ### Example
 
@@ -120,7 +119,7 @@ impl HttpRequestTrait for Health {
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
@@ -189,8 +188,9 @@ Does not wait for capacity. Capacity exhaustion (for example QueueFull), duplica
 ```rust
 use open_net::api::http::{
     HttpClient, HttpClientConfig, HttpRequestTrait, HttpRequestMethod, HttpResponseResult,
-    HttpRequestOptions, HttpTimeouts, RetrySetting
+    HttpRequestOptions, HttpTimeouts
 };
+use open_net::api::retry::RetrySetting;
 
 struct Health;
 
@@ -210,12 +210,12 @@ impl HttpRequestTrait for Health {
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
     let options = HttpRequestOptions::new()
-        .with_retry_setting(RetrySetting::None)
+        .with_retry_setting(RetrySetting::Disabled)
         .with_timeouts(HttpTimeouts::new().with_admission_timeout(
             std::time::Duration::from_secs(2),
         ))?;
@@ -276,7 +276,7 @@ Implement HttpRequestTrait, start a server with /health, submit the request, the
 
 ### Errors and behavior
 
-Waits for both in-flight capacity and a queue slot using one admission deadline from the first poll. The default admission budget is 30 seconds, independent of attempt timeouts. Timeout, shutdown and other returned errors retain the request; dropping the waiting future does not. A trait retry policy with max_retries() > 0 overrides the client; otherwise it inherits the client default. retry_policy() runs before admission; a panic there unwinds on the submitting thread/future and is not an ownership-preserving returned error.
+Waits for both in-flight capacity and a queue slot using one admission deadline from the first poll. The default admission budget is 30 seconds, independent of attempt timeouts. Timeout, shutdown and other returned errors retain the request; dropping the waiting future does not. The trait retry setting explicitly selects Inherit, Disabled, or Policy; Inherit uses the client default. retry_setting() runs before admission; a panic there unwinds on the submitting thread/future and is not an ownership-preserving returned error.
 
 ### Example
 
@@ -303,7 +303,7 @@ impl HttpRequestTrait for Health {
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
@@ -372,8 +372,9 @@ Waits for both in-flight capacity and a queue slot using one admission deadline 
 ```rust
 use open_net::api::http::{
     HttpClient, HttpClientConfig, HttpRequestTrait, HttpRequestMethod, HttpResponseResult,
-    HttpRequestOptions, HttpTimeouts, RetrySetting
+    HttpRequestOptions, HttpTimeouts
 };
+use open_net::api::retry::RetrySetting;
 
 struct Health;
 
@@ -393,12 +394,12 @@ impl HttpRequestTrait for Health {
 async fn main() -> Result<(), open_net::NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "callback-example",
     )?;
     let options = HttpRequestOptions::new()
-        .with_retry_setting(RetrySetting::None)
+        .with_retry_setting(RetrySetting::Disabled)
         .with_timeouts(HttpTimeouts::new().with_admission_timeout(
             std::time::Duration::from_secs(2),
         ))?;
@@ -439,7 +440,7 @@ pub trait HttpRequestTrait: Send + 'static {
     fn get_req_body(&self) -> Bytes;
     fn has_req_body(&self) -> bool;
     fn headers(&self) -> HeaderMap;
-    fn retry_policy(&self) -> RetryPolicy;
+    fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy>;
     fn on_response_headers(&self, headers: &HeaderMap);
     async fn deal_with_response(self: Box<Self>, result: HttpResponseResult);
 }
@@ -453,7 +454,7 @@ pub trait HttpRequestTrait: Send + 'static {
 | `get_req_body` | No | Owned Bytes; default converts get_req_data(). If overridden, this is authoritative. Return equivalent data on each retry. |
 | `has_req_body` | No | Defaults false. Nonempty bytes are detected automatically. Return true to explicitly frame an empty body. |
 | `headers` | No | Owned per-request HeaderMap; empty by default. Invalid/transport-controlled headers fail at dispatch. |
-| `retry_policy` | No | Defaults to no_retry(), which causes send/send_wait to inherit the client. Explicit options can disable retries. |
+| `retry_setting` | No | Defaults to Inherit. Disabled permits one attempt; Policy replaces the whole client policy. Explicit options are authoritative. |
 | `on_response_headers` | No | Runs on the callback lane only for the final successfully buffered response, just before its consuming handler. No-op by default; headers are read-only. |
 | `deal_with_response` | Yes | Consumes Box<Self> and the final HttpResponseResult, returns unit asynchronously. |
 
@@ -543,7 +544,9 @@ finished). A determined timeout remains a timeout even if cancellation is reques
 
 `HttpCompletion` has `request_id: HttpRequestId`,
 `response: Result<HttpResponseSummary, NetError>` and
-`callback: Result<(), NetError>`. `HttpResponseSummary` has `status: StatusCode`
+`callback: Result<(), NetError>`, and `retry_report: RetryReport`.
+The report is also available through `retry_report()`, including zero-attempt
+termination after acceptance. `HttpResponseSummary` has `status: StatusCode`
 and `attempts: u32`. The response field describes the transport result delivered
 to the callback. The callback field describes execution of both hook and handler,
 not whether the application accepted the response. Successful completion keeps
@@ -570,6 +573,7 @@ async fn cancel_and_wait(handle: HttpRequestHandle) -> Result<(), open_net::NetE
         HttpCancelOutcome::TooLate => println!("Callback started or completed"),
     }
     let completion = handle.finished().await;
+    println!("Retry report: {:?}", completion.retry_report());
     completion.callback?;
     println!("{:?}", completion.response);
     Ok(())
@@ -588,9 +592,10 @@ constructed response; the SDK never invokes callbacks for rejected submissions.
 ```rust
 use open_net::api::http::{
     HttpClient, HttpClientConfig, HttpRequestId, HttpRequestMethod, HttpRequestTrait,
-    HttpResponse, HttpResponseResult, RetryPolicy,
+    HttpResponse, HttpResponseResult, HttpRetryPolicy,
 };
 use open_net::{Bytes, EnqueueError, HeaderMap, NetError, StatusCode};
+use open_net::api::retry::RetrySetting;
 
 struct Payload;
 
@@ -602,7 +607,7 @@ impl HttpRequestTrait for Payload {
     fn get_req_body(&self) -> Bytes { Bytes::from(self.get_req_data()) }
     fn has_req_body(&self) -> bool { true }
     fn headers(&self) -> HeaderMap { HeaderMap::new() }
-    fn retry_policy(&self) -> RetryPolicy { RetryPolicy::no_retry() }
+    fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> { RetrySetting::Disabled }
     fn on_response_headers(&self, headers: &HeaderMap) {
         println!("Final headers: {}", headers.len());
     }
@@ -611,10 +616,10 @@ impl HttpRequestTrait for Payload {
     }
 }
 
-fn reject(client: &HttpClient) -> EnqueueError<Payload> {
+fn reject(client: &HttpClient) -> Result<EnqueueError<Payload>, NetError> {
     match client.send(Payload) {
-        Err(rejected) => rejected,
-        Ok(_) => panic!("admission should already be closed"),
+        Err(rejected) => Ok(rejected),
+        Ok(_) => Err(NetError::protocol("admission should already be closed")),
     }
 }
 
@@ -622,26 +627,31 @@ fn reject(client: &HttpClient) -> EnqueueError<Payload> {
 async fn main() -> Result<(), NetError> {
     rustls_openssl::default_provider()
         .install_default()
-        .expect("install the application TLS provider once");
+        .map_err(|_| open_net::NetError::from(open_net::error::ErrorKind::InvalidConfig))?;
     let request = Payload;
-    assert_eq!(request.get_path(), "/echo");
-    assert_eq!(request.get_method(), HttpRequestMethod::POST);
-    assert_eq!(request.get_req_data(), "demo");
-    assert_eq!(request.get_req_body().as_ref(), b"demo");
-    assert!(request.has_req_body());
-    assert!(request.headers().is_empty());
-    assert_eq!(request.retry_policy().max_retries(), 0);
+    if request.get_path() != "/echo"
+        || request.get_method() != HttpRequestMethod::POST
+        || request.get_req_data() != "demo"
+        || request.get_req_body().as_ref() != b"demo"
+        || !request.has_req_body()
+        || !request.headers().is_empty()
+        || !matches!(request.retry_setting(), RetrySetting::Disabled)
+    {
+        return Err(NetError::protocol("unexpected request providers"));
+    }
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "rejected-request",
     )?;
     client.request_shutdown();
-    let rejected = reject(&client);
+    let rejected = reject(&client)?;
     println!("{:?}: {}", rejected.error().kind(), rejected.value().get_path());
     let (_request, error) = rejected.into_parts();
     println!("Recovered error: {error}");
-    let recovered = reject(&client).into_inner();
-    assert_eq!(recovered.get_path(), "/echo");
-    println!("Error only: {}", reject(&client).into_error());
+    let recovered = reject(&client)?.into_inner();
+    if recovered.get_path() != "/echo" {
+        return Err(NetError::protocol("rejected input was not preserved"));
+    }
+    println!("Error only: {}", reject(&client)?.into_error());
     client.shutdown().await?;
     let response = HttpResponse::new(
         StatusCode::OK, HeaderMap::new(), Bytes::new(), 0, HttpRequestId(0),
@@ -868,7 +878,7 @@ Request headers override common client headers. Invalid or transport-controlled 
 
 [Offline trait and rejection example](#offline-trait-and-rejection-example) implements and directly calls this method; the submission programs above show SDK dispatch.
 
-## `HttpRequestTrait::retry_policy()`
+## `HttpRequestTrait::retry_setting()`
 
 ### Required features
 
@@ -877,7 +887,7 @@ Request headers override common client headers. Invalid or transport-controlled 
 ### Function signature
 
 ```text
-fn retry_policy(&self) -> RetryPolicy
+fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy>
 ```
 
 ### Steps
@@ -894,11 +904,11 @@ Not applicable.
 
 ### Return values
 
-The request policy; no_retry by default.
+The request retry setting; Inherit by default.
 
 ### Errors and behavior
 
-send/send_wait consult this provider on the caller before admission. A positive retry count overrides the client; a no-retry value inherits the client in those shorthand methods. Explicit options are authoritative and can disable retries. Provider panics unwind on the caller; ownership recovery applies to returned errors, not panics.
+send/send_wait consult this provider on the caller before admission. Inherit uses the client default; Disabled permits one attempt; Policy replaces the whole policy. Explicit options are authoritative and their Inherit also uses the client default. Provider panics unwind on the caller; ownership recovery applies to returned errors, not panics.
 
 ### Example
 
@@ -970,7 +980,7 @@ Unit after the callback future completes; application success is not inferred fr
 
 ### Errors and behavior
 
-Accepted submissions receive one terminal callback under normal SDK dispatch, including failure/cancellation. Rejected submissions receive none. HTTP 4xx/5xx remain Ok responses unless checked. The callback runs on the SDK callback lane, must not wait for its own completion or client cleanup, and is not interrupted by network timeout budgets. Completion reports callback panic or abnormal execution.
+Accepted submissions receive one terminal callback under normal SDK dispatch, including failure/cancellation. Rejected submissions receive none. HTTP 4xx/5xx remain Ok responses unless checked. The callback runs on the SDK callback lane, must not wait for its own completion or client cleanup, and is not interrupted by network timeout budgets. After a terminal network result, neither its callback queue wait nor callback execution counts toward total_timeout or retry-report elapsed. Completion reports callback panic or abnormal execution.
 
 ### Example
 
@@ -1299,3 +1309,44 @@ Waits for the header hook, consuming handler and SDK operation-resource cleanup.
 ### Example
 
 [Handle example](#httprequestid-httprequesthandle-and-completion) provides the complete cancel_and_wait helper calling this method; the send programs supply accepted handles.
+
+## `HttpCompletion::retry_report()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpCompletion::retry_report(&self) -> &RetryReport
+```
+
+### Steps
+
+Await `handle.finished()`, inspect the final report, then consume completion fields.
+
+### Parameters
+
+None.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The accepted operation's final common retry report; it is always present.
+
+### Errors and behavior
+
+Includes zero attempts when accepted work terminates before an attempt starts.
+The report describes network scheduling; `callback` separately reports callback
+execution. Once the network operation has a terminal result, both final callback
+queueing and execution are excluded from `total_timeout` and report `elapsed`.
+The queued result does not become a timeout merely because callback dispatch is
+slow. `finished()` waits for that callback and SDK resource cleanup.
+
+### Example
+
+See the complete [cancel-and-wait helper](#httprequestid-httprequesthandle-and-completion).

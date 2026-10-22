@@ -1,6 +1,7 @@
 //! Native request correlation. The table lock owns terminal arbitration; publications
 //! and resource retirement always happen after that lock has been released.
 use super::operation_control::{OperationControl, OperationPublication};
+use super::timeout_budget::TimeoutBudget;
 use crate::common::log::log_def::LogType;
 use crate::error::{ErrorKind, ErrorStage};
 use crate::ws::request_control::RegistrationTiming;
@@ -15,6 +16,18 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::CancellationToken;
+
+/// A logical request can release its slot synchronously even while an attempt
+/// admission future still holds a temporary clone. Fixed requests release on drop.
+pub(crate) struct PendingLease {
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+}
+impl PendingLease {
+    pub(crate) fn release(&self) {
+        let permit = crate::ws::cancellation::lock_recover(&self.permit).take();
+        drop(permit);
+    }
+}
 
 pub(crate) struct NativePending {
     client_id: ClientId,
@@ -31,6 +44,8 @@ pub(crate) struct NativePending {
     before_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_completion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     fail_disconnected_allocation: std::sync::atomic::AtomicBool,
 }
@@ -59,7 +74,7 @@ struct PendingEntry {
     deferred_error: Option<NetError>,
     deferred_cause: Option<TaskEndCause>,
     response: oneshot::Sender<Result<Response>>,
-    permit: OwnedSemaphorePermit,
+    permit: Arc<PendingLease>,
     retirement: Option<(OperationPublication, NetError)>,
 }
 
@@ -136,6 +151,10 @@ impl Completion {
             publication,
             response,
         } = self;
+        #[cfg(test)]
+        if let Some(pending) = entry.registration.pending().upgrade() {
+            pending.before_completion_for_test();
+        }
         let PendingEntry {
             response: sender,
             permit,
@@ -193,6 +212,8 @@ impl NativePending {
             #[cfg(test)]
             before_prepare: Mutex::new(None),
             #[cfg(test)]
+            before_completion: Mutex::new(None),
+            #[cfg(test)]
             fail_disconnected_allocation: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -201,7 +222,7 @@ impl NativePending {
         self.state.lock().map_err(NetError::from_poison)
     }
 
-    pub(crate) async fn reserve_slot(&self) -> Result<OwnedSemaphorePermit> {
+    pub(crate) async fn reserve_slot(&self) -> Result<Arc<PendingLease>> {
         let permit = tokio::select! {
             biased;
             _ = self.admission_closed.cancelled() => {
@@ -214,10 +235,12 @@ impl NativePending {
         if self.admission_closed.is_cancelled() {
             return Err(NetError::from(ErrorKind::Closed));
         }
-        Ok(permit)
+        Ok(Arc::new(PendingLease {
+            permit: Mutex::new(Some(permit)),
+        }))
     }
 
-    pub(crate) fn try_reserve_slot(&self) -> Result<OwnedSemaphorePermit> {
+    pub(crate) fn try_reserve_slot(&self) -> Result<Arc<PendingLease>> {
         if self.admission_closed.is_cancelled() {
             return Err(NetError::from(ErrorKind::Closed));
         }
@@ -230,7 +253,9 @@ impl NativePending {
         if self.admission_closed.is_cancelled() {
             return Err(NetError::from(ErrorKind::Closed));
         }
-        Ok(permit)
+        Ok(Arc::new(PendingLease {
+            permit: Mutex::new(Some(permit)),
+        }))
     }
 
     pub(crate) fn register(
@@ -238,7 +263,7 @@ impl NativePending {
         request: Arc<Request>,
         options: &RequestOptions,
         core: Arc<OperationControl>,
-        permit: OwnedSemaphorePermit,
+        permit: Arc<PendingLease>,
     ) -> Result<(RequestHandle, oneshot::Receiver<Result<Response>>)> {
         options.validate()?;
         crate::ws::validate_metadata(request.metadata())?;
@@ -268,10 +293,15 @@ impl NativePending {
             .checked_add(1)
             .ok_or_else(|| NetError::from(ErrorKind::ResourceExhausted))?;
         let registered_at = now();
-        if earlier(options.registration_deadline, options.send.deadline)
-            .is_some_and(|deadline| registered_at >= deadline)
+        if let Some(budget) = TimeoutBudget::earlier(
+            core.absolute_budget(),
+            options
+                .registration_deadline
+                .map(|at| TimeoutBudget::new(at, crate::ws::WsTimeoutPhase::Admission)),
+        )
+        .filter(|budget| registered_at >= budget.at)
         {
-            return Err(timeout());
+            return Err(budget.timeout_error());
         }
         let deadline = match options.response_timeout_origin {
             ResponseTimeoutOrigin::Registered => {
@@ -289,7 +319,7 @@ impl NativePending {
             timing.clone(),
         );
         core.bind_request(Arc::downgrade(self), request.id().clone(), token)?;
-        core.set_response_deadline(earlier(deadline, options.send.deadline));
+        core.set_response_deadline(deadline);
         let handle = RequestHandle::new(core.clone(), registration.clone());
         state.next_token = token;
         state.entries.insert(
@@ -386,8 +416,7 @@ impl NativePending {
             entry.deferred_error = Some(timeout());
             entry.deferred_cause = Some(TaskEndCause::Expired);
         }
-        let deadline = entry.deadline()?;
-        entry.core.set_response_deadline(deadline);
+        entry.core.set_response_deadline(entry.response_deadline()?);
         let (written, publication) = entry.core.select_written();
         let terminal_error = if !written {
             entry.core.selected_error()
@@ -437,17 +466,12 @@ impl NativePending {
             entry.grace_deadline = Some(deadline);
             entry.deferred_error = Some(timeout());
             entry.deferred_cause = Some(TaskEndCause::Expired);
-            entry
-                .core
-                .set_response_deadline(earlier(Some(deadline), entry.absolute_deadline));
+            entry.core.set_response_deadline(Some(deadline));
             drop(state);
             self.changed.notify_one();
             return Ok(());
         }
-        let error = entry
-            .deferred_error
-            .clone()
-            .map_or_else(timeout, |error| error);
+        let error = entry.timeout_error()?;
         let cause = entry
             .deferred_cause
             .map_or(TaskEndCause::Expired, |cause| cause);
@@ -603,7 +627,7 @@ impl NativePending {
         }
         let expired = entry.deadline()?.is_some_and(|deadline| now() >= deadline);
         let (won, completion) = if expired {
-            let error = timeout();
+            let error = entry.timeout_error()?;
             let (_, publication) = entry
                 .core
                 .select_failure(error.clone(), TaskEndCause::Expired);
@@ -813,7 +837,9 @@ impl NativePending {
             if !eligible || entry.grace_used || bounded.is_none_or(|deadline| at >= deadline) {
                 return Ok(ResolveOutcome::StaleOrFinished);
             }
-            entry.core.set_response_deadline(bounded);
+            entry
+                .core
+                .set_response_deadline(earlier(Some(record.expires_at), response_bound));
         }
         let (won, publication) = entry.core.select_response();
         let result = if won {
@@ -905,9 +931,7 @@ impl NativePending {
                     entry.grace_deadline = Some(deadline);
                     entry.deferred_error = Some(error.clone());
                     entry.deferred_cause = Some(TaskEndCause::Disconnected);
-                    entry
-                        .core
-                        .set_response_deadline(earlier(Some(deadline), entry.absolute_deadline));
+                    entry.core.set_response_deadline(Some(deadline));
                     continue;
                 }
             }
@@ -941,6 +965,27 @@ impl NativePending {
         }
         self.changed.notify_one();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_completion_for_test(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
+        let previous = self
+            .before_completion
+            .lock()
+            .map_err(NetError::from_poison)?
+            .replace(Box::new(hook));
+        drop(previous);
+        Ok(())
+    }
+    #[cfg(test)]
+    fn before_completion_for_test(&self) {
+        let hook = crate::ws::cancellation::lock_recover(&self.before_completion).take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     #[cfg(test)]
@@ -1138,16 +1183,11 @@ impl NativePending {
                     entry.grace_deadline = Some(deadline);
                     entry.deferred_error = Some(timeout());
                     entry.deferred_cause = Some(TaskEndCause::Expired);
-                    entry
-                        .core
-                        .set_response_deadline(earlier(Some(deadline), entry.absolute_deadline));
+                    entry.core.set_response_deadline(Some(deadline));
                     continue;
                 }
             }
-            let error = entry
-                .deferred_error
-                .clone()
-                .map_or_else(timeout, |error| error);
+            let error = entry.timeout_error()?;
             let cause = entry
                 .deferred_cause
                 .map_or(TaskEndCause::Expired, |cause| cause);
@@ -1230,11 +1270,29 @@ impl NativePending {
 }
 
 impl PendingEntry {
-    fn deadline(&self) -> Result<Option<Instant>> {
-        Ok(earlier(
-            self.grace_deadline.or(self.timing.deadline()?),
-            self.absolute_deadline,
+    fn response_deadline(&self) -> Result<Option<Instant>> {
+        Ok(self.grace_deadline.or(self.timing.deadline()?))
+    }
+    fn budget(&self) -> Result<Option<TimeoutBudget>> {
+        Ok(TimeoutBudget::earlier(
+            self.core.absolute_budget(),
+            self.response_deadline()?
+                .map(|at| TimeoutBudget::new(at, crate::ws::WsTimeoutPhase::Response)),
         ))
+    }
+    fn deadline(&self) -> Result<Option<Instant>> {
+        Ok(self.budget()?.map(|budget| budget.at))
+    }
+    fn timeout_error(&self) -> Result<NetError> {
+        match self.budget()? {
+            Some(budget) if budget.phase != crate::ws::WsTimeoutPhase::Response => {
+                Ok(budget.timeout_error())
+            }
+            _ => Ok(self
+                .deferred_error
+                .clone()
+                .map_or_else(timeout, |error| error)),
+        }
     }
 }
 
@@ -1347,5 +1405,11 @@ fn add(at: Instant, duration: Duration) -> Result<Instant> {
         .ok_or_else(|| NetError::config("response_timeout", "exceeds monotonic clock range"))
 }
 fn timeout() -> NetError {
-    NetError::from(ErrorKind::TimedOut).with_stage(ErrorStage::Response)
+    NetError::from(ErrorKind::TimedOut)
+        .with_stage(ErrorStage::Response)
+        .with_ws_timeout_phase(crate::ws::WsTimeoutPhase::Response)
 }
+
+#[cfg(test)]
+#[path = "native_pending_timeout_tests.rs"]
+mod timeout_tests;

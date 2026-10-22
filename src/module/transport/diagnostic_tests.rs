@@ -191,7 +191,7 @@ async fn rejected_proxy(
         released.await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     });
-    let mut socket = TcpStream::connect(address).await?;
+    let mut socket = tokio::io::BufReader::with_capacity(1024, TcpStream::connect(address).await?);
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         proxy::establish_tunnel_with_diagnostics(&mut socket, "localhost", 443, None, options),
@@ -328,4 +328,55 @@ fn repeated_io_error(error: &IoError) -> IoError {
         Some(cause) => IoError::new(error.kind(), cause.clone()),
         None => IoError::new(error.kind(), error.to_string()),
     }
+}
+
+#[test]
+fn delayed_proxy_tls_alert_keeps_its_origin_through_inner_tls_and_websocket_io() -> TestResult {
+    use crate::error::ErrorStage;
+
+    let alert = || {
+        stream::mark_proxy_tls_error(IoError::new(
+            ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateRequired),
+        ))
+    };
+    for observed_stage in [
+        ConnectStage::ProxyConnect,
+        ConnectStage::Tls,
+        ConnectStage::WebSocketUpgrade,
+        ConnectStage::WebSocketIo,
+    ] {
+        let result = classify_tls_io_with_diagnostics(
+            alert(),
+            observed_stage,
+            Some(&HandshakeDiagnosticOptions::default()),
+        );
+        if result.failure.stage() != ConnectStage::ProxyTls
+            || result.failure.error().context().stage != Some(ErrorStage::ProxyTls)
+            || result.failure.error().kind() != crate::error::ErrorKind::Tls
+            || result.failure.http_status().is_some()
+            || result.failure.retryable()
+            || result.diagnostic.as_ref().map(HandshakeDiagnostic::kind)
+                != Some(HandshakeDiagnosticKind::TlsCertificate)
+        {
+            return Err(format!("proxy TLS origin was lost at {observed_stage:?}").into());
+        }
+    }
+    let error = NetError::from(WsError::Io(alert()));
+    if error.context().stage != Some(ErrorStage::ProxyTls)
+        || error.kind() != crate::error::ErrorKind::Tls
+    {
+        return Err("established proxy TLS alert lost its origin".into());
+    }
+
+    let target_error = NetError::from(WsError::Io(IoError::new(
+        ErrorKind::InvalidData,
+        rustls::Error::AlertReceived(rustls::AlertDescription::BadCertificate),
+    )));
+    if target_error.context().stage != Some(ErrorStage::Tls)
+        || target_error.kind() != crate::error::ErrorKind::Tls
+    {
+        return Err("established target TLS alert lost its origin".into());
+    }
+    Ok(())
 }

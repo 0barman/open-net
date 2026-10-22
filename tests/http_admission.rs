@@ -1,5 +1,7 @@
 #![cfg(feature = "http-client")]
 
+use open_net::api::retry::{RetryEvent, RetrySetting};
+
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,8 +11,8 @@ use http::HeaderMap;
 use open_net::api::error::{ErrorKind, ErrorStage, NetError};
 use open_net::api::http::{
     HttpAdmissionPolicy, HttpClient, HttpClientConfig, HttpRequest, HttpRequestHandle,
-    HttpRequestMethod, HttpRequestTrait, HttpResponse, HttpResponseResult, HttpStreamResponse,
-    HttpTimeouts, RetryEvent, RetryPolicy, TimeoutPhase,
+    HttpRequestMethod, HttpRequestTrait, HttpResponse, HttpResponseResult, HttpRetryPolicy,
+    HttpStreamResponse, HttpTimeouts, TimeoutPhase,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -334,7 +336,7 @@ async fn fail_fast_client_and_request_override_reject_before_transport() -> Test
         let (active, observed) = occupy(&mut peer, &client).await?;
         let attempts = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&attempts);
-        let policy = RetryPolicy::builder()
+        let policy = HttpRetryPolicy::builder()
             .observer(move |event: &RetryEvent| {
                 if matches!(event, RetryEvent::AttemptStarted { .. }) {
                     seen.fetch_add(1, Ordering::SeqCst);
@@ -344,7 +346,7 @@ async fn fail_fast_client_and_request_override_reject_before_transport() -> Test
         for streaming in [false, true] {
             let mut builder = HttpRequest::builder()
                 .path("/rejected")
-                .retry_policy(policy.clone());
+                .retry_setting(RetrySetting::Policy(policy.clone()));
             if let Some(policy) = request_policy {
                 builder = builder.admission_policy(policy);
             }

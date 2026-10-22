@@ -1,6 +1,6 @@
 //! Fresh Windows observations. This module only samples; the service owns commit authority.
 //!
-//! Call `sample` on the service's bounded blocking worker. Cancellation revokes
+//! Call each query on its service's bounded blocking worker. Cancellation revokes
 //! the result even when a synchronous COM call cannot itself be interrupted.
 
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -15,15 +15,14 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 pub(crate) struct WindowsObservation {
     pub(crate) reachability: NetworkStatus,
-    pub(crate) network_name: Option<String>,
-    pub(crate) name_source: NetworkNameSource,
-    pub(crate) name_diagnostics: Vec<NetError>,
 }
 
-struct ResolvedName {
-    name: Option<String>,
-    source: NetworkNameSource,
-    diagnostics: Vec<NetError>,
+/// A value owned exclusively by an explicitly requested name observation.
+/// Ordinary connectivity sampling cannot construct or publish this type.
+pub(crate) struct NameSample {
+    pub(crate) name: Option<String>,
+    pub(crate) source: NetworkNameSource,
+    pub(crate) diagnostics: Vec<NetError>,
 }
 
 fn check_request(deadline: Instant, cancelled: &AtomicBool) -> Result<(), NetError> {
@@ -67,11 +66,11 @@ fn parse_wifi_ssid(output: &[u8]) -> Result<Option<String>, NetError> {
 fn resolve_name(
     wifi: Result<Option<String>, NetError>,
     fallback: impl FnOnce() -> Result<Option<String>, NetError>,
-) -> Result<ResolvedName, NetError> {
+) -> Result<NameSample, NetError> {
     let mut diagnostics = Vec::new();
     match wifi {
         Ok(Some(name)) => {
-            return Ok(ResolvedName {
+            return Ok(NameSample {
                 name: Some(name),
                 source: NetworkNameSource::WifiSsid,
                 diagnostics,
@@ -91,7 +90,7 @@ fn resolve_name(
     } else {
         NetworkNameSource::None
     };
-    Ok(ResolvedName {
+    Ok(NameSample {
         name,
         source,
         diagnostics,
@@ -153,29 +152,54 @@ impl Drop for ManagedChild {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn sample(
-    deadline: Instant,
-    cancelled: &AtomicBool,
-) -> Result<WindowsObservation, NetError> {
-    sample_inner(deadline, cancelled, true)
-}
-
 /// This worker never invokes netsh or connected-network name enumeration.
 #[cfg(target_os = "windows")]
 pub(crate) fn sample_reachability(
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> Result<WindowsObservation, NetError> {
-    sample_inner(deadline, cancelled, false)
+    with_manager(deadline, cancelled, |manager| {
+        // SAFETY: manager remains live in this apartment; no raw output buffer is used.
+        let connectivity = unsafe { manager.GetConnectivity() }.map_err(monitor_io)?;
+        check_request(deadline, cancelled)?;
+        Ok(WindowsObservation {
+            reachability: reachability_from_bits(connectivity.0 as u32),
+        })
+    })
+}
+
+/// Query names only for the separate, explicitly enabled name service.
+/// It neither queries nor publishes Internet connectivity.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn query_name(
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<NameSample, NetError> {
+    #[cfg(target_os = "windows")]
+    {
+        with_manager(deadline, cancelled, |manager| {
+            let sample = resolve_name(query_wifi_ssid(deadline, cancelled), || {
+                query_nlm_name(manager, deadline, cancelled)
+            })?;
+            check_request(deadline, cancelled)?;
+            Ok(sample)
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        check_request(deadline, cancelled)?;
+        Err(NetError::from(ErrorKind::Unsupported).with_stage(ErrorStage::NetworkMonitor))
+    }
 }
 
 #[cfg(target_os = "windows")]
-fn sample_inner(
+fn with_manager<T>(
     deadline: Instant,
     cancelled: &AtomicBool,
-    include_name: bool,
-) -> Result<WindowsObservation, NetError> {
+    query: impl FnOnce(
+        &windows::Win32::Networking::NetworkListManager::INetworkListManager,
+    ) -> Result<T, NetError>,
+) -> Result<T, NetError> {
     use windows::Win32::Networking::NetworkListManager::{INetworkListManager, NetworkListManager};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -203,42 +227,9 @@ fn sample_inner(
     let manager: INetworkListManager =
         unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }.map_err(monitor_io)?;
     check_request(deadline, cancelled)?;
-    // SAFETY: manager remains live in this apartment; no raw output buffer is used.
-    let connectivity = unsafe { manager.GetConnectivity() }.map_err(monitor_io)?;
-    check_request(deadline, cancelled)?;
-    let observation = finish_observation(
-        reachability_from_bits(connectivity.0 as u32),
-        include_name,
-        || {
-            resolve_name(query_wifi_ssid(deadline, cancelled), || {
-                query_nlm_name(&manager, deadline, cancelled)
-            })
-        },
-    )?;
+    let observation = query(&manager)?;
     check_request(deadline, cancelled)?;
     Ok(observation)
-}
-
-fn finish_observation(
-    reachability: NetworkStatus,
-    include_name: bool,
-    query_name: impl FnOnce() -> Result<ResolvedName, NetError>,
-) -> Result<WindowsObservation, NetError> {
-    if !include_name {
-        return Ok(WindowsObservation {
-            reachability,
-            network_name: None,
-            name_source: NetworkNameSource::CachedObservation,
-            name_diagnostics: Vec::new(),
-        });
-    }
-    let name = query_name()?;
-    Ok(WindowsObservation {
-        reachability,
-        network_name: name.name,
-        name_source: name.source,
-        name_diagnostics: name.diagnostics,
-    })
 }
 
 #[cfg(target_os = "windows")]
@@ -283,9 +274,33 @@ fn query_nlm_name(
 
 #[cfg(target_os = "windows")]
 fn query_wifi_ssid(deadline: Instant, cancelled: &AtomicBool) -> Result<Option<String>, NetError> {
-    let mut command = std::process::Command::new("netsh");
+    check_request(deadline, cancelled)?;
+    let mut command = std::process::Command::new(system_netsh_path()?);
     command.args(["wlan", "show", "interfaces"]);
     parse_wifi_ssid(&command_output(command, deadline, cancelled)?)
+}
+
+#[cfg(target_os = "windows")]
+fn system_netsh_path() -> Result<std::path::PathBuf, NetError> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    // A bounded UTF-16 Windows path buffer also avoids environment/PATH lookup.
+    let mut directory = vec![0u16; 32_768];
+    // SAFETY: the generated binding passes this exclusively owned output slice.
+    let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) } as usize;
+    if length == 0 {
+        return Err(monitor_io(std::io::Error::last_os_error()));
+    }
+    if length >= directory.len() {
+        return Err(NetError::from(ErrorKind::ItemTooLarge).with_stage(ErrorStage::NetworkMonitor));
+    }
+    directory.truncate(length);
+    let directory = std::path::PathBuf::from(std::ffi::OsString::from_wide(&directory));
+    if !directory.is_absolute() {
+        return Err(NetError::from(ErrorKind::InvalidConfig).with_stage(ErrorStage::NetworkMonitor));
+    }
+    Ok(directory.join("netsh.exe"))
 }
 
 #[cfg(target_os = "windows")]
@@ -531,20 +546,5 @@ mod tests {
             &cancelled,
         );
         assert_eq!(timeout.unwrap_err().kind(), ErrorKind::TimedOut);
-    }
-}
-#[cfg(test)]
-#[test]
-fn reachability_only_sampling_never_enters_failing_or_slow_name_query() {
-    for kind in [ErrorKind::Io, ErrorKind::TimedOut] {
-        let queried = std::cell::Cell::new(false);
-        let result = finish_observation(NetworkStatus::Unavailable, false, || {
-            queried.set(true);
-            Err(NetError::from(kind))
-        })
-        .unwrap();
-        assert!(!queried.get());
-        assert_eq!(result.reachability, NetworkStatus::Unavailable);
-        assert_eq!(result.name_source, NetworkNameSource::CachedObservation);
     }
 }
