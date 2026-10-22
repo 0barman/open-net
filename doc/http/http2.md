@@ -4,7 +4,7 @@ Required feature: `http-client-http2` (includes `http-client`). Without this fea
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client-http2"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client-http2"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -24,7 +24,7 @@ using open-net should accept the host's choice rather than install its own globa
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
 precedence and complete examples of both approaches.
 
-Adjust the local path to the checked-out crate. Public types below are re-exported by `open_net::api::http`. Runtime examples require a reachable HTTPS server with an accepted certificate and HTTP/2 ALPN support.
+Public types below are re-exported by `open_net::api::http`. Runtime examples require a reachable HTTPS server with an accepted certificate and HTTP/2 ALPN support.
 
 ## `HttpClientConfig::with_http_version_policy()`
 
@@ -62,11 +62,11 @@ Updated `HttpClientConfig`; the setter itself does not return a `Result`. `valid
 
 `Http2Only` with an `http` initial base URL returns `InvalidConfig` for `http_version_policy`; direct cleartext h2c base URLs are rejected. A TLS peer that cannot negotiate h2 fails a request under `Http2Only` with a TLS/protocol error; there is no HTTP/1 fallback. `Auto` does not promise that the server will choose h2. The enum is non-exhaustive, so downstream exhaustive `match` statements require a wildcard arm.
 
-`Http2Only` never follows a redirect to an HTTP target or replays a request body there, including buffered POST bodies on 307/308 redirects. This applies to buffered requests, callbacks, stream opening and SSE opening. It applies both when the transport follows redirects and when an installed authentication provider or Cookie store selects the SDK's redirect handling. Enabling those Cargo features without installing a provider or store does not change the restriction.
+`Http2Only` never follows a redirect to an HTTP target or replays a request body there, including buffered POST bodies on 307/308 redirects. The independent [transport security policy](redirects.md) now prevents HTTPS-to-HTTP redirects in `Auto`, `Http1Only`, and builds without the HTTP/2 feature as well. Initial HTTP URLs remain supported by those modes under the default transport policy.
 
-An attempted HTTP redirect fails with `Protocol/Receive` before connecting to the target, with either redirect handler. Existing rules can prevent a follow attempt altogether: for example, a redirect response without `Location` remains an unfollowed 3xx response. Such a response does not mean that a downgrade occurred. Check the returned status as well as handling request errors.
+The SDK handles every redirect for buffered requests, callbacks, stream opening and SSE opening. Installing an authentication provider or Cookie store does not select another redirect implementation. A rejected redirect returns `Protocol/Receive` with a URL-free `HttpRedirectError` source before connecting to the target. It is not automatically retried, even when protocol transport retries are enabled. `RedirectPolicy::none()`, a missing `Location`, or a non-replayable body can leave a response as an unfollowed 3xx. Check the returned status as well as handling request errors.
 
-HTTPS-to-HTTPS redirects remain supported when the target satisfies the configured certificate checks and HTTP/2 policy. This restriction does not enforce a same-origin redirect policy: an HTTPS redirect may still reach another origin. It also does not add an HTTPS-only policy to `Auto` or `Http1Only`; those policies retain their existing HTTP and redirect behavior. An explicit HTTP proxy can still carry an HTTPS request through CONNECT; see [TLS and proxies](tls_and_proxy.md).
+HTTPS-to-HTTPS redirects must satisfy the independent redirect policy as well as certificate checks and HTTP/2 requirements. The default permits only the original origin; explicitly allow another origin when needed. Allowlisting a target never bypasses the HTTPS requirement. An explicit HTTP proxy can still carry an HTTPS request through CONNECT; see [TLS and proxies](tls_and_proxy.md).
 
 ### Example
 

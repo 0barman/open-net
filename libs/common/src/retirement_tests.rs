@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{ExecutionScope, ThreadRegistry};
 use crate::common::CommonError;
 use std::sync::{mpsc, Arc};
@@ -47,8 +49,90 @@ fn retirement_work_lease_is_released_during_unwinding() {
         panic!("retirement work panic");
     });
     assert!(result.is_err());
-    assert_eq!(*super::lock(&tracker.active), 0);
+    assert_eq!(super::lock(&tracker.active).strong_count(), 0);
     tracker.wait();
+}
+
+#[test]
+fn retirement_work_shares_a_generation_until_every_lease_retires() -> TestResult {
+    let tracker = Arc::new(super::WorkTracker::default());
+    let first = tracker.register();
+    let second = tracker.register();
+    assert!(Arc::ptr_eq(&first._generation, &second._generation));
+    let generation = Arc::downgrade(&first._generation);
+    let (finished, completion) = mpsc::channel();
+    let waiting = Arc::clone(&tracker);
+    let coordinator = std::thread::spawn(move || {
+        waiting.wait();
+        let _ = finished.send(());
+    });
+    assert!(tracker.wait_started_for_test(WAIT));
+    drop(first);
+    assert_eq!(generation.strong_count(), 1);
+    assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+    drop(second);
+    completion.recv_timeout(WAIT)?;
+    coordinator
+        .join()
+        .map_err(|_| "work coordinator panicked")?;
+    assert_eq!(generation.strong_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn retirement_work_reuses_tracker_after_a_completed_generation() {
+    let tracker = Arc::new(super::WorkTracker::default());
+    let first = tracker.register();
+    let completed = Arc::downgrade(&first._generation);
+    drop(first);
+    tracker.wait();
+    let next = tracker.register();
+    assert!(!completed.ptr_eq(&Arc::downgrade(&next._generation)));
+    assert_eq!(super::lock(&tracker.active).strong_count(), 1);
+    drop(next);
+    tracker.wait();
+}
+
+#[test]
+fn retired_generation_cannot_complete_a_successor_generation() -> TestResult {
+    let tracker = Arc::new(super::WorkTracker::default());
+    let first = tracker.register();
+    let retiring = Arc::downgrade(&first._generation);
+    let (retired, retirement) = mpsc::channel();
+    // Force the last strong reference to disappear before its destructor can
+    // take the tracker lock. Registration uses the same locked helper below,
+    // making the old-drop/new-registration interleaving deterministic.
+    let mut active = super::lock(&tracker.active);
+    let retiring_thread = std::thread::spawn(move || {
+        drop(first);
+        let _ = retired.send(());
+    });
+    let deadline = std::time::Instant::now() + WAIT;
+    while retiring.strong_count() != 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let successor = tracker.register_locked(&mut active);
+    assert!(!retiring.ptr_eq(&Arc::downgrade(&successor._generation)));
+    let (finished, completion) = mpsc::channel();
+    let waiting = Arc::clone(&tracker);
+    let coordinator = std::thread::spawn(move || {
+        waiting.wait();
+        let _ = finished.send(());
+    });
+    drop(active);
+    retirement.recv_timeout(WAIT)?;
+    assert!(tracker.wait_started_for_test(WAIT));
+    assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+    drop(successor);
+    completion.recv_timeout(WAIT)?;
+    retiring_thread
+        .join()
+        .map_err(|_| "lease retirement panicked")?;
+    coordinator
+        .join()
+        .map_err(|_| "work coordinator panicked")?;
+    Ok(())
 }
 
 #[test]

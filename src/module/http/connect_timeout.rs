@@ -110,7 +110,7 @@ mod tests {
     use super::*;
     use crate::api::error::{ErrorKind, ErrorStage, NetError};
     use crate::api::http::TimeoutPhase;
-    use crate::module::http::http_failure::{connect_timeout_deadline, map_reqwest_error};
+    use crate::module::http::http_failure::{connect_timeout_deadline, map_execute_error};
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -245,7 +245,7 @@ mod tests {
         entered.notified().await;
         tokio::time::advance(Duration::from_secs(3)).await;
         let error = match request.await? {
-            Err(error) => map_reqwest_error(error, ErrorStage::Write),
+            Err(error) => map_execute_error(error),
             Ok(_) => return Err(io::Error::other("stalled resolver connected").into()),
         };
         check_connect(&error)
@@ -292,7 +292,7 @@ mod tests {
         release.notify_one();
         server.await??;
         let error = match result {
-            Err(error) => map_reqwest_error(error, ErrorStage::Write),
+            Err(error) => map_execute_error(error),
             Ok(_) => return Err(io::Error::other("stalled handshake connected").into()),
         };
         check_connect(&error)

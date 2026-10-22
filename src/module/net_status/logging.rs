@@ -98,7 +98,6 @@ pub(super) enum Fault {
     QueueFull,
     ResourceExhausted,
     SampleFailed,
-    NameFallback,
     Io,
     RuntimeUnavailable,
     Closed,
@@ -127,7 +126,6 @@ impl Fault {
             Self::QueueFull => "queue_full",
             Self::ResourceExhausted => "resource_exhausted",
             Self::SampleFailed => "sample_failed",
-            Self::NameFallback => "wifi_name_fallback",
             Self::Io => "io",
             Self::RuntimeUnavailable => "runtime_unavailable",
             Self::Closed => "closed",
@@ -155,7 +153,7 @@ impl FaultCycle {
             OpenNetLogger::is_enabled_for(LogType::Engine, LogLevel::Error),
         ) {
             crate::log_e!(LogType::Engine; "net_status.failure",
-                "operation|reason|retained_previous", operation, fault.name(), !matches!(fault, Fault::NameFallback));
+                "operation|reason|retained_previous", operation, fault.name(), true);
         }
     }
     pub(super) fn recovered(&mut self, operation: &'static str) {

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::CommonEngine;
 use crate::common::common_error::CommonError;
 use crate::common::log::log_def::LogType;

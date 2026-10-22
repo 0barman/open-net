@@ -101,7 +101,7 @@ fn dropping_unpolled_monitor_task_clears_known_state() -> TestResult {
     let (publisher, publication) = source.begin_generation()?;
     publication.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))?
         .dispatch()?;
     let completion = NetworkStatusMonitorGuard(publisher);
     let future = async move {
@@ -127,7 +127,7 @@ fn stopped_generation_completion_cannot_clear_new_generation() -> TestResult {
     let (fresh, publication) = source.begin_generation()?;
     publication.dispatch()?;
     fresh
-        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?
         .dispatch()?;
     drop(completion);
     if source.snapshot()?.reachability != Some(NetworkStatus::Available) {
@@ -141,11 +141,11 @@ fn completed_monitor_cannot_republish_a_late_platform_query() -> TestResult {
     let (publisher, publication) = source.begin_generation()?;
     publication.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))?
         .dispatch()?;
     drop(NetworkStatusMonitorGuard(publisher.clone()));
     publisher
-        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only), None)?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only))?
         .dispatch()?;
     if source.snapshot()?.reachability.is_some() {
         return Err("completed monitor accepted a late query".into());
@@ -187,7 +187,7 @@ fn stop_publishes_unknown_before_native_resource_completion() -> TestResult {
     let (publisher, publication) = client.observations.begin_generation()?;
     publication.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))?
         .dispatch()?;
     let state = MonitorState {
         observation: Some(publisher),

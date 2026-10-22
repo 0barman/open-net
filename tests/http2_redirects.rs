@@ -5,8 +5,8 @@ use bytes::Bytes;
 use http::{header, Method, Response, StatusCode};
 use open_net::api::error::{ErrorKind, ErrorStage};
 use open_net::api::http::{
-    HttpClient, HttpClientConfig, HttpProtocol, HttpRequest, HttpRequestMethod, HttpRequestTrait,
-    HttpResponseResult, HttpTlsConfig, HttpVersionPolicy,
+    HttpClient, HttpClientConfig, HttpProtocol, HttpRedirectError, HttpRequest, HttpRequestMethod,
+    HttpRequestTrait, HttpResponseResult, HttpTlsConfig, HttpVersionPolicy, RedirectPolicy,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::error::Error;
@@ -165,16 +165,35 @@ where
     let mut body = vec![0; length];
     stream.read_exact(&mut body).await?;
     let location = location.map_or_else(String::new, |url| format!("Location: {url}\r\n"));
-    let head = format!(
+    let mut response = format!(
         "HTTP/1.1 {} {}\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n",
         status.as_u16(),
         status.canonical_reason().unwrap_or("Response"),
         RESPONSE_BODY.len(),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(RESPONSE_BODY).await?;
-    stream.shutdown().await?;
+    )
+    .into_bytes();
+    response.extend_from_slice(RESPONSE_BODY);
+    // Policy rejection may close the response as soon as its headers arrive.
+    // A single response write avoids racing a second body write against that
+    // close. Only shutdown tolerates it; setup, reads, and writes remain strict.
+    stream.write_all(&response).await?;
+    allow_early_response_close(stream.shutdown().await)?;
     Ok(ObservedRequest { method, path, body })
+}
+
+fn allow_early_response_close(result: std::io::Result<()>) -> TestResult {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn h1_peer(tls: bool, status: StatusCode, location: Option<String>) -> TestResult<Peer> {
@@ -202,20 +221,22 @@ enum Provider {
     AuthAndCookies,
 }
 
-fn client_for(peer: &Peer, provider: Provider) -> TestResult<HttpClient> {
-    client_for_policy(peer, provider, HttpVersionPolicy::Http2Only)
+fn client_for(peer: &Peer, provider: Provider, allowed: &[String]) -> TestResult<HttpClient> {
+    client_for_policy(peer, provider, HttpVersionPolicy::Http2Only, allowed)
 }
 
 fn client_for_policy(
     peer: &Peer,
     provider: Provider,
     policy: HttpVersionPolicy,
+    allowed: &[String],
 ) -> TestResult<HttpClient> {
     let config = HttpClientConfig::new(format!("https://{}", peer.address))?
         .with_tls(HttpTlsConfig::default().with_root_certificates(CA, true)?)
         .with_environment_proxy(false)
         .with_timeout(Duration::from_secs(3))?
-        .with_http_version_policy(policy);
+        .with_http_version_policy(policy)
+        .with_redirect_policy(RedirectPolicy::allow_origins(allowed)?);
     let config = match provider {
         Provider::None => config,
         #[cfg(feature = "http-client-auth")]
@@ -239,6 +260,12 @@ enum Delivery {
 }
 
 const DELIVERIES: [Delivery; 3] = [Delivery::Buffered, Delivery::Streaming, Delivery::Callback];
+const ALL_DELIVERIES: [Delivery; 4] = [
+    Delivery::Buffered,
+    Delivery::Streaming,
+    Delivery::Callback,
+    Delivery::Sse,
+];
 
 struct CallbackRequest(oneshot::Sender<HttpResponseResult>);
 
@@ -350,7 +377,11 @@ async fn rejects_downgrade(
         Some(format!("http://{}/destination", cleartext.local_addr()?)),
     )
     .await?;
-    let client = client_for(&source, provider)?;
+    let client = client_for(
+        &source,
+        provider,
+        &[format!("http://{}", cleartext.local_addr()?)],
+    )?;
     let result = deliver(&client, delivery).await?;
     client.shutdown().await?;
     let source_request = source.finish().await?;
@@ -379,12 +410,18 @@ fn assert_blocked_downgrade(
             panic!("{status} {delivery:?} {provider:?} reached the cleartext listener: {other:?}")
         }
     }
-    let error = result.expect_err("HTTP/2-only must reject an HTTPS-to-HTTP redirect");
+    let error = result.expect_err("transport security must reject an HTTPS-to-HTTP redirect");
     assert_eq!(error.kind(), ErrorKind::Protocol);
     assert_eq!(error.context().stage, Some(ErrorStage::Receive));
     assert!(error.context().http_request_id.is_some());
     assert_eq!(error.context().http_attempt, Some(1));
     assert_eq!(error.timeout_phase(), None);
+    assert_eq!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<HttpRedirectError>()),
+        Some(&HttpRedirectError::InsecureTarget),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -434,7 +471,14 @@ async fn rejects_cleartext_after_an_accepted_https_redirect() -> TestResult {
             Some(format!("https://{}/intermediate", intermediate.address)),
         )
         .await?;
-        let client = client_for(&source, Provider::None)?;
+        let client = client_for(
+            &source,
+            Provider::None,
+            &[
+                format!("https://{}", intermediate.address),
+                format!("http://{}", cleartext.local_addr()?),
+            ],
+        )?;
         let result = deliver(&client, delivery).await?;
         client.shutdown().await?;
         let initial = source.finish().await?;
@@ -468,7 +512,11 @@ async fn preserves_secure_redirects(provider: Provider) -> TestResult {
                 Some(format!("https://{}/destination", destination.address)),
             )
             .await?;
-            let client = client_for(&source, provider)?;
+            let client = client_for(
+                &source,
+                provider,
+                &[format!("https://{}", destination.address)],
+            )?;
             let result = deliver(&client, delivery).await??;
             assert_eq!(result.status, StatusCode::OK);
             assert_eq!(result.protocol, HttpProtocol::Http2);
@@ -493,32 +541,45 @@ async fn https_redirects_preserve_post_bodies_without_providers() -> TestResult 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_and_http1_only_keep_existing_cleartext_redirect_behavior() -> TestResult {
+async fn auto_and_http1_only_reject_allowlisted_cleartext_redirects() -> TestResult {
+    let providers = [
+        Provider::None,
+        #[cfg(feature = "http-client-auth")]
+        Provider::Auth,
+        #[cfg(feature = "http-client-cookies")]
+        Provider::Cookies,
+        #[cfg(all(feature = "http-client-auth", feature = "http-client-cookies"))]
+        Provider::AuthAndCookies,
+    ];
     for policy in [HttpVersionPolicy::Auto, HttpVersionPolicy::Http1Only] {
-        for status in [
-            StatusCode::TEMPORARY_REDIRECT,
-            StatusCode::PERMANENT_REDIRECT,
-        ] {
-            for delivery in DELIVERIES {
-                let destination = h1_peer(false, StatusCode::OK, None).await?;
-                let source = h1_peer(
-                    true,
-                    status,
-                    Some(format!("http://{}/destination", destination.address)),
-                )
-                .await?;
-                let client = client_for_policy(&source, Provider::None, policy)?;
-                let result = deliver(&client, delivery).await??;
-                assert_eq!(result.status, StatusCode::OK);
-                assert_eq!(result.protocol, HttpProtocol::Http11);
-                assert_eq!(result.body, RESPONSE_BODY);
-                client.shutdown().await?;
-                let initial = source.finish().await?;
-                let redirected = destination.finish().await?;
-                assert_eq!(redirected.path, "/destination");
-                for observed in [initial, redirected] {
-                    assert_eq!(observed.method, Method::POST);
-                    assert_eq!(observed.body, REQUEST_BODY);
+        for provider in providers {
+            for status in REDIRECTS {
+                for delivery in ALL_DELIVERIES {
+                    let cleartext = CleartextListener::bind("127.0.0.1:0")?;
+                    cleartext.set_nonblocking(true)?;
+                    let source = h1_peer(
+                        true,
+                        status,
+                        Some(format!("http://{}/destination", cleartext.local_addr()?)),
+                    )
+                    .await?;
+                    let client = client_for_policy(
+                        &source,
+                        provider,
+                        policy,
+                        &[format!("http://{}", cleartext.local_addr()?)],
+                    )?;
+                    let result = deliver(&client, delivery).await?;
+                    client.shutdown().await?;
+                    let initial = source.finish().await?;
+                    if matches!(delivery, Delivery::Sse) {
+                        assert_eq!(initial.method, Method::GET);
+                        assert!(initial.body.is_empty());
+                    } else {
+                        assert_eq!(initial.method, Method::POST);
+                        assert_eq!(initial.body, REQUEST_BODY);
+                    }
+                    assert_blocked_downgrade(&cleartext, result, status, delivery, provider);
                 }
             }
         }
@@ -530,7 +591,7 @@ async fn auto_and_http1_only_keep_existing_cleartext_redirect_behavior() -> Test
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn installed_auth_rejects_downgrades_and_preserves_secure_redirects() -> TestResult {
     for status in REDIRECTS {
-        for delivery in DELIVERIES {
+        for delivery in ALL_DELIVERIES {
             rejects_downgrade(status, delivery, Provider::Auth).await?;
         }
     }
@@ -541,7 +602,7 @@ async fn installed_auth_rejects_downgrades_and_preserves_secure_redirects() -> T
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn installed_cookie_store_rejects_downgrades_and_preserves_secure_redirects() -> TestResult {
     for status in REDIRECTS {
-        for delivery in DELIVERIES {
+        for delivery in ALL_DELIVERIES {
             rejects_downgrade(status, delivery, Provider::Cookies).await?;
         }
     }
@@ -552,7 +613,7 @@ async fn installed_cookie_store_rejects_downgrades_and_preserves_secure_redirect
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn combined_providers_reject_downgrades_and_preserve_secure_redirects() -> TestResult {
     for status in REDIRECTS {
-        for delivery in DELIVERIES {
+        for delivery in ALL_DELIVERIES {
             rejects_downgrade(status, delivery, Provider::AuthAndCookies).await?;
         }
     }

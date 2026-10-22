@@ -1,11 +1,13 @@
 #![cfg(feature = "http-client-cookies")]
 
+use open_net::api::retry::{Backoff, RetrySchedule};
+
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use open_net::api::http::{
     CookieJar, CookieLimits, CookieRequestContext, CookieStore, CookieStoreResult, HttpClient,
     HttpClientConfig, HttpProxyConfig, HttpRequest, HttpRequestId, HttpRequestMethod,
-    HttpRequestOptions, HttpRequestTrait, HttpResponseResult, RetryPolicy,
+    HttpRequestOptions, HttpRequestTrait, HttpResponseResult, HttpRetryPolicy, RedirectPolicy,
 };
 use open_net::error::{ErrorKind, ErrorStage, NetError};
 use std::error::Error;
@@ -626,6 +628,9 @@ async fn cross_origin_redirect_removes_sensitive_common_headers_permanently() ->
     headers.insert("x-public", HeaderValue::from_static("retained"));
     let client = Client::new(
         HttpClientConfig::new(&origin.url)?
+            .with_redirect_policy(RedirectPolicy::allow_origins([target
+                .url
+                .replace("127.0.0.1", "localhost")])?)
             .with_common_headers(headers)?
             .with_cookie_store(CookieJar::new()),
     )?;
@@ -670,6 +675,7 @@ async fn domain_cookie_crosses_allowed_sibling_hosts_but_host_only_cookie_does_n
     ])?;
     let client = Client::new(
         HttpClientConfig::new("http://a.example.test")?
+            .with_redirect_policy(RedirectPolicy::allow_origins(["http://b.example.test"])?)
             .with_proxy(HttpProxyConfig::http(&peer.url)?)
             .with_cookie_store(CookieJar::new()),
     )?;
@@ -743,16 +749,11 @@ async fn non_replayable_callback_body_is_not_replayed_by_307_or_308() -> TestRes
             )
             .await?;
         let result = tokio::time::timeout(WATCHDOG, receiver).await??;
-        match result {
-            Ok(response) => check(
-                response.status.as_u16() == status,
-                "non-replayable redirect was unexpectedly followed",
-            )?,
-            Err(error) => check(
-                error.kind() == ErrorKind::BodyNotReplayable,
-                "non-replayable redirect returned unrelated error",
-            )?,
-        }
+        let response = result?;
+        check(
+            response.status.as_u16() == status,
+            "non-replayable redirect was unexpectedly followed",
+        )?;
         client.close().await?;
         let requests = peer.finish()?;
         check(requests.len() == 1, "non-replayable body was sent twice")?;
@@ -772,7 +773,21 @@ async fn retry_rebuilds_cookie_header_from_the_failed_attempt_response() -> Test
     let client = Client::new(
         HttpClientConfig::new(&peer.url)?
             .with_cookie_store(CookieJar::new())
-            .with_default_retry_policy(RetryPolicy::new(1)),
+            .with_default_retry_policy(
+                HttpRetryPolicy::builder()
+                    .schedule(
+                        RetrySchedule::builder()
+                            .max_attempts(2)
+                            .backoff(Backoff::exponential(
+                                Duration::from_millis(50).min(Duration::from_secs(30)),
+                                2.0,
+                                Duration::from_secs(30),
+                            ))
+                            .build()?,
+                    )
+                    .retry_on(open_net::api::http::RetryOn::standard())
+                    .build()?,
+            ),
     )?;
     let response = client.get("/retry").await?;
     client.close().await?;
@@ -1238,18 +1253,16 @@ async fn multi_hop_redirects_share_attempt_and_logical_deadline_budgets() -> Tes
             let jar = CookieJar::new();
             let client =
                 Client::new(HttpClientConfig::new(&peer.url)?.with_cookie_store(jar.clone()))?;
-            let policy = if total_deadline {
-                RetryPolicy::builder()
-                    .total_deadline(Duration::from_millis(350))
-                    .build()?
+            let timeouts = if total_deadline {
+                open_net::api::http::HttpTimeouts::new()
+                    .with_total_timeout(Duration::from_millis(350))
             } else {
-                RetryPolicy::builder()
-                    .attempt_timeout(Duration::from_millis(350))
-                    .build()?
+                open_net::api::http::HttpTimeouts::new()
+                    .with_attempt_timeout(Duration::from_millis(350))
             };
             let request = HttpRequest::builder()
                 .path("/start")
-                .retry_policy(policy)
+                .timeouts(timeouts)
                 .build()?;
             let result = if streaming {
                 client

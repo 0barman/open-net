@@ -67,14 +67,12 @@ fn late_subscriber_receives_current_snapshot_without_callback_replay() -> TestRe
         .prepare_observation(
             NetworkStatus::Unavailable,
             Some(crate::net_status::IpStack::None),
-            None,
         )?
         .dispatch()?;
     publisher
         .prepare_observation(
             NetworkStatus::Available,
             Some(crate::net_status::IpStack::None),
-            None,
         )?
         .dispatch()?;
     let mut receiver = source.subscribe();
@@ -126,7 +124,6 @@ fn retired_generation_cannot_overwrite_new_observation() -> TestResult {
     old.prepare_observation(
         NetworkStatus::Available,
         Some(crate::net_status::IpStack::None),
-        None,
     )?
     .dispatch()?;
     let (fresh, initial) = source.begin_generation()?;
@@ -137,14 +134,12 @@ fn retired_generation_cannot_overwrite_new_observation() -> TestResult {
         .prepare_observation(
             NetworkStatus::Available,
             Some(crate::net_status::IpStack::None),
-            None,
         )?
         .dispatch()?;
     let current = snapshot(&mut receiver);
     old.prepare_observation(
         NetworkStatus::Unavailable,
         Some(crate::net_status::IpStack::None),
-        None,
     )?
     .dispatch()?;
     old.prepare_finish(crate::net_status::MonitorState::Stopped)?
@@ -169,7 +164,6 @@ fn revision_exhaustion_reports_error_without_publishing_partial_state() -> TestR
             .prepare_observation(
                 NetworkStatus::Available,
                 Some(crate::net_status::IpStack::None),
-                None,
             )
             .and_then(super::NetworkPublication::dispatch)
             .map_err(|error| error.kind()),
@@ -195,7 +189,6 @@ fn loss_epoch_exhaustion_reports_error_without_publishing_partial_state() -> Tes
             .prepare_observation(
                 NetworkStatus::Unavailable,
                 Some(crate::net_status::IpStack::None),
-                None,
             )
             .and_then(super::NetworkPublication::dispatch)
             .map_err(|error| error.kind()),
@@ -249,7 +242,6 @@ fn generation_exhaustion_does_not_retire_the_active_publisher() -> TestResult {
         .prepare_observation(
             NetworkStatus::Available,
             Some(crate::net_status::IpStack::None),
-            None,
         )?
         .dispatch()?;
     let mut receiver = source.subscribe();
@@ -283,11 +275,7 @@ fn public_snapshot_and_observers_share_lifecycle_and_atomic_ip_versions() -> Tes
             return Err("start did not publish a new lifecycle revision".into());
         }
         publisher
-            .prepare_observation(
-                NetworkStatus::Available,
-                Some(IpStack::V4Only),
-                Some("wired".into()),
-            )?
+            .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only))?
             .dispatch()?;
         let first = receiver
             .recv()
@@ -295,11 +283,7 @@ fn public_snapshot_and_observers_share_lifecycle_and_atomic_ip_versions() -> Tes
             .ok_or("missing initial observation")?;
         let gate_first = snapshot(&mut gate);
         publisher
-            .prepare_observation(
-                NetworkStatus::Available,
-                Some(IpStack::V6Only),
-                Some("wired".into()),
-            )?
+            .prepare_observation(NetworkStatus::Available, Some(IpStack::V6Only))?
             .dispatch()?;
         let changed_ip = receiver.recv().await?.ok_or("IP-only update was lost")?;
         check_equal(changed_ip.revision, first.revision + 1)?;
@@ -307,8 +291,8 @@ fn public_snapshot_and_observers_share_lifecycle_and_atomic_ip_versions() -> Tes
         check_equal(changed_ip.reachability, Some(NetworkStatus::Available))?;
         check_equal(source.snapshot()?.revision, changed_ip.revision)?;
         check_equal(snapshot(&mut gate), gate_first)?;
-        if changed_ip.observed_at.is_none() || changed_ip.network_name.as_deref() != Some("wired") {
-            return Err("observation metadata was lost".into());
+        if changed_ip.observed_at.is_none() || changed_ip.network_name.is_some() {
+            return Err("connectivity timestamp was lost or a network name escaped".into());
         }
         source.prepare_stopped()?.dispatch()?;
         let stopped = receiver.recv().await?.ok_or("missing Stopped snapshot")?;
@@ -357,7 +341,7 @@ fn failed_without_live_monitor_can_be_stopped_and_old_finish_is_ignored() -> Tes
     let source = NetworkStatusSource::for_test()?;
     let (old, initial) = source.begin_generation()?;
     initial.dispatch()?;
-    old.prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+    old.prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))?
         .dispatch()?;
     old.prepare_finish(MonitorState::Failed(NetError::from(
         crate::error::ErrorKind::Io,
@@ -378,7 +362,7 @@ fn failed_without_live_monitor_can_be_stopped_and_old_finish_is_ignored() -> Tes
     let (fresh, initial) = source.begin_generation()?;
     initial.dispatch()?;
     fresh
-        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?
         .dispatch()?;
     let before = source.snapshot()?;
     old.prepare_finish(MonitorState::Failed(NetError::from(
@@ -397,10 +381,10 @@ fn deferred_network_notifications_reject_reordered_observations_after_restart() 
         let mut receiver = source.observe()?;
         let (old, starting) = source.begin_generation()?;
         let old_update =
-            old.prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?;
+            old.prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))?;
         let (fresh, restarting) = source.begin_generation()?;
         let fresh_update =
-            fresh.prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?;
+            fresh.prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?;
         fresh_update.dispatch()?;
         old_update.dispatch()?;
         restarting.dispatch()?;
@@ -430,13 +414,13 @@ fn generic_publication_failure_is_dispatched_and_cannot_leave_a_live_network_sna
     let (publisher, publication) = source.begin_generation()?;
     publication.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only), None)?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::V4Only))?
         .dispatch()?;
     let mut receiver = source.observe()?;
     drop(futures::executor::block_on(receiver.recv())?);
     source.publisher.exhaust_revision_for_test();
     let publication = publisher
-        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))
         .map_err(|_| "failed StatePublication was discarded inside the outer lock")?;
     if publication.result().is_ok() {
         return Err("failed commit was reported as prepared success".into());
@@ -491,7 +475,7 @@ fn shutdown_revision_exhaustion_returns_error_and_ends_observation_without_claim
     let (publisher, publication) = source.begin_generation()?;
     publication.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None), None)?
+        .prepare_observation(NetworkStatus::Unavailable, Some(IpStack::None))?
         .dispatch()?;
     let mut receiver = source.observe()?;
     drop(futures::executor::block_on(receiver.recv())?);
@@ -594,14 +578,13 @@ fn sample_validation_runs_under_source_lock_before_advancing_watermark() -> Test
     let (publisher, starting) = source.begin_generation()?;
     starting.dispatch()?;
     publisher
-        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack), None)?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?
         .dispatch()?;
     let before = source.snapshot()?;
     let skipped = publisher.prepare_sampled_observation(
         1,
         NetworkStatus::Unavailable,
         Some(IpStack::V4Only),
-        Some("expired-sample".into()),
         SystemTime::now(),
         || {
             // The final deadline check must run only after taking the source
@@ -631,7 +614,6 @@ fn sample_validation_runs_under_source_lock_before_advancing_watermark() -> Test
         1,
         NetworkStatus::Unavailable,
         Some(IpStack::V4Only),
-        None,
         SystemTime::now(),
         || Err(ErrorKind::TimedOut.into()),
     );
@@ -643,7 +625,6 @@ fn sample_validation_runs_under_source_lock_before_advancing_watermark() -> Test
             1,
             NetworkStatus::Unavailable,
             Some(IpStack::V4Only),
-            None,
             SystemTime::now(),
             || Ok(true),
         )?

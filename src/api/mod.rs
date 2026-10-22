@@ -10,6 +10,7 @@ pub mod log;
 #[cfg(feature = "net-status")]
 pub mod net_status;
 pub mod network;
+pub mod retry;
 pub mod subscription;
 #[cfg(any(feature = "ws-client", feature = "http-client"))]
 pub mod tls;
@@ -38,8 +39,9 @@ pub use log::{
 #[cfg(feature = "net-status")]
 pub use net_status::{
     IpStack, MonitorState, NetStatusClient, NetworkEvent, NetworkEventKind, NetworkEventOptions,
-    NetworkIpStackSource, NetworkNameSource, NetworkObservation, NetworkRefreshResult,
-    NetworkSnapshot, NetworkStatus,
+    NetworkIpStackSource, NetworkNameObserver, NetworkNameOptions, NetworkNameSnapshot,
+    NetworkNameSource, NetworkNameState, NetworkObservation, NetworkRefreshResult, NetworkSnapshot,
+    NetworkStatus,
 };
 pub use open_net::OpenNet;
 #[cfg(feature = "ws-client")]

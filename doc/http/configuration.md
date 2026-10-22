@@ -1,10 +1,10 @@
 # HTTP client configuration
 
-Required feature: `http-client`. This guide describes the checked-out source. In a consumer project beside the `open-net` directory, use:
+Required feature: `http-client`. This guide describes the checked-out source. In your application's `Cargo.toml`, use:
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 ```
 
@@ -23,7 +23,7 @@ using open-net should accept the host's choice rather than install its own globa
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
 precedence and complete examples of both approaches.
 
-Adjust the local path to your checkout. All types below are in `open_net::api::http`; `Duration` is `std::time::Duration`. Configuration builders consume and return ownership of the configuration. Fallible setters consume the original configuration even on `Err(NetError)`; the error does not return it. Clone first if a previous configuration must remain available. `?` returns early on failure. Create a new client to apply changed settings; changing a retained configuration does not reconfigure a running client. `Clone` copies ordinary settings and shares explicitly installed `Arc` providers.
+All types below are in `open_net::api::http`; `Duration` is `std::time::Duration`. Configuration builders consume and return ownership of the configuration. Fallible setters consume the original configuration even on `Err(NetError)`; the error does not return it. Clone first if a previous configuration must remain available. `?` returns early on failure. Create a new client to apply changed settings; changing a retained configuration does not reconfigure a running client. `Clone` copies ordinary settings and shares explicitly installed `Arc` providers.
 
 ## Construct, validate, and inspect a configuration
 
@@ -64,12 +64,12 @@ Public fields and initial values:
 | `request_queue_capacity` | `usize` | 128; `1..=tokio::sync::Semaphore::MAX_PERMITS`. |
 | `response_queue_capacity` | `usize` | 128; same range. |
 | `callback_queue_capacity` | `usize` | 128; same range. |
-| `default_retry_policy` | `RetryPolicy` | `RetryPolicy::no_retry()`. |
+| `default_retry_policy` | `HttpRetryPolicy` | `HttpRetryPolicy::no_retry()`. |
 | `tls` | `HttpTlsConfig` | Built-in WebPKI roots, no custom roots, client identity or explicit cryptographic provider. |
 | `proxy` | `Option<HttpProxyConfig>` | `None`. |
 | `environment_proxy` | `bool` | `false`. |
 
-The remaining settings are private. Defaults are: no dedicated connect timeout, inherited phase timeouts, `HttpAdmissionPolicy::Wait`, no Cookie store, no authentication provider, no middleware, and, with HTTP/2 enabled, `HttpVersionPolicy::Auto` and default `Http2Config`. Optional settings exist only with their respective features.
+The remaining settings are private. Defaults are: no dedicated connect timeout, inherited phase timeouts, `HttpAdmissionPolicy::Wait`, transport security that prevents HTTPS-to-HTTP redirects, same-origin redirects with at most ten followed hops, no Cookie store, no authentication provider, no middleware, and, with HTTP/2 enabled, `HttpVersionPolicy::Auto` and default `Http2Config`. See [transport security and redirects](redirects.md) for the independent policy setters and migration examples. Optional settings exist only with their respective features.
 
 ### Callback parameters
 
@@ -89,7 +89,7 @@ match; `HttpClientConfig::validate()` does not perform those connector checks.
 A missing provider returns `InvalidConfig` for `tls.provider` at client creation.
 See [TLS providers](../tls.md) and [TLS identity setup](tls_and_proxy.md).
 
-Relative request paths are resolved using URL joining. For base `https://example.com/api/`, `users` becomes `/api/users`; `/users` becomes `/users`. A base without a trailing slash treats its last component as a file. `..` may traverse the base path while remaining on the same origin. The client trims outer whitespace and rejects empty paths, absolute URLs, `//`, backslashes, fragments, control characters and origin changes. These rules apply to the initial request target; redirects can cross origins. See [authentication](authentication.md) and [cookies](cookies.md) for provider-aware redirects.
+Relative request paths are resolved using URL joining. For base `https://example.com/api/`, `users` becomes `/api/users`; `/users` becomes `/users`. A base without a trailing slash treats its last component as a file. `..` may traverse the base path while remaining on the same origin. The client trims outer whitespace and rejects empty paths, absolute URLs, `//`, backslashes, fragments, control characters and origin changes. These rules apply to the initial request target. Redirects have their own [policy](redirects.md): they remain on the original origin by default, and cross-origin destinations need an explicit allowlist. The SDK enforces the same rules with or without an [authentication](authentication.md) provider or [Cookie store](cookies.md).
 
 ### Example
 
@@ -253,7 +253,7 @@ Every method below consumes `self` and returns an updated configuration; later i
 
 | Methods | Required feature | Guide |
 | --- | --- | --- |
-| `with_default_retry_policy(policy: RetryPolicy) -> Self` | `http-client` | [Retry](retry.md) |
+| `with_default_retry_policy(policy: HttpRetryPolicy) -> Self` | `http-client` | [Retry](retry.md) |
 | `with_tls(tls: HttpTlsConfig) -> Self`, `with_proxy(proxy: HttpProxyConfig) -> Self`, `with_environment_proxy(enabled: bool) -> Self` | `http-client` | [TLS and proxies](tls_and_proxy.md) |
 | `with_cookie_store<S: CookieStore + 'static>(store: S) -> Self`, `with_cookie_store_arc(store: Arc<dyn CookieStore>) -> Self`, `with_cookie_limits(limits: CookieLimits) -> Result<Self, NetError>` | `http-client-cookies` | [Cookies](cookies.md) |
 | `with_auth<A: HttpAuth + 'static>(auth: A) -> Self`, `with_auth_arc(auth: Arc<dyn HttpAuth>) -> Self` | `http-client-auth` | [Authentication](authentication.md) |

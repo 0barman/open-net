@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use crate::error::ErrorKind;
 use crate::{NetError, OpenNet, OpenNetConfig};
 use std::future::Future;

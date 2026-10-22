@@ -1,8 +1,10 @@
 #![cfg(feature = "http-client")]
+
 use open_net::api::error::{ErrorKind, ErrorStage};
 use open_net::api::http::{
-    HttpClient, HttpClientConfig, HttpRequest, HttpRequestMethod, RetryEvent, RetryPolicy,
+    HttpClient, HttpClientConfig, HttpRequest, HttpRequestMethod, HttpRetryPolicy,
 };
+use open_net::api::retry::{RetryEvent, RetrySchedule, RetrySetting};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,10 +49,10 @@ async fn peer() -> TestResult<(String, oneshot::Sender<()>, Peer)> {
     });
     Ok((url, tx, Peer(task)))
 }
-fn request(policy: RetryPolicy) -> TestResult<HttpRequest> {
+fn request(policy: HttpRetryPolicy) -> TestResult<HttpRequest> {
     Ok(HttpRequest::builder()
         .path("/")
-        .retry_policy(policy)
+        .retry_setting(RetrySetting::Policy(policy))
         .build()?)
 }
 
@@ -61,11 +63,15 @@ async fn stream_total_deadline_remains_active_after_headers() -> TestResult {
     config.request_queue_capacity = 1;
     let client = HttpClient::new(config, "stream-total-budget")?;
     let mut response = client
-        .stream(request(
-            RetryPolicy::builder()
-                .with_total_deadline(Duration::from_millis(60))
+        .stream(
+            HttpRequest::builder()
+                .path("/")
+                .timeouts(
+                    open_net::api::http::HttpTimeouts::new()
+                        .with_total_timeout(Duration::from_millis(60)),
+                )
                 .build()?,
-        )?)
+        )
         .await?;
     let result = tokio::time::timeout(Duration::from_secs(2), response.next_chunk()).await?;
     check(
@@ -87,11 +93,15 @@ async fn stream_slow_consumer_cannot_read_ready_chunk_after_attempt_deadline() -
     let (url, release, _peer) = peer().await?;
     let client = HttpClient::new(HttpClientConfig::new(url)?, "stream-consumer-budget")?;
     let mut response = client
-        .stream(request(
-            RetryPolicy::builder()
-                .with_attempt_timeout(Duration::from_millis(60))
+        .stream(
+            HttpRequest::builder()
+                .path("/")
+                .timeouts(
+                    open_net::api::http::HttpTimeouts::new()
+                        .with_attempt_timeout(Duration::from_millis(60)),
+                )
                 .build()?,
-        )?)
+        )
         .await?;
     let _ = release.send(());
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -110,11 +120,18 @@ async fn stream_default_deadline_covers_admission_wait() -> TestResult {
     let (url, release, _peer) = peer().await?;
     let mut config = HttpClientConfig::new(url)?;
     config.request_queue_capacity = 1;
-    config.default_retry_policy = RetryPolicy::builder()
-        .with_total_deadline(Duration::from_millis(60))
-        .build()?;
+    config = config.with_timeouts(
+        open_net::api::http::HttpTimeouts::new().with_total_timeout(Duration::from_millis(60)),
+    )?;
     let client = HttpClient::new(config, "stream-admission-budget")?;
-    let first = client.stream(request(RetryPolicy::no_retry())?).await?;
+    let first = client
+        .stream(
+            HttpRequest::builder()
+                .path("/")
+                .timeouts(open_net::api::http::HttpTimeouts::new().without_total_timeout())
+                .build()?,
+        )
+        .await?;
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         client.stream(HttpRequest::builder().path("/").build()?),
@@ -136,8 +153,8 @@ async fn stream_observer_completes_only_after_body_eof() -> TestResult {
     let client = HttpClient::new(HttpClientConfig::new(url)?, "stream-observer-eof")?;
     let events = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&events);
-    let policy = RetryPolicy::builder()
-        .with_observer(move |event: &RetryEvent| {
+    let policy = HttpRetryPolicy::builder()
+        .observer(move |event: &RetryEvent| {
             if let Ok(mut values) = recorded.lock() {
                 values.push(event.clone());
             }
@@ -167,7 +184,7 @@ async fn stream_observer_completes_only_after_body_eof() -> TestResult {
         .clone();
     check(
         events.len() == 3
-            && matches!(events.last(), Some(RetryEvent::Completed(report)) if report.attempts == 1 && report.final_reason.is_none()),
+            && matches!(events.last(), Some(RetryEvent::Completed(report)) if report.attempts == 1 && report.stop_reason == Some(open_net::api::retry::RetryStopReason::Completed)),
         "EOF must complete observer exactly once",
     )?;
     client.shutdown().await?;
@@ -280,8 +297,8 @@ async fn stream_retry_observer_has_six_events_and_body_drop_is_failure() -> Test
     }));
     let events = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&events);
-    let policy = RetryPolicy::builder()
-        .max_attempts(2)
+    let policy = HttpRetryPolicy::builder()
+        .schedule(RetrySchedule::builder().max_attempts(2).build()?)
         .retry_on(RetryOn::standard())
         .observer(move |event: &RetryEvent| {
             if let Ok(mut events) = recorded.lock() {
@@ -305,7 +322,7 @@ async fn stream_retry_observer_has_six_events_and_body_drop_is_failure() -> Test
         .map_err(|_| std::io::Error::other("events poisoned"))?
         .clone();
     check(
-        matches!(values.as_slice(), [RetryEvent::AttemptStarted { attempt: 1 }, RetryEvent::RetryScheduled { attempt: 1, .. }, RetryEvent::AttemptFinished { attempt: 1, final_attempt: false }, RetryEvent::AttemptStarted { attempt: 2 }, RetryEvent::AttemptFinished { attempt: 2, final_attempt: true }, RetryEvent::Completed(report)] if report.attempts == 2 && report.retry_count == 1 && report.last_error.as_deref() == Some("Cancelled")),
+        matches!(values.as_slice(), [RetryEvent::AttemptStarted { attempt: 1 }, RetryEvent::RetryScheduled { attempt: 1, .. }, RetryEvent::AttemptFinished { attempt: 1, final_attempt: false }, RetryEvent::AttemptStarted { attempt: 2 }, RetryEvent::AttemptFinished { attempt: 2, final_attempt: true }, RetryEvent::Completed(report)] if report.attempts == 2 && report.retry_count == 1 && report.stop_reason == Some(open_net::api::retry::RetryStopReason::Cancelled)),
         "stream observer sequence or drop outcome was incorrect",
     )?;
     client.shutdown().await?;
@@ -317,11 +334,15 @@ async fn stream_consumes_on_thread_without_tokio_enter() -> TestResult {
     let (url, release, _peer) = peer().await?;
     let client = HttpClient::new(HttpClientConfig::new(url)?, "stream-cross-executor")?;
     let mut response = client
-        .stream(request(
-            RetryPolicy::builder()
-                .attempt_timeout(Duration::from_secs(2))
+        .stream(
+            HttpRequest::builder()
+                .path("/")
+                .timeouts(
+                    open_net::api::http::HttpTimeouts::new()
+                        .with_attempt_timeout(Duration::from_secs(2)),
+                )
                 .build()?,
-        )?)
+        )
         .await?;
     let _ = release.send(());
     let thread = std::thread::spawn(move || -> TestResult {
@@ -355,7 +376,7 @@ async fn stream_attempt_observer_can_cancel_before_network_io() -> TestResult {
         "stream-observer-cancel",
     )?;
     let canceller = client.clone();
-    let policy = RetryPolicy::builder()
+    let policy = HttpRetryPolicy::builder()
         .observer(move |event: &RetryEvent| {
             if matches!(event, RetryEvent::AttemptStarted { .. }) {
                 let _ = canceller.cancel_all();
@@ -381,17 +402,12 @@ async fn stream_attempt_observer_can_cancel_before_network_io() -> TestResult {
 async fn zero_retry_defaults_apply_to_buffered_timeout() -> TestResult {
     for total in [false, true] {
         let (url, release, _peer) = peer().await?;
-        let policy = if total {
-            RetryPolicy::builder()
-                .total_deadline(Duration::from_millis(60))
-                .build()?
+        let timeouts = if total {
+            open_net::api::http::HttpTimeouts::new().with_total_timeout(Duration::from_millis(60))
         } else {
-            RetryPolicy::builder()
-                .attempt_timeout(Duration::from_millis(60))
-                .build()?
+            open_net::api::http::HttpTimeouts::new().with_attempt_timeout(Duration::from_millis(60))
         };
-        let mut config = HttpClientConfig::new(url)?;
-        config.default_retry_policy = policy;
+        let config = HttpClientConfig::new(url)?.with_timeouts(timeouts)?;
         let client = HttpClient::new(config, format!("buffered-zero-retry-{total}"))?;
         let result = tokio::time::timeout(Duration::from_secs(2), client.get("/")).await?;
         // Total is now distinct from an individual attempt timeout.
@@ -426,11 +442,15 @@ async fn stream_total_deadline_before_headers_reports_deadline_exceeded() -> Tes
     }));
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        client.stream(request(
-            RetryPolicy::builder()
-                .total_deadline(Duration::from_millis(60))
+        client.stream(
+            HttpRequest::builder()
+                .path("/")
+                .timeouts(
+                    open_net::api::http::HttpTimeouts::new()
+                        .with_total_timeout(Duration::from_millis(60)),
+                )
                 .build()?,
-        )?),
+        ),
     )
     .await?;
     check(
@@ -448,7 +468,7 @@ async fn stream_config_timeout_includes_paused_consumption() -> TestResult {
     let mut config = HttpClientConfig::new(url)?;
     config.timeout = Duration::from_millis(60);
     let client = HttpClient::new(config, "stream-config-timeout")?;
-    let mut response = client.stream(request(RetryPolicy::no_retry())?).await?;
+    let mut response = client.stream(request(HttpRetryPolicy::no_retry())?).await?;
     let _ = release.send(());
     tokio::time::sleep(Duration::from_millis(100)).await;
     check(
@@ -501,8 +521,8 @@ async fn dropped_stream_opening_cleans_before_completed_observer() -> TestResult
     let cleanup_seen = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&cleanup_seen);
     let reentrant = client.clone();
-    let policy = RetryPolicy::builder().observer(move |event: &RetryEvent| {
-        if matches!(event, RetryEvent::Completed(report) if report.attempts == 1 && report.last_error.as_deref() == Some("Cancelled")) {
+    let policy = HttpRetryPolicy::builder().observer(move |event: &RetryEvent| {
+        if matches!(event, RetryEvent::Completed(report) if report.attempts == 1 && report.stop_reason == Some(open_net::api::retry::RetryStopReason::Cancelled)) {
             // This is a nonblocking capacity check using the public submit API.
             observed.store(reentrant.send(CapacityProbe).is_ok(), Ordering::SeqCst);
         }

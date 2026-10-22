@@ -1,4 +1,5 @@
-use crate::api::network_config::normalize_host;
+use super::stream::{tunnel_io, ProxyIo};
+use crate::api::network_config::{normalize_host, ProxyEndpoint, ProxyTransport, TlsRole};
 use crate::module::transport::failure::ConnectStage;
 #[cfg(test)]
 use crate::module::transport::failure::ConnectionFailure;
@@ -7,9 +8,7 @@ use crate::module::transport::{
     ensure_deadline, failure, proxy, timeout, NativeWebSocketStream, TransportFailure,
 };
 use crate::{NetError, NetworkConfig, NetworkStatusPolicy, ProxyConfig};
-use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
-use rustls::sign::SingleCertAndKey;
 use std::sync::Arc;
 use tokio::time::{timeout_at, Instant};
 use tokio_rustls::TlsConnector;
@@ -20,52 +19,21 @@ use tokio_tungstenite::MaybeTlsStream;
 #[derive(Clone)]
 pub(crate) struct CompiledNetworkConfig {
     original: Arc<NetworkConfig>,
-    pub(crate) proxy: ProxyConfig,
-    pub(crate) tls: Arc<rustls::ClientConfig>,
+    pub(super) proxy: CompiledProxy,
+    pub(super) target_tls: Arc<rustls::ClientConfig>,
     pub(crate) network_status_policy: NetworkStatusPolicy,
 }
 
 impl CompiledNetworkConfig {
     pub(crate) fn new(config: NetworkConfig) -> Result<Self, NetError> {
-        let original = Arc::new(config.clone());
-        let provider = crate::module::tls::select_provider(config.tls.provider.as_ref())?;
-        let identity = config
-            .tls
-            .identity
-            .as_ref()
-            .map(|identity| identity.compile(&provider))
-            .transpose()?;
-        let mut roots = crate::module::tls::root_store(
-            config.tls.root_mode == crate::api::network_config::RootCertificateMode::Append,
-        );
-        for root in config.tls.roots {
-            roots
-                .add(root)
-                .map_err(|_| NetError::from(crate::error::ErrorKind::InvalidConfig))?;
-        }
-        if roots.is_empty() {
-            return Err(NetError::from(crate::error::ErrorKind::InvalidConfig));
-        }
-        let builder = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|_| NetError::from(crate::error::ErrorKind::InvalidConfig))?
-            .with_root_certificates(roots);
-        let mut tls = match identity {
-            Some(identity) => {
-                builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(identity)))
-            }
-            None => builder.with_no_client_auth(),
-        };
-        // Keep the original HTTP/1.1 upgrade behavior; do not offer h2/ALPN or
-        // introduce cross-connection session resumption by sharing this config.
-        tls.alpn_protocols.clear();
-        tls.resumption = Resumption::disabled();
-        tls.enable_early_data = false;
+        config.proxy.validate_auth_transport()?;
+        let target_tls = config.tls.compile_for(TlsRole::Target)?;
+        let proxy = CompiledProxy::new(&config.proxy)?;
         Ok(Self {
-            original,
-            proxy: config.proxy,
-            tls: Arc::new(tls),
+            target_tls,
+            proxy,
             network_status_policy: config.network_status_policy,
+            original: Arc::new(config),
         })
     }
 
@@ -101,6 +69,11 @@ impl CompiledNetworkConfig {
         options: Option<&crate::ws::HandshakeDiagnosticOptions>,
     ) -> Result<NativeWebSocketStream, TransportFailure> {
         let fail = |failure| TransportFailure::with_options(failure, options);
+        // Recheck the immutable policy at the transport boundary before DNS/TCP.
+        self.original
+            .proxy
+            .validate_auth_transport()
+            .map_err(|error| fail(failure(error, ConnectStage::RequestBuild, false)))?;
         let tls_required = match request.uri().scheme_str() {
             Some("ws") => false,
             Some("wss") => true,
@@ -128,11 +101,11 @@ impl CompiledNetworkConfig {
             .uri()
             .port_u16()
             .map_or(if tls_required { 443 } else { 80 }, |port| port);
-        let (connect_host, connect_port) = match &self.proxy.endpoint {
+        let (connect_host, connect_port) = match self.proxy.endpoint() {
             Some(proxy) => (proxy.host.as_str(), proxy.port),
             None => (host.as_str(), port),
         };
-        let mut socket = connect_tcp(connect_host, connect_port, deadline)
+        let socket = connect_tcp(connect_host, connect_port, deadline)
             .await
             .map_err(fail)?;
         if tcp_nodelay {
@@ -140,7 +113,26 @@ impl CompiledNetworkConfig {
                 .set_nodelay(true)
                 .map_err(|error| TransportFailure::io(error, ConnectStage::Tcp, options))?;
         }
-        if let Some(proxy) = &self.proxy.endpoint {
+        let io = match &self.proxy {
+            CompiledProxy::HttpsConnect {
+                tls, server_name, ..
+            } => {
+                ensure_deadline(deadline, ConnectStage::ProxyTls).map_err(fail)?;
+                let stream = timeout_at(
+                    deadline,
+                    TlsConnector::from(Arc::clone(tls)).connect(server_name.clone(), socket),
+                )
+                .await
+                .map_err(|_| fail(timeout(ConnectStage::ProxyTls)))?
+                .map_err(|error| {
+                    classify_tls_io_with_diagnostics(error, ConnectStage::ProxyTls, options)
+                })?;
+                ProxyIo::Tls(Box::new(stream))
+            }
+            CompiledProxy::Direct | CompiledProxy::HttpConnect(_) => ProxyIo::Plain(socket),
+        };
+        let mut socket = tunnel_io(io);
+        if let Some(proxy) = self.proxy.endpoint() {
             ensure_deadline(deadline, ConnectStage::ProxyConnect).map_err(fail)?;
             timeout_at(
                 deadline,
@@ -171,7 +163,7 @@ impl CompiledNetworkConfig {
             })?;
             let tls = timeout_at(
                 deadline,
-                TlsConnector::from(Arc::clone(&self.tls)).connect(name, socket),
+                TlsConnector::from(Arc::clone(&self.target_tls)).connect(name, socket),
             )
             .await
             .map_err(|_| fail(timeout(ConnectStage::Tls)))?
@@ -189,5 +181,47 @@ impl CompiledNetworkConfig {
         .map_err(|_| fail(timeout(ConnectStage::WebSocketUpgrade)))?
         .map_err(|error| classify_upgrade_error_with_diagnostics(error, options))?;
         Ok(stream)
+    }
+}
+
+/// Routing is compiled once per client, with an independent TLS session policy
+/// for the proxy. No proxy configuration inherits the target's CA or identity.
+#[derive(Clone)]
+pub(super) enum CompiledProxy {
+    Direct,
+    HttpConnect(ProxyEndpoint),
+    HttpsConnect {
+        endpoint: ProxyEndpoint,
+        tls: Arc<rustls::ClientConfig>,
+        server_name: ServerName<'static>,
+    },
+}
+
+impl CompiledProxy {
+    fn new(config: &ProxyConfig) -> Result<Self, NetError> {
+        config.validate_auth_transport()?;
+        let Some(endpoint) = &config.endpoint else {
+            return Ok(Self::Direct);
+        };
+        Ok(match &endpoint.transport {
+            ProxyTransport::Http => Self::HttpConnect(endpoint.clone()),
+            ProxyTransport::Https(tls) => Self::HttpsConnect {
+                endpoint: endpoint.clone(),
+                tls: tls.compile_for(TlsRole::Proxy)?,
+                server_name: ServerName::try_from(endpoint.host.clone()).map_err(|_| {
+                    NetError::config(
+                        "proxy.url",
+                        "requires a valid TLS server name or IP address",
+                    )
+                })?,
+            },
+        })
+    }
+
+    pub(super) fn endpoint(&self) -> Option<&ProxyEndpoint> {
+        match self {
+            Self::Direct => None,
+            Self::HttpConnect(endpoint) | Self::HttpsConnect { endpoint, .. } => Some(endpoint),
+        }
     }
 }

@@ -17,7 +17,9 @@ use super::platform::PlatformNetworkMonitor;
 use super::refresh_trigger::{request_refresh_or_stop, RefreshWorkOutcome};
 use crate::error::NetError;
 use crate::module::net_status::logging::{Fault, FaultCycle};
-use crate::module::net_status::{IpStack, NetworkStatus};
+use crate::module::net_status::IpStack;
+#[cfg(any(not(target_os = "windows"), test))]
+use crate::module::net_status::NetworkStatus;
 use crate::net_status::{MonitorState as PublicMonitorState, NetworkSnapshot};
 use crate::subscription::common_executor::CommonCallbackExecutor;
 use crate::subscription::StateReceiver;
@@ -135,8 +137,6 @@ pub(crate) struct InnerNetStatusClient {
     // 统一快照源；公开订阅复用引擎回调池，私有 watch 维持 WS 的网络门控时序。
     observations: NetworkStatusSource,
     #[cfg(any(target_os = "windows", test))]
-    windows_sampler: Arc<super::refresh::WindowsSampler>,
-    #[cfg(any(target_os = "windows", test))]
     windows_reachability_sampler: Arc<super::refresh::WindowsSampler>,
     // 测试专用的安全初始化工厂，用于精确控制失败与并发时机，不改变生产构建。
     #[cfg(test)]
@@ -152,14 +152,12 @@ impl InnerNetStatusClient {
         let observations =
             NetworkStatusSource::new(executor, 1024)?.with_retirement(engine.retirement_work());
         #[cfg(any(target_os = "windows", test))]
-        let (windows_sampler, windows_reachability_sampler) =
-            super::refresh::WindowsSampler::pair(engine.resource_threads());
+        let windows_reachability_sampler =
+            super::refresh::WindowsSampler::new(engine.resource_threads());
         Ok(Self {
             engine,
             lifecycle: Arc::new(Mutex::new(Lifecycle::default())),
             observations,
-            #[cfg(any(target_os = "windows", test))]
-            windows_sampler,
             #[cfg(any(target_os = "windows", test))]
             windows_reachability_sampler,
             #[cfg(test)]
@@ -183,11 +181,6 @@ impl InnerNetStatusClient {
 
     pub(super) fn observation_source(&self) -> NetworkStatusSource {
         self.observations.clone()
-    }
-
-    #[cfg(any(target_os = "windows", test))]
-    pub(super) fn windows_sampler(&self) -> Arc<super::refresh::WindowsSampler> {
-        self.windows_sampler.clone()
     }
 
     #[cfg(any(target_os = "windows", test))]
@@ -230,7 +223,7 @@ impl InnerNetStatusClient {
         &self,
         status: NetworkStatus,
         ip: IpStack,
-        name: Option<String>,
+        _name: Option<String>,
     ) -> Result<(), NetError> {
         let state = self
             .current_state()?
@@ -241,7 +234,7 @@ impl InnerNetStatusClient {
                 .observation
                 .as_ref()
                 .ok_or_else(|| NetError::from(crate::error::ErrorKind::Internal))?;
-            publisher.prepare_observation(status, Some(ip), name)?
+            publisher.prepare_observation(status, Some(ip))?
         };
         publication.dispatch()
     }
@@ -399,8 +392,6 @@ impl InnerNetStatusClient {
         // exposes no join API. Dropping that runtime on its ordinary thread
         // drains async tasks and blocking work before the completion guard runs.
         #[cfg(target_os = "windows")]
-        let windows_sampler = self.windows_sampler.clone();
-        #[cfg(target_os = "windows")]
         let windows_reachability_sampler = self.windows_reachability_sampler.clone();
         let threads = self.engine.resource_threads();
         let task = async move {
@@ -431,8 +422,6 @@ impl InnerNetStatusClient {
                                 shared_state,
                                 stop_receiver,
                                 initial_sender,
-                                #[cfg(target_os = "windows")]
-                                windows_sampler,
                                 #[cfg(target_os = "windows")]
                                 windows_reachability_sampler,
                                 #[cfg(test)]
@@ -474,9 +463,8 @@ impl InnerNetStatusClient {
     ) -> (Vec<watch::Receiver<bool>>, Option<NetError>) {
         #[cfg(any(target_os = "windows", test))]
         if permanent {
-            // Explicit engine shutdown must release the sampling lanes even
+            // Explicit engine shutdown must release the sampling lane even
             // while applications retain clients or read-only contexts.
-            self.windows_sampler.close();
             self.windows_reachability_sampler.close();
         }
         let mut error = None;
@@ -638,18 +626,15 @@ impl InnerNetStatusClient {
         reachability: NetworkStatus,
         ip_stack: IpStack,
     ) -> Result<(), NetError> {
-        let network_name = None;
         let publication = {
             let guard = state.lock().map_err(NetError::from_poison)?;
             if !guard.active.load(Ordering::Acquire) {
                 return Ok(());
             }
             match &guard.observation {
-                Some(observation) => Some(observation.prepare_observation(
-                    reachability,
-                    Some(ip_stack),
-                    network_name,
-                )?),
+                Some(observation) => {
+                    Some(observation.prepare_observation(reachability, Some(ip_stack))?)
+                }
                 None => None,
             }
         };
@@ -673,7 +658,6 @@ impl InnerNetStatusClient {
         state: Arc<Mutex<MonitorState>>,
         mut stop_receiver: oneshot::Receiver<()>,
         initial_state: watch::Sender<MonitorInitialization>,
-        #[cfg(target_os = "windows")] windows_sampler: Arc<super::refresh::WindowsSampler>,
         #[cfg(target_os = "windows")] windows_reachability_sampler: Arc<
             super::refresh::WindowsSampler,
         >,
@@ -782,18 +766,6 @@ impl InnerNetStatusClient {
 
             Ok::<(), NetError>(())
         };
-        #[cfg(target_os = "windows")]
-        {
-            // Both futures belong to this monitor generation. Stop/drop of the
-            // main loop drops the name future and its Cancellation guard; native
-            // work has no publisher and cannot commit a late result.
-            tokio::select! {
-                biased;
-                result = observations => result?,
-                result = Self::monitor_windows_names(&state, &windows_sampler) => result?,
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
         observations.await?;
 
         // On macOS the native source waits for cancellation completion and
@@ -821,8 +793,8 @@ impl InnerNetStatusClient {
         })
     }
 
-    // Background reachability and explicit reachability queries share a bounded
-    // lane; name queries use another lane and a separate commit watermark.
+    // Background and explicit refreshes collect only reachability on bounded
+    // workers. Name observation belongs to a separate explicitly enabled service.
     // Native work never owns the commit capability and cannot publish after stop.
     async fn observe_or_stop(
         state: &Arc<Mutex<MonitorState>>,
@@ -966,14 +938,6 @@ impl InnerNetStatusClient {
                 sampled.id,
                 sampled.observation.reachability,
                 Some(ip_stack),
-                if matches!(
-                    sampled.observation.name_source,
-                    crate::net_status::NetworkNameSource::CachedObservation
-                ) {
-                    super::network_status_snapshot::NetworkNameUpdate::Preserve
-                } else {
-                    sampled.observation.network_name.into()
-                },
                 sampled.sampled_at,
                 || {
                     let validity = cancel.check(deadline);
@@ -988,91 +952,6 @@ impl InnerNetStatusClient {
             None => None,
         };
         Ok((true, publication))
-    }
-
-    #[cfg(any(target_os = "windows", test))]
-    async fn monitor_windows_names(
-        state: &Arc<Mutex<MonitorState>>,
-        sampler: &super::refresh::WindowsSampler,
-    ) -> Result<(), NetError> {
-        let mut interval = time::interval(Duration::from_secs(2));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut faults = FaultCycle::default();
-        let mut fallback_faults = FaultCycle::default();
-        loop {
-            interval.tick().await;
-            if !state
-                .lock()
-                .map_err(NetError::from_poison)?
-                .active
-                .load(Ordering::Acquire)
-            {
-                return Ok(());
-            }
-            let cancel = super::refresh::Cancellation::new();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let result = time::timeout_at(
-                time::Instant::from_std(deadline),
-                sampler.sample_background(deadline, cancel.flag.clone()),
-            )
-            .await;
-            let sampled = match result {
-                Ok(Ok(sampled)) => sampled,
-                Ok(Err(error)) => {
-                    // A name-query fault does not invalidate successful Internet
-                    // reachability; retain the last name and retry next period.
-                    faults.failure("name_sample", Fault::from_error(&error));
-                    continue;
-                }
-                Err(_) => {
-                    faults.failure("name_sample", Fault::Timeout);
-                    continue;
-                }
-            };
-            if sampled.observation.name_diagnostics.is_empty() {
-                fallback_faults.recovered("name_fallback");
-            } else {
-                fallback_faults.failure("name_fallback", Fault::NameFallback);
-            }
-            let mut commit_fault = None;
-            let publication = {
-                let monitor = state.lock().map_err(NetError::from_poison)?;
-                if !monitor.active.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                match &monitor.observation {
-                    Some(publisher) => publisher.prepare_sampled_name_observation(
-                        sampled.id,
-                        sampled.observation.network_name,
-                        sampled.sampled_at,
-                        || match cancel.check(deadline) {
-                            Ok(()) => Ok(true),
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    crate::error::ErrorKind::TimedOut
-                                        | crate::error::ErrorKind::Cancelled
-                                ) =>
-                            {
-                                commit_fault = Some(Fault::from_error(&error));
-                                Ok(false)
-                            }
-                            Err(error) => Err(error),
-                        },
-                    )?,
-                    None => None,
-                }
-            };
-            if let Some(failure) = commit_fault {
-                faults.failure("name_sample", failure);
-            }
-            if let Some(publication) = publication {
-                publication.dispatch()?;
-                if commit_fault.is_none() {
-                    faults.recovered("name_sample");
-                }
-            }
-        }
     }
 
     #[cfg(any(target_os = "windows", test))]
@@ -1114,4 +993,4 @@ mod resample_tests;
 
 #[cfg(test)]
 #[path = "background_name_tests.rs"]
-mod background_name_tests;
+mod connectivity_minimization_tests;

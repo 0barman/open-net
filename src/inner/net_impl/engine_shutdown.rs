@@ -398,7 +398,7 @@ impl OpenNetInner {
         let wait = self
             .shutdown
             .as_ref()
-            .expect("published engine has shutdown owner")
+            .ok_or_else(|| NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Close))?
             .wait();
         tokio::pin!(wait);
         std::future::poll_fn(|cx| {
@@ -410,5 +410,28 @@ impl OpenNetInner {
             }
             std::future::Future::poll(wait.as_mut(), cx)
         }).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_shutdown_owner_returns_internal_close_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut inner = OpenNetInner::new_with_config(
+            crate::OpenNetConfig::default().with_runtime_worker_threads(1),
+        )?;
+        let owner = inner.shutdown.take().ok_or("shutdown owner missing")?;
+        let result = futures::executor::block_on(inner.shutdown());
+        // Restore the owner before checking the injected failure so ordinary
+        // cleanup still joins the runtime and all retirement work.
+        inner.shutdown = Some(owner);
+        futures::executor::block_on(inner.shutdown())?;
+        let error = result.err().ok_or("missing shutdown owner was accepted")?;
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(error.context().stage, Some(ErrorStage::Close));
+        Ok(())
     }
 }

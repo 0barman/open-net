@@ -10,6 +10,11 @@ const MIN_HTTP2_FRAME: u32 = 16_384;
 const MAX_HTTP2_FRAME: u32 = 16_777_215;
 
 /// Selects the HTTP protocol versions an HTTP client may use.
+///
+/// Redirect target authorization and downgrade prevention are configured
+/// independently through [`crate::api::http::RedirectPolicy`] and
+/// [`crate::api::http::HttpTransportSecurity`]. Every mode prevents HTTPS-to-HTTP
+/// redirects by default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum HttpVersionPolicy {

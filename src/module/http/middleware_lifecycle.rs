@@ -23,6 +23,7 @@ struct CompletionState {
     emitted: bool,
     outcome: Option<Result<http::StatusCode, NetError>>,
     elapsed: Duration,
+    final_report: Option<RetryReport>,
     pending: Option<TerminalObservation>,
 }
 pub(super) struct MiddlewareCompletion {
@@ -48,22 +49,25 @@ impl MiddlewareCompletion {
         }
         let mut terminal = state.pending.take()?;
         state.emitted = true;
+        if let Some(report) = &state.final_report {
+            terminal.report = report.clone();
+        }
         terminal.report.elapsed = terminal.report.elapsed.max(state.elapsed);
         if let Some(outcome) = &state.outcome {
             match outcome {
                 Ok(status) => {
-                    terminal.report.final_reason = if status.is_success() {
-                        None
-                    } else {
-                        Some(RetryReason::HttpStatus(*status))
-                    };
-                    terminal.report.last_error = None;
+                    if terminal.report.stop_reason.is_none() {
+                        terminal.report.stop_reason = Some(if status.is_success() {
+                            RetryStopReason::Completed
+                        } else {
+                            RetryStopReason::NotRetryable
+                        });
+                    }
                 }
-                Err(error) => {
-                    terminal.report.final_reason = Some(retry_reason_for_error(error));
-                    terminal.report.last_error = Some(format!("{:?}", error.kind()));
-                    terminal.report.exhausted = false;
+                Err(error) if error.retry_report().is_none() => {
+                    terminal.report.stop_reason = Some(stop_for_error(error));
                 }
+                Err(_) => {}
             }
         }
         Some(terminal)
@@ -84,11 +88,19 @@ impl MiddlewareCompletion {
         }
     }
 
-    fn finish(&self, outcome: Option<Result<http::StatusCode, NetError>>, attempts: u32) {
+    fn finish(
+        &self,
+        outcome: Option<Result<http::StatusCode, NetError>>,
+        attempts: u32,
+        report: RetryReport,
+    ) {
         let ready = self.state(|state| {
             state.finished = true;
             state.outcome = outcome;
-            state.elapsed = self.start.elapsed();
+            state.elapsed = report.elapsed;
+            if state.outcome.is_some() {
+                state.final_report = Some(report);
+            }
             if attempts == 0 && state.pending.is_none() {
                 if let Some(observer) = &self.observer {
                     state.pending = Some(TerminalObservation {
@@ -129,6 +141,7 @@ impl MiddlewareLease {
                 emitted: false,
                 outcome: None,
                 elapsed: Duration::ZERO,
+                final_report: None,
                 pending: None,
             }),
             observer,
@@ -168,10 +181,34 @@ impl MiddlewareLease {
             Ok(HttpMiddlewareResponse::Streaming(_)) => None,
             Err(error) => Some(Err(error.clone())),
         };
+        let mut report = match self.control.retry_report() {
+            Some(report) => report,
+            None => RetryReport::new(),
+        };
+        report.elapsed = report.elapsed.max(self.completion.start.elapsed());
+        match &outcome {
+            Some(Err(error)) if error.retry_report().is_none() => {
+                report.stop_reason = Some(stop_for_error(error))
+            }
+            Some(Ok(status)) if report.stop_reason.is_none() => {
+                report.stop_reason = Some(if status.is_success() {
+                    RetryStopReason::Completed
+                } else {
+                    RetryStopReason::NotRetryable
+                })
+            }
+            _ => {}
+        }
+        if outcome.is_some() {
+            self.control.set_retry_report(report.clone());
+        }
         self.finished = true;
         self.release();
-        self.completion
-            .finish(outcome, self.control.attempt.load(Ordering::Acquire));
+        self.completion.finish(
+            outcome,
+            self.control.attempt.load(Ordering::Acquire),
+            report,
+        );
     }
 }
 impl Drop for MiddlewareLease {
@@ -184,6 +221,16 @@ impl Drop for MiddlewareLease {
                     NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Dispatch)
                 )),
                 self.control.attempt.load(Ordering::Acquire),
+                {
+                    let mut report = match self.control.retry_report() {
+                        Some(report) => report,
+                        None => RetryReport::new(),
+                    };
+                    report.elapsed = self.completion.start.elapsed();
+                    report.stop_reason = Some(RetryStopReason::Cancelled);
+                    self.control.set_retry_report(report.clone());
+                    report
+                },
             );
         }
     }

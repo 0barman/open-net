@@ -1,11 +1,14 @@
 use super::{ClientId, ConnectionId, Message, PeerClose, SessionId};
 use bytes::Bytes;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::time::SystemTime;
 
 /// Received business message or protocol-control payload.
-#[derive(Clone, Debug)]
+///
+/// `Debug` reports payload summaries without exposing business bodies or control-frame contents.
+#[derive(Clone)]
 pub enum IncomingPayload {
     /// Text or binary business message.
     Message(
@@ -27,6 +30,23 @@ pub enum IncomingPayload {
         /// Decoded close code and reason.
         PeerClose,
     ),
+}
+
+impl fmt::Debug for IncomingPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(message) => formatter.debug_tuple("Message").field(message).finish(),
+            Self::Ping(bytes) => formatter
+                .debug_struct("Ping")
+                .field("bytes", &bytes.len())
+                .finish(),
+            Self::Pong(bytes) => formatter
+                .debug_struct("Pong")
+                .field("bytes", &bytes.len())
+                .finish(),
+            Self::Close(close) => formatter.debug_tuple("Close").field(close).finish(),
+        }
+    }
 }
 
 /// Source identity assigned by the receiving connection; owns no session resources.

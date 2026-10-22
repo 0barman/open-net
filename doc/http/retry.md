@@ -1,616 +1,357 @@
-# Retries
+# HTTP retries
 
-Required features: `http-client`. Retry support has no additional feature.
-Create a project with `cargo new retry-example` and add the following
-dependencies to its `Cargo.toml`, adjusting the source path to your checkout.
-Every complete program on this page uses these dependencies:
+Required features: `http-client`. Retry support has no additional feature and
+ships in the `open-net` crate. See [shared schedules and observations](../retry.md)
+for `RetrySchedule`, `Backoff`, `Jitter`, `RetrySetting`, decisions and reports.
+The packaged [http_retry example](../../examples/http_retry.rs) accepts a base URL
+and optional relative path:
+
+These commands run in the matching library source directory containing its
+`Cargo.toml`, after obtaining that source. Adding a dependency to an application
+does not install the library's examples into that application.
+
+```sh
+cargo run --manifest-path Cargo.toml --no-default-features --features http-client --example http_retry -- http://127.0.0.1:8080 /status
+```
+
+Every complete program on this page uses these dependency settings:
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 ```
 
-## Application TLS provider
+Client examples initialize an application-selected TLS provider, including for
+plain HTTP. Configuration-only examples need no provider. See [TLS](../tls.md)
+for provider ownership and prerequisites; the SDK does not install one for you.
 
-open-net does not choose a cryptographic provider. Each complete program that
-creates an HTTP client below initializes the example application's provider in
-`main`; copy the program as written. Configuration-only examples need no provider
-until a client is built. Client creation requires a provider even for plain HTTP
-and otherwise returns `InvalidConfig` for `tls.provider`.
+## Policy and execution contract
 
-The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
-once in the host application, or pass an explicit per-client provider. A library
-using open-net should accept the host's choice rather than install its own global
-provider. See [TLS providers](../tls.md) for build prerequisites, provider
-precedence and complete examples of both approaches.
+`HttpRetryPolicy` combines a shared schedule with HTTP classification, replay
+safety, `Retry-After`, an optional synchronous classifier and an observer. Its
+default performs **one attempt and no retries**. Building a schedule with several
+attempts alone does not select transient HTTP reasons: configure `RetryOn` or a
+classifier explicitly. The policy stores configuration; each request creates
+independent execution state.
 
-See [timeouts](timeouts_and_admission.md) for deadline inheritance and
-[callback requests](callback_requests.md) for submitting custom request traits.
-A retry replays an operation, so configure it according to the endpoint's actual
-contract. The default client policy performs **one attempt and no retries**.
+`max_attempts` includes the first attempt and any 401 credential-refresh
+replay. `Disabled` or a one-attempt schedule permits no refresh replay. Credential
+loading/refresh during request preparation is distinct from replaying a received
+401. Redirects stay within an attempt and retain their own hop budget; disabling
+retries does not disable redirects. `transport_sends` counts redirect dispatches
+separately from attempts.
 
-## RetryPolicy and RetryPolicyBuilder
+The SDK classifies an entire buffered attempt, including body reading. HTTP 200
+followed by a body-read failure remains `Err(NetError)` with its received status
+and headers. Exhaustion preserves the last response/error plus its retry report.
+A final HTTP error status is still a response value unless the caller applies a
+[status policy](requests_and_responses.md). Scheduling completion does not imply
+business success.
 
-### Required features
+[Timeouts](timeouts_and_admission.md) belong to `HttpTimeouts`, independently of
+retry configuration. The total budget covers admission, preparation, attempts,
+authentication, body reading and backoff. It starts at a synchronous submission
+call, or the first poll of an asynchronous submission future. An unpolled future
+and an application's outer queue are outside that budget. Backoff waits observe
+cancellation, total expiry and shutdown. Once the network operation has a terminal result, both final callback queueing
+and callback execution are outside `total_timeout` and the report's `elapsed`.
+The queued result is not changed into a timeout while waiting for the callback.
+`finished()` still waits for callback execution and SDK resource cleanup.
+Concrete buffered middleware receives its internal network result without waiting
+on the application callback queue. Middleware's own work before and after
+`next.run()` remains subject to cancellation and the total budget.
 
-`http-client`.
+The classifier applies to buffered responses and attempt errors. Streaming never
+buffers a response just for classification, and a delivered stream is never
+replayed. Built-in status/transport policy can retry before returning the stream.
 
-### Function signatures and parameters
+## Retry a transient endpoint
 
-Factory functions have no receiver. Other builder functions consume `self`;
-accessors borrow `&self`. The tables list every public inherent method. Parameters
-shown in a signature are required; a missing setter keeps its default.
-
-| Factory signature | Return value and defaults |
-| --- | --- |
-| `RetryPolicy::no_retry() -> Self` | One attempt, no selected reasons, no explicit deadlines, Automatic safety |
-| `RetryPolicy::none() -> Self` | Alias of `no_retry()` |
-| `RetryPolicy::new(max_retries: u32) -> Self` | Retry count after the first attempt, clamped to 32; zero gives no retries |
-| `RetryPolicy::standard() -> Self` | `new(2)`: three total attempts |
-| `RetryPolicy::builder() -> RetryPolicyBuilder` | Same as `RetryPolicyBuilder::default()`: one attempt, no reasons, no backoff, no deadlines, Ignore server delay, Automatic safety, no observer or predicate |
-
-`new(n)` for positive `n` selects standard transient reasons and exponential
-backoff starting at 50 milliseconds and capped at 30 seconds. It adds no jitter.
-`RetryPolicy::default()` is `no_retry()`, not `standard()`.
-
-| Builder signature | Parameter meaning and validation |
-| --- | --- |
-| `max_attempts(self, max_attempts: u32) -> Self` | Total attempts including the first; legal range 1–33 |
-| `attempt_timeout(self, timeout: Duration) -> Self` | Positive legacy per-attempt limit |
-| `total_deadline(self, deadline: Duration) -> Self` | Positive legacy operation-wide limit |
-| `backoff(self, backoff: Backoff) -> Self` | Retry delay selection |
-| `retry_on(self, retry_on: RetryOn) -> Self` | Replace all reason categories |
-| `retry_after(self, mode: RetryAfterMode) -> Self` | Select server delay handling |
-| `retry_after_cap(self, cap: Duration) -> Self` | Positive cap, used in RespectWithCap mode |
-| `safety(self, safety: RequestSafety) -> Self` | Replay permission |
-| `observer(self, observer: impl RetryObserver) -> Self` | Retained thread-safe lifecycle observer |
-| `application_predicate(self, predicate: impl Fn(&HttpResponse) -> bool + Send + Sync + 'static) -> Self` | Inspect a fully buffered response; also enables application retries |
-| `build(self) -> Result<RetryPolicy, RetryPolicyError>` | Validate and construct the policy |
-
-Each setter also has an exact `with_` alias with the same argument and return type:
-`with_max_attempts`, `with_attempt_timeout`, `with_total_deadline`, `with_backoff`,
-`with_retry_on`, `with_retry_after`, `with_retry_after_cap`, `with_safety`,
-`with_observer`, `with_application_predicate`.
-Repeated setters replace the previous value. Calling `retry_on` after
-`application_predicate` can disable its application reason again.
-
-### Steps
-
-1. Start with `standard()`, `new(n)`, or the explicit builder.
-2. Select reason categories, replay safety, delays, and optional deadlines.
-3. Validate a builder with `build()` and handle `RetryPolicyError`.
-4. Install the policy using `HttpClientConfig::with_default_retry_policy`,
-   `HttpRequestBuilder::retry_policy`, or `HttpRequestOptions::with_retry_policy`.
-5. Execute and release the response. Shut down the client when finished.
-
-### Callback parameters
-
-An application predicate receives `&HttpResponse` and returns `bool`: `true`
-requests another attempt only when the other retry checks also allow it. The
-predicate must inspect without side effects. `Send + Sync + 'static` permits
-storage and invocation by background work: move owned data or `Arc` into it,
-not a reference to a short-lived stack value. It applies to buffered responses,
-not to a delivered stream. Observers receive `&RetryEvent` (see below).
-
-### Return values and errors
-
-A built policy is cloneable configuration, not an active task. `build()` returns
-`Err(RetryPolicyError)` for these exact cases:
-
-| Error | Cause |
-| --- | --- |
-| `InvalidMaxAttempts` | Zero or more than 33 total attempts |
-| `EmptyBackoffSequence` | Empty sequence |
-| `InvalidBackoff` | Exponential maximum below initial delay |
-| `ZeroAttemptTimeout` | Zero attempt timeout |
-| `ZeroTotalDeadline` | Zero total deadline |
-| `ZeroRetryAfterCap` | Zero server-delay cap |
-
-Builder validation checks these rules; timeout resolution additionally checks
-monotonic-clock representability. `RetryPolicyError` implements `Display` and
-`std::error::Error`. Request execution still returns `NetError` for transport,
-cancellation, timeout, or shutdown failures. A final HTTP 4xx/5xx response is
-still `Ok(HttpResponse)` unless explicitly checked with a status policy.
-
-### Errors and behavior
-
-Replay requires remaining attempt budget, an allowed reason and acceptable
-method safety. A classification accessor alone does not imply a retry will run.
-Admission, preparation, backoff and attempts remain part of one logical request;
-cancellation and applicable deadlines terminate that operation. A stream is
-never replayed after it has been returned to the caller. Application predicates
-only run on fully buffered responses.
-
-For a final buffered-body failure, `NetError::http_response_head()` may retain
-that attempt's status and headers while the original failure classification,
-source and timeout phase remain authoritative. A later retry never reuses an
-earlier attempt's head, and explicit cancellation carries no head. Do not treat
-retained status as a successful result or as automatic permission to replay a
-request. See [response-head diagnostics](requests_and_responses.md#neterrorhttp_response_head).
-
-### Example
-
-Start a server at `127.0.0.1:8080` serving `/status`. A transient response such as
-503 can trigger up to two retries; expect observer events and a final status or
-error. The program shuts down even when the request fails. `.await` waits without
-blocking a runtime thread; `?` propagates configuration errors.
+This example permits three attempts with two explicit delays. The 10-second
+total timeout is an example setting, not a new SDK default. Start a local server
+at `127.0.0.1:8080` with `/status`; the smoke fixture returns 503 twice and then
+200. Final status/result and report remain available after completion.
 
 ```rust
-use open_net::api::http::{Backoff, HttpClient, HttpClientConfig, HttpRequest, RetryEvent, RetryOn, RetryPolicy};
+use open_net::api::{
+    http::{HttpClient, HttpClientConfig, HttpRequest, HttpRetryPolicy, HttpTimeouts, RetryOn},
+    retry::{Backoff, RetryEvent, RetrySchedule},
+};
 use std::time::Duration;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rustls_openssl::default_provider()
-        .install_default()
-        .expect("install the application TLS provider once");
-    let policy = RetryPolicy::builder()
+    rustls_openssl::default_provider().install_default()
+        .map_err(|_| std::io::Error::other("application TLS provider already installed"))?;
+    let schedule = RetrySchedule::builder()
         .max_attempts(3)
-        .backoff(Backoff::exponential(Duration::from_millis(100), Duration::from_secs(1)))
+        .backoff(Backoff::sequence([
+            Duration::from_millis(100), Duration::from_millis(200),
+        ]))
+        .build()?;
+    let policy = HttpRetryPolicy::builder()
+        .schedule(schedule)
         .retry_on(RetryOn::standard())
-        .total_deadline(Duration::from_secs(10))
         .observer(|event: &RetryEvent| println!("{event:?}"))
         .build()?;
-    let config = HttpClientConfig::new("http://127.0.0.1:8080")?.with_default_retry_policy(policy);
+    let config = HttpClientConfig::new("http://127.0.0.1:8080")?
+        .with_default_retry_policy(policy)
+        .with_timeouts(HttpTimeouts::new().with_total_timeout(Duration::from_secs(10)))?;
     let client = HttpClient::new(config, "retry-example")?;
     let result = client.request(HttpRequest::builder().path("/status").build()?).await;
     client.shutdown().await?;
-    println!("{:?}", result.map(|response| response.status));
+    let response = result?;
+    let report = response.retry_report()
+        .ok_or_else(|| std::io::Error::other("completed response has no retry report"))?;
+    println!("HTTP retry completed: {}", response.status());
+    println!("attempts={}, sends={}, stop={:?}",
+        report.attempts(), report.transport_sends(), report.stop_reason());
     Ok(())
 }
 ```
 
-### Policy accessors and compatibility setters
+## Built-in reasons and replay safety
 
-These methods are infallible. No callbacks apply except the predicate setter.
-All `with_*` methods consume and return `Self`. Durations have explicit Rust units.
+`RetryOn::standard()` enables statuses 408, 425, 429, 500, 502, 503 and 504;
+transport categories DNS, connect, pre-send timeout, read reset and body read;
+and buffered body-read failures. `RetryOn::none()` starts empty. Setters replace
+one category while retaining the others. `RetryReason::Application` is selected
+by the classifier, and `RetryAfter` is a delay hint, so neither is enabled by
+`RetryOn::allows` alone.
 
-| Signature | Return value / behavior |
+`TransportErrorKind` also exposes `Tls`, `Write`, `Protocol` and `DeliveryUnknown`
+for explicit endpoint policy. These categories do not override request safety.
+The available categories are not a promise that the backend can distinguish
+every transport phase:
+
+- `DeliveryUnknown` is produced when a request execution transport failure
+  occurs before response headers and reliable send/receive evidence is absent.
+  The peer may have received part or all of the request. This includes ambiguous
+  upload failures, disconnects while awaiting headers, and HTTP/2 keepalive
+  timeouts. It does not establish whether the server performed the operation.
+  `NetError::kind()` remains `Io` or `TimedOut`; the retry category does not change
+  it to `ErrorKind::DeliveryUnknown`. `context().stage` is `None` when the phase
+  cannot be established.
+- `Write` requires reliable evidence that writing failed. The current reqwest
+  backend does not reliably expose that distinction and does not emit this
+  category for execution failures. Ambiguous failures use `DeliveryUnknown`.
+- `TimeoutBeforeSend` requires positive evidence that the timeout preceded
+  sending. A `Write` stage, an elapsed timer, or a failed execution future does
+  not provide that evidence. The current backend does not emit this category
+  for execution failures.
+
+`RetryOn::standard()` does not select `DeliveryUnknown` or `Write`. Correctly
+classifying ambiguous execution failures as `DeliveryUnknown` narrows its retry
+behavior: failures previously grouped into `ReadReset` or `TimeoutBeforeSend`
+are no longer retried by `standard()` alone. With built-in classification, an
+endpoint must explicitly select `DeliveryUnknown` and still satisfy request
+safety and body replayability.
+
+HTTP/2 keepalive timeout before response headers retains `ErrorKind::TimedOut` and
+`http_timeout_phase = None`: a transport keepalive timer is not an SDK-owned
+phase budget. It is not a read reset or evidence that the request was unsent.
+Deadline phases are selected separately using `with_timeout_phases`; no phase is selected by default. Connect, Headers, IdleRead and Attempt can be selected. Admission and Total are filtered out of this setter and remain terminal. Cancellation and shutdown are never retried.
+
+| `RequestSafety` | Replay permission |
 | --- | --- |
-| `max_retries(&self) -> u32` | Retry budget excluding the initial attempt |
-| `max_attempts(&self) -> u32` | Total attempt budget |
-| `attempt_timeout(&self) -> Option<Duration>` | Explicit legacy attempt limit; `None` means unset |
-| `total_deadline(&self) -> Option<Duration>` | Explicit legacy total limit; `None` means unset |
-| `backoff(&self) -> &Backoff` | Configured delay rule |
-| `retry_after(&self) -> RetryAfterMode` | Server-delay mode |
-| `retry_after_cap(&self) -> Option<Duration>` | Explicit cap; `None` uses the policy maximum in RespectWithCap |
-| `safety(&self) -> &RequestSafety` | Replay declaration |
-| `retry_on(&self) -> &RetryOn` | Reason classifier |
-| `observer(&self) -> Option<RetryObserverHandle>` | Cloned handle or `None` if absent |
-| `max_delay(&self) -> Duration` | Backoff upper bound |
-| `with_max_retries(self, max_retries: u32) -> Self` | Clamp to 32 and update total attempts |
-| `with_retryable_statuses(self, statuses: impl IntoIterator<Item = StatusCode>) -> Self` | Replace status set, retaining other categories; empty disables status retries |
-| `with_transport_errors(self, enabled: bool) -> Self` | False clears transport categories and body-read flag; true restores standard transport categories only if empty, without re-enabling the separate body-read flag |
-| `with_non_idempotent(self, enabled: bool) -> Self` | Set IdempotentByContract if true, Automatic if false; does not bypass body safety |
-| `with_max_delay(self, max_delay: Duration) -> Self` | Nonzero changes delay bound; zero leaves it unchanged |
-| `with_application_predicate(self, predicate: impl Fn(&HttpResponse) -> bool + Send + Sync + 'static) -> Self` | Store predicate and enable application reason |
-| `backoff_delay(&self, retry_ordinal: u32) -> Duration` | Configured delay capped by max_delay; ordinal zero returns zero |
-| `retry_delay(&self, retry_ordinal: u32, server_delay: Option<Duration>) -> Duration` | Combine backoff, server mode and optional cap |
-| `allows_method(&self, method: &Method, replayable_body: bool) -> bool` | Method-safety check only; does not check attempt budget |
-| `should_retry_status(&self, status: StatusCode) -> bool` | Status membership |
-| `should_retry_reason(&self, reason: RetryReason) -> bool` | Reason membership |
-| `should_retry_error(&self, error: &NetError) -> bool` | Classify retained typed error evidence, otherwise fallback kind/stage |
-| `can_retry_attempt(&self, attempt: u32) -> bool` | Here `attempt` is a retry ordinal: 1 through max_retries; zero is false |
+| `Never` | Never replay, including auth refresh |
+| `Automatic` | Only the SDK's idempotent HTTP methods: GET, HEAD, OPTIONS, PUT and DELETE |
+| `IdempotentByContract` | The endpoint contract explicitly guarantees idempotency |
+| `IdempotencyKey(String)` | The endpoint deduplicates using this nonempty key |
 
-## Backoff and RetryAfterMode
-
-### Required features
-
-`http-client`.
-
-### Function signatures and parameters
-
-| Signature / variant | Parameters and meaning |
-| --- | --- |
-| `Backoff::None` | No delay |
-| `Backoff::constant(delay: Duration) -> Self` / `Constant(Duration)` | Same delay each time |
-| `Backoff::exponential(initial: Duration, max: Duration) -> Self` / `Exponential { initial, max }` | Double initial by retry ordinal, saturating at max |
-| `Backoff::sequence(delays: impl IntoIterator<Item = Duration>) -> Self` / `Sequence(Vec<Duration>)` | One delay per retry; reuse last after the end |
-| `Backoff::delay_for(&self, retry_ordinal: u32) -> Duration` | One-based retry ordinal; zero returns zero |
-| `RetryAfterMode::select(self, server_delay: Option<Duration>, backoff_delay: Duration, cap: Option<Duration>) -> Duration` | Choose delay; `None` server value falls back to backoff |
-
-### Steps, return values, and errors
-
-Construct a backoff, install it on a policy builder, then call `build()` to validate.
-Constructors and delay readers are infallible; empty sequences and reversed
-exponential bounds fail when building the policy. Zero delay is allowed. There
-are no callbacks. `delay_for` returns a duration, not a sleep future.
-
-`Ignore` always chooses backoff. `PreferServer` prefers a valid server delay and
-does not apply the cap. `RespectWithCap` clips the selected delay using `cap` if
-present. `RetryPolicy::retry_delay` supplies its `max_delay` when no explicit cap
-exists in RespectWithCap mode. `Retry-After` does not itself authorize a retry;
-the status/error must qualify. The transport handles supported delta-seconds and
-HTTP-date values; malformed hints fall back to configured backoff.
-
-Date parsing uses `httpdate` for IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`),
-obsolete RFC 850, and asctime forms. A compatibility adapter also accepts the
-previous parser's common RFC 2822 forms: numeric offsets such as `+0000`,
-`-0000`, `+0200`, and `-0400`; `GMT`, `UT`, `UTC`, and the US timezone names
-`EST`/`EDT`, `CST`/`CDT`, `MST`/`MDT`, `PST`/`PDT`. It preserves case-insensitive
-names, extra ASCII whitespace, a missing weekday or seconds, a one-digit day,
-and one simple trailing parenthesized comment. Explicit weekdays and calendar
-dates must agree. Past dates select zero delay, including dates before 1970;
-`:60` seconds normalize to the following second.
-
-The compatibility adapter supports years `0000` through `9999`; RFC 2822
-two-digit years retain the `1950..2049` interpretation. Obsolete RFC 850 dates
-use `httpdate`'s fixed `1970..2069` interpretation, rather than a rolling
-50-year window. Nested, escaped, or multiple comments and other unsupported
-date syntax fall back to backoff. Applications should send IMF-fixdate or
-delta-seconds for interoperable HTTP headers.
-
-### Example
-
-This program runs offline and checks delay selection.
+A body must also be replayable. `IdempotencyKey` is a safety declaration; it does
+not inject a header or JSON field. The caller must encode the same key as required
+by its server. Do not declare an ordinary POST safe without that server contract.
+Debug formatting redacts the key.
 
 ```rust
-use open_net::api::http::{Backoff, RetryAfterMode};
-use std::time::Duration;
-fn main() {
-    let constant = Backoff::constant(Duration::from_millis(100));
-    let exponential = Backoff::exponential(Duration::from_millis(100), Duration::from_secs(1));
-    let sequence = Backoff::sequence([Duration::ZERO, Duration::from_millis(200)]);
-    assert_eq!(constant.delay_for(2), Duration::from_millis(100));
-    assert_eq!(exponential.delay_for(3), Duration::from_millis(400));
-    assert_eq!(sequence.delay_for(9), Duration::from_millis(200));
-    assert_eq!(Backoff::None.delay_for(1), Duration::ZERO);
-    let delay = RetryAfterMode::RespectWithCap.select(Some(Duration::from_secs(8)),
-        Duration::from_secs(1), Some(Duration::from_secs(2)));
-    assert_eq!(delay, Duration::from_secs(2));
-}
-```
+use open_net::{StatusCode, api::{
+    http::{HttpRequest, HttpRetryPolicy, Method, RequestSafety, RetryOn, RetryReason, TimeoutPhase, TransportErrorKind},
+    retry::{RetrySchedule, RetrySetting},
+}};
 
-## RetryOn, RetryReason, TransportErrorKind, and RequestSafety
-
-### Required features
-
-`http-client`.
-
-### Function signatures and parameters
-
-| RetryOn signature | Behavior |
-| --- | --- |
-| `standard() -> Self` | Statuses 408, 425, 429, 500, 502, 503, 504; transport Dns, Connect, TimeoutBeforeSend, ReadReset, BodyRead; body-read flag true, application false |
-| `none() -> Self` | Empty reason sets and false flags |
-| `with_statuses(self, statuses: impl IntoIterator<Item = StatusCode>) -> Self` | Replace statuses |
-| `with_transport(self, reasons: impl IntoIterator<Item = TransportErrorKind>) -> Self` | Replace transport categories |
-| `with_body_read(self, enabled: bool) -> Self` | Set dedicated body-read flag |
-| `with_application(self, enabled: bool) -> Self` | Set application predicate flag |
-| `allows(&self, reason: RetryReason) -> bool` | Test a reason; RetryAfter is always false |
-| `statuses(&self) -> &[StatusCode]` | Borrow status set |
-| `transport(&self) -> &[TransportErrorKind]` | Borrow transport set |
-| `retries_body_read(&self) -> bool` | Read body flag |
-| `retries_application(&self) -> bool` | Read application flag |
-
-`RetryReason` variants are `HttpStatus(StatusCode)`, `Transport(TransportErrorKind)`,
-`BodyRead`, `Application`, `RetryAfter`. Transport categories are `Dns`, `Connect`,
-`Tls`, `TimeoutBeforeSend`, `Write`, `ReadReset`, `BodyRead`, `Protocol`,
-`DeliveryUnknown`. Standard reasons exclude TLS, write, framing/protocol and unknown
-delivery; opt-in to those categories requires careful endpoint replay guarantees.
-
-| RequestSafety variant | Meaning |
-| --- | --- |
-| `Never` | Never replay |
-| `Automatic` (default) | This implementation recognizes GET, HEAD, OPTIONS, PUT, DELETE as idempotent |
-| `IdempotentByContract` | Application asserts server-side idempotence; non-idempotent methods still need replayable bodies |
-| `IdempotencyKey(String)` | Application asserts server-side deduplication; body safety still applies |
-
-### Steps, callback parameters, and return values
-
-Construct reason sets, set them on the policy builder, and select safety.
-No callbacks apply here. Constructors/setters return configuration; readers return
-slices or booleans. All methods above are infallible.
-
-### Errors and behavior
-
-A safety declaration is not a server guarantee. `IdempotencyKey` does **not** add a
-header or body field: provide the key exactly as your service requires. Policy
-checks do not manufacture replayable content. Classification is separate from
-remaining budget, cancellation and deadlines. The method-only `allows_method`
-query accepts recognized idempotent methods even when `replayable_body` is false;
-the worker separately refuses a required replay with `BodyNotReplayable` before
-a second send. A replayability declaration must match the actual request provider.
-
-### Example
-
-This offline example demonstrates explicit reason selection and an idempotency
-header. Replace the key with a stable per-operation value for a real service.
-
-```rust
-use open_net::{StatusCode, api::http::{HttpRequest, Method, RequestSafety, RetryOn, RetryPolicy, RetryReason, TransportErrorKind}};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reasons = RetryOn::none()
         .with_statuses([StatusCode::SERVICE_UNAVAILABLE])
         .with_transport([TransportErrorKind::Connect])
-        .with_body_read(false).with_application(false);
-    assert!(reasons.allows(RetryReason::HttpStatus(StatusCode::SERVICE_UNAVAILABLE)));
-    assert_eq!(reasons.statuses().len(), 1);
-    assert_eq!(reasons.transport().len(), 1);
-    assert!(!reasons.retries_body_read() && !reasons.retries_application());
-    let policy = RetryPolicy::builder().max_attempts(2).retry_on(reasons)
-        .safety(RequestSafety::IdempotencyKey("operation-42".into())).build()?;
-    let request = HttpRequest::builder().method(Method::POST).path("/jobs")
-        .header("Idempotency-Key", "operation-42")?
-        .body("payload".into()).retry_policy(policy).build()?;
-    assert_eq!(request.method, Method::POST);
-    Ok(())
-}
-```
-
-## RetrySetting and HttpRequestOptions
-
-### Required features
-
-`http-client`.
-
-### Function signatures and parameters
-
-`RetrySetting::{Inherit, None, Policy(RetryPolicy)}` chooses the client default,
-explicitly disables retries, or replaces the client policy. Default is `Inherit`.
-`resolve(&self, default: &RetryPolicy) -> RetryPolicy` returns a policy clone;
-`None` returns `no_retry()`. It does not modify the supplied default.
-
-| HttpRequestOptions signature | Meaning / return |
-| --- | --- |
-| `new() -> Self` | Same as default: inherited policy, replayable body true, no request ID, inherited timeouts |
-| `with_retry_policy(self, retry_policy: RetryPolicy) -> Self` | Explicit policy, including explicit no-retry |
-| `with_retry_setting(self, setting: RetrySetting) -> Self` | Select inheritance/disable/replacement |
-| `retry_setting(&self) -> RetrySetting` | Clone of selection |
-| `with_replayable_body(self, replayable_body: bool) -> Self` | Declare body replayability |
-| `with_request_id(self, request_id: HttpRequestId) -> Self` | Use client-local cancellation/correlation ID |
-| `with_timeouts(self, timeouts: HttpTimeouts) -> Result<Self, NetError>` | Replace all request timeout overrides, validating durations |
-| `timeouts(&self) -> &HttpTimeouts` | Borrow explicit overrides |
-
-Public fields are `retry_policy: RetryPolicy`, `replayable_body: bool`, and
-`request_id: Option<HttpRequestId>`. `None` ID requests automatic allocation.
-Private inheritance markers prevent external struct literals; use `new()` and
-setters to keep policy selection consistent. Values are copied into accepted work.
-
-### Steps, return values, and callbacks
-
-Build options, pass them to `send_with_options` or `send_wait_with_options`, and
-keep the returned request handle if you need completion. For concrete requests,
-use builder `retry_policy` or `retry_setting` instead. There are no callbacks on
-option construction; request callbacks are described in the callback guide.
-
-### Errors and behavior
-
-Only `with_timeouts` above returns validation errors (`InvalidInput`). Request
-submission can reject a duplicate active ID or invalid request. The original
-request is retained in `EnqueueError` on ordinary rejection. Option configuration
-does not itself submit or retry anything. Last selection wins; `Inherit` restores
-the client's policy even after a previous explicit override.
-
-### Example
-
-This program inspects options offline; the handle flow is in the callback guide.
-
-```rust
-use open_net::api::http::{HttpRequestOptions, HttpRequestId, HttpTimeouts, RetryPolicy, RetrySetting};
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let inherited = RetrySetting::Inherit.resolve(&RetryPolicy::standard());
-    assert_eq!(inherited.max_attempts(), 3);
-    let options = HttpRequestOptions::new()
-        .with_retry_policy(RetryPolicy::standard())
-        .with_retry_setting(RetrySetting::None)
-        .with_replayable_body(false)
-        .with_request_id(HttpRequestId(42))
-        .with_timeouts(HttpTimeouts::new())?;
-    assert_eq!(options.retry_setting(), RetrySetting::None);
-    assert!(!options.replayable_body);
-    assert_eq!(options.timeouts(), &HttpTimeouts::new());
-    Ok(())
-}
-```
-
-## ApplicationPredicate and retry observation
-
-### Required features
-
-`http-client`.
-
-### Function signatures
-
-```text
-ApplicationPredicate::new(predicate: impl Fn(&HttpResponse) -> bool + Send + Sync + 'static) -> Self
-RetryContext::new(method: Method, host: impl Into<String>, path: impl AsRef<str>) -> Self
-RetryReport::new() -> Self
-trait RetryObserver: Send + Sync + 'static {
-    fn observe(&self, event: &RetryEvent);
-}
-RetryObserverHandle::new(observer: impl RetryObserver) -> Self
-RetryObserverHandle::notify(&self, event: RetryEvent)
-```
-
-### Steps and parameters
-
-Supply a `Fn(&RetryEvent) + Send + Sync + 'static` closure directly to
-`RetryPolicyBuilder::observer`, or implement `RetryObserver`. The policy keeps a
-cloneable handle. `notify` manually delivers an owned event; it does not cause a
-request attempt. `ApplicationPredicate::new` builds a cloneable predicate wrapper;
-install a closure using the policy's `application_predicate` setter. Its evaluation
-method is internal. `RetryContext` and `RetryReport` constructors build data values.
-
-### Callback parameters and return values
-
-| RetryEvent | Payload |
-| --- | --- |
-| `AttemptStarted { attempt: u32 }` | One-based attempt number |
-| `AttemptFinished { attempt: u32, final_attempt: bool }` | Attempt number and whether terminal |
-| `RetryScheduled { attempt: u32, delay: Duration }` | Number of the attempt that just completed and the delay before its retry; for example, `attempt: 1` schedules attempt 2 |
-| `Completed(RetryReport)` | Terminal operation summary |
-
-Observers return `()`. Keep them short and nonblocking: notification is synchronous
-where execution calls it, not a dedicated application thread. The handle catches
-observer unwinding panics and logs the failure. No drop-based unsubscribe handle
-is provided for observers; they live with the policy and its clones. Predicate
-callbacks return a boolean; do not assume observer panic isolation also applies
-to arbitrary application predicate code.
-
-| RetryContext public field | Type / initial value |
-| --- | --- |
-| `attempt` | `u32`, 1 |
-| `method` | `Method`, supplied method |
-| `host` | `String`, strips scheme, credentials, path/query/fragment |
-| `path` | `String`, removes query and fragment |
-| `status` | `Option<StatusCode>`, None |
-| `reason` | `Option<RetryReason>`, None |
-| `elapsed` | `Duration`, zero |
-| `remaining` | `Option<Duration>`, None (no supplied remaining budget) |
-
-The observer signature receives an event, not a `RetryContext` parameter.
-
-| RetryReport public field | Type / new or default value |
-| --- | --- |
-| `attempts` | `u32`, 0 |
-| `retry_count` | `u32`, 0 |
-| `elapsed` | `Duration`, zero |
-| `final_reason` | `Option<RetryReason>`, None |
-| `exhausted` | `bool`, false |
-| `last_error` | `Option<String>`, None |
-
-### Errors and behavior
-
-Constructors and `notify` have no Result return. Report fields distinguish the
-actual attempts from the configured maximum. `retry_count` counts scheduled
-retries, including a retry cancelled during its backoff before the next attempt
-starts. The current `exhausted` flag records reaching the configured ordinary
-attempt boundary; it is not a success/failure flag and can be true for a successful
-response, including a one-attempt policy. `last_error` contains the terminal error
-kind label when execution records an error, rather than the complete error source.
-`None` reason or error means none was recorded. With `http-client-auth`, a permitted
-credential-refresh replay has its own limit and can add an attempt beyond the
-ordinary policy maximum; see [authentication](authentication.md). Debug output redacts idempotency keys and error contents, but public
-fields can hold application data; do not treat arbitrary manual values as sanitized.
-
-### Example
-
-This offline example constructs a predicate, verifies context sanitization and
-delivers a synthetic observer event. Synthetic events do not make network calls.
-
-```rust
-use open_net::api::http::{ApplicationPredicate, HttpResponse, Method, RetryContext, RetryEvent, RetryObserverHandle, RetryReport};
-fn main() {
-    let _predicate = ApplicationPredicate::new(|response: &HttpResponse| response.body.is_empty());
-    let context = RetryContext::new(Method::GET, "https://name:secret@example.com", "/status?token=secret#detail");
-    assert_eq!(context.host, "example.com");
-    assert_eq!(context.path, "/status");
-    let observer = RetryObserverHandle::new(|event: &RetryEvent| println!("{event:?}"));
-    observer.notify(RetryEvent::Completed(RetryReport::new()));
-}
-```
-
-## Offline policy inspection example
-
-This complete program checks the compatibility setters, factory defaults and
-classification accessors without submitting any request. Classifying a reason
-never authorizes replay on its own.
-
-```rust
-use open_net::{error::ErrorKind, NetError, StatusCode, api::http::{HttpResponse, Method, RetryPolicy, RetryReason}};
-use std::time::Duration;
-fn main() {
-    assert_eq!(RetryPolicy::no_retry(), RetryPolicy::none());
-    assert_eq!(RetryPolicy::new(99).max_retries(), 32);
-    assert_eq!(RetryPolicy::standard().max_attempts(), 3);
-    let policy = RetryPolicy::standard()
-        .with_max_retries(2)
-        .with_retryable_statuses([StatusCode::SERVICE_UNAVAILABLE])
-        .with_transport_errors(false)
-        .with_non_idempotent(true)
-        .with_max_delay(Duration::from_secs(1))
-        .with_application_predicate(|response: &HttpResponse| response.body.is_empty());
-    assert_eq!(policy.attempt_timeout(), None);
-    assert_eq!(policy.total_deadline(), None);
-    let _configured = (policy.backoff(), policy.retry_after(), policy.retry_after_cap(),
-        policy.safety(), policy.retry_on(), policy.observer(), policy.max_delay());
-    assert_eq!(policy.backoff_delay(0), Duration::ZERO);
-    assert_eq!(policy.retry_delay(1, None), Duration::from_millis(50));
-    assert!(policy.allows_method(&Method::POST, true));
-    assert!(policy.should_retry_status(StatusCode::SERVICE_UNAVAILABLE));
-    assert!(policy.should_retry_reason(RetryReason::Application));
-    assert!(!policy.should_retry_error(&NetError::from(ErrorKind::InvalidInput)));
-    assert!(policy.can_retry_attempt(2));
-    assert!(!policy.can_retry_attempt(0));
-}
-```
-
-## Builder and alias example
-
-Every alias below replaces the same field as its unprefixed counterpart. This
-program validates the final settings and checks one invalid attempt count.
-
-```rust
-use open_net::api::http::{Backoff, HttpResponse, RequestSafety, RetryAfterMode, RetryEvent, RetryOn, RetryPolicy, RetryPolicyError};
-use std::time::Duration;
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let policy = RetryPolicy::builder()
-        .max_attempts(2).with_max_attempts(3)
-        .attempt_timeout(Duration::from_secs(1)).with_attempt_timeout(Duration::from_secs(2))
-        .total_deadline(Duration::from_secs(5)).with_total_deadline(Duration::from_secs(6))
-        .backoff(Backoff::None).with_backoff(Backoff::constant(Duration::from_millis(10)))
-        .retry_on(RetryOn::none()).with_retry_on(RetryOn::standard())
-        .retry_after(RetryAfterMode::Ignore).with_retry_after(RetryAfterMode::RespectWithCap)
-        .retry_after_cap(Duration::from_secs(1)).with_retry_after_cap(Duration::from_secs(2))
-        .safety(RequestSafety::Never).with_safety(RequestSafety::Automatic)
-        .observer(|event: &RetryEvent| println!("{event:?}"))
-        .with_observer(|event: &RetryEvent| println!("{event:?}"))
-        .application_predicate(|response: &HttpResponse| response.body.is_empty())
-        .with_application_predicate(|response: &HttpResponse| response.body.is_empty())
+        .with_body_read(true)
+        .with_timeout_phases([TimeoutPhase::Connect, TimeoutPhase::Headers, TimeoutPhase::IdleRead, TimeoutPhase::Attempt]);
+    if !reasons.allows(RetryReason::HttpStatus(StatusCode::SERVICE_UNAVAILABLE))
+        || !reasons.retries_body_read()
+    {
+        return Err(std::io::Error::other("configured retry reasons missing").into());
+    }
+    println!("statuses={:?}, transport={:?}, timeout phases={:?}",
+        reasons.statuses(), reasons.transport(), reasons.timeout_phases());
+    let policy = HttpRetryPolicy::builder()
+        .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+        .retry_on(reasons)
+        .safety(RequestSafety::IdempotencyKey("demo-operation-001".into()))
         .build()?;
-    assert_eq!(policy.max_attempts(), 3);
-    assert_eq!(policy.attempt_timeout(), Some(Duration::from_secs(2)));
-    assert_eq!(policy.total_deadline(), Some(Duration::from_secs(6)));
-    assert_eq!(RetryPolicy::builder().max_attempts(0).build().unwrap_err(), RetryPolicyError::InvalidMaxAttempts);
+    let request = HttpRequest::builder().method(Method::POST).path("/deduplicated-operation")
+        .header("idempotency-key", "demo-operation-001")?
+        .body("payload".into())
+        .retry_setting(RetrySetting::Policy(policy))
+        .build()?;
+    println!("request method: {:?}", request.method);
     Ok(())
 }
 ```
 
-## Custom observer example
+## Classify a business response
 
-The trait callback is synchronous. This offline example calls it directly and
-then through the panic-isolating handle; neither call performs a request.
+`HttpRetryContext<'a>` has public fields `outcome: Result<&'a HttpResponse,
+&'a NetError>`, `attempt: u32`, `elapsed: Duration` and
+`remaining: Option<Duration>`. It borrows the completed attempt; it does not own
+or invoke the final application callback.
 
-```rust
-use open_net::api::http::{RetryEvent, RetryObserver, RetryObserverHandle, RetryReport};
-struct Observer;
-impl RetryObserver for Observer {
-    fn observe(&self, event: &RetryEvent) { println!("{event:?}"); }
-}
-fn main() {
-    Observer.observe(&RetryEvent::AttemptStarted { attempt: 1 });
-    RetryObserverHandle::new(Observer).notify(RetryEvent::Completed(RetryReport::new()));
-}
-```
+Return `Default` to apply built-in rules, `Retry` for a transient business result,
+or `Stop` to veto all retries for that attempt, including an eligible 401 auth
+replay. `Retry` cannot bypass safety, attempt/total limits, cancellation or
+shutdown. A classifier unwind becomes a provider failure. Keep classifiers
+synchronous, read-only and short; asynchronous work belongs elsewhere.
 
-## Installing retry selections example
-
-This offline program constructs configuration and concrete requests. The final
-selection replaces the earlier selection at the same layer.
+This demonstrates a small byte protocol. Production JSON code should parse the
+application's documented business schema. No application-specific business code
+or server contract is built into the SDK.
 
 ```rust
-use open_net::api::http::{HttpClientConfig, HttpRequest, RetryPolicy, RetrySetting};
+use open_net::api::{
+    http::{HttpRetryContext, HttpRetryPolicy, RetryOn},
+    retry::{RetryDecision, RetrySchedule},
+};
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = HttpClientConfig::new("http://127.0.0.1:8080")?
-        .with_default_retry_policy(RetryPolicy::standard());
-    let request = HttpRequest::builder().path("/status")
-        .retry_policy(RetryPolicy::new(1)).retry_setting(RetrySetting::Inherit).build()?;
-    assert_eq!(config.default_retry_policy.max_attempts(), 3);
-    assert_eq!(request.path, "/status");
+    let policy = HttpRetryPolicy::builder()
+        .schedule(RetrySchedule::builder().max_attempts(3).build()?)
+        .retry_on(RetryOn::standard())
+        .classifier(|context: HttpRetryContext<'_>| match context.outcome {
+            Ok(response) if response.body().as_ref() == b"BUSY" => RetryDecision::Retry,
+            Ok(response) if response.body().as_ref() == b"PERMANENT_FAILURE" => RetryDecision::Stop,
+            _ => RetryDecision::Default,
+        })
+        .build()?;
+    println!("business retry attempt limit: {}", policy.schedule().max_attempts());
     Ok(())
 }
 ```
 
-## Individual retry functions
+## Respect Retry-After
 
-The family tables above provide an index and shared behavior. The entries below
-specify each function separately and link to a complete program that demonstrates
-its call. All configuration is local until installed and a request is submitted.
+`RetryAfterMode::Ignore` uses the local delay. `Respect` takes the maximum of the
+already-jittered local delay and a valid server delay. It never caps or shortens a
+server minimum. Missing/invalid hints use the local delay. A hint longer than the
+remaining total budget causes a cancellable wait until total expiry and a timeout;
+it must not trigger an early retry. There is no `PreferServer`, `RespectWithCap`,
+or retry-after cap API.
 
-## `RetryPolicy::no_retry()`
+```rust
+use open_net::api::http::{HttpRetryPolicy, RetryAfterMode};
+use std::time::Duration;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let local = Duration::from_secs(2);
+    let selected = RetryAfterMode::Respect.select(Some(Duration::from_secs(8)), local);
+    if selected != Duration::from_secs(8) {
+        return Err(std::io::Error::other("server minimum was shortened").into());
+    }
+    let policy = HttpRetryPolicy::builder().retry_after(RetryAfterMode::Respect).build()?;
+    println!("mode={:?}, selected={selected:?}", policy.retry_after());
+    Ok(())
+}
+```
+
+## Request settings and callback adapters
+
+`RetrySetting<HttpRetryPolicy>` is the single source of retry selection on a
+request/options value. `Inherit` chooses the client default, `Disabled` explicitly
+uses one attempt, and `Policy(policy)` replaces the whole policy. No hidden
+boolean or separate public `retry_policy` field competes with that choice.
+
+`HttpRequestTrait::retry_setting()` defaults to `Inherit`. `send` and `send_wait`
+use that selection. `send_with_options` and `send_wait_with_options` use the
+explicit options as authoritative; options `Inherit` means the client default,
+not the trait policy. An adapter can deliberately copy `request.retry_setting()`
+into its options before submission. All existing enqueue ownership and once-only
+callback contracts remain in force.
+
+```rust
+use open_net::api::{
+    http::{HttpClientConfig, HttpRequest, HttpRequestId, HttpRequestOptions, HttpRetryPolicy, HttpTimeouts, RetryOn},
+    retry::{RetrySchedule, RetrySetting},
+};
+use std::time::Duration;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let policy = HttpRetryPolicy::builder()
+        .schedule(RetrySchedule::builder().max_attempts(3).build()?)
+        .retry_on(RetryOn::standard()).build()?;
+    let config = HttpClientConfig::new("http://127.0.0.1:8080")?
+        .with_default_retry_policy(policy);
+    let request = HttpRequest::builder().path("/health")
+        .retry_setting(RetrySetting::Inherit).build()?;
+    let options = HttpRequestOptions::new()
+        .with_retry_setting(RetrySetting::Disabled)
+        .with_replayable_body(true)
+        .with_request_id(HttpRequestId(42))
+        .with_timeouts(HttpTimeouts::new().with_total_timeout(Duration::from_secs(5)))?;
+    if config.default_retry_policy.schedule().max_attempts() != 3
+        || !matches!(request.retry_setting(), RetrySetting::Inherit)
+        || !matches!(options.retry_setting(), RetrySetting::Disabled)
+    {
+        return Err(std::io::Error::other("retry setting precedence changed").into());
+    }
+    println!("callback options: {:?}", options.timeouts());
+    let disabled = HttpRetryPolicy::no_retry();
+    println!("safety={:?}, reasons={:?}, observer={:?}",
+        disabled.safety(), disabled.retry_on(), disabled.observer());
+    Ok(())
+}
+```
+
+`HttpRequestOptions` public fields remain `replayable_body: bool` (default `true`)
+and `request_id: Option<HttpRequestId>` (default `None`). Retry selection and
+`HttpTimeouts` are accessed through methods. Durations, custom request IDs,
+headers and admission errors follow their existing validation rules.
+
+## Migration from the previous API
+
+| Previous API | Current API |
+| --- | --- |
+| Imports from `open_net::api::http` for `Backoff`, `RetrySetting`, `RetryContext`, `RetryEvent`, `RetryObserver`, `RetryObserverHandle`, `RetryReport` | Import these common types from `open_net::api::retry`; the old HTTP re-exports are removed |
+| `RetryPolicy`, `RetryPolicyBuilder`, `RetryPolicyError` | `HttpRetryPolicy`, `HttpRetryPolicyBuilder`, common `RetryConfigError` |
+| `RetryPolicy::new(retries)` / policy `max_attempts`, backoff and max-delay setters | `RetrySchedule::builder().max_attempts(retries + 1).backoff(...).build()?`, then policy `.schedule(...)`; validate arithmetic in caller code |
+| Construction: `RetryPolicy::none()` / `no_retry()` | `HttpRetryPolicy::no_retry()`; the `none` alias is removed |
+| Construction: `RetryPolicy::standard()` | No direct constructor. Build a three-attempt schedule with `Backoff::exponential(Duration::from_millis(50), 2.0, Duration::from_secs(30))`, then select `.retry_on(RetryOn::standard())`; the policy's default safety remains Automatic |
+| Configuration: `with_retryable_statuses(statuses)` | Configure the policy builder with `.retry_on(RetryOn::none().with_statuses(statuses))`, or start from the desired existing reason set to preserve other categories |
+| Configuration: `with_transport_errors(enabled)` | Select categories through `RetryOn::with_transport(...)` and buffered body failures through `with_body_read(...)`; no direct boolean shortcut remains |
+| Configuration: `with_non_idempotent(enabled)` | Set builder `.safety(RequestSafety::IdempotentByContract)` for the former true setting, or `.safety(RequestSafety::Automatic)` for false; body replayability still applies |
+| Queries: `RetryPolicy::max_attempts()`, `max_retries()`, `backoff()` | `policy.schedule().max_attempts()`, its value minus one, and `policy.schedule().backoff()`; the validated attempt count is always at least one |
+| Delay queries: `RetryPolicy::backoff_delay(...)`, `retry_delay(...)` | Use `policy.schedule().delay_for(ordinal)?` for the deterministic local delay, then `policy.retry_after().select(server_delay, local_delay)` when needed; there is no single public replacement for the complete runtime jitter/deadline calculation |
+| Reason queries: `should_retry_status(status)`, `should_retry_reason(reason)` | `policy.retry_on().allows(RetryReason::HttpStatus(status))` and `policy.retry_on().allows(reason)` inspect the reason selection; they do not authorize a complete replay |
+| Runtime eligibility queries: `allows_method`, `should_retry_error`, `can_retry_attempt` | Removed without direct public equivalents; runtime combines safety, replayability, error classification, attempt count and deadlines. Inspect `safety()`, `retry_on()` and `schedule()` for configuration only |
+| `Backoff::exponential(initial, max)` / `Backoff::Exponential { initial, max }` | Add the `multiplier` argument/field; `2.0` preserves the previous doubling factor |
+| `Backoff::delay_for(ordinal) -> Duration` | Returns `Result<Duration, RetryConfigError>`; ordinal zero and sequence overflow are errors, and sequence overflow no longer repeats the last value |
+| `RetrySetting::None` | `RetrySetting::Disabled` |
+| `RetrySetting::resolve(&default)` | `RetrySetting<HttpRetryPolicy>::resolve(&default, HttpRetryPolicy::no_retry())` |
+| Request `.retry_policy(...)` / options `.with_retry_policy(...)` | `.retry_setting(RetrySetting::Policy(...))` / `.with_retry_setting(...)` |
+| Trait `retry_policy()` | `retry_setting() -> RetrySetting<HttpRetryPolicy>` |
+| `ApplicationPredicate` and `with_application` | Three-way `HttpRetryPolicyBuilder::classifier` |
+| Policy attempt timeout / total deadline | `HttpTimeouts` |
+| `PreferServer`, `RespectWithCap`, retry-after cap | `Ignore` or `Respect` |
+| HTTP-specific `RetryContext`, report reason/error fields | Common timing context/report; inspect final response/error separately |
+| `HttpCompletion` structure | Adds `retry_report: RetryReport` and `retry_report()`; callers constructing literals must provide it |
+| Response/error report access | New `HttpResponse::retry_report()` and `NetError::retry_report()` return optional borrowed reports |
+
+Old compatibility aliases are intentionally removed. The client setter remains
+`with_default_retry_policy`, now accepting `HttpRetryPolicy`. `request`, `send`,
+`send_wait`, and the explicit-options entry points retain their result/callback
+signatures. [Responses](requests_and_responses.md), completion handles and
+[`NetError`](../retry.md#neterrorretry_report) expose the common report.
+
+## `HttpRetryPolicy::no_retry()`
 
 ### Required features
 
@@ -619,12 +360,12 @@ its call. All configuration is local until installed and a request is submitted.
 ### Function signature
 
 ```text
-RetryPolicy::no_retry() -> Self
+HttpRetryPolicy::no_retry() -> Self
 ```
 
 ### Steps
 
-Create the policy or builder, configure if needed, and install the result before sending.
+Construct a one-attempt policy.
 
 ### Parameters
 
@@ -636,17 +377,17 @@ None.
 
 ### Return values
 
-A policy with one attempt, empty reasons, no delay or deadlines, and Automatic safety.
+One attempt, no built-in retry reasons, Automatic safety, Ignore server delay, and no classifier/observer.
 
 ### Errors and behavior
 
-Infallible. The first attempt still runs.
+This is also the default. Authentication replay requires another available attempt.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#request-settings-and-callback-adapters).
 
-## `RetryPolicy::none()`
+## `HttpRetryPolicy::builder()`
 
 ### Required features
 
@@ -655,12 +396,12 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::none() -> Self
+HttpRetryPolicy::builder() -> HttpRetryPolicyBuilder
 ```
 
 ### Steps
 
-Create the policy or builder, configure if needed, and install the result before sending.
+Create a builder, select schedule and reasons, then build.
 
 ### Parameters
 
@@ -672,17 +413,17 @@ None.
 
 ### Return values
 
-The same disabled policy as no_retry().
+A builder initialized from `no_retry()`.
 
 ### Errors and behavior
 
-Infallible alias of no_retry().
+Selecting a multi-attempt schedule alone does not enable HTTP reasons.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#retry-a-transient-endpoint).
 
-## `RetryPolicy::new()`
+## `HttpRetryPolicy::schedule()`
 
 ### Required features
 
@@ -691,48 +432,12 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::new(max_retries: u32) -> Self
+HttpRetryPolicy::schedule(&self) -> &RetrySchedule
 ```
 
 ### Steps
 
-Create the policy or builder, configure if needed, and install the result before sending.
-
-### Parameters
-
-`max_retries`: retries after the first attempt. Zero disables retries; values above 32 are clamped.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-A policy with at most 33 total attempts.
-
-### Errors and behavior
-
-Infallible. Positive values use standard transient reasons and exponential delay from 50 ms to 30 s without jitter. No deadlines are installed.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::standard()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::standard() -> Self
-```
-
-### Steps
-
-Create the policy or builder, configure if needed, and install the result before sending.
+Read the immutable schedule.
 
 ### Parameters
 
@@ -744,17 +449,17 @@ None.
 
 ### Return values
 
-new(2): three total attempts.
+A borrowed shared retry schedule.
 
 ### Errors and behavior
 
-Infallible. Default::default() instead returns no_retry().
+Configuration only; running counters are available in a report.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#classify-a-business-response).
 
-## `RetryPolicy::builder()`
+## `HttpRetryPolicy::retry_on()`
 
 ### Required features
 
@@ -763,12 +468,12 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::builder() -> RetryPolicyBuilder
+HttpRetryPolicy::retry_on(&self) -> &RetryOn
 ```
 
 ### Steps
 
-Create the policy or builder, configure if needed, and install the result before sending.
+Read built-in reason selection.
 
 ### Parameters
 
@@ -780,17 +485,17 @@ None.
 
 ### Return values
 
-An unvalidated builder with one attempt, no reasons or delay, no deadlines, Ignore server delay and Automatic safety.
+A borrowed configured reason set.
 
 ### Errors and behavior
 
-Infallible. Call build() to validate after setting fields.
+Classifier decisions can override built-in classification within safety and budget limits.
 
 ### Example
 
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
+See the complete [example](#request-settings-and-callback-adapters).
 
-## `RetryPolicy::max_retries()`
+## `HttpRetryPolicy::retry_after()`
 
 ### Required features
 
@@ -799,16 +504,16 @@ Run the complete [builder and alias example](#builder-and-alias-example), which 
 ### Function signature
 
 ```text
-RetryPolicy::max_retries(&self) -> u32
+HttpRetryPolicy::retry_after(&self) -> RetryAfterMode
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Read server-delay handling.
 
 ### Parameters
 
-No explicit arguments.
+None.
 
 ### Callback parameters
 
@@ -816,17 +521,17 @@ None.
 
 ### Return values
 
-Retry budget excluding the first attempt.
+`Ignore` or `Respect`.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+The default is `Ignore`.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#respect-retry-after).
 
-## `RetryPolicy::max_attempts()`
+## `HttpRetryPolicy::safety()`
 
 ### Required features
 
@@ -835,16 +540,16 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::max_attempts(&self) -> u32
+HttpRetryPolicy::safety(&self) -> &RequestSafety
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Read the replay-safety declaration.
 
 ### Parameters
 
-No explicit arguments.
+None.
 
 ### Callback parameters
 
@@ -852,17 +557,17 @@ None.
 
 ### Return values
 
-Total attempt budget including the first attempt.
+A borrowed safety value.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+Debug output redacts an idempotency key. The declaration does not inject it into the request.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#request-settings-and-callback-adapters).
 
-## `RetryPolicy::attempt_timeout()`
+## `HttpRetryPolicy::observer()`
 
 ### Required features
 
@@ -871,16 +576,16 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::attempt_timeout(&self) -> Option<Duration>
+HttpRetryPolicy::observer(&self) -> Option<RetryObserverHandle>
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Clone a handle to the installed observer when needed.
 
 ### Parameters
 
-No explicit arguments.
+None.
 
 ### Callback parameters
 
@@ -888,17 +593,17 @@ None.
 
 ### Return values
 
-Explicit legacy per-attempt duration, or None when unset.
+An optional common observer handle.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+Clones share the observer only; they do not share request counters.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#request-settings-and-callback-adapters).
 
-## `RetryPolicy::total_deadline()`
+## `HttpRetryPolicyBuilder::schedule()`
 
 ### Required features
 
@@ -907,16 +612,16 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::total_deadline(&self) -> Option<Duration>
+HttpRetryPolicyBuilder::schedule(self, schedule: RetrySchedule) -> Self
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Build a validated shared schedule and install it.
 
 ### Parameters
 
-No explicit arguments.
+`schedule`: complete attempt/backoff/jitter settings.
 
 ### Callback parameters
 
@@ -924,17 +629,17 @@ None.
 
 ### Return values
 
-Explicit legacy operation deadline, or None when unset.
+The updated builder.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+Replaces the schedule; reason selection, safety and timeout configuration remain separate.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#retry-a-transient-endpoint).
 
-## `RetryPolicy::backoff()`
+## `HttpRetryPolicyBuilder::retry_on()`
 
 ### Required features
 
@@ -943,16 +648,16 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::backoff(&self) -> &Backoff
+HttpRetryPolicyBuilder::retry_on(self, retry_on: RetryOn) -> Self
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Choose built-in retry reasons.
 
 ### Parameters
 
-No explicit arguments.
+`retry_on`: the complete reason set.
 
 ### Callback parameters
 
@@ -960,17 +665,17 @@ None.
 
 ### Return values
 
-Borrowed delay rule.
+The updated builder.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+The last setter replaces the prior reason set. Safety and budgets still apply.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#built-in-reasons-and-replay-safety).
 
-## `RetryPolicy::retry_after()`
+## `HttpRetryPolicyBuilder::retry_after()`
 
 ### Required features
 
@@ -979,16 +684,16 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::retry_after(&self) -> RetryAfterMode
+HttpRetryPolicyBuilder::retry_after(self, mode: RetryAfterMode) -> Self
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Select whether valid server delay hints are respected.
 
 ### Parameters
 
-No explicit arguments.
+`mode`: `Ignore` or `Respect`.
 
 ### Callback parameters
 
@@ -996,17 +701,17 @@ None.
 
 ### Return values
 
-Copied server-delay mode.
+The updated builder.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+Respect uses a lower bound after jitter and never shortens a server minimum.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#respect-retry-after).
 
-## `RetryPolicy::retry_after_cap()`
+## `HttpRetryPolicyBuilder::safety()`
 
 ### Required features
 
@@ -1015,16 +720,16 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::retry_after_cap(&self) -> Option<Duration>
+HttpRetryPolicyBuilder::safety(self, safety: RequestSafety) -> Self
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Declare the endpoint replay contract.
 
 ### Parameters
 
-No explicit arguments.
+`safety`: Never, Automatic, contract-idempotent or a nonempty idempotency key.
 
 ### Callback parameters
 
@@ -1032,17 +737,17 @@ None.
 
 ### Return values
 
-Explicit server-delay cap, or None; RespectWithCap then falls back to max_delay in retry_delay().
+The updated builder.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+An empty key fails `build()`. Replay still requires a replayable body.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
+See the complete [example](#built-in-reasons-and-replay-safety).
 
-## `RetryPolicy::safety()`
+## `HttpRetryPolicyBuilder::observer()`
 
 ### Required features
 
@@ -1051,16 +756,89 @@ Run the complete [policy inspection example](#offline-policy-inspection-example)
 ### Function signature
 
 ```text
-RetryPolicy::safety(&self) -> &RequestSafety
+HttpRetryPolicyBuilder::observer(self, observer: impl RetryObserver) -> Self
 ```
 
 ### Steps
 
-Borrow an existing policy and read the configured value.
+Install a short read-only event observer.
 
 ### Parameters
 
-No explicit arguments.
+`observer`: a thread-safe `RetryObserver` or compatible closure.
+
+### Callback parameters
+
+`&RetryEvent`; returns `()`.
+
+### Return values
+
+The updated builder.
+
+### Errors and behavior
+
+Notifications are synchronous; unwinds are isolated/logged. The observer cannot change the result.
+
+### Example
+
+See the complete [example](#retry-a-transient-endpoint).
+
+## `HttpRetryPolicyBuilder::classifier()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpRetryPolicyBuilder::classifier<F>(self, classifier: F) -> Self
+where F: for<'a> Fn(HttpRetryContext<'a>) -> RetryDecision + Send + Sync + 'static
+```
+
+### Steps
+
+Install a read-only buffered-attempt classifier.
+
+### Parameters
+
+`classifier`: returns Default, Retry or Stop.
+
+### Callback parameters
+
+`HttpRetryContext` by value with borrowed outcome; returns `RetryDecision`.
+
+### Return values
+
+The updated builder.
+
+### Errors and behavior
+
+Stop vetoes built-in/auth retry. Retry cannot bypass safety or budgets. A panic is converted to provider failure. Streaming bodies are not buffered for this hook.
+
+### Example
+
+See the complete [example](#classify-a-business-response).
+
+## `HttpRetryPolicyBuilder::build()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpRetryPolicyBuilder::build(self) -> Result<HttpRetryPolicy, RetryConfigError>
+```
+
+### Steps
+
+Validate protocol-specific settings and retain the completed policy.
+
+### Parameters
+
+None.
 
 ### Callback parameters
 
@@ -1068,1491 +846,15 @@ None.
 
 ### Return values
 
-Borrowed replay declaration.
+An HTTP policy or common configuration error.
 
 ### Errors and behavior
 
-Infallible; reading configuration does not schedule retries or reserve capacity.
+An empty declared idempotency key is rejected. Schedule validation has already occurred in `RetryScheduleBuilder::build`.
 
 ### Example
 
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::retry_on()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::retry_on(&self) -> &RetryOn
-```
-
-### Steps
-
-Borrow an existing policy and read the configured value.
-
-### Parameters
-
-No explicit arguments.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Borrowed reason classifier.
-
-### Errors and behavior
-
-Infallible; reading configuration does not schedule retries or reserve capacity.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::observer()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::observer(&self) -> Option<RetryObserverHandle>
-```
-
-### Steps
-
-Borrow an existing policy and read the configured value.
-
-### Parameters
-
-No explicit arguments.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Cloned shared observer handle, or None if absent.
-
-### Errors and behavior
-
-Infallible; reading configuration does not schedule retries or reserve capacity.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::max_delay()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::max_delay(&self) -> Duration
-```
-
-### Steps
-
-Borrow an existing policy and read the configured value.
-
-### Parameters
-
-No explicit arguments.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Configured upper bound for backoff_delay(). PreferServer can select a larger server delay.
-
-### Errors and behavior
-
-Infallible; reading configuration does not schedule retries or reserve capacity.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::with_max_retries()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::with_max_retries(self, max_retries: u32) -> Self
-```
-
-### Steps
-
-Apply to an existing policy and retain the returned value.
-
-### Parameters
-
-`max_retries`: retries after the first attempt.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated policy.
-
-### Errors and behavior
-
-Infallible configuration. Clamps to 32 and updates total attempts; does not populate reason sets or change backoff.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::with_retryable_statuses()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::with_retryable_statuses(self, statuses: impl IntoIterator<Item = StatusCode>) -> Self
-```
-
-### Steps
-
-Apply to an existing policy and retain the returned value.
-
-### Parameters
-
-`statuses`: the complete replacement status set.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated policy.
-
-### Errors and behavior
-
-Infallible configuration. Empty disables status retries while preserving other reasons.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::with_transport_errors()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::with_transport_errors(self, enabled: bool) -> Self
-```
-
-### Steps
-
-Apply to an existing policy and retain the returned value.
-
-### Parameters
-
-`enabled`: whether to enable compatibility transport retries.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated policy.
-
-### Errors and behavior
-
-Infallible configuration. False clears transport categories and the body-read flag. True restores standard transport categories only if empty; it does not re-enable the separate body-read flag.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::with_non_idempotent()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::with_non_idempotent(self, enabled: bool) -> Self
-```
-
-### Steps
-
-Apply to an existing policy and retain the returned value.
-
-### Parameters
-
-`enabled`: whether the application asserts idempotence for other methods.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated policy.
-
-### Errors and behavior
-
-Infallible configuration. True selects IdempotentByContract, false Automatic. This does not bypass body replayability checks or add a server idempotency key.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::with_max_delay()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::with_max_delay(self, max_delay: Duration) -> Self
-```
-
-### Steps
-
-Apply to an existing policy and retain the returned value.
-
-### Parameters
-
-`max_delay`: backoff bound with explicit Rust units.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated policy.
-
-### Errors and behavior
-
-Infallible configuration. Zero is ignored. Nonzero replaces the bound; PreferServer can still select a larger delay.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::with_application_predicate()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::with_application_predicate(self, predicate: impl Fn(&HttpResponse) -> bool + Send + Sync + 'static) -> Self
-```
-
-### Steps
-
-Apply to an existing policy and retain the returned value.
-
-### Parameters
-
-`predicate`: owned thread-safe closure retained by the policy.
-
-### Callback parameters
-
-`predicate: Fn(&HttpResponse) -> bool + Send + Sync + 'static` receives a fully buffered response; true selects an application retry only if reason, attempt and safety checks permit it. It is not evaluated on a delivered stream. Keep it nonblocking and do not assume panic isolation.
-
-### Return values
-
-The updated policy.
-
-### Errors and behavior
-
-Infallible configuration. Replaces the predicate and enables the Application reason. Does not change method safety or attempt budget.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::backoff_delay()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::backoff_delay(&self, retry_ordinal: u32) -> Duration
-```
-
-### Steps
-
-Call on a configured policy before interpreting a candidate retry.
-
-### Parameters
-
-`retry_ordinal`: one-based retry number; zero denotes no retry.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-A Duration capped by max_delay.
-
-### Errors and behavior
-
-Infallible. Zero ordinal returns zero; computes only, without sleeping.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::retry_delay()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::retry_delay(&self, retry_ordinal: u32, server_delay: Option<Duration>) -> Duration
-```
-
-### Steps
-
-Call on a configured policy before interpreting a candidate retry.
-
-### Parameters
-
-`retry_ordinal`: retry number; `server_delay`: parsed server hint or None.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Duration selected from backoff and server mode.
-
-### Errors and behavior
-
-Infallible. Ignore uses backoff; PreferServer uses a present server hint without a cap; RespectWithCap uses its explicit cap or max_delay. The hint does not authorize replay.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::allows_method()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::allows_method(&self, method: &Method, replayable_body: bool) -> bool
-```
-
-### Steps
-
-Call on a configured policy before interpreting a candidate retry.
-
-### Parameters
-
-`method`: candidate method; `replayable_body`: whether the body can be recreated.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Whether the method-safety declaration allows replay.
-
-### Errors and behavior
-
-Infallible. This checks safety only. Automatic recognizes GET/HEAD/OPTIONS/PUT/DELETE even with replayable_body=false; the worker separately refuses a required non-replayable body.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::should_retry_status()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::should_retry_status(&self, status: StatusCode) -> bool
-```
-
-### Steps
-
-Call on a configured policy before interpreting a candidate retry.
-
-### Parameters
-
-`status`: response code to classify.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Whether the code belongs to the policy status set.
-
-### Errors and behavior
-
-Infallible. Does not inspect attempt budget, body safety or deadlines.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::should_retry_reason()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::should_retry_reason(&self, reason: RetryReason) -> bool
-```
-
-### Steps
-
-Call on a configured policy before interpreting a candidate retry.
-
-### Parameters
-
-`reason`: category to classify.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Whether the reason classifier permits the category.
-
-### Errors and behavior
-
-Infallible. RetryAfter is never sufficient by itself; classification does not execute work.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::should_retry_error()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::should_retry_error(&self, error: &NetError) -> bool
-```
-
-### Steps
-
-Call on a configured policy before interpreting a candidate retry.
-
-### Parameters
-
-`error`: HTTP worker error or another NetError.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Whether the retained typed error evidence or fallback kind/stage matches allowed categories.
-
-### Errors and behavior
-
-Infallible. Application and RetryAfter do not become retryable transport evidence. Classification alone is not a replay decision.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicy::can_retry_attempt()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicy::can_retry_attempt(&self, attempt: u32) -> bool
-```
-
-### Steps
-
-Call on a configured policy before interpreting a candidate retry.
-
-### Parameters
-
-`attempt`: retry ordinal, despite the parameter name; 1 means the first retry.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-True for 1 through max_retries; false for zero or beyond the budget.
-
-### Errors and behavior
-
-Infallible. This is not the one-based attempt number used in RetryEvent; it checks budget only.
-
-### Example
-
-Run the complete [policy inspection example](#offline-policy-inspection-example), which calls this method.
-
-## `RetryPolicyBuilder::max_attempts()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::max_attempts(self, max_attempts: u32) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`max_attempts`: total attempts, legal range 1 through 33.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default 1. build() returns InvalidMaxAttempts outside that range.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_max_attempts()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_max_attempts(self, max_attempts: u32) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`max_attempts`: total attempts, legal range 1 through 33.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default 1. build() returns InvalidMaxAttempts outside that range. Exact alias of `max_attempts`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::attempt_timeout()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::attempt_timeout(self, timeout: Duration) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`timeout`: positive legacy per-attempt duration.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially unset. Zero fails build() with ZeroAttemptTimeout; clock range is checked at timeout resolution. Explicit HttpTimeouts overrides or disables this fallback.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_attempt_timeout()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_attempt_timeout(self, timeout: Duration) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`timeout`: positive legacy per-attempt duration.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially unset. Zero fails build() with ZeroAttemptTimeout; clock range is checked at timeout resolution. Explicit HttpTimeouts overrides or disables this fallback. Exact alias of `attempt_timeout`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::total_deadline()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::total_deadline(self, deadline: Duration) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`deadline`: positive legacy operation-wide duration.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially unset. Zero fails build() with ZeroTotalDeadline; explicit HttpTimeouts can replace or disable the fallback.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_total_deadline()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_total_deadline(self, deadline: Duration) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`deadline`: positive legacy operation-wide duration.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially unset. Zero fails build() with ZeroTotalDeadline; explicit HttpTimeouts can replace or disable the fallback. Exact alias of `total_deadline`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::backoff()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::backoff(self, backoff: Backoff) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`backoff`: complete replacement delay rule.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default None. build() rejects empty sequences and exponential maximum below initial. Zero delay is allowed.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_backoff()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_backoff(self, backoff: Backoff) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`backoff`: complete replacement delay rule.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default None. build() rejects empty sequences and exponential maximum below initial. Zero delay is allowed. Exact alias of `backoff`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::retry_on()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::retry_on(self, retry_on: RetryOn) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`retry_on`: complete replacement reason classifier.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default none(). This replaces every category, so calling after application_predicate can disable Application again.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_retry_on()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_retry_on(self, retry_on: RetryOn) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`retry_on`: complete replacement reason classifier.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default none(). This replaces every category, so calling after application_predicate can disable Application again. Exact alias of `retry_on`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::retry_after()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::retry_after(self, mode: RetryAfterMode) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`mode`: Ignore, PreferServer, or RespectWithCap.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default Ignore. A server delay never independently authorizes replay.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_retry_after()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_retry_after(self, mode: RetryAfterMode) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`mode`: Ignore, PreferServer, or RespectWithCap.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default Ignore. A server delay never independently authorizes replay. Exact alias of `retry_after`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::retry_after_cap()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::retry_after_cap(self, cap: Duration) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`cap`: positive server-delay cap.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially unset. build() rejects zero with ZeroRetryAfterCap even if another mode is selected. Applied only by RespectWithCap.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_retry_after_cap()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_retry_after_cap(self, cap: Duration) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`cap`: positive server-delay cap.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially unset. build() rejects zero with ZeroRetryAfterCap even if another mode is selected. Applied only by RespectWithCap. Exact alias of `retry_after_cap`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::safety()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::safety(self, safety: RequestSafety) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`safety`: application replay declaration.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default Automatic. IdempotencyKey does not insert a header; supply the server key yourself.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_safety()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_safety(self, safety: RequestSafety) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`safety`: application replay declaration.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Default Automatic. IdempotencyKey does not insert a header; supply the server key yourself. Exact alias of `safety`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::observer()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::observer(self, observer: impl RetryObserver) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`observer`: owned thread-safe observer.
-
-### Callback parameters
-
-`observer` implements `RetryObserver: Send + Sync + 'static` and receives `&RetryEvent`, returning (). The policy retains it; invocation is synchronous and handle notification catches unwinding panics. Keep it short and nonblocking.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially absent. Replacement drops this builder's old reference; retained policy clones may still share it.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_observer()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_observer(self, observer: impl RetryObserver) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`observer`: owned thread-safe observer.
-
-### Callback parameters
-
-`observer` implements `RetryObserver: Send + Sync + 'static` and receives `&RetryEvent`, returning (). The policy retains it; invocation is synchronous and handle notification catches unwinding panics. Keep it short and nonblocking.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially absent. Replacement drops this builder's old reference; retained policy clones may still share it. Exact alias of `observer`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::application_predicate()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::application_predicate(self, predicate: impl Fn(&HttpResponse) -> bool + Send + Sync + 'static) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`predicate`: owned thread-safe predicate.
-
-### Callback parameters
-
-`predicate: Fn(&HttpResponse) -> bool + Send + Sync + 'static` receives a fully buffered response; true selects an application retry only if reason, attempt and safety checks permit it. It is not evaluated on a delivered stream. Keep it nonblocking and do not assume panic isolation.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially absent. Replaces the callback and enables the Application reason.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::with_application_predicate()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::with_application_predicate(self, predicate: impl Fn(&HttpResponse) -> bool + Send + Sync + 'static) -> Self
-```
-
-### Steps
-
-Apply the setter, retain the returned builder, then call build().
-
-### Parameters
-
-`predicate`: owned thread-safe predicate.
-
-### Callback parameters
-
-`predicate: Fn(&HttpResponse) -> bool + Send + Sync + 'static` receives a fully buffered response; true selects an application retry only if reason, attempt and safety checks permit it. It is not evaluated on a delivered stream. Keep it nonblocking and do not assume panic isolation.
-
-### Return values
-
-The updated unvalidated builder.
-
-### Errors and behavior
-
-No immediate Result error; the last setter of this field wins. Initially absent. Replaces the callback and enables the Application reason. Exact alias of `application_predicate`.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `RetryPolicyBuilder::build()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryPolicyBuilder::build(self) -> Result<RetryPolicy, RetryPolicyError>
-```
-
-### Steps
-
-Finish the builder and handle the result before installation.
-
-### Parameters
-
-Consumes the builder; no explicit arguments.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Validated RetryPolicy, or RetryPolicyError.
-
-### Errors and behavior
-
-Rejects InvalidMaxAttempts, EmptyBackoffSequence, InvalidBackoff, ZeroAttemptTimeout, ZeroTotalDeadline and ZeroRetryAfterCap as listed above. No request is started.
-
-### Example
-
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
-
-## `Backoff::constant()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-Backoff::constant(delay: Duration) -> Self
-```
-
-### Steps
-
-Construct the delay rule, install on a policy builder and validate with build().
-
-### Parameters
-
-`delay`: fixed duration; zero is permitted.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Constant(delay).
-
-### Errors and behavior
-
-Infallible constructor. No validation failure.
-
-### Example
-
-Run the complete [delay selection program](#backoff-and-retryaftermode).
-
-## `Backoff::exponential()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-Backoff::exponential(initial: Duration, max: Duration) -> Self
-```
-
-### Steps
-
-Construct the delay rule, install on a policy builder and validate with build().
-
-### Parameters
-
-`initial`: first delay; `max`: cap, both explicit durations.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Exponential { initial, max }.
-
-### Errors and behavior
-
-Infallible constructor. Reversed bounds fail later at policy build, not here. Delay doubles with saturation.
-
-### Example
-
-Run the complete [delay selection program](#backoff-and-retryaftermode).
-
-## `Backoff::sequence()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-Backoff::sequence(delays: impl IntoIterator<Item = Duration>) -> Self
-```
-
-### Steps
-
-Construct the delay rule, install on a policy builder and validate with build().
-
-### Parameters
-
-`delays`: finite sequence consumed into owned storage.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Sequence of collected durations.
-
-### Errors and behavior
-
-Infallible constructor. An empty sequence fails policy build. Reuses the last value after the sequence ends; zero values are permitted.
-
-### Example
-
-Run the complete [delay selection program](#backoff-and-retryaftermode).
-
-## `Backoff::delay_for()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-Backoff::delay_for(&self, retry_ordinal: u32) -> Duration
-```
-
-### Steps
-
-Read the chosen delay for an upcoming retry.
-
-### Parameters
-
-`retry_ordinal`: one-based retry number.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The raw backoff delay.
-
-### Errors and behavior
-
-Infallible; ordinal zero returns zero. Exponential calculation caps its shift at 31, so ordinals above 32 reuse the 32nd exponential delay even if below the configured maximum. An unvalidated empty Sequence returns zero here, although policy build rejects it. Computes a Duration without sleeping. The policy may additionally cap this value.
-
-### Example
-
-Run the complete [delay selection program](#backoff-and-retryaftermode).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryAfterMode::select()`
 
@@ -2563,16 +865,16 @@ Run the complete [delay selection program](#backoff-and-retryaftermode).
 ### Function signature
 
 ```text
-RetryAfterMode::select(self, server_delay: Option<Duration>, backoff_delay: Duration, cap: Option<Duration>) -> Duration
+RetryAfterMode::select(self, server_delay: Option<Duration>, backoff_delay: Duration) -> Duration
 ```
 
 ### Steps
 
-Choose a mode, then pass the parsed hint and fallback delay.
+Combine a parsed server hint with the already-jittered local delay.
 
 ### Parameters
 
-`server_delay`: valid hint or None; `backoff_delay`: fallback; `cap`: optional bound.
+`server_delay`: optional hint; `backoff_delay`: computed local delay.
 
 ### Callback parameters
 
@@ -2580,15 +882,15 @@ None.
 
 ### Return values
 
-The selected Duration.
+The local delay for Ignore/no hint, otherwise their maximum.
 
 ### Errors and behavior
 
-Infallible. Ignore selects backoff. PreferServer selects a present hint without clipping. RespectWithCap clips the selected hint or fallback if cap is Some. This function does not parse HTTP headers or sleep.
+Pure calculation. The executor separately enforces cancellation and the total deadline; it never sends early when the selected delay exceeds remaining time.
 
 ### Example
 
-Run the complete [delay selection program](#backoff-and-retryaftermode).
+See the complete [example](#respect-retry-after).
 
 ## `RetryOn::standard()`
 
@@ -2604,7 +906,7 @@ RetryOn::standard() -> Self
 
 ### Steps
 
-Construct the standard reasons and install them on a policy builder.
+Use the documented conservative transient reason set.
 
 ### Parameters
 
@@ -2616,15 +918,15 @@ None.
 
 ### Return values
 
-Statuses 408/425/429/500/502/503/504; transport Dns/Connect/TimeoutBeforeSend/ReadReset/BodyRead; body-read enabled, application disabled.
+Standard statuses, transport categories and body-read selection.
 
 ### Errors and behavior
 
-Infallible. Excludes TLS, write, protocol and unknown-delivery categories.
+Does not supply an attempt budget or safety declaration.
 
 ### Example
 
-Run the complete [builder and alias example](#builder-and-alias-example), which calls this method and validates the final policy.
+See the complete [example](#retry-a-transient-endpoint).
 
 ## `RetryOn::none()`
 
@@ -2640,7 +942,7 @@ RetryOn::none() -> Self
 
 ### Steps
 
-Start from no reasons and add only the categories required by the endpoint.
+Start an explicit reason configuration from empty sets.
 
 ### Parameters
 
@@ -2652,15 +954,15 @@ None.
 
 ### Return values
 
-Empty status/transport sets and false body/application flags.
+No statuses, transport categories or body-read retry.
 
 ### Errors and behavior
 
-Infallible. Setting a reason later still does not increase the attempt budget.
+This is the policy builder default; classifiers remain independently configurable.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryOn::with_statuses()`
 
@@ -2676,11 +978,11 @@ RetryOn::with_statuses(self, statuses: impl IntoIterator<Item = StatusCode>) -> 
 
 ### Steps
 
-Apply to a reason set and retain the returned value.
+Replace the HTTP status selection.
 
 ### Parameters
 
-`statuses`: complete status list.
+`statuses`: statuses eligible for retry.
 
 ### Callback parameters
 
@@ -2688,15 +990,15 @@ None.
 
 ### Return values
 
-Updated reason set.
+The updated reason set.
 
 ### Errors and behavior
 
-Infallible. Replaces status membership; empty disables status retries.
+Other categories are preserved. A retry still requires remaining budget and replay permission.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryOn::with_transport()`
 
@@ -2712,11 +1014,11 @@ RetryOn::with_transport(self, reasons: impl IntoIterator<Item = TransportErrorKi
 
 ### Steps
 
-Apply to a reason set and retain the returned value.
+Replace transport reason selection.
 
 ### Parameters
 
-`reasons`: complete transport category list.
+`reasons`: eligible transport categories.
 
 ### Callback parameters
 
@@ -2724,15 +1026,15 @@ None.
 
 ### Return values
 
-Updated reason set.
+The updated reason set.
 
 ### Errors and behavior
 
-Infallible. Replaces transport membership independently of the body-read flag.
+Other categories are preserved. DeliveryUnknown does not override request safety.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryOn::with_body_read()`
 
@@ -2748,11 +1050,11 @@ RetryOn::with_body_read(self, enabled: bool) -> Self
 
 ### Steps
 
-Apply to a reason set and retain the returned value.
+Enable or disable buffered body-read retry.
 
 ### Parameters
 
-`enabled`: dedicated body-read reason flag.
+`enabled`: whether body-read failures are eligible.
 
 ### Callback parameters
 
@@ -2760,51 +1062,15 @@ None.
 
 ### Return values
 
-Updated reason set.
+The updated reason set.
 
 ### Errors and behavior
 
-Infallible. Controls BodyRead reason; a separately selected Transport(BodyRead) can also be considered by worker error classification.
+A failed body remains an error even if HTTP status was 200. A returned stream is never replayed.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
-
-## `RetryOn::with_application()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryOn::with_application(self, enabled: bool) -> Self
-```
-
-### Steps
-
-Apply to a reason set and retain the returned value.
-
-### Parameters
-
-`enabled`: application reason flag.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Updated reason set.
-
-### Errors and behavior
-
-Infallible. True also needs an installed predicate and other retry checks. False disables that reason even with a stored predicate.
-
-### Example
-
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryOn::allows()`
 
@@ -2820,11 +1086,11 @@ RetryOn::allows(&self, reason: RetryReason) -> bool
 
 ### Steps
 
-Inspect the configured reason set.
+Inspect reason membership.
 
 ### Parameters
 
-`reason`: candidate reason.
+`reason`: an HTTP status, transport, body-read or other classification.
 
 ### Callback parameters
 
@@ -2832,15 +1098,15 @@ None.
 
 ### Return values
 
-Whether it matches the configured categories.
+Whether that reason belongs to the set.
 
 ### Errors and behavior
 
-Infallible. RetryAfter always returns false.
+Application and RetryAfter return false; application scheduling uses a classifier and RetryAfter only adjusts delay.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryOn::statuses()`
 
@@ -2856,11 +1122,11 @@ RetryOn::statuses(&self) -> &[StatusCode]
 
 ### Steps
 
-Inspect the configured reason set.
+Inspect the selected HTTP statuses.
 
 ### Parameters
 
-No explicit arguments.
+None.
 
 ### Callback parameters
 
@@ -2868,15 +1134,15 @@ None.
 
 ### Return values
 
-Borrowed status slice.
+A borrowed status slice.
 
 ### Errors and behavior
 
-Infallible. An empty slice means no status membership.
+No mutation or execution occurs.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryOn::transport()`
 
@@ -2892,11 +1158,11 @@ RetryOn::transport(&self) -> &[TransportErrorKind]
 
 ### Steps
 
-Inspect the configured reason set.
+Inspect the selected transport categories.
 
 ### Parameters
 
-No explicit arguments.
+None.
 
 ### Callback parameters
 
@@ -2904,15 +1170,15 @@ None.
 
 ### Return values
 
-Borrowed transport category slice.
+A borrowed category slice.
 
 ### Errors and behavior
 
-Infallible. The dedicated body-read flag is separate.
+No mutation or execution occurs.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `RetryOn::retries_body_read()`
 
@@ -2928,11 +1194,11 @@ RetryOn::retries_body_read(&self) -> bool
 
 ### Steps
 
-Inspect the configured reason set.
+Read the explicit body-read toggle.
 
 ### Parameters
 
-No explicit arguments.
+None.
 
 ### Callback parameters
 
@@ -2940,87 +1206,15 @@ None.
 
 ### Return values
 
-The dedicated body-read flag.
+Whether the body-read category is selected.
 
 ### Errors and behavior
 
-Infallible. Transport(BodyRead) is configured separately.
+The transport category BodyRead can also select a body-read retry; replay safety and budgets still apply.
 
 ### Example
 
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
-
-## `RetryOn::retries_application()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryOn::retries_application(&self) -> bool
-```
-
-### Steps
-
-Inspect the configured reason set.
-
-### Parameters
-
-No explicit arguments.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-The application reason flag.
-
-### Errors and behavior
-
-Infallible. A true flag alone does not supply a predicate.
-
-### Example
-
-Run the complete [reason selection program](#retryon-retryreason-transporterrorkind-and-requestsafety).
-
-## `RetrySetting::resolve()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetrySetting::resolve(&self, default: &RetryPolicy) -> RetryPolicy
-```
-
-### Steps
-
-Resolve a selection against the client policy.
-
-### Parameters
-
-`default`: borrowed client policy used for Inherit.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-A cloned default for Inherit, no_retry() for None, or cloned explicit Policy.
-
-### Errors and behavior
-
-Infallible; resolution neither changes the source policy nor sends a request.
-
-### Example
-
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
+See the complete [example](#built-in-reasons-and-replay-safety).
 
 ## `HttpRequestOptions::new()`
 
@@ -3036,7 +1230,7 @@ HttpRequestOptions::new() -> Self
 
 ### Steps
 
-Construct options before passing them to send_with_options or send_wait_with_options.
+Create options for an explicit-options callback submission.
 
 ### Parameters
 
@@ -3048,51 +1242,15 @@ None.
 
 ### Return values
 
-Options with Inherit, replayable_body=true, no request ID and inheriting timeouts.
+Inherit retry/timeouts, replayable body true, and no custom request ID.
 
 ### Errors and behavior
 
-Infallible. Use setters rather than struct literals because inheritance metadata is private.
+Explicit options are authoritative over the trait retry setting.
 
 ### Example
 
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
-
-## `HttpRequestOptions::with_retry_policy()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-HttpRequestOptions::with_retry_policy(self, retry_policy: RetryPolicy) -> Self
-```
-
-### Steps
-
-Apply before submitting a callback request and retain the returned options.
-
-### Parameters
-
-`retry_policy`: explicit replacement, including no_retry().
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Updated request options.
-
-### Errors and behavior
-
-Infallible configuration. Selects Policy and disables client-policy inheritance.
-
-### Example
-
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
+See the complete [example](#request-settings-and-callback-adapters).
 
 ## `HttpRequestOptions::with_retry_setting()`
 
@@ -3103,16 +1261,16 @@ Run the complete [request options program](#retrysetting-and-httprequestoptions)
 ### Function signature
 
 ```text
-HttpRequestOptions::with_retry_setting(self, setting: RetrySetting) -> Self
+HttpRequestOptions::with_retry_setting(self, setting: RetrySetting<HttpRetryPolicy>) -> Self
 ```
 
 ### Steps
 
-Apply before submitting a callback request and retain the returned options.
+Choose inherit, disable or full policy replacement.
 
 ### Parameters
 
-`setting`: Inherit, None or Policy.
+`setting`: complete selection for this operation.
 
 ### Callback parameters
 
@@ -3120,87 +1278,15 @@ None.
 
 ### Return values
 
-Updated request options.
+The updated options.
 
 ### Errors and behavior
 
-Infallible configuration. Last selection wins. Inherit restores client-policy inheritance even after an explicit replacement.
+Inherit selects the client default, not the trait policy.
 
 ### Example
 
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
-
-## `HttpRequestOptions::with_replayable_body()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-HttpRequestOptions::with_replayable_body(self, replayable_body: bool) -> Self
-```
-
-### Steps
-
-Apply before submitting a callback request and retain the returned options.
-
-### Parameters
-
-`replayable_body`: whether a fresh body can be produced.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Updated request options.
-
-### Errors and behavior
-
-Infallible configuration. Must reflect the provider contract. Declaring true cannot manufacture a replayable body.
-
-### Example
-
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
-
-## `HttpRequestOptions::with_request_id()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-HttpRequestOptions::with_request_id(self, request_id: HttpRequestId) -> Self
-```
-
-### Steps
-
-Apply before submitting a callback request and retain the returned options.
-
-### Parameters
-
-`request_id`: caller-supplied client-local ID.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Updated request options.
-
-### Errors and behavior
-
-Infallible configuration. Sets Some(id); duplicate active IDs can later reject admission. Automatic allocation is the default when absent.
-
-### Example
-
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
+See the complete [example](#request-settings-and-callback-adapters).
 
 ## `HttpRequestOptions::retry_setting()`
 
@@ -3211,16 +1297,16 @@ Run the complete [request options program](#retrysetting-and-httprequestoptions)
 ### Function signature
 
 ```text
-HttpRequestOptions::retry_setting(&self) -> RetrySetting
+HttpRequestOptions::retry_setting(&self) -> RetrySetting<HttpRetryPolicy>
 ```
 
 ### Steps
 
-Inspect the current options selection.
+Read the authoritative selection.
 
 ### Parameters
 
-No explicit arguments.
+None.
 
 ### Callback parameters
 
@@ -3228,15 +1314,87 @@ None.
 
 ### Return values
 
-A clone of the retry selection.
+A cloned selection.
 
 ### Errors and behavior
 
-Infallible; this is not the policy resolved against a client.
+Cloning the policy never shares operation counters.
 
 ### Example
 
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
+See the complete [example](#request-settings-and-callback-adapters).
+
+## `HttpRequestOptions::with_replayable_body()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpRequestOptions::with_replayable_body(self, replayable: bool) -> Self
+```
+
+### Steps
+
+Declare whether callback request content can be recreated.
+
+### Parameters
+
+`replayable`: false prevents all replay.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The updated options.
+
+### Errors and behavior
+
+A true value does not authorize replay of an unsafe method by itself.
+
+### Example
+
+See the complete [example](#request-settings-and-callback-adapters).
+
+## `HttpRequestOptions::with_request_id()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpRequestOptions::with_request_id(self, id: HttpRequestId) -> Self
+```
+
+### Steps
+
+Choose a local operation identifier before admission.
+
+### Parameters
+
+`id`: custom HTTP request ID.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The updated options.
+
+### Errors and behavior
+
+Duplicate active IDs fail admission and return the unaccepted input. This is unrelated to server idempotency keys.
+
+### Example
+
+See the complete [example](#request-settings-and-callback-adapters).
 
 ## `HttpRequestOptions::with_timeouts()`
 
@@ -3252,11 +1410,11 @@ HttpRequestOptions::with_timeouts(self, timeouts: HttpTimeouts) -> Result<Self, 
 
 ### Steps
 
-Construct overrides and install before callback submission.
+Validate and install request-level timeout settings.
 
 ### Parameters
 
-`timeouts`: complete request override layer.
+`timeouts`: phase overrides or inherited defaults.
 
 ### Callback parameters
 
@@ -3264,15 +1422,15 @@ None.
 
 ### Return values
 
-Updated options or NetError.
+Updated options, or an invalid-input error.
 
 ### Errors and behavior
 
-InvalidInput for zero or clock-unrepresentable explicit durations. Replaces the whole layer; unspecified phases inherit.
+Zero or unrepresentable enabled durations are rejected. Retry policies do not carry timeouts.
 
 ### Example
 
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
+See the complete [example](#request-settings-and-callback-adapters).
 
 ## `HttpRequestOptions::timeouts()`
 
@@ -3288,115 +1446,7 @@ HttpRequestOptions::timeouts(&self) -> &HttpTimeouts
 
 ### Steps
 
-Borrow the installed options layer.
-
-### Parameters
-
-No explicit arguments.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-A reference to explicit overrides.
-
-### Errors and behavior
-
-Infallible; does not expose resolved deadlines.
-
-### Example
-
-Run the complete [request options program](#retrysetting-and-httprequestoptions).
-
-## `ApplicationPredicate::new()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-ApplicationPredicate::new(predicate: impl Fn(&HttpResponse) -> bool + Send + Sync + 'static) -> Self
-```
-
-### Steps
-
-Wrap a thread-safe owned closure. Install predicates using a policy setter accepting a closure.
-
-### Parameters
-
-`predicate`: callback to retain.
-
-### Callback parameters
-
-`predicate: Fn(&HttpResponse) -> bool + Send + Sync + 'static` receives a fully buffered response; true selects an application retry only if reason, attempt and safety checks permit it. It is not evaluated on a delivered stream. Keep it nonblocking and do not assume panic isolation.
-
-### Return values
-
-Cloneable callback wrapper.
-
-### Errors and behavior
-
-Infallible; evaluation is internal. Construction does not perform a request.
-
-### Example
-
-Run the complete [predicate and observation program](#applicationpredicate-and-retry-observation).
-
-## `RetryContext::new()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryContext::new(method: Method, host: impl Into<String>, path: impl AsRef<str>) -> Self
-```
-
-### Steps
-
-Construct a sanitized context value for application bookkeeping.
-
-### Parameters
-
-`method`: method; `host`: URL or host; `path`: request path, optionally with query/fragment.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Context with attempt=1, supplied method, sanitized host/path, empty status/reason/remaining and zero elapsed.
-
-### Errors and behavior
-
-Infallible. Host excludes scheme/credentials/path/query/fragment; path excludes query/fragment. Observers receive RetryEvent, not this context.
-
-### Example
-
-Run the complete [predicate and observation program](#applicationpredicate-and-retry-observation).
-
-## `RetryReport::new()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryReport::new() -> Self
-```
-
-### Steps
-
-Construct a blank report before filling application-owned fields.
+Inspect configured timeout overrides.
 
 ### Parameters
 
@@ -3408,123 +1458,15 @@ None.
 
 ### Return values
 
-Zero attempts/retry_count/elapsed, exhausted=false, no reason or last_error.
+A borrowed timeout settings value.
 
 ### Errors and behavior
 
-Infallible; constructing a report does not observe a live operation.
+Shows overrides rather than a resolved running deadline.
 
 ### Example
 
-Run the complete [custom observer example](#custom-observer-example).
-
-## `RetryObserver::observe()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryObserver::observe(&self, event: &RetryEvent)
-```
-
-### Steps
-
-Implement the trait, then install the observer using a policy builder or handle.
-
-### Parameters
-
-`event`: borrowed attempt/retry/completion event; clone data if retaining it.
-
-### Callback parameters
-
-Receives &RetryEvent. RetryScheduled.attempt identifies the attempt just completed, not the upcoming retry. Return promptly to avoid delaying the request.
-
-### Return values
-
-() when the callback returns.
-
-### Errors and behavior
-
-Synchronous callback. Direct calls have no wrapper panic protection; RetryObserverHandle::notify catches unwinding panics. A Completed report exhausted flag is not a success/failure signal.
-
-### Example
-
-Run the complete [custom observer example](#custom-observer-example).
-
-## `RetryObserverHandle::new()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryObserverHandle::new(observer: impl RetryObserver) -> Self
-```
-
-### Steps
-
-Wrap an implementation or compatible closure.
-
-### Parameters
-
-`observer`: owned thread-safe callback implementation.
-
-### Callback parameters
-
-`observer` implements `RetryObserver: Send + Sync + 'static` and receives `&RetryEvent`, returning (). The policy retains it; invocation is synchronous and handle notification catches unwinding panics. Keep it short and nonblocking.
-
-### Return values
-
-A cloneable shared handle.
-
-### Errors and behavior
-
-Infallible; clones share the observer and there is no unsubscribe API.
-
-### Example
-
-Run the complete [custom observer example](#custom-observer-example).
-
-## `RetryObserverHandle::notify()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-RetryObserverHandle::notify(&self, event: RetryEvent)
-```
-
-### Steps
-
-Deliver an owned event to the retained observer.
-
-### Parameters
-
-`event`: synthetic or recorded RetryEvent.
-
-### Callback parameters
-
-Invokes the retained observer with &event during this call.
-
-### Return values
-
-().
-
-### Errors and behavior
-
-Infallible Result contract; catches/logs unwinding observer panics. Synchronous notification never submits or retries a request.
-
-### Example
-
-Run the complete [custom observer example](#custom-observer-example).
+See the complete [example](#request-settings-and-callback-adapters).
 
 ## `HttpClientConfig::with_default_retry_policy()`
 
@@ -3535,16 +1477,16 @@ Run the complete [custom observer example](#custom-observer-example).
 ### Function signature
 
 ```text
-HttpClientConfig::with_default_retry_policy(self, policy: RetryPolicy) -> Self
+HttpClientConfig::with_default_retry_policy(self, policy: HttpRetryPolicy) -> Self
 ```
 
 ### Steps
 
-Set before client construction or request build, retaining the returned value.
+Install a default policy before creating the client.
 
 ### Parameters
 
-`policy`: default policy for inherited requests.
+`policy`: already validated HTTP retry policy.
 
 ### Callback parameters
 
@@ -3552,51 +1494,15 @@ None.
 
 ### Return values
 
-Updated `HttpClientConfig`.
+The updated configuration.
 
 ### Errors and behavior
 
-Infallible setting. Initial default is no_retry(). Replaces the client policy; explicit request selections override it.
+Used only for operations selecting Inherit. The default configuration uses `HttpRetryPolicy::no_retry()`.
 
 ### Example
 
-Run the complete [retry installation program](#installing-retry-selections-example).
-
-## `HttpRequestBuilder::retry_policy()`
-
-### Required features
-
-`http-client`.
-
-### Function signature
-
-```text
-HttpRequestBuilder::retry_policy(self, policy: RetryPolicy) -> Self
-```
-
-### Steps
-
-Set before client construction or request build, retaining the returned value.
-
-### Parameters
-
-`policy`: explicit policy for one concrete request.
-
-### Callback parameters
-
-None.
-
-### Return values
-
-Updated `HttpRequestBuilder`.
-
-### Errors and behavior
-
-Infallible setting. Selects Policy, including explicit no_retry(); call build() to finish the request.
-
-### Example
-
-Run the complete [retry installation program](#installing-retry-selections-example).
+See the complete [example](#request-settings-and-callback-adapters).
 
 ## `HttpRequestBuilder::retry_setting()`
 
@@ -3607,16 +1513,16 @@ Run the complete [retry installation program](#installing-retry-selections-examp
 ### Function signature
 
 ```text
-HttpRequestBuilder::retry_setting(self, setting: RetrySetting) -> Self
+HttpRequestBuilder::retry_setting(self, setting: RetrySetting<HttpRetryPolicy>) -> Self
 ```
 
 ### Steps
 
-Set before client construction or request build, retaining the returned value.
+Select the request policy, then build and submit.
 
 ### Parameters
 
-`setting`: Inherit, None or Policy.
+`setting`: Inherit, Disabled or Policy.
 
 ### Callback parameters
 
@@ -3624,12 +1530,157 @@ None.
 
 ### Return values
 
-Updated `HttpRequestBuilder`.
+The updated request builder.
 
 ### Errors and behavior
 
-Infallible setting. Last selection wins; Inherit restores client-policy inheritance. Call build() to finish the request.
+The last setter wins; there is no parallel retry_policy field.
 
 ### Example
 
-Run the complete [retry installation program](#installing-retry-selections-example).
+See the complete [example](#request-settings-and-callback-adapters).
+
+## `HttpRequest::retry_setting()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpRequest::retry_setting(&self) -> RetrySetting<HttpRetryPolicy>
+```
+
+### Steps
+
+Inspect the request selection before submission.
+
+### Parameters
+
+None.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+A cloned selection.
+
+### Errors and behavior
+
+Read-only and independent of runtime state.
+
+### Example
+
+See the complete [example](#request-settings-and-callback-adapters).
+
+## `HttpResponse::retry_report()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+HttpResponse::retry_report(&self) -> Option<&RetryReport>
+```
+
+### Steps
+
+Inspect the completed operation report before consuming the response.
+
+### Parameters
+
+None.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+A borrowed report when attached by the SDK.
+
+### Errors and behavior
+
+Manual/synthetic responses may initially have no report. Retrying exhaustion preserves the response and its report.
+
+### Example
+
+See the complete [example](#retry-a-transient-endpoint).
+
+
+## `RetryOn::with_timeout_phases()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+RetryOn::with_timeout_phases(self, phases: impl IntoIterator<Item = TimeoutPhase>) -> Self
+```
+
+### Steps
+
+Replace the selected attempt timeout phases.
+
+### Parameters
+
+`phases`: Connect, Headers, IdleRead or Attempt.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The updated reason set.
+
+### Errors and behavior
+
+No phases are selected by default. Admission and Total entries are discarded and cannot make those timeouts retryable. Other retry categories are preserved.
+
+### Example
+
+See the complete [reason-selection example](#built-in-reasons-and-replay-safety).
+
+## `RetryOn::timeout_phases()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+RetryOn::timeout_phases(&self) -> &[TimeoutPhase]
+```
+
+### Steps
+
+Inspect selected attempt timeout phases.
+
+### Parameters
+
+None.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+A borrowed phase slice.
+
+### Errors and behavior
+
+This shows policy configuration rather than elapsed/running deadline state.
+
+### Example
+
+See the complete [reason-selection example](#built-in-reasons-and-replay-safety).

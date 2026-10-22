@@ -6,6 +6,7 @@ use crate::module::ws_client::io_diagnostics::{classify_io_error, ClassifiedSink
 use crate::module::ws_client::io_event::IoEvent;
 use crate::module::ws_client::native_pending::NativePending;
 use crate::module::ws_client::operation_control::OperationControl;
+use crate::module::ws_client::timeout_budget::TimeoutBudget;
 use crate::module::ws_client::write::control_message::ControlMessage;
 use crate::module::ws_client::write::priority_write_queue::PriorityWriteQueue;
 use crate::module::ws_client::write::queued_request::QueuedRequest;
@@ -688,11 +689,13 @@ impl RequestWriteFailure {
         }
     }
 
-    fn deadline(data_started: bool, connection_uncertain: bool) -> Self {
+    fn deadline(data_started: bool, connection_uncertain: bool, budget: TimeoutBudget) -> Self {
         crate::log_t!(LogType::WSC; "deadline", "data_started|connection_uncertain", data_started, connection_uncertain);
         crate::log_e!(LogType::WSC; "deadline", "error|data_started|connection_uncertain", "request_deadline_elapsed", data_started, connection_uncertain);
         Self {
-            request_error: NetError::from(crate::error::ErrorKind::TimedOut),
+            request_error: budget
+                .timeout_error()
+                .with_stage(crate::error::ErrorStage::Write),
             connection_action: if data_started || connection_uncertain {
                 RequestAction::StopWithError(NetError::from(
                     crate::error::ErrorKind::DeliveryUnknown,
@@ -762,12 +765,11 @@ where
         )));
         return RequestAction::Continue;
     };
-    let write_deadline = request
-        .dispatch_phase
-        .absolute_deadline()
-        .map_or(write_deadline, |deadline| {
-            write_deadline.min(Instant::from_std(deadline))
-        });
+    let write_budget =
+        TimeoutBudget::new(write_deadline.into_std(), crate::ws::WsTimeoutPhase::Write);
+    let write_budget =
+        TimeoutBudget::earlier(request.dispatch_phase.absolute_budget(), Some(write_budget))
+            .map_or(write_budget, |budget| budget);
     // Registered response expiry is arbitrated by NativePending, including its
     // bounded Manual grace. Freezing that deadline here would cancel a request
     // even after the table extended an already accepted response's claim window.
@@ -776,7 +778,7 @@ where
         request.message.clone(),
         data_frame_payload_size,
         first_frame_control_budget,
-        write_deadline,
+        write_budget,
         control_rx,
         control_write_timeout,
         data_frame_write_timeout,
@@ -836,11 +838,29 @@ where
             }
             let cancelled =
                 request.dispatch_cancel.is_cancelled() || request.dispatch_phase.is_finished();
-            let retry = !cancelled
-                && failure.requeue == RequestRequeue::IdempotentRetry
-                && request.can_retry();
+            let retry_delay = if !cancelled
+                && request.registration.is_none()
+                && request.dispatch_phase.has_write_attempt()
+                && (failure.requeue != RequestRequeue::Never
+                    || failure.request_error.kind() == crate::error::ErrorKind::TimedOut)
+            {
+                match request
+                    .dispatch_phase
+                    .raw_retry_after(&failure.request_error)
+                {
+                    Ok(delay) => delay,
+                    Err(error) => {
+                        request.complete(Err(error));
+                        return action;
+                    }
+                }
+            } else {
+                None
+            };
+            let retry = retry_delay.is_some();
             let wait = !cancelled
                 && failure.requeue == RequestRequeue::WaitForReconnect
+                && (!request.dispatch_phase.has_write_attempt() || request.registration.is_some())
                 && request.can_wait_for_reconnect();
             let requeued = if retry || wait {
                 match &request.registration {
@@ -856,7 +876,14 @@ where
                     RequestAction::StopWithError(error)
                 }
                 Ok(true) => {
-                    if retry {
+                    if let Some(delay) = retry_delay {
+                        let Some(ready_at) = std::time::Instant::now().checked_add(delay) else {
+                            request.complete(Err(NetError::from(
+                                crate::error::ErrorKind::InvalidPolicy,
+                            )));
+                            return action;
+                        };
+                        request.ready_at = Some(ready_at);
                         let Some(attempt) = request.attempt.checked_add(1) else {
                             request.complete(Err(NetError::from(
                                 crate::error::ErrorKind::ResourceExhausted,
@@ -870,10 +897,12 @@ where
                     }
                     // The requeued registration has relinquished this physical identity.
                     // Retire other pending requests without destroying the queued retry.
-                    if let Err(error) =
-                        pending_requests.fail_connection(connection, failure.request_error)
-                    {
-                        return RequestAction::StopWithError(error);
+                    if !matches!(action, RequestAction::Continue) {
+                        if let Err(error) =
+                            pending_requests.fail_connection(connection, failure.request_error)
+                        {
+                            return RequestAction::StopWithError(error);
+                        }
                     }
                     action
                 }
@@ -907,7 +936,7 @@ fn inactive_operation_error(control: &OperationControl) -> NetError {
                 .deadline()
                 .is_some_and(|deadline| Instant::now().into_std() >= deadline)
             {
-                NetError::from(crate::error::ErrorKind::TimedOut)
+                control.deadline_error()
             } else {
                 NetError::from(crate::error::ErrorKind::Cancelled)
             }
@@ -932,18 +961,33 @@ async fn handle_control_message<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
+    handle_control_message_with_budget(write, control, timeout, cancel, None).await
+}
+
+async fn handle_control_message_with_budget<W>(
+    write: &mut W,
+    control: ControlMessage,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    request_budget: Option<TimeoutBudget>,
+) -> ControlAction
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
     crate::log_t!(LogType::WSC; "ws.write.handle_control_message", "arg_write_present|arg_control_kind|timeout|arg_cancel_present", true, match &control { ControlMessage::FlushAutomatic => "flush_automatic", ControlMessage::PeerClose(_) => "peer_close", ControlMessage::CloseWith { .. } => "local_close" }, timeout, true);
     match control {
-        ControlMessage::FlushAutomatic => match flush_sink(write, timeout, cancel).await {
-            Ok(()) => ControlAction::Continue,
-            Err(error) => ControlAction::Failed {
-                error,
-                origin: ControlOrigin::Automatic,
-            },
-        },
+        ControlMessage::FlushAutomatic => {
+            match flush_sink_with_budget(write, timeout, cancel, request_budget).await {
+                Ok(()) => ControlAction::Continue,
+                Err(error) => ControlAction::Failed {
+                    error,
+                    origin: ControlOrigin::Automatic,
+                },
+            }
+        }
         ControlMessage::PeerClose(done_tx) => {
             crate::log_s!(LogType::WSC; "ws.write.handle_control_message", "state", "peer_close_reply_flush_started");
-            let result = flush_sink(write, timeout, cancel).await;
+            let result = flush_sink_with_budget(write, timeout, cancel, request_budget).await;
             let _ = done_tx.send(result.clone());
             match result {
                 Ok(()) => ControlAction::Stop(ControlStop::ConnectionClosed),
@@ -1008,7 +1052,12 @@ where
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 let kind = crate::module::ws_client::io_diagnostics::classify_io_error(&error);
-                let error = NetError::from(error).with_stage(ErrorStage::Close);
+                let error = NetError::from(error);
+                let error = if error.context().stage.is_none() {
+                    error.with_stage(ErrorStage::Close)
+                } else {
+                    error
+                };
                 let mut context = error.context().clone();
                 context.io_end = Some(kind);
                 Err(error.with_context(context))
@@ -1019,10 +1068,11 @@ where
 }
 
 /// Flushes Tungstenite's automatically queued Pong or peer-Close response.
-async fn flush_sink<W>(
+async fn flush_sink_with_budget<W>(
     write: &mut W,
     timeout: Duration,
     cancel: &CancellationToken,
+    request_budget: Option<TimeoutBudget>,
 ) -> Result<(), NetError>
 where
     W: Sink<Message, Error = WsError> + Unpin,
@@ -1032,6 +1082,8 @@ where
         crate::log_e!(LogType::WSC; "ws.write.flush_sink", "error", "unrepresentable_deadline");
         NetError::from(crate::error::ErrorKind::InvalidConfig)
     })?;
+    let selected_budget = request_budget.filter(|budget| budget.at <= deadline.into_std());
+    let deadline = selected_budget.map_or(deadline, |budget| Instant::from_std(budget.at));
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -1053,9 +1105,29 @@ where
             },
             Err(_) => {
                 crate::log_e!(LogType::WSC; "ws.write.flush_sink", "error|delivery", "sink_operation_timeout", "unknown");
-                Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
+                Err(selected_budget.map_or_else(
+                    || NetError::from(crate::error::ErrorKind::DeliveryUnknown), budget_delivery_unknown))
             },
         },
+    }
+}
+
+/// Preserve the budget that actually stopped an in-flight control write.
+fn budget_delivery_unknown(budget: TimeoutBudget) -> NetError {
+    let error = budget
+        .timeout_error()
+        .with_stage(crate::error::ErrorStage::Write);
+    let context = error.context().clone();
+    NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error).with_context(context)
+}
+
+async fn within_request_budget<T>(
+    budget: TimeoutBudget,
+    future: impl std::future::Future<Output = Result<T, NetError>>,
+) -> Result<T, NetError> {
+    match tokio::time::timeout_at(Instant::from_std(budget.at), future).await {
+        Ok(result) => result,
+        Err(_) => Err(budget_delivery_unknown(budget)),
     }
 }
 
@@ -1069,12 +1141,13 @@ async fn drain_ready_controls_with_recovery<W>(
     heartbeat: &mut HeartbeatSchedule,
     heartbeat_state: &HeartbeatState,
     recovery: &mut HeartbeatRecovery,
-    request_deadline: Instant,
+    request_budget: TimeoutBudget,
     remaining_controls: &mut usize,
 ) -> Result<ControlAction, NetError>
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
+    let request_deadline = Instant::from_std(request_budget.at);
     crate::log_t!(LogType::WSC; "ws.write.drain_ready_controls_with_recovery", "arg_write_present|arg_control_rx_present|timeout|arg_cancel_present|arg_heartbeat_present|arg_heartbeat_state_present|arg_recovery_active|request_deadline|remaining_controls|deadline_elapsed", true, true, timeout, true, true, true, recovery.active, format!("{request_deadline:?}"), *remaining_controls, Instant::now() >= request_deadline);
     loop {
         // A burst of ready controls may itself consume multiple write deadlines.
@@ -1082,15 +1155,18 @@ where
         let now = Instant::now();
         if now >= request_deadline {
             crate::log_e!(LogType::WSC; "ws.write.drain_ready_controls_with_recovery", "error", "TimeoutError");
-            return Err(NetError::from(crate::error::ErrorKind::TimedOut));
+            return Err(request_budget.timeout_error());
         }
-        service_due_heartbeat_work(
-            write,
-            heartbeat_state,
-            recovery,
-            timeout.min(request_deadline.saturating_duration_since(now)),
-            Some(request_deadline),
-            cancel,
+        within_request_budget(
+            request_budget,
+            service_due_heartbeat_work(
+                write,
+                heartbeat_state,
+                recovery,
+                timeout,
+                Some(request_budget),
+                cancel,
+            ),
         )
         .await?;
         if *remaining_controls == 0 {
@@ -1108,8 +1184,14 @@ where
                 if *remaining_controls > 0 {
                     *remaining_controls -= 1;
                 }
-                let bounded_timeout = timeout.min(request_deadline.saturating_duration_since(now));
-                let action = handle_control_message(write, control, bounded_timeout, cancel).await;
+                let action = handle_control_message_with_budget(
+                    write,
+                    control,
+                    timeout,
+                    cancel,
+                    Some(request_budget),
+                )
+                .await;
                 if matches!(
                     action,
                     ControlAction::Stop(_) | ControlAction::Failed { .. }
@@ -1118,15 +1200,18 @@ where
                 }
                 let now = Instant::now();
                 if now >= request_deadline {
-                    return Err(NetError::from(crate::error::ErrorKind::TimedOut));
+                    return Err(request_budget.timeout_error());
                 }
-                service_due_heartbeat_work(
-                    write,
-                    heartbeat_state,
-                    recovery,
-                    timeout.min(request_deadline.saturating_duration_since(now)),
-                    Some(request_deadline),
-                    cancel,
+                within_request_budget(
+                    request_budget,
+                    service_due_heartbeat_work(
+                        write,
+                        heartbeat_state,
+                        recovery,
+                        timeout,
+                        Some(request_budget),
+                        cancel,
+                    ),
                 )
                 .await?;
                 // A ready-control producer can refill the channel between every receive.
@@ -1136,15 +1221,19 @@ where
                     let now = Instant::now();
                     if now >= request_deadline {
                         crate::log_e!(LogType::WSC; "ws.write.drain_ready_controls_with_recovery", "error", "TimeoutError");
-                        return Err(NetError::from(crate::error::ErrorKind::TimedOut));
+                        return Err(request_budget.timeout_error());
                     }
-                    handle_heartbeat_tick_with_recovery(
-                        write,
-                        heartbeat_state,
-                        recovery,
-                        pong_timeout,
-                        timeout.min(request_deadline.saturating_duration_since(now)),
-                        cancel,
+                    within_request_budget(
+                        request_budget,
+                        handle_heartbeat_tick_with_budget(
+                            write,
+                            heartbeat_state,
+                            recovery,
+                            pong_timeout,
+                            timeout,
+                            cancel,
+                            Some(request_budget),
+                        ),
                     )
                     .await?;
                 }
@@ -1186,7 +1275,10 @@ where
         heartbeat,
         heartbeat_state,
         &mut recovery,
-        request_deadline,
+        TimeoutBudget::new(
+            request_deadline.into_std(),
+            crate::ws::WsTimeoutPhase::Write,
+        ),
         remaining_controls,
     )
     .await
@@ -1204,6 +1296,30 @@ async fn handle_heartbeat_tick_with_recovery<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
+    handle_heartbeat_tick_with_budget(
+        write,
+        heartbeat_state,
+        recovery,
+        pong_timeout,
+        control_write_timeout,
+        cancel,
+        None,
+    )
+    .await
+}
+
+async fn handle_heartbeat_tick_with_budget<W>(
+    write: &mut W,
+    heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
+    pong_timeout: Duration,
+    control_write_timeout: Duration,
+    cancel: &CancellationToken,
+    request_budget: Option<TimeoutBudget>,
+) -> Result<(), NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
     crate::log_t!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "arg_write_present|arg_heartbeat_state_present|arg_recovery_active|pong_timeout|control_write_timeout|arg_cancel_present", true, true, recovery.active, pong_timeout, control_write_timeout, true);
     if recovery.is_active() {
         if !heartbeat_state.has_outstanding_probe() && recovery.awaiting_pong() {
@@ -1211,12 +1327,13 @@ where
             return Ok(());
         }
         if heartbeat_state.is_timed_out(Instant::now()) || recovery.due(Instant::now()) {
-            return drive_heartbeat_recovery(
+            return drive_heartbeat_recovery_with_budget(
                 write,
                 heartbeat_state,
                 recovery,
                 control_write_timeout,
                 cancel,
+                request_budget,
             )
             .await;
         }
@@ -1228,12 +1345,13 @@ where
             return Ok(());
         }
         HeartbeatTick::TimedOut => {
-            return drive_heartbeat_recovery(
+            return drive_heartbeat_recovery_with_budget(
                 write,
                 heartbeat_state,
                 recovery,
                 control_write_timeout,
                 cancel,
+                request_budget,
             )
             .await;
         }
@@ -1247,6 +1365,7 @@ where
         Message::Ping(payload.clone()),
         control_write_timeout,
         cancel,
+        request_budget,
     )
     .await;
     match send_result {
@@ -1280,6 +1399,28 @@ async fn drive_heartbeat_recovery<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
+    drive_heartbeat_recovery_with_budget(
+        write,
+        heartbeat_state,
+        recovery,
+        control_write_timeout,
+        cancel,
+        None,
+    )
+    .await
+}
+
+async fn drive_heartbeat_recovery_with_budget<W>(
+    write: &mut W,
+    heartbeat_state: &HeartbeatState,
+    recovery: &mut HeartbeatRecovery,
+    control_write_timeout: Duration,
+    cancel: &CancellationToken,
+    request_budget: Option<TimeoutBudget>,
+) -> Result<(), NetError>
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
     if recovery.is_active() && !heartbeat_state.has_outstanding_probe() && recovery.awaiting_pong()
     {
         recovery.finish();
@@ -1307,7 +1448,9 @@ where
                 .with_stage(crate::error::ErrorStage::Heartbeat));
         }
         if recovery.recovery_flush_pending {
-            if let Err(error) = flush_sink(write, control_write_timeout, cancel).await {
+            if let Err(error) =
+                flush_sink_with_budget(write, control_write_timeout, cancel, request_budget).await
+            {
                 recovery.recovery_flush_pending = false;
                 return Err(error);
             }
@@ -1324,6 +1467,7 @@ where
             Message::Ping(payload.clone()),
             control_write_timeout,
             cancel,
+            request_budget,
         )
         .await
         {
@@ -1360,7 +1504,7 @@ async fn drive_normal_ping_retry<W>(
     heartbeat_state: &HeartbeatState,
     recovery: &mut HeartbeatRecovery,
     control_write_timeout: Duration,
-    request_deadline: Option<Instant>,
+    request_budget: Option<TimeoutBudget>,
     cancel: &CancellationToken,
 ) -> Result<(), NetError>
 where
@@ -1375,26 +1519,32 @@ where
         recovery.clear_normal_retry();
         return Ok(());
     }
-    let now = Instant::now();
-    let timeout = match request_deadline {
-        Some(deadline) => {
-            if now >= deadline {
-                heartbeat_state.abandon_probe(payload.as_ref());
-                recovery.clear_normal_retry();
-                return Err(NetError::from(crate::error::ErrorKind::TimedOut));
-            }
-            control_write_timeout.min(deadline.saturating_duration_since(now))
+    let request_deadline = request_budget.map(|budget| Instant::from_std(budget.at));
+    if let Some(budget) = request_budget {
+        if Instant::now() >= Instant::from_std(budget.at) {
+            heartbeat_state.abandon_probe(payload.as_ref());
+            recovery.clear_normal_retry();
+            return Err(budget.timeout_error());
         }
-        None => control_write_timeout,
-    };
+    }
     // WriteBufferFull means the attempted Ping was returned before acceptance. Flush the
     // already-buffered frames first, then retry the same exact payload from this writer.
-    if let Err(error) = flush_sink(write, timeout, cancel).await {
+    if let Err(error) =
+        flush_sink_with_budget(write, control_write_timeout, cancel, request_budget).await
+    {
         heartbeat_state.abandon_probe(payload.as_ref());
         recovery.clear_normal_retry();
         return Err(error);
     }
-    match send_control_frame_outcome(write, Message::Ping(payload.clone()), timeout, cancel).await {
+    match send_control_frame_outcome(
+        write,
+        Message::Ping(payload.clone()),
+        control_write_timeout,
+        cancel,
+        request_budget,
+    )
+    .await
+    {
         ControlWriteOutcome::Complete => {
             heartbeat_state.mark_sent(payload.as_ref(), Instant::now());
             recovery.clear_normal_retry();
@@ -1421,7 +1571,7 @@ async fn service_due_heartbeat_work<W>(
     heartbeat_state: &HeartbeatState,
     recovery: &mut HeartbeatRecovery,
     control_write_timeout: Duration,
-    request_deadline: Option<Instant>,
+    request_budget: Option<TimeoutBudget>,
     cancel: &CancellationToken,
 ) -> Result<(), NetError>
 where
@@ -1433,18 +1583,19 @@ where
             heartbeat_state,
             recovery,
             control_write_timeout,
-            request_deadline,
+            request_budget,
             cancel,
         )
         .await?;
     }
     if heartbeat_state.is_timed_out(Instant::now()) || recovery.due(Instant::now()) {
-        drive_heartbeat_recovery(
+        drive_heartbeat_recovery_with_budget(
             write,
             heartbeat_state,
             recovery,
             control_write_timeout,
             cancel,
+            request_budget,
         )
         .await?;
     }
@@ -1502,7 +1653,7 @@ async fn send_request_message_with_phase<W>(
     message: Message,
     data_frame_payload_size: Option<usize>,
     first_frame_control_budget: usize,
-    write_deadline: Instant,
+    write_budget: TimeoutBudget,
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     control_write_timeout: Duration,
     data_frame_write_timeout: Duration,
@@ -1516,6 +1667,7 @@ async fn send_request_message_with_phase<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
+    let write_deadline = Instant::from_std(write_budget.at);
     crate::log_t!(LogType::WSC; "ws.write.send_request_message_with_phase", "arg_write_present|arg_message_type|arg_message_bytes|data_frame_payload_size|first_frame_control_budget|write_deadline|arg_control_rx_present|control_write_timeout|data_frame_write_timeout|arg_heartbeat_present|arg_heartbeat_state_present|arg_recovery_active|arg_connection_cancel_present|arg_dispatch_cancel_present|arg_dispatch_phase_present", true, match &message { Message::Text(_) => "text", Message::Binary(_) => "binary", Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", Message::Frame(_) => "frame" }, message.len(), data_frame_payload_size, first_frame_control_budget, format!("{write_deadline:?}"), true, control_write_timeout, data_frame_write_timeout, true, true, recovery.active, true, true, true);
     let mut frames = OutgoingMessageFrames::new(message, data_frame_payload_size).peekable();
     let mut wrote_frame = false;
@@ -1528,7 +1680,11 @@ where
             return Err(RequestWriteFailure::cancelled(wrote_frame));
         }
         if Instant::now() >= write_deadline {
-            return Err(RequestWriteFailure::deadline(wrote_frame, wrote_frame));
+            return Err(RequestWriteFailure::deadline(
+                wrote_frame,
+                wrote_frame,
+                write_budget,
+            ));
         }
         if connection_cancel.is_cancelled() {
             return Err(RequestWriteFailure::connection(
@@ -1547,11 +1703,11 @@ where
             heartbeat,
             heartbeat_state,
             recovery,
-            write_deadline,
+            write_budget,
             &mut remaining_controls,
         )
         .await
-        .map_err(|error| classify_boundary_failure(error, wrote_frame, write_deadline))?;
+        .map_err(|error| classify_boundary_failure(error, wrote_frame, write_budget))?;
         match control_action {
             ControlAction::Continue => {}
             ControlAction::Stop(ControlStop::ConnectionClosed) => {
@@ -1568,25 +1724,33 @@ where
                     error,
                     origin,
                     wrote_frame,
-                    write_deadline,
+                    write_budget,
                 ));
             }
         }
         if let Some(pong_timeout) = heartbeat.tick().now_or_never() {
             let now = Instant::now();
             if now >= write_deadline {
-                return Err(RequestWriteFailure::deadline(wrote_frame, wrote_frame));
+                return Err(RequestWriteFailure::deadline(
+                    wrote_frame,
+                    wrote_frame,
+                    write_budget,
+                ));
             }
-            handle_heartbeat_tick_with_recovery(
-                write,
-                heartbeat_state,
-                recovery,
-                pong_timeout,
-                control_write_timeout.min(write_deadline.saturating_duration_since(now)),
-                connection_cancel,
+            within_request_budget(
+                write_budget,
+                handle_heartbeat_tick_with_budget(
+                    write,
+                    heartbeat_state,
+                    recovery,
+                    pong_timeout,
+                    control_write_timeout,
+                    connection_cancel,
+                    Some(write_budget),
+                ),
             )
             .await
-            .map_err(|error| classify_boundary_failure(error, wrote_frame, write_deadline))?;
+            .map_err(|error| classify_boundary_failure(error, wrote_frame, write_budget))?;
         }
         // heartbeat 写入期间可能又收到 Ping/Close，因此紧邻 data frame 再排空一次。
         if remaining_controls > 0 {
@@ -1598,11 +1762,11 @@ where
                 heartbeat,
                 heartbeat_state,
                 recovery,
-                write_deadline,
+                write_budget,
                 &mut remaining_controls,
             )
             .await
-            .map_err(|error| classify_boundary_failure(error, wrote_frame, write_deadline))?;
+            .map_err(|error| classify_boundary_failure(error, wrote_frame, write_budget))?;
             match control_action {
                 ControlAction::Continue => {}
                 ControlAction::Stop(ControlStop::ConnectionClosed) => {
@@ -1619,7 +1783,7 @@ where
                         error,
                         origin,
                         wrote_frame,
-                        write_deadline,
+                        write_budget,
                     ));
                 }
             }
@@ -1628,7 +1792,7 @@ where
             write,
             frame,
             wrote_frame,
-            write_deadline,
+            write_budget,
             data_frame_write_timeout,
             connection_cancel,
             dispatch_cancel,
@@ -1643,24 +1807,36 @@ where
     Ok(())
 }
 
+/// Preserve the TLS layer even when a partially sent frame has unknown delivery.
+fn unknown_delivery_error(error: WsError) -> NetError {
+    let stage = match &error {
+        WsError::Io(error) => crate::module::transport::tls_error_stage(error)
+            .unwrap_or(crate::error::ErrorStage::Write),
+        WsError::Tls(_) => crate::error::ErrorStage::Tls,
+        _ => crate::error::ErrorStage::Write,
+    };
+    NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error).with_stage(stage)
+}
+
 /// Classifies a control/heartbeat boundary failure without confusing the control frame's
 /// uncertain write state with delivery of a business frame that has not started.
 fn classify_boundary_failure(
     error: NetError,
     data_started: bool,
-    request_deadline: Instant,
+    request_budget: TimeoutBudget,
 ) -> RequestWriteFailure {
+    let request_deadline = Instant::from_std(request_budget.at);
     crate::log_t!(LogType::WSC; "ws.write.classify_boundary_failure", "error_kind|error_stage|data_started|request_deadline|deadline_elapsed", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), data_started, format!("{request_deadline:?}"), Instant::now() >= request_deadline);
     if error.kind() == crate::error::ErrorKind::TimedOut
         && error.context().stage != Some(crate::error::ErrorStage::Heartbeat)
     {
-        RequestWriteFailure::deadline(data_started, data_started)
+        RequestWriteFailure::deadline(data_started, data_started, request_budget)
     } else if error.kind() == crate::error::ErrorKind::DeliveryUnknown
-        && Instant::now() >= request_deadline
+        && error.ws_timeout_phase().is_some()
     {
         // The request deadline bounded an in-flight control write. The business request is still
         // known-unsent when `data_started` is false, but the shared sink must be discarded.
-        RequestWriteFailure::deadline(data_started, true)
+        RequestWriteFailure::deadline(data_started, true, request_budget)
     } else {
         RequestWriteFailure::connection(error, data_started)
     }
@@ -1670,13 +1846,14 @@ fn classify_control_failure(
     error: NetError,
     origin: ControlOrigin,
     data_started: bool,
-    request_deadline: Instant,
+    request_budget: TimeoutBudget,
 ) -> RequestWriteFailure {
+    let request_deadline = Instant::from_std(request_budget.at);
     crate::log_t!(LogType::WSC; "ws.write.classify_control_failure", "error_kind|error_stage|origin|data_started|request_deadline|deadline_elapsed", format!("{:?}", error.kind()), format!("{:?}", error.context().stage), format!("{origin:?}"), data_started, format!("{request_deadline:?}"), Instant::now() >= request_deadline);
     if origin == ControlOrigin::LocalClose {
         RequestWriteFailure::local_close(data_started, Some(error))
     } else {
-        classify_boundary_failure(error, data_started, request_deadline)
+        classify_boundary_failure(error, data_started, request_budget)
     }
 }
 
@@ -1688,7 +1865,7 @@ async fn send_data_frame_with_phase<W>(
     write: &mut W,
     frame: Message,
     data_started: bool,
-    request_deadline: Instant,
+    request_budget: TimeoutBudget,
     frame_write_timeout: Duration,
     connection_cancel: &CancellationToken,
     dispatch_cancel: &CancellationToken,
@@ -1697,13 +1874,18 @@ async fn send_data_frame_with_phase<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
+    let request_deadline = Instant::from_std(request_budget.at);
     crate::log_t!(LogType::WSC; "ws.write.send_data_frame_with_phase", "arg_write_present|arg_frame_bytes|data_started|request_deadline|frame_write_timeout|arg_connection_cancel_present|arg_dispatch_cancel_present|arg_dispatch_phase_present|deadline_elapsed", true, frame.len(), data_started, format!("{request_deadline:?}"), frame_write_timeout, true, true, true, Instant::now() >= request_deadline);
     let now = Instant::now();
     if dispatch_cancel.is_cancelled() {
         return Err(RequestWriteFailure::cancelled(data_started));
     }
     if now >= request_deadline {
-        return Err(RequestWriteFailure::deadline(data_started, data_started));
+        return Err(RequestWriteFailure::deadline(
+            data_started,
+            data_started,
+            request_budget,
+        ));
     }
     if connection_cancel.is_cancelled() {
         return Err(RequestWriteFailure::connection(
@@ -1715,8 +1897,19 @@ where
         Some(deadline) => deadline,
         None => request_deadline,
     };
-    let deadline = request_deadline.min(frame_deadline);
     let request_deadline_wins = request_deadline <= frame_deadline;
+    let deadline = request_deadline.min(frame_deadline);
+    let selected_budget = if request_deadline_wins {
+        request_budget
+    } else {
+        TimeoutBudget::new(frame_deadline.into_std(), crate::ws::WsTimeoutPhase::Write)
+    };
+    if let Err(error) = dispatch_phase.begin_write_attempt() {
+        return Err(RequestWriteFailure::connection(
+            error,
+            data_started || dispatch_phase.data_write_started(),
+        ));
+    }
     let mut frame = Some(frame);
     let send = async {
         std::future::poll_fn(|cx| {
@@ -1732,7 +1925,7 @@ where
                 return std::task::Poll::Ready(Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::Cancelled), data_started || dispatch_phase.data_write_started())));
             }
             if Instant::now() >= deadline {
-                return std::task::Poll::Ready(Err(RequestWriteFailure::deadline(data_started || dispatch_phase.data_write_started(), true)));
+                return std::task::Poll::Ready(Err(RequestWriteFailure::deadline(data_started || dispatch_phase.data_write_started(), true, selected_budget)));
             }
             let may_write = match dispatch_phase.start_data_write(data_started) {
                 Ok(may_write) => may_write,
@@ -1754,14 +1947,12 @@ where
             // the same atomic state prevents this request from entering the sink.
             std::task::Poll::Ready(Pin::new(&mut *write).start_send(frame).map_err(|error| {
                 crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", crate::common::log::summary::error(&error), "unknown");
-                RequestWriteFailure::connection(NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error)
-                    .with_stage(crate::error::ErrorStage::Write), true)
+                RequestWriteFailure::connection(unknown_delivery_error(error), true)
             }))
         }).await?;
         write.flush().await.map_err(|error| {
             crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", crate::common::log::summary::error(&error), "unknown");
-            RequestWriteFailure::connection(NetError::with_source(crate::error::ErrorKind::DeliveryUnknown, error)
-                .with_stage(crate::error::ErrorStage::Write), true)
+            RequestWriteFailure::connection(unknown_delivery_error(error), true)
         })
     };
     tokio::select! {
@@ -1773,12 +1964,15 @@ where
                 Ok(())
             },
             Ok(Err(failure)) => Err(failure),
-            Err(_) if request_deadline_wins => {
-                Err(RequestWriteFailure::deadline(data_started || dispatch_phase.data_write_started(), true))
-            }
             Err(_) => {
-                crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", "frame_write_timeout", "unknown");
-                Err(RequestWriteFailure::connection(NetError::from(crate::error::ErrorKind::DeliveryUnknown), data_started || dispatch_phase.data_write_started()))
+                let data_started = data_started || dispatch_phase.data_write_started();
+                if request_deadline_wins || !data_started {
+                    // Readiness expiry is a Write timeout even when no business
+                    // data entered the sink; Closed would prohibit its retry.
+                    Err(RequestWriteFailure::deadline(data_started, true, selected_budget))
+                } else {
+                    Err(RequestWriteFailure::connection(budget_delivery_unknown(selected_budget), true))
+                }
             },
         },
         _ = connection_cancel.cancelled() => {
@@ -1827,7 +2021,7 @@ where
         message,
         data_frame_payload_size,
         first_frame_control_budget,
-        write_deadline,
+        TimeoutBudget::new(write_deadline.into_std(), crate::ws::WsTimeoutPhase::Write),
         control_rx,
         control_write_timeout,
         data_frame_write_timeout,
@@ -1873,7 +2067,10 @@ where
         write,
         frame,
         data_started,
-        request_deadline,
+        TimeoutBudget::new(
+            request_deadline.into_std(),
+            crate::ws::WsTimeoutPhase::Write,
+        ),
         frame_write_timeout,
         connection_cancel,
         dispatch_cancel,
@@ -1894,6 +2091,7 @@ async fn send_control_frame_outcome<W>(
     frame: Message,
     timeout: Duration,
     cancel: &CancellationToken,
+    request_budget: Option<TimeoutBudget>,
 ) -> ControlWriteOutcome
 where
     W: Sink<Message, Error = WsError> + Unpin,
@@ -1910,6 +2108,8 @@ where
             ));
         }
     };
+    let selected_budget = request_budget.filter(|budget| budget.at <= deadline.into_std());
+    let deadline = selected_budget.map_or(deadline, |budget| Instant::from_std(budget.at));
     tokio::select! {
         biased;
         _ = cancel.cancelled() => ControlWriteOutcome::Failed(NetError::from(crate::error::ErrorKind::Cancelled)),
@@ -1930,7 +2130,10 @@ where
                     .with_stage(crate::error::ErrorStage::Write),
             ),
             Ok(Err(error)) => ControlWriteOutcome::Failed(error.into()),
-            Err(_) => ControlWriteOutcome::Failed(NetError::from(crate::error::ErrorKind::DeliveryUnknown)),
+            Err(_) => ControlWriteOutcome::Failed(selected_budget.map_or_else(
+                || NetError::from(crate::error::ErrorKind::DeliveryUnknown),
+                budget_delivery_unknown,
+            )),
         },
     }
 }
@@ -1945,7 +2148,7 @@ where
     W: Sink<Message, Error = WsError> + Unpin,
 {
     crate::log_t!(LogType::WSC; "ws.write.send_control_frame", "arg_write_present|arg_frame_type|arg_frame_bytes|timeout|arg_cancel_present", true, match &frame { Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", _ => "data" }, frame.len(), timeout, true);
-    match send_control_frame_outcome(write, frame, timeout, cancel).await {
+    match send_control_frame_outcome(write, frame, timeout, cancel, None).await {
         ControlWriteOutcome::Complete => Ok(()),
         ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => Err(error),
     }
@@ -2123,6 +2326,10 @@ mod registration_cancellation_tests;
 #[cfg(test)]
 #[path = "ws_write/response_deadline_tests.rs"]
 mod response_deadline_tests;
+
+#[cfg(test)]
+#[path = "ws_write/retry_budget_tests.rs"]
+mod retry_budget_tests;
 
 #[cfg(test)]
 /// Frame-level tests retain the original programmable sinks and wire assertions.
@@ -2383,6 +2590,8 @@ mod tests {
         messages: Arc<Mutex<Vec<Message>>>,
         flush_count: usize,
         fail_on_flush: usize,
+        fail_on_send: bool,
+        injected_error: Option<WsError>,
     }
 
     impl NthFlushErrorSink {
@@ -2391,11 +2600,30 @@ mod tests {
                 messages: Arc::new(Mutex::new(Vec::new())),
                 flush_count: 0,
                 fail_on_flush,
+                fail_on_send: false,
+                injected_error: None,
+            }
+        }
+
+        fn with_injected_error(error: WsError, fail_on_send: bool) -> Self {
+            Self {
+                fail_on_send,
+                injected_error: Some(error),
+                ..Self::new(1)
             }
         }
 
         fn recorded(&self) -> Arc<Mutex<Vec<Message>>> {
             Arc::clone(&self.messages)
+        }
+
+        fn failure(&mut self) -> WsError {
+            self.injected_error.take().unwrap_or_else(|| {
+                WsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected flush failure",
+                ))
+            })
         }
     }
 
@@ -2410,7 +2638,8 @@ mod tests {
         }
 
         fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
-            self.messages
+            let this = self.get_mut();
+            this.messages
                 .lock()
                 .map_err(|error| {
                     WsError::Io(std::io::Error::other(format!(
@@ -2418,6 +2647,9 @@ mod tests {
                     )))
                 })?
                 .push(message);
+            if this.fail_on_send {
+                return Err(this.failure());
+            }
             Ok(())
         }
 
@@ -2428,10 +2660,7 @@ mod tests {
             let this = self.get_mut();
             this.flush_count += 1;
             if this.flush_count == this.fail_on_flush {
-                Poll::Ready(Err(WsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "injected flush failure",
-                ))))
+                Poll::Ready(Err(this.failure()))
             } else {
                 Poll::Ready(Ok(()))
             }
@@ -2443,6 +2672,75 @@ mod tests {
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn tls_alerts_during_start_send_and_flush_preserve_unknown_delivery_and_tls_origin(
+    ) -> TestResult {
+        use crate::error::{ErrorKind, ErrorStage};
+
+        #[derive(Clone, Copy)]
+        enum Source {
+            ProxyIo,
+            TargetIo,
+            TargetTls,
+        }
+        for source in [Source::ProxyIo, Source::TargetIo, Source::TargetTls] {
+            for fail_on_send in [false, true] {
+                let tls_error =
+                    rustls::Error::AlertReceived(rustls::AlertDescription::BadCertificate);
+                let (source, stage) = match source {
+                    Source::ProxyIo => (
+                        WsError::Io(crate::module::transport::test_proxy_tls_error(
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, tls_error),
+                        )),
+                        ErrorStage::ProxyTls,
+                    ),
+                    Source::TargetIo => (
+                        WsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            tls_error,
+                        )),
+                        ErrorStage::Tls,
+                    ),
+                    Source::TargetTls => (WsError::Tls(tls_error.into()), ErrorStage::Tls),
+                };
+                let mut sink = NthFlushErrorSink::with_injected_error(source, fail_on_send);
+                let failure = send_data_frame(
+                    &mut sink,
+                    Message::Binary(Bytes::from_static(b"TLS delivery boundary")),
+                    false,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    &CancellationToken::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .err()
+                .ok_or_else(|| test_error("injected TLS writer failure unexpectedly succeeded"))?;
+                check_eq!(failure.request_error.kind(), ErrorKind::DeliveryUnknown)?;
+                check_eq!(failure.request_error.context().stage, Some(stage))?;
+                let RequestAction::StopWithError(connection_error) = failure.connection_action
+                else {
+                    return Err(test_error(
+                        "TLS writer failure did not retire its connection",
+                    ));
+                };
+                check_eq!(connection_error.kind(), ErrorKind::DeliveryUnknown)?;
+                check_eq!(connection_error.context().stage, Some(stage))?;
+                check_eq!(failure.requeue, RequestRequeue::IdempotentRetry)?;
+                check_eq!(sink.flush_count, usize::from(!fail_on_send))?;
+                check!(sink.injected_error.is_none(), "TLS source was not consumed")?;
+                check_eq!(
+                    sink.recorded()
+                        .lock()
+                        .map_err(|error| test_error(format!("recorded messages lock: {error:?}")))?
+                        .len(),
+                    1
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// 永远不接受写入的 sink，用于验证控制写 deadline。
@@ -4116,6 +4414,698 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn drive_raw_write<W>(
+        sink: &mut W,
+        request: QueuedRequest,
+        queue: &Arc<PriorityWriteQueue>,
+        generation: u64,
+    ) -> TestResult<RequestAction>
+    where
+        W: Sink<Message, Error = WsError> + Unpin,
+    {
+        drive_write_with_pending(
+            sink,
+            request,
+            queue,
+            generation,
+            &crate::module::ws_client::v2_test_support::pending(1)?,
+        )
+        .await
+    }
+
+    async fn drive_write_with_pending<W>(
+        sink: &mut W,
+        request: QueuedRequest,
+        queue: &Arc<PriorityWriteQueue>,
+        generation: u64,
+        pending: &Arc<NativePending>,
+    ) -> TestResult<RequestAction>
+    where
+        W: Sink<Message, Error = WsError> + Unpin,
+    {
+        let (_controls, mut control_rx) = mpsc::channel(1);
+        let period = Duration::from_secs(3_600);
+        let mut schedule = HeartbeatSchedule::from_interval(
+            tokio::time::interval_at(Instant::now() + period, period),
+            period,
+        );
+        let heartbeat = HeartbeatState::new(generation);
+        let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig::default());
+        Ok(handle_queued_request(
+            sink,
+            request,
+            queue,
+            pending,
+            generation,
+            None,
+            MAX_READY_CONTROLS_PER_BOUNDARY,
+            &mut control_rx,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &mut schedule,
+            &heartbeat,
+            &mut recovery,
+            &CancellationToken::new(),
+        )
+        .await)
+    }
+
+    #[tokio::test]
+    async fn raw_retry_uses_delayed_queue_and_one_terminal_report() -> TestResult {
+        use crate::api::retry::{
+            Backoff, RetryEvent, RetrySchedule, RetrySetting, RetryStopReason,
+        };
+        use crate::ws::{SendOptions, WsReplaySafety, WsSendRetryOn, WsSendRetryPolicy};
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let policy = WsSendRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::Constant(Duration::from_millis(30)))
+                    .build()?,
+            )
+            .retry_on(WsSendRetryOn::none().with_write_errors(true))
+            .safety(WsReplaySafety::IdempotentByContract)
+            .observer(move |event: &RetryEvent| {
+                if let Ok(mut events) = observed.lock() {
+                    events.push(event.clone());
+                }
+            })
+            .build()?;
+        let request = crate::module::ws_client::v2_test_support::queued(
+            42,
+            SendOptions {
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            },
+        )?;
+        let control = request.dispatch_phase.clone();
+        let operation_id = control.id();
+        let queue = PriorityWriteQueue::new(1, 64)?;
+        let mut first = RecordingSink::new(None);
+        first.fail_on_flush = Some(1);
+        check!(matches!(
+            drive_raw_write(&mut first, request, &queue, 1).await?,
+            RequestAction::StopWithError(_)
+        ))?;
+        check!(!control.is_finished())?;
+        check_eq!(control.retry_report().attempts, 1)?;
+        check!(queue.try_next().is_none())?;
+        let request = crate::module::ws_client::v2_test_support::bounded(queue.next())
+            .await?
+            .ok_or_else(|| test_error("retry queue lost operation"))?;
+        check_eq!(request.dispatch_phase.id(), operation_id)?;
+        let mut second = RecordingSink::new(None);
+        check_eq!(
+            drive_raw_write(&mut second, request, &queue, 2).await?,
+            RequestAction::Continue
+        )?;
+        check_eq!(control.written().await?, crate::ws::WriteOutcome::Written)?;
+        let report = control.retry_report();
+        check_eq!(report.attempts, 2)?;
+        check_eq!(report.retry_count, 1)?;
+        check_eq!(report.transport_sends, 2)?;
+        check_eq!(report.stop_reason, Some(RetryStopReason::Completed))?;
+        control.cancel()?;
+        check_eq!(control.retry_report(), report)?;
+        let events = events
+            .lock()
+            .map_err(|error| test_error(error.to_string()))?;
+        check_eq!(events.len(), 6)?;
+        check!(matches!(
+            events.first(),
+            Some(RetryEvent::AttemptStarted { attempt: 1 })
+        ))?;
+        check!(
+            matches!(events.last(), Some(RetryEvent::Completed(final_report)) if final_report == &report)
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_retry_readiness_timeout_counts_attempt_without_transport_send() -> TestResult {
+        use crate::api::retry::{RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::ws::{SendOptions, WsReplaySafety, WsSendRetryOn, WsSendRetryPolicy};
+        let policy = WsSendRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .retry_on(WsSendRetryOn::none().with_write_timeout(true))
+            .safety(WsReplaySafety::IdempotentByContract)
+            .build()?;
+        let request = crate::module::ws_client::v2_test_support::queued(
+            44,
+            SendOptions {
+                write_timeout: Duration::from_millis(10),
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            },
+        )?;
+        let control = request.dispatch_phase.clone();
+        let queue = PriorityWriteQueue::new(1, 64)?;
+        let mut blocked = PendingSink::default();
+        check!(matches!(
+            drive_raw_write(&mut blocked, request, &queue, 1).await?,
+            RequestAction::StopWithError(_)
+        ))?;
+        blocked.verify()?;
+        check_eq!(control.retry_report().attempts, 1)?;
+        check_eq!(control.retry_report().transport_sends, 0)?;
+        let request = queue
+            .try_next()
+            .ok_or_else(|| test_error("readiness timeout retry missing"))?;
+        let mut ready = RecordingSink::new(None);
+        check_eq!(
+            drive_raw_write(&mut ready, request, &queue, 2).await?,
+            RequestAction::Continue
+        )?;
+        check_eq!(control.written().await?, crate::ws::WriteOutcome::Written)?;
+        let report = control.retry_report();
+        check_eq!(report.attempts, 2)?;
+        check_eq!(report.transport_sends, 1)?;
+        check_eq!(report.stop_reason, Some(RetryStopReason::Completed))?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_retry_slow_classifier_propagates_expired_total_deadline() -> TestResult {
+        use crate::api::retry::{RetryDecision, RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::ws::{SendOptions, WsReplaySafety, WsSendRetryPolicy};
+        let classified = Arc::new(AtomicUsize::new(0));
+        let observed = classified.clone();
+        let policy = WsSendRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .safety(WsReplaySafety::IdempotentByContract)
+            .classifier(move |context| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let remaining = context
+                    .retry
+                    .remaining
+                    .map_or(Duration::ZERO, |remaining| remaining);
+                std::thread::sleep(remaining.saturating_add(Duration::from_millis(2)));
+                RetryDecision::Retry
+            })
+            .build()?;
+        let request = crate::module::ws_client::v2_test_support::queued(
+            45,
+            SendOptions {
+                deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            },
+        )?;
+        let control = request.dispatch_phase.clone();
+        let queue = PriorityWriteQueue::new(1, 64)?;
+        let mut sink = RecordingSink::new(None);
+        sink.fail_on_flush = Some(1);
+        drive_raw_write(&mut sink, request, &queue, 1).await?;
+        check_eq!(classified.load(Ordering::SeqCst), 1)?;
+        let error = control
+            .written()
+            .await
+            .err()
+            .ok_or_else(|| test_error("expired classifier returned success"))?;
+        check_eq!(error.kind(), crate::error::ErrorKind::DeliveryUnknown)?;
+        let cause = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<NetError>())
+            .ok_or_else(|| test_error("delivery failure lost deadline cause"))?;
+        check_eq!(cause.kind(), crate::error::ErrorKind::TimedOut)?;
+        check_eq!(
+            cause.ws_timeout_phase(),
+            Some(crate::ws::WsTimeoutPhase::Total)
+        )?;
+        check_eq!(
+            error.ws_timeout_phase(),
+            Some(crate::ws::WsTimeoutPhase::Total)
+        )?;
+        let report = error
+            .retry_report()
+            .ok_or_else(|| test_error("deadline report missing"))?;
+        check_eq!(report.stop_reason, Some(RetryStopReason::TimedOut))?;
+        check_eq!(report.attempts, 1)?;
+        check_eq!(report.transport_sends, 1)?;
+        check!(queue.try_next().is_none())?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_retry_observer_cancellation_stops_sends_and_scheduling() -> TestResult {
+        use crate::api::retry::{RetryEvent, RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::ws::{
+            CancellationGroup, SendOptions, WsReplaySafety, WsSendRetryOn, WsSendRetryPolicy,
+        };
+        for cancel_at_start in [true, false] {
+            let cancellation = CancellationGroup::new();
+            let observer_cancellation = cancellation.clone();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = events.clone();
+            let policy = WsSendRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+                .retry_on(WsSendRetryOn::none().with_write_errors(true))
+                .safety(WsReplaySafety::IdempotentByContract)
+                .observer(move |event: &RetryEvent| {
+                    if let Ok(mut events) = observed.lock() {
+                        events.push(event.clone());
+                    }
+                    if (cancel_at_start && matches!(event, RetryEvent::AttemptStarted { .. }))
+                        || (!cancel_at_start && matches!(event, RetryEvent::AttemptFinished { .. }))
+                    {
+                        observer_cancellation.cancel();
+                    }
+                })
+                .build()?;
+            let request = crate::module::ws_client::v2_test_support::queued(
+                46,
+                SendOptions {
+                    cancellation: Some(cancellation),
+                    retry_setting: RetrySetting::Policy(policy),
+                    ..Default::default()
+                },
+            )?;
+            let control = request.dispatch_phase.clone();
+            control.bind_cancellation()?;
+            let queue = PriorityWriteQueue::new(1, 64)?;
+            let mut sink = RecordingSink::new(None);
+            sink.fail_on_flush = Some(1);
+            let recorded = sink.recorded();
+            drive_raw_write(&mut sink, request, &queue, 1).await?;
+            check!(control.written().await.is_err())?;
+            let report = control.retry_report();
+            check_eq!(report.stop_reason, Some(RetryStopReason::Cancelled))?;
+            check_eq!(report.attempts, 1)?;
+            check_eq!(report.transport_sends, u64::from(!cancel_at_start))?;
+            check_eq!(
+                recorded
+                    .lock()
+                    .map_err(|error| test_error(error.to_string()))?
+                    .len(),
+                usize::from(!cancel_at_start)
+            )?;
+            check!(queue.try_next().is_none())?;
+            let events = events
+                .lock()
+                .map_err(|error| test_error(error.to_string()))?;
+            check!(!events
+                .iter()
+                .any(|event| matches!(event, RetryEvent::RetryScheduled { .. })))?;
+            check_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, RetryEvent::Completed(_)))
+                    .count(),
+                1
+            )?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_total_deadline_does_not_become_a_retryable_write_timeout() -> TestResult {
+        use crate::api::retry::{RetryDecision, RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::ws::{
+            SendOptions, WsReplaySafety, WsSendRetryOn, WsSendRetryPolicy, WsTimeoutPhase,
+        };
+        let policy = WsSendRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .retry_on(
+                WsSendRetryOn::none()
+                    .with_write_timeout(true)
+                    .with_errors([crate::error::ErrorKind::TimedOut]),
+            )
+            .safety(WsReplaySafety::IdempotentByContract)
+            .classifier(|_| RetryDecision::Retry)
+            .build()?;
+        let request = crate::module::ws_client::v2_test_support::queued(
+            47,
+            SendOptions {
+                write_timeout: Duration::from_secs(1),
+                deadline: Some(std::time::Instant::now() + Duration::from_millis(20)),
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            },
+        )?;
+        let control = request.dispatch_phase.clone();
+        let queue = PriorityWriteQueue::new(1, 64)?;
+        let (started, started_rx) = oneshot::channel();
+        let mut sink = FlushPendingSink::new(started);
+        drive_raw_write(&mut sink, request, &queue, 1).await?;
+        started_rx.await?;
+        let error = control
+            .written()
+            .await
+            .err()
+            .ok_or_else(|| test_error("total deadline ignored"))?;
+        check_eq!(error.kind(), crate::error::ErrorKind::DeliveryUnknown)?;
+        check_eq!(error.ws_timeout_phase(), Some(WsTimeoutPhase::Total))?;
+        let report = error
+            .retry_report()
+            .ok_or_else(|| test_error("total deadline report missing"))?;
+        check_eq!(report.stop_reason, Some(RetryStopReason::TimedOut))?;
+        check_eq!(report.attempts, 1)?;
+        check_eq!(report.transport_sends, 1)?;
+        check!(queue.try_next().is_none())?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settled_control_timeout_is_not_reclassified_by_late_boundary_consumption() -> TestResult
+    {
+        let budget = TimeoutBudget::new(
+            (Instant::now() + Duration::from_millis(50)).into_std(),
+            crate::ws::WsTimeoutPhase::Attempt,
+        );
+        let mut sink = PendingSink::default();
+        let action = handle_control_message_with_budget(
+            &mut sink,
+            ControlMessage::FlushAutomatic,
+            Duration::from_millis(5),
+            &CancellationToken::new(),
+            Some(budget),
+        )
+        .await;
+        let ControlAction::Failed { error, origin } = action else {
+            return Err(test_error("control flush did not time out"));
+        };
+        check_eq!(error.kind(), crate::error::ErrorKind::DeliveryUnknown)?;
+        check_eq!(error.ws_timeout_phase(), None)?;
+        std::thread::sleep(
+            budget
+                .at
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_add(Duration::from_millis(2)),
+        );
+        let failure = classify_control_failure(error, origin, true, budget);
+        check_eq!(
+            failure.request_error.kind(),
+            crate::error::ErrorKind::DeliveryUnknown
+        )?;
+        check_eq!(failure.request_error.ws_timeout_phase(), None)?;
+        check_eq!(failure.requeue, RequestRequeue::IdempotentRetry)?;
+        sink.verify()?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settled_write_timeout_keeps_its_budget_when_writer_delivery_is_delayed() -> TestResult
+    {
+        use crate::api::retry::{RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::module::ws_client::v2_test_support as fixture;
+        use crate::ws::{
+            ResponseRouting, TaskEndCause, WebSocketClientConfig, WsReplaySafety,
+            WsRequestOperationOptions, WsRequestRetryOn, WsRequestRetryPolicy, WsTimeoutPhase,
+        };
+        let runtime = fixture::runtime(
+            WebSocketClientConfig::default(),
+            ResponseRouting::Manual,
+            true,
+        )
+        .await?;
+        let policy = WsRequestRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .retry_on(WsRequestRetryOn::none().with_write_timeout(true))
+            .safety(WsReplaySafety::IdempotencyKey)
+            .build()?;
+        let receipt = fixture::requests(&runtime)
+            .request_with_factory("delayed-writer", |context| {
+                Ok(crate::ws::Message::text(context.request_id().as_str()))
+            })?
+            .options(WsRequestOperationOptions {
+                write_timeout: Duration::from_millis(10),
+                attempt_timeout: Some(Duration::from_millis(100)),
+                total_timeout: Some(Duration::from_secs(2)),
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            })
+            .enqueue()
+            .await
+            .map_err(|error| error.into_error())?;
+        let request = fixture::bounded(runtime.queue.next())
+            .await?
+            .ok_or_else(|| test_error("first tracked write missing"))?;
+        let core = request.dispatch_phase.clone();
+        let absolute = core
+            .absolute_budget()
+            .ok_or_else(|| test_error("attempt budget missing"))?;
+        check_eq!(absolute.phase, WsTimeoutPhase::Attempt)?;
+        let registration = request
+            .registration
+            .as_ref()
+            .ok_or_else(|| test_error("tracked registration missing"))?;
+        let first_id = registration.request_id().clone();
+        let connection = crate::ws::ConnectionId::from_allocated(1);
+        check!(core.mark_writing(connection))?;
+        check!(runtime.pending.bind_connection(registration, connection)?)?;
+        let budget = TimeoutBudget::new(
+            (Instant::now() + request.config.write_timeout).into_std(),
+            WsTimeoutPhase::Write,
+        );
+        check!(budget.at < absolute.at)?;
+        let (started, started_rx) = oneshot::channel();
+        let mut sink = FlushPendingSink::new(started);
+        let (_controls, mut control_rx) = mpsc::channel(1);
+        let period = Duration::from_secs(3_600);
+        let mut heartbeat = HeartbeatSchedule::from_interval(
+            tokio::time::interval_at(Instant::now() + period, period),
+            period,
+        );
+        let mut recovery = HeartbeatRecovery::new(HeartbeatRetryConfig::default());
+        let failure = send_request_message_with_phase(
+            &mut sink,
+            request.message.clone(),
+            None,
+            MAX_READY_CONTROLS_PER_BOUNDARY,
+            budget,
+            &mut control_rx,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &mut heartbeat,
+            &HeartbeatState::new(1),
+            &mut recovery,
+            &CancellationToken::new(),
+            &request.dispatch_cancel,
+            &core,
+        )
+        .await
+        .err()
+        .ok_or_else(|| test_error("stalled writer unexpectedly succeeded"))?;
+        started_rx.await?;
+        check_eq!(
+            failure.request_error.ws_timeout_phase(),
+            Some(WsTimeoutPhase::Write)
+        )?;
+        // The transport timer has settled. Delay its writer-side delivery while
+        // the later Attempt timer expires, without allowing the runner to poll.
+        std::thread::sleep(
+            absolute
+                .at
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_add(Duration::from_millis(2)),
+        );
+        request.complete(Err(failure.request_error));
+        let selected = core
+            .selected_error()
+            .ok_or_else(|| test_error("writer completion missing"))?;
+        check_eq!(selected.ws_timeout_phase(), Some(WsTimeoutPhase::Write))?;
+        let next = fixture::bounded(runtime.queue.next())
+            .await?
+            .ok_or_else(|| test_error("settled Write timeout was replaced by Attempt timeout"))?;
+        let next_id = next
+            .registration
+            .as_ref()
+            .ok_or_else(|| test_error("retry registration missing"))?
+            .request_id();
+        check!(*next_id != first_id)?;
+        let (started, started_rx) = oneshot::channel();
+        let mut sink = FlushPendingSink::new(started);
+        drive_write_with_pending(&mut sink, next, &runtime.queue, 1, &runtime.pending).await?;
+        started_rx.await?;
+        let error = fixture::bounded(receipt.response())
+            .await?
+            .err()
+            .ok_or_else(|| test_error("two stalled writes unexpectedly succeeded"))?;
+        check_eq!(error.ws_timeout_phase(), Some(WsTimeoutPhase::Write))?;
+        let report = error
+            .retry_report()
+            .ok_or_else(|| test_error("logical report missing"))?;
+        check_eq!(report.stop_reason, Some(RetryStopReason::AttemptsExhausted))?;
+        check_eq!(report.attempts, 2)?;
+        check_eq!(report.transport_sends, 2)?;
+        runtime.end(
+            NetError::from(crate::error::ErrorKind::EngineDropped),
+            TaskEndCause::Shutdown,
+        );
+        fixture::bounded(runtime.wait_requests()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracked_write_timeout_retries_logical_request_with_fresh_wire_identity() -> TestResult
+    {
+        use crate::api::retry::{RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::module::ws_client::v2_test_support as fixture;
+        use crate::ws::{
+            DisconnectedPolicy, ResponseRouting, TaskEndCause, WebSocketClientConfig,
+            WsReplaySafety, WsRequestOperationOptions, WsRequestRetryOn, WsRequestRetryPolicy,
+            WsTimeoutPhase,
+        };
+        let mut config = WebSocketClientConfig::default();
+        config.requests.max_pending = 1;
+        let runtime = fixture::runtime(config, ResponseRouting::Manual, true).await?;
+        let factory_calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = factory_calls.clone();
+        let policy = WsRequestRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .retry_on(WsRequestRetryOn::none().with_write_timeout(true))
+            .safety(WsReplaySafety::IdempotencyKey)
+            .build()?;
+        let receipt = fixture::requests(&runtime)
+            .request_with_factory("same-business-key", move |context| {
+                observed.lock().map_err(NetError::from_poison)?.push((
+                    context.attempt(),
+                    context.request_id().clone(),
+                    context.operation_id(),
+                    context.idempotency_key().to_owned(),
+                ));
+                Ok(crate::ws::Message::text(format!(
+                    "{}|{}",
+                    context.request_id(),
+                    context.idempotency_key()
+                )))
+            })?
+            .options(WsRequestOperationOptions {
+                write_timeout: Duration::from_millis(20),
+                response_timeout: Duration::from_secs(1),
+                total_timeout: Some(Duration::from_secs(2)),
+                disconnected: DisconnectedPolicy::WaitForReconnect,
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            })
+            .enqueue()
+            .await
+            .map_err(|error| error.into_error())?;
+        let operation_id = receipt.handle().id();
+        let mut wire_ids = Vec::new();
+        for generation in 1..=2 {
+            let request = fixture::bounded(runtime.queue.next())
+                .await?
+                .ok_or_else(|| test_error("logical write attempt was not queued"))?;
+            let registration = request
+                .registration
+                .as_ref()
+                .ok_or_else(|| test_error("logical attempt missing tracked registration"))?;
+            wire_ids.push(registration.request_id().clone());
+            let control = request.dispatch_phase.clone();
+            runtime.activate_connection(crate::ws::ConnectionId::from_allocated(generation))?;
+            let (started, started_rx) = oneshot::channel();
+            let mut sink = FlushPendingSink::new(started);
+            let recorded = sink.recorded();
+            check!(matches!(
+                drive_write_with_pending(
+                    &mut sink,
+                    request,
+                    &runtime.queue,
+                    generation,
+                    &runtime.pending
+                )
+                .await?,
+                RequestAction::StopWithError(_)
+            ))?;
+            fixture::bounded(started_rx).await??;
+            check_eq!(
+                recorded
+                    .lock()
+                    .map_err(|error| test_error(error.to_string()))?
+                    .len(),
+                1
+            )?;
+            let error = control
+                .selected_error()
+                .ok_or_else(|| test_error("write timeout not selected"))?;
+            check_eq!(error.kind(), crate::error::ErrorKind::DeliveryUnknown)?;
+            check_eq!(error.ws_timeout_phase(), Some(WsTimeoutPhase::Write))?;
+            let timeout = std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<NetError>())
+                .ok_or_else(|| test_error("unknown delivery lost actual write timeout"))?;
+            check_eq!(timeout.kind(), crate::error::ErrorKind::TimedOut)?;
+            check_eq!(timeout.ws_timeout_phase(), Some(WsTimeoutPhase::Write))?;
+            check_eq!(control.retry_report().transport_sends, 1)?;
+        }
+        let error = fixture::bounded(receipt.response())
+            .await?
+            .err()
+            .ok_or_else(|| test_error("two timed out writes unexpectedly succeeded"))?;
+        let report = error
+            .retry_report()
+            .ok_or_else(|| test_error("logical retry report missing"))?;
+        check_eq!(report.stop_reason, Some(RetryStopReason::AttemptsExhausted))?;
+        check_eq!(report.attempts, 2)?;
+        check_eq!(report.retry_count, 1)?;
+        check_eq!(report.transport_sends, 2)?;
+        let calls = factory_calls
+            .lock()
+            .map_err(|error| test_error(error.to_string()))?;
+        check_eq!(calls.len(), 2)?;
+        check_eq!(wire_ids.len(), 2)?;
+        check!(wire_ids.first() != wire_ids.get(1))?;
+        for (index, (attempt, request_id, captured_operation, key)) in calls.iter().enumerate() {
+            check_eq!(*attempt as usize, index + 1)?;
+            check_eq!(wire_ids.get(index), Some(request_id))?;
+            check_eq!(*captured_operation, operation_id)?;
+            check_eq!(key.as_str(), "same-business-key")?;
+        }
+        drop(calls);
+        check!(runtime.queue.try_next().is_none())?;
+        check!(runtime.pending.snapshot()?.is_empty())?;
+        runtime.end(
+            NetError::from(crate::error::ErrorKind::EngineDropped),
+            TaskEndCause::Shutdown,
+        );
+        fixture::bounded(runtime.wait_requests()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_retry_exhaustion_preserves_last_delivery_error_and_report() -> TestResult {
+        use crate::api::retry::{RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::ws::{SendOptions, WsReplaySafety, WsSendRetryOn, WsSendRetryPolicy};
+        let policy = WsSendRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .retry_on(WsSendRetryOn::none().with_write_errors(true))
+            .safety(WsReplaySafety::IdempotentByContract)
+            .build()?;
+        let request = crate::module::ws_client::v2_test_support::queued(
+            43,
+            SendOptions {
+                retry_setting: RetrySetting::Policy(policy),
+                ..Default::default()
+            },
+        )?;
+        let control = request.dispatch_phase.clone();
+        let queue = PriorityWriteQueue::new(1, 64)?;
+        let mut first = RecordingSink::new(None);
+        first.fail_on_flush = Some(1);
+        drive_raw_write(&mut first, request, &queue, 1).await?;
+        let request = queue
+            .try_next()
+            .ok_or_else(|| test_error("retry missing"))?;
+        let mut second = RecordingSink::new(None);
+        second.fail_on_flush = Some(1);
+        drive_raw_write(&mut second, request, &queue, 2).await?;
+        let error = control
+            .written()
+            .await
+            .err()
+            .ok_or_else(|| test_error("exhausted send succeeded"))?;
+        check_eq!(error.kind(), crate::error::ErrorKind::DeliveryUnknown)?;
+        let report = error
+            .retry_report()
+            .ok_or_else(|| test_error("error lost retry report"))?;
+        check_eq!(report.attempts, 2)?;
+        check_eq!(report.transport_sends, 2)?;
+        check_eq!(report.stop_reason, Some(RetryStopReason::AttemptsExhausted))?;
+        check!(queue.try_next().is_none())?;
         Ok(())
     }
 }

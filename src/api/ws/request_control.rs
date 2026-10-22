@@ -128,7 +128,9 @@ impl fmt::Debug for RequestRegistration {
 ///
 /// The snapshot does not retain the request payload and does not freeze later
 /// state transitions.
-#[derive(Clone, Debug)]
+///
+/// `Debug` summarizes the business identifier and metadata while retaining operation diagnostics.
+#[derive(Clone)]
 pub struct RequestSnapshot {
     /// Identifier of the underlying send operation.
     pub operation_id: OperationId,
@@ -150,6 +152,22 @@ pub struct RequestSnapshot {
     pub operation: OperationSnapshot,
 }
 
+impl fmt::Debug for RequestSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestSnapshot")
+            .field("operation_id", &self.operation_id)
+            .field("request_id", &self.request_id)
+            .field("session_id", &self.session_id)
+            .field("connection_id", &self.connection_id)
+            .field("registered_at", &self.registered_at)
+            .field("response_deadline", &self.response_deadline)
+            .field("metadata_entries", &self.metadata.len())
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
 /// Shareable handle for observing or explicitly terminating a request.
 ///
 /// The handle does not retain the request payload. Clones operate on the same
@@ -166,6 +184,22 @@ pub struct RequestHandle {
 }
 
 impl RequestHandle {
+    pub(crate) fn retry_report(&self) -> crate::api::retry::RetryReport {
+        self.core.retry_report()
+    }
+
+    pub(crate) fn has_selected_result(&self) -> bool {
+        self.core.is_finished()
+    }
+
+    /// Compete with response/failure selection under the same pending/core
+    /// authority, then let the existing response channel publish that winner.
+    pub(crate) fn expire_operation_attempt(&self) {
+        self.core
+            .prepare_termination(self.core.deadline_error(), TaskEndCause::Expired)
+            .dispatch();
+    }
+
     pub(crate) fn new(core: Arc<OperationControl>, registration: RequestRegistration) -> Self {
         Self { core, registration }
     }

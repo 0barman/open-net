@@ -1,10 +1,11 @@
 #![cfg(feature = "http-client")]
 
+use open_net::api::retry::{Backoff, RetrySchedule, RetrySetting};
+
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use open_net::api::http::{
-    Backoff, HttpClient, HttpClientConfig, HttpRequest, HttpStatusPolicy, RetryOn, RetryPolicy,
-    RetrySetting,
+    HttpClient, HttpClientConfig, HttpRequest, HttpRetryPolicy, HttpStatusPolicy, RetryOn,
 };
 use open_net::error::ErrorKind;
 use open_net::{NetError, OpenNet};
@@ -418,7 +419,21 @@ async fn result_api_shortcuts_inherit_global_retry_defaults() -> TestResult {
     .await?;
     let config = HttpClientConfig::new(format!("http://{}", server.address))?
         .with_timeout(Duration::from_secs(1))?
-        .with_default_retry_policy(open_net::api::http::RetryPolicy::new(1));
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(
+                    RetrySchedule::builder()
+                        .max_attempts(2)
+                        .backoff(Backoff::exponential(
+                            Duration::from_millis(50).min(Duration::from_secs(30)),
+                            2.0,
+                            Duration::from_secs(30),
+                        ))
+                        .build()?,
+                )
+                .retry_on(open_net::api::http::RetryOn::standard())
+                .build()?,
+        );
     let (net, client) = make_client_with_config("result-inherit-default-retry", config).await?;
     let response = bounded(client.get("/retry")).await??;
     check(
@@ -441,11 +456,24 @@ async fn result_api_application_predicate_retries_buffered_response() -> TestRes
     ])
     .await?;
     let (net, client) = make_client(&server, "result-application-predicate").await?;
-    let policy = RetryPolicy::builder()
-        .max_attempts(2)
-        .backoff(Backoff::None)
-        .retry_on(RetryOn::none().with_application(true))
-        .application_predicate(|response| response.body.as_ref() == b"retry-once")
+    let policy = HttpRetryPolicy::builder()
+        .schedule(
+            RetrySchedule::builder()
+                .max_attempts(2)
+                .backoff(Backoff::None)
+                .build()?,
+        )
+        .retry_on(RetryOn::none())
+        .classifier(move |context| {
+            if context
+                .outcome
+                .is_ok_and(|response| response.body.as_ref() == b"retry-once")
+            {
+                open_net::api::retry::RetryDecision::Retry
+            } else {
+                open_net::api::retry::RetryDecision::Default
+            }
+        })
         .build()?;
     let request = HttpRequest::builder()
         .path("/application")
@@ -470,11 +498,25 @@ async fn result_api_request_policy_explicitly_disables_client_retry() -> TestRes
     .await?;
     let config = HttpClientConfig::new(format!("http://{}", server.address))?
         .with_timeout(Duration::from_secs(1))?
-        .with_default_retry_policy(open_net::api::http::RetryPolicy::new(1));
+        .with_default_retry_policy(
+            HttpRetryPolicy::builder()
+                .schedule(
+                    RetrySchedule::builder()
+                        .max_attempts(2)
+                        .backoff(Backoff::exponential(
+                            Duration::from_millis(50).min(Duration::from_secs(30)),
+                            2.0,
+                            Duration::from_secs(30),
+                        ))
+                        .build()?,
+                )
+                .retry_on(open_net::api::http::RetryOn::standard())
+                .build()?,
+        );
     let (net, client) = make_client_with_config("result-explicit-no-retry", config).await?;
     let request = HttpRequest::builder()
         .path("/retry")
-        .retry_setting(RetrySetting::None)
+        .retry_setting(RetrySetting::Disabled)
         .build()?;
     let response = bounded(client.request(request)).await??;
     check(

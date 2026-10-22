@@ -6,12 +6,11 @@
 
 Every example on this page uses `http-client`, which also enables `net-status`.
 Use Rust 1.89 or later. Create a consumer crate with `cargo new http-example`,
-then add the following to its `Cargo.toml`. Replace `/path/to/open-net` with
-the library directory containing `Cargo.toml` in your checkout.
+then use the following dependency configuration.
 
 ```toml
 [dependencies]
-open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
@@ -285,6 +284,7 @@ async fn main() -> Result<(), open_net::NetError> {
 - [Engine shutdown and subscription lifetime](../lifecycle.md)
 - [Network observations](network_status.md)
 - [Client configuration](configuration.md)
+- [Transport security and redirects](redirects.md)
 - [Request codecs](request_codecs.md)
 - [Timeouts and admission](timeouts_and_admission.md)
 - [Retries](retry.md)

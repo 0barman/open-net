@@ -12,6 +12,7 @@ use crate::LogType;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
 use std::sync::Arc;
+use tokio::time::Instant;
 
 /// A cloneable handle to shared HTTP workers.
 ///
@@ -33,7 +34,7 @@ impl HttpClient {
     /// can be owned by a custom request or captured by its callback.
     pub fn new(config: HttpClientConfig, thread_name: impl Into<String>) -> Result<Self, NetError> {
         let thread_name = thread_name.into();
-        crate::log_s!(LogType::HTTP; "new", "thread_name|config", thread_name, format!("{:?}", config));
+        crate::log_s!(LogType::HTTP; "new", "config", format!("{:?}", config));
         if thread_name.trim().is_empty() || thread_name.contains('\0') {
             return Err(NetError::from(ErrorKind::InvalidInput));
         }
@@ -50,7 +51,7 @@ impl HttpClient {
         context: NetworkStatusContext,
     ) -> Result<Self, NetError> {
         let thread_name = thread_name.into();
-        crate::log_s!(LogType::HTTP; "new_with_network_status", "thread_name|config", thread_name, format!("{:?}", config));
+        crate::log_s!(LogType::HTTP; "new_with_network_status", "config", format!("{:?}", config));
         if thread_name.trim().is_empty() || thread_name.contains('\0') {
             return Err(NetError::from(ErrorKind::InvalidInput));
         }
@@ -93,7 +94,7 @@ impl HttpClient {
     /// to wait for the callback and resource cleanup. `Err` retains the original
     /// request in [`EnqueueError`] and never schedules its callback.
     /// Requests and their `FnOnce` state need only be `Send`, not `Sync` or `Clone`.
-    /// A positive request retry policy overrides the client; otherwise it is inherited.
+    /// Retry selection explicitly inherits, disables, or replaces the client policy.
     ///
     /// # Examples
     ///
@@ -126,9 +127,13 @@ impl HttpClient {
     where
         R: HttpRequestTrait,
     {
+        let start = Instant::now();
         crate::log_s!(LogType::HTTP; "send", "request_type", std::any::type_name::<R>());
-        let options = Self::request_options(&request);
-        self.send_with_options(request, options)
+        let options = match Self::request_options(&request, start) {
+            Ok(options) => options,
+            Err(error) => return Err(EnqueueError::new(request, error)),
+        };
+        self.inner.submit_request_at(request, options, start)
     }
 
     /// Attempt admission with explicit execution options, retaining input on failure.
@@ -143,8 +148,9 @@ impl HttpClient {
     where
         R: HttpRequestTrait,
     {
+        let start = Instant::now();
         crate::log_s!(LogType::HTTP; "send_with_options", "request_type|options", std::any::type_name::<R>(), format!("{:?}", options));
-        self.inner.submit_request(request, options)
+        self.inner.submit_request_at(request, options, start)
     }
 
     /// Wait for admission capacity, then return a handle for the accepted request.
@@ -160,9 +166,15 @@ impl HttpClient {
     where
         R: HttpRequestTrait,
     {
+        let start = Instant::now();
         crate::log_s!(LogType::HTTP; "send_wait", "request_type", std::any::type_name::<R>());
-        let options = Self::request_options(&request);
-        self.send_wait_with_options(request, options).await
+        let options = match Self::request_options(&request, start) {
+            Ok(options) => options,
+            Err(error) => return Err(EnqueueError::new(request, error)),
+        };
+        self.inner
+            .submit_request_wait_at(request, options, start)
+            .await
     }
 
     /// Wait for bounded admission with explicit retry and timeout options.
@@ -179,16 +191,33 @@ impl HttpClient {
     where
         R: HttpRequestTrait,
     {
+        let start = Instant::now();
         crate::log_s!(LogType::HTTP; "send_wait_with_options", "request_type|options", std::any::type_name::<R>(), format!("{:?}", options));
-        self.inner.submit_request_wait(request, options).await
+        self.inner
+            .submit_request_wait_at(request, options, start)
+            .await
     }
 
-    fn request_options<R: HttpRequestTrait>(request: &R) -> HttpRequestOptions {
-        let policy = request.retry_policy();
-        if policy.max_retries() > 0 {
-            HttpRequestOptions::new().with_retry_policy(policy)
-        } else {
-            HttpRequestOptions::new()
+    fn request_options<R: HttpRequestTrait>(
+        request: &R,
+        start: Instant,
+    ) -> Result<HttpRequestOptions, NetError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.retry_setting())) {
+            Ok(setting) => Ok(HttpRequestOptions::new().with_retry_setting(setting)),
+            Err(payload) => {
+                if let Err(second) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+                {
+                    std::mem::forget(second);
+                }
+                let mut report = crate::api::retry::RetryReport::new();
+                report.elapsed = start.elapsed();
+                report.stop_reason = Some(crate::api::retry::RetryStopReason::PolicyFailed);
+                Err(NetError::from(ErrorKind::ProviderFailed)
+                    .with_stage(crate::api::error::ErrorStage::Provider)
+                    .with_http_attempt(0)
+                    .with_retry_report(report))
+            }
         }
     }
 
@@ -199,8 +228,9 @@ impl HttpClient {
     /// Dropping the waiting future requests cancellation. HTTP status failures are still
     /// `Ok(HttpResponse)` until classified with [`HttpResponse::check_status`].
     pub async fn request(&self, request: HttpRequest) -> Result<HttpResponse, NetError> {
+        let start = Instant::now();
         crate::log_s!(LogType::HTTP; "request", "method|body_bytes", request.method.as_str(), request.body.len());
-        self.inner.request_buffered(request).await
+        self.inner.request_buffered(request, start).await
     }
 
     /// Issue a `GET` request and wait for its fully buffered response.
@@ -208,7 +238,9 @@ impl HttpClient {
     /// `path` must satisfy the client's same-origin relative-path rules. The
     /// request uses the configured default retry policy.
     pub async fn get(&self, path: impl Into<String>) -> Result<HttpResponse, NetError> {
-        self.request(HttpRequest::builder().path(path).build()?)
+        let start = Instant::now();
+        self.inner
+            .request_buffered(HttpRequest::builder().path(path).build()?, start)
             .await
     }
 
@@ -218,7 +250,12 @@ impl HttpClient {
         path: impl Into<String>,
         headers: HeaderMap,
     ) -> Result<HttpResponse, NetError> {
-        self.request(HttpRequest::builder().path(path).headers(headers).build()?)
+        let start = Instant::now();
+        self.inner
+            .request_buffered(
+                HttpRequest::builder().path(path).headers(headers).build()?,
+                start,
+            )
             .await
     }
 
@@ -231,16 +268,18 @@ impl HttpClient {
         path: impl Into<String>,
         body: impl AsRef<[u8]>,
     ) -> Result<HttpResponse, NetError> {
-        let path = path.into();
-        crate::log_s!(LogType::HTTP; "post", "path", path);
-        self.request(
-            HttpRequest::builder()
-                .method(Method::POST)
-                .path(path)
-                .body(Bytes::copy_from_slice(body.as_ref()))
-                .build()?,
-        )
-        .await
+        let start = Instant::now();
+        crate::log_s!(LogType::HTTP; "post");
+        self.inner
+            .request_buffered(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .path(path)
+                    .body(Bytes::copy_from_slice(body.as_ref()))
+                    .build()?,
+                start,
+            )
+            .await
     }
 
     /// Issue a `POST` request with caller-supplied headers and an owned body.
@@ -250,17 +289,19 @@ impl HttpClient {
         headers: HeaderMap,
         body: impl AsRef<[u8]>,
     ) -> Result<HttpResponse, NetError> {
-        let path = path.into();
-        crate::log_s!(LogType::HTTP; "post_with_headers", "path", path);
-        self.request(
-            HttpRequest::builder()
-                .method(Method::POST)
-                .path(path)
-                .headers(headers)
-                .body(Bytes::copy_from_slice(body.as_ref()))
-                .build()?,
-        )
-        .await
+        let start = Instant::now();
+        crate::log_s!(LogType::HTTP; "post_with_headers");
+        self.inner
+            .request_buffered(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .path(path)
+                    .headers(headers)
+                    .body(Bytes::copy_from_slice(body.as_ref()))
+                    .build()?,
+                start,
+            )
+            .await
     }
 
     /// Compatibility alias for [`Self::get`].
@@ -287,11 +328,21 @@ impl HttpClient {
     /// headers and body. Paused consumption continues to consume these budgets.
     /// Consume to a terminal item or drop the stream to return admission capacity.
     pub async fn stream(&self, request: HttpRequest) -> Result<HttpStreamResponse, NetError> {
+        self.stream_at(request, Instant::now()).await
+    }
+    async fn stream_at(
+        &self,
+        request: HttpRequest,
+        start: Instant,
+    ) -> Result<HttpStreamResponse, NetError> {
         #[cfg(feature = "http-client-middleware")]
         if self.inner.has_middleware() {
-            return self.inner.stream_request_with_middleware(request).await;
+            return self
+                .inner
+                .stream_request_with_middleware(request, start)
+                .await;
         }
-        self.inner.stream_request(request).await
+        self.inner.stream_request(request, start).await
     }
 
     /// Start a streaming `GET` request intended for server-sent events.
@@ -303,10 +354,13 @@ impl HttpClient {
         path: impl Into<String>,
         headers: HeaderMap,
     ) -> Result<HttpStreamResponse, NetError> {
-        let path = path.into();
-        crate::log_s!(LogType::HTTP; "sse", "path", path);
-        self.stream(HttpRequest::builder().path(path).headers(headers).build()?)
-            .await
+        let start = Instant::now();
+        crate::log_s!(LogType::HTTP; "sse");
+        self.stream_at(
+            HttpRequest::builder().path(path).headers(headers).build()?,
+            start,
+        )
+        .await
     }
 
     /// Cancel the operation currently registered under an ID, including a stream.
@@ -418,5 +472,141 @@ mod tests {
             .shutdown()
             .await
             .map_err(|error| format!("shutdown failed: {error:?}"))
+    }
+}
+
+#[cfg(test)]
+mod submission_budget_tests {
+    use super::*;
+    use crate::api::http::{
+        HttpRequestMethod, HttpResponseResult, HttpRetryPolicy, HttpTimeouts, TimeoutPhase,
+    };
+    use crate::api::retry::{RetrySetting, RetryStopReason};
+    use crate::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn check(value: bool, message: &str) -> TestResult {
+        if value {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(message).into())
+        }
+    }
+    struct SlowRequest {
+        before_admission: bool,
+        callbacks: Arc<AtomicUsize>,
+        sender: mpsc::Sender<HttpResponseResult>,
+    }
+    #[async_trait]
+    impl HttpRequestTrait for SlowRequest {
+        fn get_path(&self) -> String {
+            "/".to_owned()
+        }
+        fn get_method(&self) -> HttpRequestMethod {
+            HttpRequestMethod::GET
+        }
+        fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> {
+            if self.before_admission {
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            RetrySetting::Inherit
+        }
+        fn get_req_body(&self) -> Bytes {
+            if !self.before_admission {
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            Bytes::new()
+        }
+        async fn deal_with_response(self: Box<Self>, result: HttpResponseResult) {
+            self.callbacks.fetch_add(1, Ordering::AcqRel);
+            let _ = self.sender.send(result);
+        }
+    }
+    #[tokio::test]
+    async fn synchronous_sdk_preparation_consumes_the_submission_total() -> TestResult {
+        for wait in [false, true] {
+            for before_admission in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                listener.set_nonblocking(true)?;
+                let config = HttpClientConfig::new(format!("http://{}", listener.local_addr()?))?
+                    .with_timeouts(
+                    HttpTimeouts::new().with_total_timeout(Duration::from_millis(20)),
+                )?;
+                let client = HttpClient::new(config, "http-entry-budget-test")?;
+                let callbacks = Arc::new(AtomicUsize::new(0));
+                let (sender, receiver) = mpsc::channel();
+                let request = SlowRequest {
+                    before_admission,
+                    callbacks: Arc::clone(&callbacks),
+                    sender,
+                };
+                let admitted = if wait {
+                    client.send_wait(request).await
+                } else {
+                    client.send(request)
+                };
+                let error = if before_admission {
+                    let rejected = match admitted {
+                        Ok(_) => {
+                            return Err(
+                                std::io::Error::other("expired preparation was admitted").into()
+                            )
+                        }
+                        Err(rejected) => rejected,
+                    };
+                    check(
+                        callbacks.load(Ordering::Acquire) == 0,
+                        "rejected request callback ran inside SDK",
+                    )?;
+                    let (request, error) = rejected.into_parts();
+                    Box::new(request)
+                        .deal_with_response(Err(error.clone()))
+                        .await;
+                    error
+                } else {
+                    let handle = admitted?;
+                    let completion = handle.finished().await;
+                    match completion.response {
+                        Ok(_) => {
+                            return Err(std::io::Error::other(
+                                "expired accepted preparation succeeded",
+                            )
+                            .into())
+                        }
+                        Err(error) => error,
+                    }
+                };
+                check(
+                    error.timeout_phase() == Some(TimeoutPhase::Total),
+                    "preparation did not consume total budget",
+                )?;
+                let report = error
+                    .retry_report()
+                    .ok_or_else(|| std::io::Error::other("missing preparation retry report"))?;
+                check(
+                    report.transport_sends == 0
+                        && report.attempts == u32::from(!before_admission)
+                        && report.stop_reason == Some(RetryStopReason::TimedOut),
+                    "preparation report has incorrect sends/attempts/stop",
+                )?;
+                check(
+                    callbacks.load(Ordering::Acquire) == 1,
+                    "request callback ownership was violated",
+                )?;
+                let delivered = receiver.recv_timeout(Duration::from_secs(1))?;
+                check(
+                    delivered.is_err(),
+                    "callback did not receive terminal error",
+                )?;
+                check(
+                    matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),
+                    "expired preparation reached the transport",
+                )?;
+                client.shutdown().await?;
+            }
+        }
+        Ok(())
     }
 }

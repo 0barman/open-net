@@ -4,7 +4,7 @@ Required feature: `http-client-cookies` (includes `http-client`). Cookie process
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client-cookies"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client-cookies"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
@@ -25,7 +25,7 @@ using open-net should accept the host's choice rather than install its own globa
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
 precedence and complete examples of both approaches.
 
-Adjust the local path to this checkout. Public Cookie types, `Url`, `Method`, `HeaderMap` and `HeaderValue` are re-exported by `open_net::api::http`. `Arc` is `std::sync::Arc`.
+Public Cookie types, `Url`, `Method`, `HeaderMap` and `HeaderValue` are re-exported by `open_net::api::http`. `Arc` is `std::sync::Arc`.
 
 ## Create, limit and install a `CookieJar`
 
@@ -286,7 +286,7 @@ No closure arguments at installation; the trait methods borrow the provider with
 
 Custom stores must enforce domain, path, Secure, expiry and SameSite themselves. Worker calls catch unwinding panics and sanitize arbitrary provider errors to `ProviderFailed/Provider`. Only outgoing header-size `ItemTooLarge/RequestBuild` retains that classification. Synchronous provider calls cannot be preempted; cancellation is checked around them, so blocking them delays cleanup.
 
-Each response hop updates the store once before redirect/auth/retry decisions and before exposing streaming headers. Up to ten redirects may be followed. Cross-origin redirects remove explicit sensitive headers, while the jar is reevaluated for the destination's allowed cookies. Redirect errors and cancellation remain normal HTTP operation errors. This does not make request paths accept absolute URLs.
+Each response hop updates the store once before redirect/auth/retry decisions and before exposing streaming headers. The [redirect policy](redirects.md) defaults to at most ten followed hops on the original origin and blocks HTTPS-to-HTTP redirects in every HTTP version mode. An explicitly allowed cross-origin redirect removes explicit sensitive headers, while the jar is reevaluated for the destination's allowed cookies. The store still processes the received response when redirects are disabled or the next target is rejected, but no cookies are requested for a rejected destination. Redirect policy rejections are not automatically retried. Cancellation remains a normal HTTP operation error. Installing a Cookie store does not change the redirect implementation, and request paths still cannot be absolute URLs.
 
 ### Example
 

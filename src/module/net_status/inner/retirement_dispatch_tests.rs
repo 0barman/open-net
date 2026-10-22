@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! The callback pool must remain open until deferred terminal delivery finishes.
 use super::super::network_status_snapshot::NetworkStatusSource;
 use super::*;

@@ -30,13 +30,12 @@ fn service() -> Result<Arc<SharedNetworkService>, NetError> {
 }
 
 #[tokio::test]
-async fn service_shutdown_closes_both_sampling_lanes_with_retained_handles() -> TestResult {
+async fn service_shutdown_closes_sampling_lane_with_retained_handles() -> TestResult {
     let service = service()?;
     let context = service.context();
-    let names = context.windows_sampler()?;
     let reachability = context.windows_reachability_sampler()?;
     bounded(service.shutdown()).await??;
-    for sampler in [names, reachability] {
+    for sampler in [reachability.clone(), reachability] {
         let result = sampler
             .sample_background(
                 std::time::Instant::now() + Duration::from_secs(5),

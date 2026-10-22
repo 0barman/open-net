@@ -2,12 +2,12 @@
 
 Required features: `http-client`. There is no separate timeout or admission feature.
 Every Rust block below is a complete program. Create a project with
-`cargo new timeouts-example` and add these dependencies to its `Cargo.toml`,
-with the path adjusted to your checkout:
+`cargo new timeouts-example` and use these dependency settings in its
+`Cargo.toml`:
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -63,7 +63,7 @@ representable by the monotonic clock. No callback parameters apply.
 | `with_attempt_timeout(self, timeout: Duration) -> Self` | `timeout`, required | Bound preparation and execution of one attempt through body completion |
 | `without_attempt_timeout(self) -> Self` | None | Disable attempt timeout even if legacy settings supply one |
 | `with_total_timeout(self, timeout: Duration) -> Self` | `timeout`, required | Bound the operation including admission, middleware, retries and body |
-| `without_total_timeout(self) -> Self` | None | Disable total timeout even if the retry policy supplies one |
+| `without_total_timeout(self) -> Self` | None | Disable the inherited client total timeout |
 
 ### Steps
 
@@ -97,8 +97,8 @@ request field uses the client field. If both inherit:
 | Admission | 30 seconds, independent of the legacy request timeout |
 | Headers | Disabled |
 | IdleRead | Disabled |
-| Attempt | Client `timeout` (30 seconds initially), or the smaller of it and the retry policy's attempt timeout |
-| Total | Retry policy `total_deadline`, otherwise disabled |
+| Attempt | Client `timeout` (30 seconds initially) |
+| Total | Disabled |
 | Connect | Separate client connection setting, initially disabled; not a field of `HttpTimeouts` |
 
 Replacing a `HttpTimeouts` object replaces that entire layer, not just the fields
@@ -107,7 +107,7 @@ An explicit disable overrides inherited fallback values. Disabling Admission doe
 not disable Total. Unrelated budgets continue running and any can end the operation.
 For response futures, budgets and admission policy are resolved at first poll,
 before middleware. Middleware cannot retroactively change admission.
-The total budget excludes client lookup/creation and preceding application work.
+The total budget starts at the synchronous submission call, or the first poll of an asynchronous submission future. It excludes an unpolled future, client lookup/creation and preceding application work or an outer application queue. It covers SDK admission, preparation, retries and backoff. Once the network operation has a terminal result, final callback queueing and execution are both excluded from `total_timeout` and the retry report's `elapsed`. Waiting in the callback queue does not turn that terminal result into a timeout. `finished()` still waits for the callback and SDK resource cleanup.
 For a deadline that also covers those steps, bound them in the application and
 pass the positive remaining duration to the request; see the
 [async response example](requests_and_responses.md#awaiting-a-buffered-response).
@@ -175,8 +175,10 @@ NetError::timeout_phase(&self) -> Option<TimeoutPhase>
 ### Steps and parameters
 
 After receiving an error, call the method on it; no explicit parameters and no
-callbacks. `Some(phase)` identifies the expired HTTP budget; `None` means the error
-has no HTTP timeout classification. Reading the error does not cancel other work.
+callbacks. `Some(phase)` identifies the expired SDK-owned HTTP budget. `None`
+means no such budget was identified; the error can still have
+`ErrorKind::TimedOut`, for example after an HTTP/2 keepalive timeout. Reading the
+error does not cancel other work.
 
 ### Return values and errors
 
@@ -195,6 +197,14 @@ other HTTP phase budgets use `ErrorKind::TimedOut`. When budgets overlap, the
 earliest absolute deadline wins. Exact deadline ties are resolved in this order:
 Total, Admission, Attempt, Connect, Headers, IdleRead. Transport, cancellation, and
 shutdown failures can occur instead of a timeout.
+
+A transport keepalive timeout is not a `Connect`, `Headers`, or `Attempt`
+budget expiry. When it interrupts execution before response headers without
+reliable delivery evidence, its retry category is `DeliveryUnknown`, its broad
+kind remains `TimedOut`, and `context().stage` and `timeout_phase()` are `None`.
+Neither the timeout kind nor a processing stage proves that no request bytes
+reached the peer. See [retry classification](retry.md#built-in-reasons-and-replay-safety)
+for explicit selection and replay safety.
 
 ### Example
 
@@ -337,7 +347,7 @@ A new override object with every phase set to inherit.
 
 ### Errors and behavior
 
-Infallible; inheriting does not mean disabled. Admission falls back to 30 seconds and Attempt to the legacy client/policy setting.
+Infallible; inheriting does not mean disabled. Admission falls back to 30 seconds and Attempt to the legacy client timeout setting.
 
 ### Example
 
@@ -589,7 +599,7 @@ The updated override object.
 
 ### Errors and behavior
 
-No immediate validation error. Installation validates durations: client configuration returns InvalidConfig, callback options or request build return InvalidInput. The last setting for this phase wins. An explicit setting replaces the inherited legacy client/retry attempt limit.
+No immediate validation error. Installation validates durations: client configuration returns InvalidConfig, callback options or request build return InvalidInput. The last setting for this phase wins. An explicit setting replaces the inherited legacy client attempt limit.
 
 ### Example
 
@@ -625,7 +635,7 @@ The updated object with this phase explicitly disabled.
 
 ### Errors and behavior
 
-Infallible. Explicit disable overrides client and fallback values, while other phase budgets remain active. It does not mean an operation can never time out. An explicit setting replaces the inherited legacy client/retry attempt limit.
+Infallible. Explicit disable overrides client and fallback values, while other phase budgets remain active. It does not mean an operation can never time out. An explicit setting replaces the inherited legacy client attempt limit.
 
 ### Example
 

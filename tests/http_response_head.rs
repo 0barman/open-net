@@ -1,9 +1,11 @@
 #![cfg(feature = "http-client")]
 
+use open_net::api::retry::{Backoff, RetrySchedule, RetrySetting};
+
 use http::StatusCode;
 use open_net::api::http::{
-    Backoff, HeaderMap, HttpClient, HttpClientConfig, HttpRequestMethod, HttpRequestOptions,
-    HttpRequestTrait, HttpResponseResult, HttpTimeouts, RetryOn, RetryPolicy, TimeoutPhase,
+    HeaderMap, HttpClient, HttpClientConfig, HttpRequestMethod, HttpRequestOptions,
+    HttpRequestTrait, HttpResponseResult, HttpRetryPolicy, HttpTimeouts, RetryOn, TimeoutPhase,
 };
 use open_net::error::{ErrorKind, ErrorStage, NetError};
 use std::error::Error;
@@ -293,12 +295,16 @@ async fn retries_keep_only_the_final_attempt_response_head() -> TestResult {
     for last in [PARTIAL_UNAUTHORIZED, MALFORMED, COMPLETE_OK] {
         let server = peer(vec![PARTIAL_OK, last], false).await?;
         let client = HttpClient::new(HttpClientConfig::new(&server.url)?, "retry-head")?;
-        let policy = RetryPolicy::builder()
-            .max_attempts(2)
-            .backoff(Backoff::None)
+        let policy = HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::None)
+                    .build()?,
+            )
             .retry_on(RetryOn::none().with_body_read(true))
             .build()?;
-        let options = HttpRequestOptions::new().with_retry_policy(policy);
+        let options = HttpRequestOptions::new().with_retry_setting(RetrySetting::Policy(policy));
         let (result, completion, hooks) = request(&client, options).await?;
         if last == COMPLETE_OK {
             let response = result?;

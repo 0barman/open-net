@@ -2,14 +2,16 @@
 
 [Library overview](../../README.md) · [TLS providers](../tls.md) · [Engine and subscription lifetime](../lifecycle.md)
 
+See [message and request retries](retry.md) for shared schedules, per-operation
+policies, wire request identity and factory-backed replay.
+
 `ws-client` uses rustls for `wss://` connections, but `open-net` does not select
 or install a cryptographic provider. The application must add a rustls 0.23
 provider and inject it into the WebSocket `NetworkConfig` before creating the
 engine, or install its chosen process provider first.
 
 Use Rust 1.89 or later. Create a consumer with `cargo new websocket-example`,
-use the dependencies below and replace the path with your checkout's `open-net`
-directory. Each Rust block is a complete independent `src/main.rs` program.
+use the dependency settings below. Each Rust block is a complete independent `src/main.rs` program.
 `cargo check` verifies compilation; `cargo run` executes the selected example.
 Only examples calling `connect` need a reachable WebSocket server. Configuration
 validation and named-client creation alone do not connect to a server.
@@ -22,7 +24,7 @@ ring or AWS-LC provider can be supplied through the same
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["ws-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["ws-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -489,7 +491,7 @@ fn main() -> open_net::Result<()> {
 }
 ```
 
-## Explicit HTTP CONNECT proxies
+## Explicit HTTP and HTTPS CONNECT proxies
 
 ### Required features
 
@@ -501,22 +503,27 @@ fn main() -> open_net::Result<()> {
 ```text
 ProxyBasicAuth::new(username: &str, password: &str) -> Result<ProxyBasicAuth, NetError>
 ProxyConfig::http_connect(url: &str, auth: Option<ProxyBasicAuth>) -> Result<ProxyConfig, NetError>
+ProxyConfig::https_connect(url: &str, auth: Option<ProxyBasicAuth>, proxy_tls: TlsConfig) -> Result<ProxyConfig, NetError>
+ProxyConfig::http_connect_with_auth_policy(url: &str, auth: Option<ProxyBasicAuth>, policy: ProxyAuthTransportPolicy) -> Result<ProxyConfig, NetError>
 ProxyConfig::direct() -> ProxyConfig
 NetworkConfig::with_proxy(self, proxy: ProxyConfig) -> NetworkConfig
 ```
 
 ### Steps
 
-Create optional proxy credentials, parse an HTTP proxy endpoint, and install
-the proxy in a complete network policy together with the application's provider.
-Use that policy as an engine default or as a complete per-client replacement.
+Create optional proxy credentials, parse the proxy endpoint, and install
+the proxy in a complete network policy. HTTPS proxies take a separate
+`TlsConfig` for the client-to-proxy TLS session. Use that policy as an engine
+default or as a complete per-client replacement.
 
 ### Parameters
 
 | Parameter | Required | Description |
 | --- | --- | --- |
-| `url: &str` | Yes | `http://host[:port]`, at most 2048 bytes; default port 80. No embedded credentials, non-root path, query or fragment. HTTPS and SOCKS proxy URLs are not supported by this API. |
+| `url: &str` | Yes | HTTP constructors accept `http://host[:port]` (default port 80); `https_connect` accepts `https://host[:port]` (default port 443). At most 2048 bytes; no embedded credentials, non-root path, query or fragment. SOCKS is unsupported. |
 | `auth: Option<ProxyBasicAuth>` | Yes | `None` for no proxy credentials or a separately constructed Basic identity. |
+| `proxy_tls: TlsConfig` | HTTPS proxies | Independent provider, roots and optional mTLS identity for the proxy. |
+| `policy: ProxyAuthTransportPolicy` | Explicit HTTP policy constructor | `RequireTls` is the default; `AllowPlaintext` permits Basic credentials over an unencrypted proxy connection. |
 | `username`, `password` | For Basic authentication | Each at most 4096 ASCII bytes, without control characters. Username cannot contain a colon; password may contain ordinary colons. |
 
 ### Callback parameters
@@ -531,22 +538,37 @@ Credential and endpoint constructors return an owned configuration or
 
 ### Errors and behavior
 
-Both `ws://` and `wss://` targets use an HTTP CONNECT tunnel when configured.
+Both `ws://` and `wss://` targets use an HTTP/1.1 CONNECT tunnel when configured.
 Default/direct mode never reads proxy environment variables. Proxy credentials
-belong to the CONNECT request, not the origin WebSocket handshake. A plain HTTP
-proxy does not encrypt those Basic credentials, even when the tunneled target
-uses WSS. Configuration Debug output redacts credentials.
+belong to the CONNECT request and are removed from the target WebSocket
+handshake. Configuration Debug output redacts credentials.
 
-Invalid input produces `InvalidConfig` under `proxy.*`. Connection-time proxy
-failures carry `ErrorStage::Proxy`; a rejected CONNECT response exposes its status
-through `NetError::http_status()` when available. For example, a 407 rejection is
-`HandshakeRejected` at `Proxy`, rather than an origin WebSocket 401. Classify the
-stage and status instead of parsing formatted error strings.
+`http_connect(url, Some(auth))` now returns `InvalidConfig` before any network
+connection. Use `https_connect` for encrypted proxy authentication, or
+`http_connect_with_auth_policy(..., ProxyAuthTransportPolicy::AllowPlaintext)`
+for an explicit plaintext exception. Neither localhost/private addresses nor
+a WSS target exempt authentication from the default policy.
+
+`NetworkConfig::with_tls` continues to configure target WSS only; its roots,
+provider and client identity are not inherited by proxy TLS. HTTPS proxy
+verification uses the proxy URL's host and fails without sending Basic
+credentials when the certificate is invalid. There is no HTTP downgrade or
+direct fallback. HTTPS proxying to a `ws://` target protects only the
+client-to-proxy connection; use `wss://` for target TLS.
+
+Invalid proxy input produces `InvalidConfig` under `proxy.*`. Proxy TLS
+certificate/protocol failures carry `ErrorStage::ProxyTls`, target TLS failures
+retain `ErrorStage::Tls`, and CONNECT failures carry `ErrorStage::Proxy`.
+A rejected CONNECT response exposes its status through `NetError::http_status()`
+when available. For example, a 407 rejection is `HandshakeRejected` at `Proxy`.
+Classify the stage and status instead of parsing formatted error strings.
 
 Per-client `NetworkConfig` replaces TLS, proxy and network-status settings
 together. To change only routing, clone an existing policy and call `with_proxy`.
 Starting from `NetworkConfig::default()` would also discard its explicit provider
 and other settings. HTTP clients do not inherit this WebSocket policy.
+See [WebSocket proxy migration](../ws_proxy_migration.md) for compatibility
+details, private proxy roots, explicit plaintext examples and connection stages.
 
 ### Example
 
@@ -555,19 +577,23 @@ the demonstration credentials and endpoint before connecting to a real service.
 
 ```rust
 use open_net::network::{NetworkConfig, ProxyBasicAuth, ProxyConfig, TlsConfig};
+use open_net::tls::CryptoProvider;
 use open_net::ws::WebSocketClientConfig;
 use open_net::OpenNet;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> open_net::Result<()> {
+    let provider: Arc<CryptoProvider> = Arc::new(rustls_openssl::default_provider());
     let auth = ProxyBasicAuth::new("demo-user", "demo-password")?;
-    let proxy = ProxyConfig::http_connect("http://127.0.0.1:8080", Some(auth))?;
+    let proxy = ProxyConfig::https_connect(
+        "https://proxy.example.com:8443",
+        Some(auth),
+        TlsConfig::default().with_crypto_provider(Arc::clone(&provider)),
+    )?;
     let defaults = NetworkConfig::default()
         .with_proxy(proxy)
-        .with_tls(TlsConfig::default().with_crypto_provider(Arc::new(
-            rustls_openssl::default_provider(),
-        )));
+        .with_tls(TlsConfig::default().with_crypto_provider(provider));
     let net = OpenNet::new_with_network_config(defaults.clone())?;
     let _proxied = net.create_ws_client("through-proxy").await?;
     let direct = defaults.with_proxy(ProxyConfig::direct());

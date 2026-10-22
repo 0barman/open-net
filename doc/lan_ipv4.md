@@ -29,19 +29,24 @@ cargo new lan-address-example
 cd lan-address-example
 ```
 
-Add the following dependency to its `Cargo.toml`. This example uses a local
-source checkout; replace the path with your `open-net` package directory. No
+Use the following dependency configuration. No
 async runtime, TLS provider or remote server is needed for the standalone
 examples.
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net-test/open-net", default-features = false, features = ["net-status"] }
+open-net = { version = "0.3.3", default-features = false, features = ["net-status"] }
 ```
 
 Each Rust block below is a complete, separate `src/main.rs`. Copy one block
 at a time and run `cargo run`. Actual results depend on the host's interfaces
 and permissions. Running the example does not start network monitoring.
+
+Addresses, interface names and raw collection diagnostics can reveal the host's
+network environment. These examples print counts and selection state. Read an
+address only for the application's requested LAN feature; keep the raw inventory
+and diagnostic text out of logs, telemetry and published support reports unless
+the application has explicitly reviewed and sanitized them.
 
 ## network::lan_ipv4_snapshot()
 
@@ -104,15 +109,10 @@ sections below before using a result to change an advertised endpoint.
 ```rust
 fn main() -> open_net::Result<()> {
     let lan = open_net::network::lan_ipv4_snapshot()?;
-    println!("collection={:?}, diagnostics={:?}", lan.completeness(), lan.diagnostics());
-    for candidate in lan.candidates() {
-        println!("{} {} /{} {:?} link={:?} default={:?} excluded={:?}",
-            candidate.interface_name(), candidate.address(), candidate.prefix_len(),
-            candidate.interface_kind(), candidate.link_active(),
-            candidate.is_default_route(), candidate.default_exclusions());
-    }
+    println!("collection={:?}, candidates={}, diagnostic_count={}",
+        lan.completeness(), lan.candidates().len(), lan.diagnostics().len());
     if let Some(selected) = lan.recommended() {
-        println!("recommend {}: {:?}", selected.address(), selected.recommendation_reason());
+        println!("recommendation available: {:?}", selected.recommendation_reason());
     } else {
         println!("No default recommendation; inspect the candidate evidence");
     }
@@ -217,9 +217,9 @@ other eligible addresses only at the same evidence level. Ties use interface ID
 and address, rather than OS enumeration order. Exactly zero or one entry has
 `is_recommended() == true`; `recommended()` refers to that same entry.
 
-For example, this policy prefers active `en0 / 172.16.1.46` over inactive
-`bridge100 / 192.168.2.1` when the native facts establish those roles. Neither
-names nor these particular addresses are required by the algorithm. Selection
+For example, this policy prefers an active LAN interface over an inactive
+bridge when the native facts establish those roles. No particular interface
+name or host address is required by the algorithm. Selection
 does not guarantee a successful bind or reachability from a phone/peer; firewall,
 AP isolation, routing and network changes still matter.
 
@@ -258,19 +258,19 @@ handle a missing recommendation explicitly instead of inventing a fallback addre
 
 For a caller that needs only `Option<Ipv4Addr>`, the following
 complete example extracts the recommended address from the snapshot.
-It also keeps incomplete-collection diagnostics visible.
+It reports the collection state and diagnostic count without printing network
+addresses or raw diagnostic text.
 
 ```rust
 use open_net::network::lan_ipv4_snapshot;
 
 fn main() -> open_net::Result<()> {
     let snapshot = lan_ipv4_snapshot()?;
-    for diagnostic in snapshot.diagnostics() {
-        eprintln!("LAN collection: {diagnostic}");
-    }
+    println!("Collection: {:?}; diagnostic count: {}",
+        snapshot.completeness(), snapshot.diagnostics().len());
     let address = snapshot.recommended().map(|candidate| candidate.address());
     match address {
-        Some(address) => println!("Selected address: {address}"),
+        Some(_address) => println!("A LAN address was selected for application use"),
         None => println!("No default address selected; keep application policy explicit"),
     }
     Ok(())
@@ -279,11 +279,10 @@ fn main() -> open_net::Result<()> {
 
 Deterministic SDK fixtures cover the inactive-bridge case, private-prefix parity,
 VPN/default routes, active bridges, unknown/failed metadata, address boundaries,
-enumeration order, and repeated IPs. `open-net-demo/tests/net_status_lan_ipv4.rs`
-exercises the public API and lifecycle on the actual host; the macOS initialization
-failure fixture also checks independent LAN querying during Failed monitoring.
+enumeration order, and repeated IPs. Validate the public API and lifecycle on the
+platforms your application supports, including failure and recovery behavior.
 Platform parser tests and cross-compilation are not substitutes for native
-Windows/Linux execution or actual peer connectivity tests.
+execution or actual peer connectivity tests.
 
 Native ownership and the exact unsafe audit records are described in
 [LAN native safety](lan_ipv4_native_safety.md).

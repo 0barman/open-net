@@ -304,6 +304,7 @@ impl WSClientInner {
                 Arc::clone(&self.queue),
                 Arc::clone(&self.urgent_queue),
                 self.shutdown.clone(),
+                Arc::clone(&self.config),
             );
             *admission = Arc::downgrade(&lifecycle);
             (runtime, journal)

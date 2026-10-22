@@ -1,4 +1,5 @@
-// Explicit gates also identify test helpers when the production-source guard scans this file.
+#![cfg(test)]
+
 use super::*;
 use crate::api::http::{HttpRequestMethod, HttpRequestTrait, HttpResponseResult};
 use crate::{OpenNet, OpenNetConfig};

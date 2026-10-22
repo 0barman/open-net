@@ -192,7 +192,7 @@ impl HandshakeDiagnostic {
                 | ConnectStage::RequestBuild
                 | ConnectStage::EventDelivery => Kind::Local,
                 ConnectStage::Dns => Kind::Dns,
-                ConnectStage::Tls => Kind::TlsProtocol,
+                ConnectStage::Tls | ConnectStage::ProxyTls => Kind::TlsProtocol,
                 _ if failure.error().kind() == crate::error::ErrorKind::Tls => Kind::TlsProtocol,
                 _ if failure.error().kind() == crate::error::ErrorKind::Protocol => Kind::Protocol,
                 _ => Kind::Other,

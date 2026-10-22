@@ -62,6 +62,7 @@ struct LocalState {
 pub(crate) struct NetworkObservationOwner {
     context: NetworkStatusContext,
     engine: Arc<CommonEngine>,
+    names: super::names::NameScope,
     local: Mutex<LocalState>,
     view: NetworkViewHandle,
     source: StateSource<NetworkSnapshot>,
@@ -98,6 +99,7 @@ impl NetworkObservationOwner {
             return Err(NetError::from(ErrorKind::Closed));
         }
         let engine = context.common_engine()?;
+        let names = super::names::NameScope::new(context.name_service()?);
         // Register before exposing the view to a concurrent terminal commit.
         // Even an unpolled bridge owns this lease until its future is dropped.
         let bridge_work = engine.retirement_work().register();
@@ -112,6 +114,7 @@ impl NetworkObservationOwner {
         let owner = Arc::new(Self {
             context,
             engine,
+            names,
             view,
             source,
             bridge_stop: Mutex::new(Some(bridge_stop)),
@@ -311,6 +314,9 @@ impl NetworkObservationOwner {
         }
     }
     fn retire(&self, permanent: bool, source_error: Option<NetError>) -> Result<(), NetError> {
+        if permanent {
+            self.names.request_close();
+        }
         // The local bridge can be stopped before the deferred start-waiter
         // wake is submitted below. Keep its successor work registered across
         // that handoff, including when the source already closed this view.
@@ -391,6 +397,11 @@ impl NetworkObservationOwner {
                 }
             }
         }
+        if self.names.is_closed() {
+            if let Err(error) = self.names.wait_cleanup().await {
+                failure.get_or_insert(error);
+            }
+        }
         if closed {
             let mut finished = self.bridge_finished.clone();
             while !*finished.borrow_and_update() {
@@ -413,6 +424,15 @@ impl NetworkObservationOwner {
             return Err(ErrorKind::Closed.into());
         }
         Ok(())
+    }
+
+    pub(crate) fn observe_network_names(
+        &self,
+        options: crate::net_status::NetworkNameOptions,
+    ) -> Result<crate::net_status::NetworkNameObserver, NetError> {
+        options.validate()?;
+        self.admit_lan_query()?;
+        self.names.observe(options)
     }
 
     pub(crate) fn snapshot(&self) -> Result<NetworkSnapshot, NetError> {
@@ -486,7 +506,6 @@ impl NetworkObservationOwner {
         sample_id: u64,
         reachability: NetworkStatus,
         ip_stack: Option<IpStack>,
-        network_name: impl Into<super::network_status_snapshot::NetworkNameUpdate>,
         observed_at: std::time::SystemTime,
         validate: impl FnOnce() -> Result<(), NetError>,
     ) -> Result<NetworkSnapshot, NetError> {
@@ -495,7 +514,6 @@ impl NetworkObservationOwner {
             sample_id,
             reachability,
             ip_stack,
-            network_name,
             observed_at,
             validate,
         )?;
@@ -552,3 +570,7 @@ fn log_error(event: &str, error: &NetError) {
 #[cfg(test)]
 #[path = "facade_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "facade_name_tests.rs"]
+mod name_tests;

@@ -34,7 +34,7 @@ async fn exercise(
         }
         TestResult::Ok(String::from_utf8(request)?)
     });
-    let mut socket = TcpStream::connect(address).await?;
+    let mut socket = tokio::io::BufReader::with_capacity(1024, TcpStream::connect(address).await?);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         establish_tunnel(
@@ -195,5 +195,41 @@ async fn proxy_eof_preserves_io_source_and_proxy_stage() -> TestResult {
     {
         return Err("proxy EOF lost its source or original stage".into());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn connect_flushes_buffered_writes_and_keeps_read_ahead_tunnel_data() -> TestResult {
+    // BufStream deliberately holds this small CONNECT in its write buffer.
+    // Without flush(), both sides wait forever, just as TLS can under backpressure.
+    let (client, mut peer) = tokio::io::duplex(32);
+    let client = async {
+        let mut stream = tokio::io::BufStream::new(client);
+        establish_tunnel(&mut stream, "localhost", 443, None)
+            .await
+            .map_err(|failure| failure.error())?;
+        let mut tunnel = [0; 6];
+        stream.read_exact(&mut tunnel).await?;
+        if &tunnel != b"tunnel" {
+            return Err("CONNECT discarded bytes already read from the tunnel".into());
+        }
+        TestResult::Ok(())
+    };
+    let server = async {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            if request.len() >= 256 {
+                return Err("fixture CONNECT exceeded bounds".into());
+            }
+            request.push(peer.read_u8().await?);
+        }
+        peer.write_all(b"HTTP/1.1 103 Hint\r\n\r\nHTTP/1.1 200 OK\r\n\r\ntunnel")
+            .await?;
+        TestResult::Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::try_join!(client, server)
+    })
+    .await??;
     Ok(())
 }

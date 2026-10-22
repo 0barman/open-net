@@ -14,7 +14,6 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::{sleep_until, timeout_at, Instant};
 use tokio_tungstenite::tungstenite::Error as WsError;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub(crate) mod compiled_network_config;
 #[cfg(test)]
@@ -22,12 +21,32 @@ mod diagnostic_tests;
 mod proxy;
 #[cfg(test)]
 mod proxy_tests;
+pub(crate) mod stream;
 #[cfg(test)]
 mod tcp_race_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) type NativeWebSocketStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(crate) use stream::{proxy_tls_io, tcp_ref, NativeWebSocketStream};
+
+#[cfg(test)]
+pub(crate) fn test_proxy_tls_error(error: std::io::Error) -> std::io::Error {
+    stream::mark_proxy_tls_error(error)
+}
+
+/// Preserve a TLS alert's origin after the WebSocket handshake, too.
+pub(crate) fn tls_error_stage(error: &std::io::Error) -> Option<crate::error::ErrorStage> {
+    if proxy_tls_io(error).is_some() {
+        Some(crate::error::ErrorStage::ProxyTls)
+    } else if error
+        .get_ref()
+        .is_some_and(|source| source.is::<rustls::Error>())
+    {
+        Some(crate::error::ErrorStage::Tls)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct TransportFailure {
@@ -123,12 +142,16 @@ pub(crate) fn classify_upgrade_error_with_diagnostics(
 }
 
 fn tls_io_kind(error: &std::io::Error, stage: ConnectStage) -> HandshakeDiagnosticKind {
+    let proxy_error = proxy_tls_io(error);
+    let error = proxy_error.unwrap_or(error);
     if let Some(source) = error
         .get_ref()
         .and_then(|source| source.downcast_ref::<rustls::Error>())
     {
         rustls_kind(source)
-    } else if stage == ConnectStage::Tls && error.kind() == std::io::ErrorKind::InvalidData {
+    } else if (proxy_error.is_some() || matches!(stage, ConnectStage::Tls | ConnectStage::ProxyTls))
+        && error.kind() == std::io::ErrorKind::InvalidData
+    {
         HandshakeDiagnosticKind::TlsProtocol
     } else {
         HandshakeDiagnosticKind::Io(error.kind())
@@ -349,16 +372,24 @@ where
 }
 
 fn classify_tls_io(error: std::io::Error, stage: ConnectStage) -> ConnectionFailure {
-    if error
+    let proxy_error = proxy_tls_io(&error);
+    let source_error = proxy_error.unwrap_or(&error);
+    if source_error
         .get_ref()
         .is_some_and(|source| source.is::<rustls::Error>())
-        || (stage == ConnectStage::Tls && error.kind() == std::io::ErrorKind::InvalidData)
+        || ((proxy_error.is_some() || matches!(stage, ConnectStage::Tls | ConnectStage::ProxyTls))
+            && error.kind() == std::io::ErrorKind::InvalidData)
     {
         // rustls protocol/certificate alerts can arrive when Upgrade first reads
         // a TLS 1.3 server's rejection of the client's certificate.
+        let tls_stage = if proxy_error.is_some() || stage == ConnectStage::ProxyTls {
+            ConnectStage::ProxyTls
+        } else {
+            ConnectStage::Tls
+        };
         failure(
             NetError::with_source(crate::error::ErrorKind::Tls, error),
-            ConnectStage::Tls,
+            tls_stage,
             false,
         )
     } else {

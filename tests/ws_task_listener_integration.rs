@@ -15,6 +15,7 @@ fn source(event: &TaskEvent) -> String {
     match &event.source {
         TaskSource::Message(v) => v.as_text().unwrap_or("").to_owned(),
         TaskSource::Request(v) => v.id().as_str().to_owned(),
+        TaskSource::RequestOperation(_) => event.operation_id.to_string(),
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

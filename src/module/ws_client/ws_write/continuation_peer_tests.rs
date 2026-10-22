@@ -217,7 +217,17 @@ async fn check_interrupted_prefix_on_wire(deadline: bool) -> TestResult {
     let sender = fixture::sender(&runtime);
     let options = SendOptions {
         write_timeout: REQUEST_TIMEOUT,
-        retry: crate::ws::SendRetryPolicy::Idempotent { max_retries: 1 },
+        retry_setting: crate::api::retry::RetrySetting::Policy(
+            crate::ws::WsSendRetryPolicy::builder()
+                .schedule(
+                    crate::api::retry::RetrySchedule::builder()
+                        .max_attempts(2)
+                        .build()?,
+                )
+                .retry_on(crate::ws::WsSendRetryOn::none().with_write_errors(true))
+                .safety(crate::ws::WsReplaySafety::IdempotentByContract)
+                .build()?,
+        ),
         disconnected: DisconnectedPolicy::WaitForReconnect,
         ..Default::default()
     };

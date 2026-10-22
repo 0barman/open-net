@@ -2,6 +2,7 @@
 
 mod events;
 mod ip_stack;
+mod names;
 mod net_status_client;
 mod network_status;
 mod refresh;
@@ -14,6 +15,7 @@ pub use crate::network::{
 use crate::NetError;
 pub use events::{NetworkEvent, NetworkEventKind, NetworkEventOptions, NetworkObservation};
 pub use ip_stack::IpStack;
+pub use names::{NetworkNameObserver, NetworkNameOptions, NetworkNameSnapshot, NetworkNameState};
 pub use net_status_client::NetStatusClient;
 pub use network_status::NetworkStatus;
 pub use refresh::{NetworkIpStackSource, NetworkNameSource, NetworkRefreshResult};
@@ -34,7 +36,9 @@ pub struct NetworkSnapshot {
     pub ip_stack: Option<IpStack>,
     /// Timestamp at which the observation was collected.
     pub observed_at: Option<SystemTime>,
-    /// Human-readable network identifier supplied by the platform, when available.
+    /// Legacy compatibility field. SDK-produced connectivity snapshots always
+    /// contain `None`. Use `NetStatusClient::observe_network_names` to explicitly
+    /// observe names on a separate channel.
     pub network_name: Option<String>,
 }
 

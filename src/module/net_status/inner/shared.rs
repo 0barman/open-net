@@ -30,19 +30,18 @@ impl std::fmt::Debug for NetworkStatusContext {
     }
 }
 impl NetworkStatusContext {
+    pub(super) fn name_service(&self) -> Result<Arc<super::names::NameService>, NetError> {
+        self.service
+            .upgrade()
+            .map(|service| service.names.clone())
+            .ok_or_else(|| NetError::from(ErrorKind::Closed))
+    }
     pub(super) fn observation_source(
         &self,
     ) -> Result<super::network_status_snapshot::NetworkStatusSource, NetError> {
         self.service
             .upgrade()
             .map(|service| service.inner.observation_source())
-            .ok_or_else(|| NetError::from(ErrorKind::Closed))
-    }
-    #[cfg(any(windows, test))]
-    pub(super) fn windows_sampler(&self) -> Result<Arc<super::refresh::WindowsSampler>, NetError> {
-        self.service
-            .upgrade()
-            .map(|service| service.inner.windows_sampler())
             .ok_or_else(|| NetError::from(ErrorKind::Closed))
     }
     #[cfg(any(windows, test))]
@@ -257,6 +256,7 @@ struct Admission {
 pub(crate) struct SharedNetworkService {
     engine: Arc<CommonEngine>,
     inner: Arc<InnerNetStatusClient>,
+    names: Arc<super::names::NameService>,
     admission: Mutex<Admission>,
     commands: mpsc::UnboundedSender<Command>,
     closed: CleanupTicket,
@@ -272,6 +272,14 @@ enum Command {
 }
 impl SharedNetworkService {
     pub(crate) fn new(engine: Arc<CommonEngine>) -> Result<Arc<Self>, NetError> {
+        let names = super::names::NameService::new(engine.clone());
+        Self::with_names(engine, names)
+    }
+
+    pub(super) fn with_names(
+        engine: Arc<CommonEngine>,
+        names: Arc<super::names::NameService>,
+    ) -> Result<Arc<Self>, NetError> {
         let inner = Arc::new(InnerNetStatusClient::new(engine.clone())?);
         let (commands, receiver) = mpsc::unbounded_channel();
         let (closed_sender, closed) = CleanupTicket::pending();
@@ -284,6 +292,7 @@ impl SharedNetworkService {
         Ok(Arc::new(Self {
             engine,
             inner,
+            names,
             commands,
             admission: Mutex::new(Admission {
                 closed: false,
@@ -323,6 +332,7 @@ impl SharedNetworkService {
             // is held while the source wakes its internal SDK readers.
             self.inner.request_destroy();
             let _ = self.commands.send(Command::Close);
+            self.names.request_close();
         }
     }
     #[cfg(test)]
@@ -340,7 +350,9 @@ impl SharedNetworkService {
     }
     pub(crate) async fn shutdown(&self) -> Result<(), NetError> {
         self.request_close();
-        self.closed.wait().await
+        let monitor = self.closed.wait().await;
+        let names = self.names.wait_cleanup().await;
+        monitor.and(names)
     }
 }
 
@@ -696,6 +708,12 @@ mod tests {
             futures::poll!(&mut waiting).is_pending(),
             "start waiter unexpectedly completed",
         )?;
+        // Polling wait_started only queues Ensure. A subsequent nonlast release
+        // is a FIFO acknowledgement that the coordinator admitted this waiter
+        // before we fail initialization. Otherwise it could legitimately see a
+        // later Ensure as a retry, leaving that new generation gated forever.
+        let barrier = service.context().acquire()?;
+        barrier.release().wait().await?;
         let _ = release.send(());
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await?;
         check(

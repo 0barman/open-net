@@ -41,8 +41,8 @@ impl HttpRequestTrait for ResultRequest {
         self.request.cookie_context.clone()
     }
 
-    fn retry_policy(&self) -> crate::api::http::RetryPolicy {
-        self.request.retry_policy.clone()
+    fn retry_setting(&self) -> crate::api::retry::RetrySetting<crate::api::http::HttpRetryPolicy> {
+        self.request.retry_setting()
     }
 
     async fn deal_with_response(mut self: Box<Self>, result: HttpResponseResult) {

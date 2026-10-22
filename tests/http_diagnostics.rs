@@ -96,7 +96,18 @@ async fn auth_failures_log_only_safe_boundary_classification() -> TestResult {
             let client = net
                 .create_http_client_with_config(
                     "auth-diagnostic",
-                    HttpClientConfig::new(&peer.url)?.with_auth(FailingAuth { panics, response }),
+                    HttpClientConfig::new(&peer.url)?
+                        // The 401 provider is only entered while the shared retry budget permits replay.
+                        .with_default_retry_policy(
+                            open_net::api::http::HttpRetryPolicy::builder()
+                                .schedule(
+                                    open_net::retry::RetrySchedule::builder()
+                                        .max_attempts(2)
+                                        .build()?,
+                                )
+                                .build()?,
+                        )
+                        .with_auth(FailingAuth { panics, response }),
                 )
                 .await?;
             for stream in [false, true] {

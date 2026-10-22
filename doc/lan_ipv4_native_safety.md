@@ -65,6 +65,9 @@ LAN connectivity testing.
 
 ## Source guard
 
+The following audit fixtures are maintainer source-checkout resources. They are
+not part of the published crate and are not prerequisites for using the library.
+
 `tests/ws_client_no_panics.rs` scans the production and network-status
 sources. Its reviewed FFI file set includes the two collector paths
 above. `tests/fixtures/lan-ffi-unsafe-audit.tsv` records each exact unsafe

@@ -1,9 +1,10 @@
 #![cfg(feature = "http-client")]
 
+use open_net::api::retry::{Backoff, RetryEvent, RetrySchedule, RetrySetting, RetryStopReason};
+
 use http::StatusCode;
 use open_net::api::http::{
-    Backoff, HttpClientConfig, HttpProxyConfig, HttpRequest, RetryOn, RetryPolicy,
-    TransportErrorKind,
+    HttpClientConfig, HttpProxyConfig, HttpRequest, HttpRetryPolicy, RetryOn, TransportErrorKind,
 };
 use open_net::error::{ErrorKind, ErrorStage};
 use open_net::OpenNet;
@@ -131,14 +132,18 @@ async fn body_retry_flag_and_legacy_transport_matrix() -> TestResult {
         } else {
             vec![]
         };
-        let policy = RetryPolicy::builder()
-            .max_attempts(2)
-            .backoff(Backoff::None)
+        let policy = HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::None)
+                    .build()?,
+            )
             .retry_on(RetryOn::none().with_body_read(body).with_transport(reasons))
             .build()?;
         let request = HttpRequest::builder()
             .path("/body")
-            .retry_policy(policy.clone())
+            .retry_setting(RetrySetting::Policy(policy.clone()))
             .build()?;
         let result = tokio::time::timeout(TIMEOUT, client.request(request)).await?;
         if body || transport {
@@ -154,7 +159,9 @@ async fn body_retry_flag_and_legacy_transport_matrix() -> TestResult {
             };
             check(error.kind() == ErrorKind::Io, "truncation was not I/O")?;
             check(
-                !policy.should_retry_error(&error),
+                error
+                    .retry_report()
+                    .is_some_and(|report| report.attempts == 1),
                 "disabled query still retries",
             )?;
         }
@@ -194,22 +201,21 @@ async fn connect_407_retains_status_stage_and_source() -> TestResult {
 }
 
 #[test]
-fn legacy_transport_disable_clears_body_flag() -> TestResult {
-    let policy = RetryPolicy::standard().with_transport_errors(false);
+fn transport_selection_keeps_body_flag_explicit() -> TestResult {
+    let reasons = RetryOn::none().with_transport([TransportErrorKind::BodyRead]);
     check(
-        !policy.retry_on().retries_body_read(),
-        "legacy disable left body_read enabled",
-    )?;
-    let restored = policy.with_transport_errors(true);
-    check(
-        !restored.retry_on().retries_body_read(),
-        "legacy enable unexpectedly changed dedicated flag",
+        !reasons.retries_body_read(),
+        "transport selection changed the dedicated body flag",
     )?;
     check(
-        restored.should_retry_reason(open_net::api::http::RetryReason::Transport(
+        reasons.allows(open_net::api::http::RetryReason::Transport(
             TransportErrorKind::BodyRead,
         )),
-        "legacy enable did not restore BodyRead transport",
+        "explicit transport reason was lost",
+    )?;
+    check(
+        RetryOn::none().with_body_read(true).transport().is_empty(),
+        "body flag changed transport reasons",
     )
 }
 
@@ -229,9 +235,13 @@ async fn malformed_body_requires_explicit_protocol_selection() -> TestResult {
         } else {
             vec![]
         };
-        let policy = RetryPolicy::builder()
-            .max_attempts(2)
-            .backoff(Backoff::None)
+        let policy = HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::None)
+                    .build()?,
+            )
             .retry_on(
                 RetryOn::none()
                     .with_body_read(true)
@@ -243,7 +253,7 @@ async fn malformed_body_requires_explicit_protocol_selection() -> TestResult {
             client.request(
                 HttpRequest::builder()
                     .path("/chunk")
-                    .retry_policy(policy.clone())
+                    .retry_setting(RetrySetting::Policy(policy.clone()))
                     .build()?,
             ),
         )
@@ -261,7 +271,10 @@ async fn malformed_body_requires_explicit_protocol_selection() -> TestResult {
                 }
             };
             check(
-                error.kind() == ErrorKind::Protocol && !policy.should_retry_error(&error),
+                error.kind() == ErrorKind::Protocol
+                    && error
+                        .retry_report()
+                        .is_some_and(|report| report.attempts == 1),
                 "invalid framing classification/query mismatch",
             )?;
         }
@@ -276,7 +289,6 @@ async fn malformed_body_requires_explicit_protocol_selection() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn body_failure_observer_reports_only_final_outcome() -> TestResult {
-    use open_net::api::http::{RetryEvent, RetryReason};
     const TRUNCATED: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx";
     const COMPLETE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
     for success in [true, false] {
@@ -290,9 +302,13 @@ async fn body_failure_observer_reports_only_final_outcome() -> TestResult {
             )
             .await?;
         let (tx, rx) = std::sync::mpsc::channel();
-        let policy = RetryPolicy::builder()
-            .max_attempts(2)
-            .backoff(Backoff::None)
+        let policy = HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::None)
+                    .build()?,
+            )
             .retry_on(RetryOn::none().with_body_read(true))
             .observer(move |event: &RetryEvent| {
                 if let Err(error) = tx.send(event.clone()) {
@@ -305,7 +321,7 @@ async fn body_failure_observer_reports_only_final_outcome() -> TestResult {
             client.request(
                 HttpRequest::builder()
                     .path("/observer")
-                    .retry_policy(policy)
+                    .retry_setting(RetrySetting::Policy(policy))
                     .build()?,
             ),
         )
@@ -328,12 +344,12 @@ async fn body_failure_observer_reports_only_final_outcome() -> TestResult {
             "observer retry counts changed",
         )?;
         check(
-            report.final_reason
-                == if success {
-                    None
+            report.stop_reason
+                == Some(if success {
+                    RetryStopReason::Completed
                 } else {
-                    Some(RetryReason::BodyRead)
-                },
+                    RetryStopReason::AttemptsExhausted
+                }),
             "final reason does not match final result",
         )?;
         check(events.len() == 6, "retry event sequence length changed")?;
@@ -352,9 +368,13 @@ async fn response_header_eof_does_not_use_body_only_retry() -> TestResult {
             HttpClientConfig::new(format!("http://{}", server.address))?,
         )
         .await?;
-    let policy = RetryPolicy::builder()
-        .max_attempts(2)
-        .backoff(Backoff::None)
+    let policy = HttpRetryPolicy::builder()
+        .schedule(
+            RetrySchedule::builder()
+                .max_attempts(2)
+                .backoff(Backoff::None)
+                .build()?,
+        )
         .retry_on(RetryOn::none().with_body_read(true))
         .build()?;
     let result = tokio::time::timeout(
@@ -362,7 +382,7 @@ async fn response_header_eof_does_not_use_body_only_retry() -> TestResult {
         client.request(
             HttpRequest::builder()
                 .path("/head")
-                .retry_policy(policy.clone())
+                .retry_setting(RetrySetting::Policy(policy.clone()))
                 .build()?,
         ),
     )
@@ -374,7 +394,9 @@ async fn response_header_eof_does_not_use_body_only_retry() -> TestResult {
         }
     };
     check(
-        !policy.should_retry_error(&error),
+        error
+            .retry_report()
+            .is_some_and(|report| report.attempts == 1),
         "header EOF query used body-only flag",
     )?;
     check(
@@ -405,9 +427,13 @@ async fn body_retry_preserves_method_safety() -> TestResult {
                 HttpClientConfig::new(format!("http://{}", server.address))?,
             )
             .await?;
-        let policy = RetryPolicy::builder()
-            .max_attempts(2)
-            .backoff(Backoff::None)
+        let policy = HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::None)
+                    .build()?,
+            )
             .safety(safety)
             .retry_on(RetryOn::none().with_body_read(true))
             .build()?;
@@ -417,7 +443,7 @@ async fn body_retry_preserves_method_safety() -> TestResult {
                 HttpRequest::builder()
                     .method(method)
                     .path("/safety")
-                    .retry_policy(policy)
+                    .retry_setting(RetrySetting::Policy(policy))
                     .build()?,
             ),
         )
@@ -437,7 +463,6 @@ async fn body_retry_preserves_method_safety() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_and_deadline_during_body_backoff_replace_previous_reason() -> TestResult {
-    use open_net::api::http::{RetryEvent, RetryReason};
     for cancel in [false, true] {
         let server =
             peer(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx").await?;
@@ -450,10 +475,13 @@ async fn cancellation_and_deadline_during_body_backoff_replace_previous_reason()
             .await?;
         let observed_client = client.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        let policy = RetryPolicy::builder()
-            .max_attempts(2)
-            .backoff(Backoff::Constant(Duration::from_secs(1)))
-            .total_deadline(Duration::from_millis(100))
+        let policy = HttpRetryPolicy::builder()
+            .schedule(
+                RetrySchedule::builder()
+                    .max_attempts(2)
+                    .backoff(Backoff::Constant(Duration::from_secs(1)))
+                    .build()?,
+            )
             .retry_on(RetryOn::none().with_body_read(true))
             .observer(move |event: &RetryEvent| {
                 if cancel && matches!(event, RetryEvent::RetryScheduled { .. }) {
@@ -473,7 +501,11 @@ async fn cancellation_and_deadline_during_body_backoff_replace_previous_reason()
             client.request(
                 HttpRequest::builder()
                     .path("/backoff")
-                    .retry_policy(policy)
+                    .timeouts(
+                        open_net::api::http::HttpTimeouts::new()
+                            .with_total_timeout(Duration::from_millis(100)),
+                    )
+                    .retry_setting(RetrySetting::Policy(policy))
                     .build()?,
             ),
         )
@@ -500,11 +532,16 @@ async fn cancellation_and_deadline_during_body_backoff_replace_previous_reason()
             .first()
             .ok_or_else(|| std::io::Error::other("missing backoff report"))?;
         check(
-            report.attempts == 1 && report.retry_count == 1,
+            report.attempts == 1 && report.retry_count == 0,
             "backoff counters changed",
         )?;
         check(
-            report.final_reason == Some(RetryReason::Application),
+            report.stop_reason
+                == Some(if cancel {
+                    RetryStopReason::Cancelled
+                } else {
+                    RetryStopReason::TimedOut
+                }),
             "previous body failure overwrote terminal reason",
         )?;
         check(

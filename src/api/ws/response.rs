@@ -14,6 +14,7 @@ pub struct Response {
     received_at: SystemTime,
     /// Physical connection that received the response.
     connection_id: ConnectionId,
+    retry_report: Option<crate::api::retry::RetryReport>,
 }
 
 impl Response {
@@ -28,9 +29,18 @@ impl Response {
             message,
             received_at: incoming.received_at(),
             connection_id: incoming.connection_id(),
+            retry_report: None,
         })
     }
 
+    /// Retry diagnostics for a completed logical request; absent on fixed single requests.
+    pub fn retry_report(&self) -> Option<&crate::api::retry::RetryReport> {
+        self.retry_report.as_ref()
+    }
+    pub(crate) fn with_retry_report(mut self, report: crate::api::retry::RetryReport) -> Self {
+        self.retry_report = Some(report);
+        self
+    }
     /// Returns the associated request identifier.
     pub fn request_id(&self) -> &RequestId {
         &self.request_id

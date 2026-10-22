@@ -70,11 +70,14 @@ impl OpenNet {
     }
 
     /// Creates an engine with default settings and queue capacities of 128.
-    ///
-    /// When the `ws-client` feature is enabled, the default WebSocket TLS
-    /// connector is compiled during this call. Supply a provider with
-    /// [`Self::new_with_network_config`] or install the application's process
-    /// provider before calling this constructor. The SDK never installs one.
+    #[cfg_attr(
+        feature = "ws-client",
+        doc = "
+When the `ws-client` feature is enabled, the default WebSocket TLS
+connector is compiled during this call. Supply a provider with
+[`Self::new_with_network_config`] or install the application's process
+provider before calling this constructor. The SDK never installs one."
+    )]
     pub fn new() -> Result<Self, NetError> {
         crate::log_s!(LogType::Engine; "OpenNet-new");
         Self::new_with_config(OpenNetConfig::default())
@@ -125,7 +128,7 @@ impl OpenNet {
     /// The returned client is disconnected; call `connect` or `start_session` to establish a session.
     #[cfg(feature = "ws-client")]
     pub async fn create_ws_client(&self, thread_name: &str) -> Result<WebSocketClient, NetError> {
-        crate::log_t!(LogType::WSC; "create_ws_client", "thread_name", thread_name);
+        crate::log_t!(LogType::WSC; "create_ws_client");
         let result: Result<WebSocketClient, NetError> = async {
             self.create_ws_client_with_config(thread_name, WebSocketClientConfig::default())
                 .await
@@ -146,7 +149,7 @@ impl OpenNet {
         thread_name: &str,
         config: WebSocketClientConfig,
     ) -> Result<WebSocketClient, NetError> {
-        crate::log_t!(LogType::WSC; "create_ws_client_with_config", "thread_name|config", thread_name, format!("{:?}", config));
+        crate::log_t!(LogType::WSC; "create_ws_client_with_config", "config", format!("{:?}", config));
         let result: Result<WebSocketClient, NetError> = async {
             let thread_name = thread_name.trim();
             if thread_name.is_empty() {
@@ -176,7 +179,7 @@ impl OpenNet {
         thread_name: &str,
         config: WebSocketClientConfig,
     ) -> Result<WebSocketClient, NetError> {
-        crate::log_t!(LogType::WSC; "get_or_create_ws_client_with_config", "thread_name|config", thread_name, format!("{:?}", config));
+        crate::log_t!(LogType::WSC; "get_or_create_ws_client_with_config", "config", format!("{:?}", config));
         let result: Result<WebSocketClient, NetError> = async {
             let thread_name = thread_name.trim();
             if thread_name.is_empty() || thread_name.contains('\0') {
@@ -240,8 +243,8 @@ impl OpenNet {
         network_config: crate::network::NetworkConfig,
     ) -> Result<WebSocketClient, NetError> {
         crate::log_t!(LogType::WSC; "ws.create_ws_client_with_network_config",
-            "thread_name|config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_config_proxy_direct|network_config_proxy_authenticated|network_config_status_policy|network_config_tls_root_mode|network_config_tls_custom_root_count|network_config_tls_identity_present|network_config_tls_provider_present",
-            thread_name, config.close_timeout, config.queues.commands, config.heartbeat.is_some(),
+            "config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_config_proxy_direct|network_config_proxy_authenticated|network_config_status_policy|network_config_tls_root_mode|network_config_tls_custom_root_count|network_config_tls_identity_present|network_config_tls_provider_present",
+            config.close_timeout, config.queues.commands, config.heartbeat.is_some(),
             network_config.proxy().is_direct(), network_config.proxy().is_authenticated(),
             format!("{:?}", network_config.network_status_policy()), format!("{:?}", network_config.tls().root_mode()),
             network_config.tls().custom_root_count(), network_config.tls().client_identity().is_some(),
@@ -264,7 +267,7 @@ impl OpenNet {
     #[cfg(feature = "ws-client")]
     /// Returns a shared handle to an existing WebSocket client.
     pub fn get_ws_client(&self, thread_name: &str) -> Result<WebSocketClient, NetError> {
-        crate::log_t!(LogType::WSC; "get_ws_client", "thread_name", thread_name);
+        crate::log_t!(LogType::WSC; "get_ws_client");
         let result: Result<WebSocketClient, NetError> = (|| {
             if thread_name.trim().is_empty() {
                 return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
@@ -286,7 +289,7 @@ impl OpenNet {
     /// an absent name returns [`crate::error::ErrorKind::ClientNotFound`]. Use
     /// [`Self::destroy_ws_client_if_exists`] for repeated, idempotent cleanup.
     pub async fn destroy_ws_client(&self, thread_name: &str) -> Result<(), NetError> {
-        crate::log_t!(LogType::WSC; "destroy_ws_client", "thread_name", thread_name);
+        crate::log_t!(LogType::WSC; "destroy_ws_client");
         let result: Result<(), NetError> = async {
             if thread_name.trim().is_empty() {
                 return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
@@ -309,7 +312,7 @@ impl OpenNet {
     /// runtime and accepted cleanup continues if its waiter is cancelled.
     #[cfg(feature = "ws-client")]
     pub async fn destroy_ws_client_if_exists(&self, thread_name: &str) -> Result<(), NetError> {
-        crate::log_t!(LogType::WSC; "destroy_ws_client_if_exists", "thread_name", thread_name);
+        crate::log_t!(LogType::WSC; "destroy_ws_client_if_exists");
         let result: Result<(), NetError> = async {
             let thread_name = thread_name.trim();
             if thread_name.is_empty() || thread_name.contains('\0') {
@@ -369,7 +372,7 @@ impl OpenNet {
         thread_name: &str,
     ) -> Result<NetStatusClient, NetError> {
         let thread_name = thread_name.trim();
-        crate::log_t!(LogType::Engine; "net_status.create_net_status_client", "thread_name", thread_name);
+        crate::log_t!(LogType::Engine; "net_status.create_net_status_client");
         if thread_name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
@@ -391,7 +394,7 @@ impl OpenNet {
     /// reserved until cleanup completes. Use `NetStatusClient::stop` to pause instead.
     pub async fn destroy_net_status_client(&self, thread_name: &str) -> Result<(), NetError> {
         let thread_name = thread_name.trim();
-        crate::log_t!(LogType::Engine; "net_status.destroy_net_status_client", "thread_name", thread_name);
+        crate::log_t!(LogType::Engine; "net_status.destroy_net_status_client");
         if thread_name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
         }
@@ -426,7 +429,7 @@ impl OpenNet {
         thread_name: &str,
         config: HttpClientConfig,
     ) -> Result<HttpClient, NetError> {
-        crate::log_t!(LogType::HTTP; "create_http_client_with_config", "thread_name|config", thread_name, format!("{:?}", config));
+        crate::log_t!(LogType::HTTP; "create_http_client_with_config", "config", format!("{:?}", config));
         let result: Result<HttpClient, NetError> = async {
             let thread_name = thread_name.trim();
             if thread_name.is_empty() || thread_name.contains('\0') {
@@ -445,7 +448,7 @@ impl OpenNet {
     #[cfg(feature = "http-client")]
     /// Returns a shared handle to an existing HTTP client.
     pub fn get_http_client(&self, thread_name: &str) -> Result<HttpClient, NetError> {
-        crate::log_t!(LogType::HTTP; "get_http_client", "thread_name", thread_name);
+        crate::log_t!(LogType::HTTP; "get_http_client");
         let name = thread_name.trim();
         if name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));
@@ -456,7 +459,7 @@ impl OpenNet {
     #[cfg(feature = "http-client")]
     /// Permanently destroys a named HTTP client after its worker exits.
     pub async fn destroy_http_client(&self, thread_name: &str) -> Result<(), NetError> {
-        crate::log_t!(LogType::HTTP; "destroy_http_client", "thread_name", thread_name);
+        crate::log_t!(LogType::HTTP; "destroy_http_client");
         let name = thread_name.trim();
         if name.is_empty() {
             return Err(NetError::from(crate::error::ErrorKind::InvalidInput));

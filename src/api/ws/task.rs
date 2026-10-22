@@ -31,8 +31,11 @@ pub struct TaskEvent {
 }
 
 /// Original task input shared by cloned events without copying the payload.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum TaskSource {
+    /// Metadata for a logical request whose wire payload is generated per attempt.
+    /// The factory and idempotency key are deliberately excluded.
+    RequestOperation(Arc<crate::Metadata>),
     /// A message send that has no response tracking.
     Message(
         /// Original message shared by the task and observers.
@@ -45,10 +48,31 @@ pub enum TaskSource {
     ),
 }
 
+impl std::fmt::Debug for TaskSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => f.debug_tuple("Message").field(message).finish(),
+            Self::Request(request) => f.debug_tuple("Request").field(request).finish(),
+            Self::RequestOperation(metadata) => f
+                .debug_struct("RequestOperation")
+                .field("metadata_entries", &metadata.len())
+                .finish(),
+        }
+    }
+}
+
 impl TaskSource {
     /// Counts the owned variable-size input once for the shared payload budget.
     pub(crate) fn payload_bytes(&self) -> Result<usize> {
         match self {
+            Self::RequestOperation(metadata) => {
+                metadata.iter().try_fold(0usize, |bytes, (key, value)| {
+                    bytes
+                        .checked_add(key.len())
+                        .and_then(|size| size.checked_add(value.len()))
+                        .ok_or_else(|| NetError::from(ErrorKind::ItemTooLarge))
+                })
+            }
             Self::Message(message) => Ok(message.len()),
             Self::Request(request) => {
                 let mut bytes = request

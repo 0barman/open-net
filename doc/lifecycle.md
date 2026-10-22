@@ -13,12 +13,11 @@ for a new lifecycle.
 The two engine shutdown methods require no Cargo feature. The examples below
 also create network-status clients, so they enable `net-status`. Use Rust 1.89
 or later, create a project with `cargo new engine-lifecycle-example`, and add
-these dependencies to its `Cargo.toml`. Replace the local path with your
-`open-net` package directory.
+these dependency settings to its `Cargo.toml`.
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net-test/open-net", default-features = false, features = ["net-status"] }
+open-net = { version = "0.3.3", default-features = false, features = ["net-status"] }
 futures = "0.3.34"
 ```
 

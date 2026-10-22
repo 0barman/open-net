@@ -15,8 +15,8 @@ pub use lan_ipv4::{
 
 #[cfg(feature = "ws-client")]
 pub use crate::api::network_config::{
-    ClientIdentity, NetworkConfig, NetworkStatusPolicy, ProxyBasicAuth, ProxyConfig,
-    RootCertificateMode, TlsConfig,
+    ClientIdentity, NetworkConfig, NetworkStatusPolicy, ProxyAuthTransportPolicy, ProxyBasicAuth,
+    ProxyConfig, RootCertificateMode, TlsConfig,
 };
 
 /// Select a LAN IPv4 using the original compatibility heuristic.

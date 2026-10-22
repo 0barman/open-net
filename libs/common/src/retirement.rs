@@ -3,7 +3,7 @@
 use super::CommonError;
 use std::cell::Cell;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 
 thread_local! {
@@ -121,30 +121,48 @@ impl Drop for StartingThread {
     }
 }
 
-/// Counts accepted asynchronous retirement work while producers are shutting
+/// Tracks accepted asynchronous retirement work while producers are shutting
 /// down. A producer registers derived work before releasing its own lease.
 /// There is deliberately no seal: accepted bridges may still dispatch terminal
 /// observations while the independent coordinator is waiting for them.
 #[derive(Default)]
 pub(crate) struct WorkTracker {
-    active: Mutex<usize>,
+    active: Mutex<Weak<WorkGeneration>>,
     changed: Condvar,
     #[cfg(test)]
     wait_started: (Mutex<bool>, Condvar),
 }
 
 pub(crate) struct WorkLease {
+    _generation: Arc<WorkGeneration>,
+}
+
+/// All concurrently active leases share one generation. Its final strong
+/// reference provides the completion signal without a separate work counter
+/// that could overflow while already accepted work is being handed off.
+struct WorkGeneration {
     tracker: Arc<WorkTracker>,
 }
 
 impl WorkTracker {
     pub(crate) fn register(self: &Arc<Self>) -> WorkLease {
         let mut active = lock(&self.active);
-        *active = active
-            .checked_add(1)
-            .expect("retirement work count overflow");
+        self.register_locked(&mut active)
+    }
+
+    fn register_locked(self: &Arc<Self>, active: &mut Weak<WorkGeneration>) -> WorkLease {
+        let generation = match active.upgrade() {
+            Some(generation) => generation,
+            None => {
+                let generation = Arc::new(WorkGeneration {
+                    tracker: Arc::clone(self),
+                });
+                *active = Arc::downgrade(&generation);
+                generation
+            }
+        };
         WorkLease {
-            tracker: Arc::clone(self),
+            _generation: generation,
         }
     }
 
@@ -157,7 +175,10 @@ impl WorkTracker {
             self.wait_started.1.notify_all();
         }
         let mut active = lock(&self.active);
-        while *active != 0 {
+        // Upgrading here would make the waiter itself keep the work alive.
+        // The last generation drop takes this mutex before notifying, so a
+        // zero transition cannot lose a wake between this check and waiting.
+        while active.strong_count() != 0 {
             active = self
                 .changed
                 .wait(active)
@@ -177,15 +198,13 @@ impl WorkTracker {
     }
 }
 
-impl Drop for WorkLease {
+impl Drop for WorkGeneration {
     fn drop(&mut self) {
-        let mut active = lock(&self.tracker.active);
-        *active -= 1;
-        let finished = *active == 0;
-        drop(active);
-        if finished {
-            self.tracker.changed.notify_all();
-        }
+        // A new generation may already have replaced this one after its final
+        // strong reference disappeared. Never clear the current generation:
+        // the waiter must inspect it again after every notification.
+        let _active = lock(&self.tracker.active);
+        self.tracker.changed.notify_all();
     }
 }
 

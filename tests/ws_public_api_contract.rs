@@ -79,7 +79,7 @@ fn registration_and_cancellation_apis_match_v2_request_contract() {
 fn registration_deadline_apis_preserve_v2_configuration_literals() -> TestResult {
     use open_net::ws::{
         DisconnectedPolicy, MessageLane, Priority, RequestOptions, RequestRegistration,
-        ResponseTimeoutOrigin, SendOptions, SendRetryPolicy,
+        ResponseTimeoutOrigin, SendOptions,
     };
     use std::time::Instant;
     let _: fn(&RequestRegistration) -> Instant = RequestRegistration::registered_at;
@@ -96,7 +96,7 @@ fn registration_deadline_apis_preserve_v2_configuration_literals() -> TestResult
             enqueue_timeout: Some(Duration::from_secs(1)),
             write_timeout: Duration::from_secs(10),
             deadline: None,
-            retry: SendRetryPolicy::Never,
+            retry_setting: open_net::retry::RetrySetting::Disabled,
             disconnected: DisconnectedPolicy::Reject,
             cancellation: None,
             metadata: Default::default(),
@@ -458,6 +458,8 @@ fn complete_configuration_literals_and_root_exports_type_check() -> TestResult {
                 interval: Duration::from_secs(2),
             }),
         },
+        default_send_retry_policy: open_net::ws::WsSendRetryPolicy::no_retry(),
+        default_request_retry_policy: open_net::ws::WsRequestRetryPolicy::no_retry(),
         close_timeout: Duration::from_secs(2),
         heartbeat: Some(open_net::ws::HeartbeatConfig {
             interval: Duration::from_secs(20),
@@ -493,6 +495,77 @@ fn heartbeat_retry_configuration_is_public_and_fallible() -> TestResult {
         retry,
     };
     heartbeat.validate()?;
+    Ok(())
+}
+
+#[test]
+fn shared_retry_schedules_and_ws_policy_overrides_are_public() -> TestResult {
+    use open_net::retry::{Backoff, RetrySchedule, RetrySetting};
+    use open_net::ws::{
+        WsReplaySafety, WsRequestRetryOn, WsRequestRetryPolicy, WsSendRetryOn, WsSendRetryPolicy,
+    };
+    requires_send_sync_clone::<WsSendRetryPolicy>();
+    requires_send_sync_clone::<WsRequestRetryPolicy>();
+    let schedule = RetrySchedule::builder()
+        .max_attempts(3)
+        .backoff(Backoff::sequence([
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ]))
+        .build()?;
+    let send = WsSendRetryPolicy::builder()
+        .schedule(schedule.clone())
+        .retry_on(
+            WsSendRetryOn::none()
+                .with_write_errors(true)
+                .with_write_timeout(true),
+        )
+        .safety(WsReplaySafety::IdempotentByContract)
+        .build()?;
+    let request = WsRequestRetryPolicy::builder()
+        .schedule(schedule)
+        .retry_on(
+            WsRequestRetryOn::none()
+                .with_response_timeout(true)
+                .with_attempt_timeout(true),
+        )
+        .safety(WsReplaySafety::IdempotencyKey)
+        .classifier(|_| open_net::retry::RetryDecision::Default)
+        .build()?;
+    let config = WebSocketClientConfig::default()
+        .with_default_send_retry_policy(send.clone())
+        .with_default_request_retry_policy(request.clone());
+    config.validate()?;
+    check(
+        config.default_send_retry_policy.schedule().max_attempts() == 3,
+        "send default lost schedule",
+    )?;
+    check(
+        config
+            .default_request_retry_policy
+            .schedule()
+            .max_attempts()
+            == 3,
+        "request default lost schedule",
+    )?;
+    let disabled = RetrySetting::Disabled.resolve(&send, WsSendRetryPolicy::no_retry());
+    check(
+        disabled.schedule().max_attempts() == 1,
+        "Disabled inherited retries",
+    )?;
+    let inherited = RetrySetting::Inherit.resolve(&request, WsRequestRetryPolicy::no_retry());
+    check(
+        inherited.schedule().max_attempts() == 3,
+        "Inherit lost client default",
+    )?;
+    check(
+        WebSocketClientConfig::default()
+            .default_request_retry_policy
+            .schedule()
+            .max_attempts()
+            == 1,
+        "request retries enabled by default",
+    )?;
     Ok(())
 }
 

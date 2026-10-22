@@ -6,11 +6,10 @@
 
 Use Rust 1.89 or later and the `http-client` feature (it also enables `net-status`).
 Create a consumer with `cargo new http-example` and add these dependencies.
-Replace `/path/to/open-net` with the library directory containing Cargo.toml.
 
 ```toml
 [dependencies]
-open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 futures-util = "0.3"
@@ -103,7 +102,7 @@ Not applicable.
 
 ### Errors and behavior
 
-The normal admission, path, header, cancellation and timeout rules apply. HTTP error statuses remain successful response values until check_status(). Retries may occur before the stream is returned, subject to policy; never after return.
+The normal admission, path, header, cancellation and timeout rules apply. HTTP error statuses remain successful response values until check_status(). Built-in status/transport retries may occur before the stream is returned, subject to policy; never after return. The buffered business classifier is not applied to streaming responses, and the SDK does not buffer a stream to run it.
 
 ### Example
 

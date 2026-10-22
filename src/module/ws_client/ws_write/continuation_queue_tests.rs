@@ -121,7 +121,7 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
     let sender = fixture::sender(&runtime);
     let options = SendOptions {
         write_timeout: WRITE_TIMEOUT,
-        retry: crate::ws::SendRetryPolicy::Idempotent { max_retries: 2 },
+        retry_setting: crate::api::retry::RetrySetting::Disabled,
         disconnected: DisconnectedPolicy::WaitForReconnect,
         ..Default::default()
     };

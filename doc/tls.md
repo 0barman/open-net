@@ -77,19 +77,51 @@ WebSocket clients inherit the engine's `NetworkConfig` unless a complete
 per-client override is supplied. HTTP uses its own `HttpTlsConfig`; the
 WebSocket engine policy does not implicitly configure HTTP clients.
 
+## WebSocket proxy TLS and target TLS
+
+`ProxyConfig::https_connect(url, auth, proxy_tls)` establishes TLS to the proxy
+before sending HTTP/1.1 CONNECT. A `wss://` target then establishes a second TLS
+session inside that tunnel. `NetworkConfig::with_tls(target_tls)` continues to
+configure only the target session.
+
+These are separate `TlsConfig` values. Each independently selects its explicit
+provider, or the host's process provider when no explicit provider is supplied.
+Proxy roots, target roots and client identities are not copied between them.
+Sharing an `Arc<CryptoProvider>` explicitly is supported; it does not share roots
+or client identities. A proxy-specific configuration error is reported under
+`proxy.tls.*` during network configuration validation or connector creation.
+The reusable PEM setters still report `tls.*` while parsing their inputs, before
+the resulting `TlsConfig` is assigned to either role.
+
+Certificate verification uses the proxy URL's host for the outer session and
+the target URL's host for the inner session. DNS hosts use their corresponding
+SNI; IP addresses require matching IP subject alternative names. Failure to
+verify the proxy certificate or name sends no CONNECT credentials, and there
+is no automatic HTTP downgrade or direct-connection fallback. The two TLS
+sessions retain strict certificate verification, disabled early data and disabled
+session resumption.
+
+An HTTPS proxy protects CONNECT, including its destination and Basic
+credentials, on the client-to-proxy connection. For `ws://`, application traffic
+after the proxy remains unencrypted. For `wss://`, the inner TLS session protects
+application traffic to the target. The proxy still knows the CONNECT destination.
+See [WebSocket proxy migration](ws_proxy_migration.md) for complete setup examples,
+the default refusal of Basic authentication over HTTP proxies, and explicit
+plaintext exceptions.
+
 ## Select a provider per client
 
-This example supplies a third-party provider directly. In a consumer crate
-beside the `open-net` directory, add:
+This example supplies a third-party provider directly. Use these dependency
+settings:
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["ws-client", "http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["ws-client", "http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Replace the path with your checkout's library directory. Copy this complete
+Copy this complete
 program to `src/main.rs` and run `cargo run`. It creates both clients and shuts
 them down without contacting a server:
 

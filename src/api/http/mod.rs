@@ -39,6 +39,8 @@ pub mod middleware;
 /// Buffered multipart request construction (requires `http-client-codecs`).
 #[cfg(feature = "http-client-codecs")]
 pub mod multipart;
+/// Redirect target authorization and transport security requirements.
+pub mod redirect;
 #[cfg(feature = "http-client-codecs")]
 mod request_codecs;
 pub mod retry;
@@ -78,10 +80,10 @@ pub use middleware::{
 };
 #[cfg(feature = "http-client-codecs")]
 pub use multipart::Multipart;
+pub use redirect::{HttpRedirectError, HttpTransportSecurity, RedirectPolicy};
 pub use retry::{
-    ApplicationPredicate, Backoff, HttpRequestOptions, RequestSafety, RetryAfterMode, RetryContext,
-    RetryEvent, RetryObserver, RetryObserverHandle, RetryOn, RetryPolicy, RetryPolicyBuilder,
-    RetryPolicyError, RetryReason, RetryReport, RetrySetting, TransportErrorKind,
+    HttpRequestOptions, HttpRetryContext, HttpRetryPolicy, HttpRetryPolicyBuilder, RequestSafety,
+    RetryAfterMode, RetryOn, RetryReason, TransportErrorKind,
 };
 #[cfg(feature = "http-client-cookies")]
 pub use url::Url;

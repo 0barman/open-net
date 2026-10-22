@@ -1,4 +1,8 @@
 #![cfg(feature = "http-client")]
+use crate::api::retry::{
+    RetryDecision, RetryEvent, RetryObserverHandle, RetryReport, RetryStopReason,
+};
+use crate::retry_core::RetryState;
 
 use crate::api::error::{EnqueueError, ErrorKind, ErrorStage, NetError};
 use crate::api::http::HttpClient;
@@ -9,7 +13,7 @@ mod request_completion;
 #[path = "worker_shutdown.rs"]
 mod worker_shutdown;
 use crate::module::http::http_failure::{
-    map_body_error, map_reqwest_error, map_response_error, retry_reason_for_error,
+    map_body_error, map_execute_error, map_reqwest_error, retry_reason_for_error,
 };
 use crate::module::http::network_observation::HttpNetworkObservation;
 use crate::module::http::request_wait_guard::RequestWaitGuard;
@@ -33,8 +37,8 @@ use crate::api::http::{HttpCall, HttpMiddleware, HttpMiddlewareResponse, HttpRes
 use crate::api::http::{
     HttpCancelOutcome, HttpClientConfig, HttpCompletion, HttpRequest, HttpRequestHandle,
     HttpRequestId, HttpRequestOptions, HttpRequestTrait, HttpResponse, HttpResponseHead,
-    HttpResponseResult, HttpResponseSummary, HttpStreamResponse, RetryEvent, RetryObserverHandle,
-    RetryReason, RetryReport,
+    HttpResponseResult, HttpResponseSummary, HttpStreamResponse, HttpTransportSecurity,
+    RetryReason,
 };
 #[cfg(feature = "http-client-http2")]
 use crate::api::http::{HttpResponseInfo, HttpVersionPolicy};
@@ -60,11 +64,9 @@ use tokio::time::Instant;
 mod cookie_hooks;
 #[cfg(feature = "http-client-cookies")]
 use cookie_hooks::{apply_cookie_header, update_response_cookies};
-#[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
 #[path = "response_hops.rs"]
 mod response_hops;
-#[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
-use response_hops::{follow_response_hops, uses_worker_redirects, ResponseHops};
+use response_hops::{follow_response_hops, ResponseHops};
 
 #[cfg(feature = "http-client-middleware")]
 #[path = "middleware_lifecycle.rs"]
@@ -83,6 +85,10 @@ mod shutdown_admission_tests;
 #[cfg(test)]
 #[path = "cookie_worker_tests.rs"]
 mod cookie_worker_tests;
+
+#[cfg(all(test, feature = "http-client-middleware"))]
+#[path = "middleware_retry_boundary_tests.rs"]
+mod middleware_retry_boundary_tests;
 
 #[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
 fn provider_failure_log(operation: &'static str, reason: &'static str) {
@@ -115,6 +121,8 @@ pub(crate) struct SendJob {
     pub(crate) registry: Arc<RequestRegistry>,
     pub(crate) permit: Arc<OwnedSemaphorePermit>,
     pub(crate) operation_start: Instant,
+    // Only the SDK's concrete middleware result adapter may bypass user callbacks.
+    pub(crate) inline_result: bool,
     pub(crate) completion: Option<CompletionLease>,
 }
 
@@ -152,47 +160,53 @@ pub(crate) struct HttpClientInner {
 struct RetryObserverLifecycle {
     observer: Option<RetryObserverHandle>,
     operation_start: Instant,
-    attempts: u32,
-    retry_count: u32,
+    state: RetryState,
+    control: Option<Arc<CancellationSignal>>,
     current_attempt: Option<u32>,
-    terminal_reason: Option<RetryReason>,
-    last_retry_reason: Option<RetryReason>,
     completed: bool,
+    frozen_report: Option<RetryReport>,
     #[cfg(feature = "http-client-middleware")]
     deferred: Option<Arc<MiddlewareCompletion>>,
 }
-
+fn retry_state_error(error: crate::retry_core::RetryStateError) -> NetError {
+    NetError::with_source(ErrorKind::Internal, error).with_stage(ErrorStage::Dispatch)
+}
+fn stop_for_error(error: &NetError) -> RetryStopReason {
+    match error.kind() {
+        ErrorKind::Cancelled => RetryStopReason::Cancelled,
+        ErrorKind::TimedOut | ErrorKind::DeadlineExceeded => RetryStopReason::TimedOut,
+        ErrorKind::QueueClosed => RetryStopReason::Shutdown,
+        ErrorKind::ProviderFailed | ErrorKind::Internal => RetryStopReason::PolicyFailed,
+        _ => RetryStopReason::NotRetryable,
+    }
+}
 impl RetryObserverLifecycle {
-    fn new(observer: Option<RetryObserverHandle>, operation_start: Instant) -> Self {
+    fn new(
+        observer: Option<RetryObserverHandle>,
+        operation_start: Instant,
+        schedule: crate::api::retry::RetrySchedule,
+    ) -> Self {
         Self {
             observer,
             operation_start,
-            attempts: 0,
-            retry_count: 0,
+            state: RetryState::new(schedule),
+            control: None,
             current_attempt: None,
-            terminal_reason: None,
-            last_retry_reason: None,
             completed: false,
+            frozen_report: None,
             #[cfg(feature = "http-client-middleware")]
             deferred: None,
         }
     }
-
-    fn attempt_started(&mut self, attempt: u32) {
-        self.attempts = self.attempts.max(attempt);
+    fn attempt_started(&mut self) -> Result<u32, NetError> {
+        let attempt = self.state.begin_attempt().map_err(retry_state_error)?;
         self.current_attempt = Some(attempt);
         if let Some(observer) = &self.observer {
             observer.notify(RetryEvent::AttemptStarted { attempt });
         }
+        Ok(attempt)
     }
-
-    fn note_reason(&mut self, reason: RetryReason) {
-        self.terminal_reason = Some(reason);
-    }
-
-    fn retry_scheduled(&mut self, attempt: u32, delay: Duration, reason: RetryReason) {
-        self.retry_count = self.retry_count.saturating_add(1);
-        self.last_retry_reason = Some(reason);
+    fn retry_scheduled(&mut self, attempt: u32, delay: Duration, _reason: RetryReason) {
         if let Some(observer) = &self.observer {
             observer.notify(RetryEvent::RetryScheduled { attempt, delay });
             observer.notify(RetryEvent::AttemptFinished {
@@ -202,46 +216,46 @@ impl RetryObserverLifecycle {
         }
         self.current_attempt = None;
     }
-
-    fn complete(&mut self, result: &HttpResponseResult, exhausted: bool) {
-        self.complete_summary(result.as_ref().map(|response| response.status), exhausted);
+    fn report(&self) -> RetryReport {
+        if let Some(report) = &self.frozen_report {
+            return report.clone();
+        }
+        let mut report = self.state.report(self.operation_start.elapsed());
+        if let Some(control) = &self.control {
+            report.transport_sends = control.transport_sends.load(Ordering::Acquire);
+        }
+        report
     }
-
+    fn stop(&mut self, reason: RetryStopReason) {
+        self.state.finish(reason);
+    }
+    fn complete(&mut self, result: &HttpResponseResult, exhausted: bool) {
+        self.complete_summary(result.as_ref().map(|r| r.status), exhausted);
+    }
     fn complete_summary(&mut self, result: Result<http::StatusCode, &NetError>, exhausted: bool) {
         if self.completed {
             return;
         }
         self.completed = true;
-        self.emit_terminal(Some(result), exhausted);
+        let reason = match result {
+            Err(error) => stop_for_error(error),
+            Ok(status) if status.is_success() => RetryStopReason::Completed,
+            Ok(_) if exhausted => RetryStopReason::AttemptsExhausted,
+            Ok(_) => RetryStopReason::NotRetryable,
+        };
+        self.state.finish(reason);
+        self.emit_terminal();
     }
-
-    fn emit_terminal(
-        &mut self,
-        result: Option<Result<http::StatusCode, &NetError>>,
-        exhausted: bool,
-    ) {
+    fn emit_terminal(&mut self) {
+        let report = self.report();
+        self.frozen_report = Some(report.clone());
+        if let Some(control) = &self.control {
+            control.set_retry_report(report.clone());
+        }
         let Some(observer) = &self.observer else {
             return;
         };
         let attempt = self.current_attempt.take();
-        let final_reason = match result {
-            Some(Ok(status)) if status.is_success() => None,
-            Some(Ok(status)) => Some(RetryReason::HttpStatus(status)),
-            Some(Err(error)) => self
-                .terminal_reason
-                .or_else(|| Some(retry_reason_for_error(error))),
-            None => self.terminal_reason.or(self.last_retry_reason),
-        };
-        let report = RetryReport {
-            attempts: self.attempts,
-            retry_count: self.retry_count,
-            elapsed: self.operation_start.elapsed(),
-            final_reason,
-            exhausted,
-            last_error: result
-                .and_then(Result::err)
-                .map(|error| format!("{:?}", error.kind())),
-        };
         #[cfg(feature = "http-client-middleware")]
         if let Some(deferred) = &self.deferred {
             deferred.queue(TerminalObservation {
@@ -251,21 +265,29 @@ impl RetryObserverLifecycle {
             });
             return;
         }
-        if let Some(attempt) = attempt {
-            observer.notify(RetryEvent::AttemptFinished {
-                attempt,
-                final_attempt: true,
-            });
+        let terminal = PendingRetryObservation {
+            observer: observer.clone(),
+            attempt,
+            report,
+        };
+        if let Some(control) = &self.control {
+            if control.defer_observer.load(Ordering::Acquire) {
+                match control.pending_observation.lock() {
+                    Ok(mut slot) => *slot = Some(terminal),
+                    Err(error) => *error.into_inner() = Some(terminal),
+                }
+                return;
+            }
         }
-        observer.notify(RetryEvent::Completed(report));
+        terminal.emit();
     }
 }
-
 impl Drop for RetryObserverLifecycle {
     fn drop(&mut self) {
         if !self.completed {
             self.completed = true;
-            self.emit_terminal(None, false);
+            self.state.finish(RetryStopReason::Cancelled);
+            self.emit_terminal();
         }
     }
 }
@@ -291,10 +313,30 @@ impl Drop for RegistrationGuard {
     }
 }
 
+struct PendingRetryObservation {
+    observer: RetryObserverHandle,
+    attempt: Option<u32>,
+    report: RetryReport,
+}
+impl PendingRetryObservation {
+    fn emit(self) {
+        if let Some(attempt) = self.attempt {
+            self.observer.notify(RetryEvent::AttemptFinished {
+                attempt,
+                final_attempt: true,
+            });
+        }
+        self.observer.notify(RetryEvent::Completed(self.report));
+    }
+}
 pub(crate) struct CancellationSignal {
     phase: std::sync::atomic::AtomicU8,
     completion: std::sync::OnceLock<HttpCompletion>,
     completion_notify: Notify,
+    retry_report: Mutex<Option<RetryReport>>,
+    defer_observer: AtomicBool,
+    pending_observation: Mutex<Option<PendingRetryObservation>>,
+    transport_sends: std::sync::atomic::AtomicU64,
     attempt: std::sync::atomic::AtomicU32,
     streaming: AtomicBool,
     #[cfg(feature = "http-client-middleware")]
@@ -312,6 +354,10 @@ impl CancellationSignal {
             phase: std::sync::atomic::AtomicU8::new(0),
             completion: std::sync::OnceLock::new(),
             completion_notify: Notify::new(),
+            retry_report: Mutex::new(None),
+            defer_observer: AtomicBool::new(false),
+            pending_observation: Mutex::new(None),
+            transport_sends: std::sync::atomic::AtomicU64::new(0),
             attempt: std::sync::atomic::AtomicU32::new(0),
             streaming: AtomicBool::new(false),
             #[cfg(feature = "http-client-middleware")]
@@ -324,6 +370,36 @@ impl CancellationSignal {
         }
     }
 
+    fn set_retry_report(&self, report: RetryReport) {
+        match self.retry_report.lock() {
+            Ok(mut slot) => *slot = Some(report),
+            Err(error) => *error.into_inner() = Some(report),
+        }
+    }
+    fn retry_report(&self) -> Option<RetryReport> {
+        match self.retry_report.lock() {
+            Ok(slot) => slot.clone(),
+            Err(error) => error.into_inner().clone(),
+        }
+    }
+    fn emit_pending_observation(&self, report: RetryReport) {
+        let terminal = match self.pending_observation.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(error) => error.into_inner().take(),
+        };
+        if let Some(mut terminal) = terminal {
+            terminal.report = report;
+            terminal.emit();
+        }
+    }
+    fn record_transport_send(&self) -> Result<(), NetError> {
+        self.transport_sends
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map(|_| ())
+            .map_err(|_| NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Dispatch))
+    }
     pub(crate) fn cancel(&self) {
         let _ = self.request_cancel();
     }
@@ -455,6 +531,7 @@ impl RequestAdmission {
             registry: Arc::clone(&registration.registry),
             permit,
             operation_start,
+            inline_result: false,
             completion: None,
         };
         (returned, job, registration)
@@ -822,15 +899,9 @@ impl HttpClientInner {
         &self,
         options: &HttpRequestOptions,
     ) -> Result<ResolvedTimeouts, NetError> {
-        let policy = if options.use_default_retry_policy && options.retry_policy.max_retries() == 0
-        {
-            &self.config.default_retry_policy
-        } else {
-            &options.retry_policy
-        };
         self.config
             .timeouts()
-            .resolve(options.timeouts(), self.config.timeout, policy)
+            .resolve(options.timeouts(), self.config.timeout)
     }
 
     fn reserve_request(
@@ -851,12 +922,15 @@ impl HttpClientInner {
     pub(crate) async fn request_buffered(
         self: &Arc<Self>,
         request: HttpRequest,
+        operation_start: Instant,
     ) -> Result<HttpResponse, NetError> {
         #[cfg(feature = "http-client-middleware")]
         if self.has_middleware() {
-            return self.request_with_middleware(request).await;
+            return self.request_with_middleware(request, operation_start).await;
         }
-        let (admission, resolved) = self.admit_buffered_future(&request).await?;
+        let (admission, resolved) = self
+            .admit_buffered_future_at(&request, operation_start)
+            .await?;
         let (sender, receiver) = oneshot::channel();
         let options = HttpRequestOptions::new()
             .with_retry_setting(request.retry_setting())
@@ -886,11 +960,15 @@ impl HttpClientInner {
     pub(crate) async fn request_with_middleware(
         self: &Arc<Self>,
         request: HttpRequest,
+        operation_start: Instant,
     ) -> Result<HttpResponse, NetError> {
-        let policy = request
-            .retry_setting()
-            .resolve(&self.config.default_retry_policy);
-        let (admission, resolved) = self.admit_buffered_future(&request).await?;
+        let policy = request.retry_setting().resolve(
+            &self.config.default_retry_policy,
+            crate::api::http::HttpRetryPolicy::no_retry(),
+        );
+        let (admission, resolved) = self
+            .admit_buffered_future_at(&request, operation_start)
+            .await?;
         let total = StreamBudget::total(admission.request.operation_start, resolved.total)?;
         let request_id = admission.request.id();
         let control = Arc::clone(&admission.request.registered.control);
@@ -910,16 +988,9 @@ impl HttpClientInner {
             Box::pin(async move { inner.run_buffered_terminal(admission, call, resolved).await })
         });
         let runner = build_middleware_runner(chain, 0, terminal);
-        let result = run_middleware_runner(runner, call, control, total, lease).await?;
+        let result = run_middleware_runner(runner, call, control, total, lease, None).await?;
         match result {
-            HttpMiddlewareResponse::Buffered(response) => {
-                if response.request_id() != request_id {
-                    return Err(NetError::from(ErrorKind::Protocol)
-                        .with_stage(ErrorStage::Response)
-                        .with_http_request_id(request_id));
-                }
-                Ok(response)
-            }
+            HttpMiddlewareResponse::Buffered(response) => Ok(response),
             other => Err(middleware_mode_error(
                 request_id,
                 HttpResponseMode::Buffered,
@@ -956,8 +1027,12 @@ impl HttpClientInner {
             &admission.registered.control,
             ErrorStage::Dispatch,
         )?;
-        let (_, job, registration) =
+        let (_, mut job, registration) =
             admission.into_job(ResultRequest::new(request, sender), options);
+        // ResultRequest only delivers an owned result through a oneshot. Keeping
+        // it on the user callback lane would charge unrelated callback backlog
+        // to the outer middleware budget after networking has already finished.
+        job.inline_result = true;
         let control = Arc::clone(&job.control);
         registration.commit();
         drop(slot.send(SendCommand::Job(job)));
@@ -1018,16 +1093,24 @@ impl HttpClientInner {
     pub(crate) async fn stream_request(
         &self,
         request: HttpRequest,
+        operation_start: Instant,
     ) -> Result<HttpStreamResponse, NetError> {
-        let operation_start = Instant::now();
-        let policy = request
-            .retry_setting()
-            .resolve(&self.config.default_retry_policy);
-        let resolved =
-            self.config
-                .timeouts()
-                .resolve(request.timeouts(), self.config.timeout, &policy)?;
+        let policy = request.retry_setting().resolve(
+            &self.config.default_retry_policy,
+            crate::api::http::HttpRetryPolicy::no_retry(),
+        );
         let mut owner = StreamOwner::new(&policy, operation_start);
+        let resolved = match self
+            .config
+            .timeouts()
+            .resolve(request.timeouts(), self.config.timeout)
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let report = owner.complete(Err(&error), false);
+                return Err(error.with_retry_report(report));
+            }
+        };
         let admission = self
             .admit_stream(
                 self.future_admission_policy(&request),
@@ -1039,8 +1122,8 @@ impl HttpClientInner {
         let (request_id, control) = match admission {
             Ok(admission) => admission,
             Err(error) => {
-                owner.complete(Err(&error), false);
-                return Err(error);
+                let report = owner.complete(Err(&error), false);
+                return Err(error.with_retry_report(report));
             }
         };
         let result = self
@@ -1062,8 +1145,8 @@ impl HttpClientInner {
         match result {
             Ok(response) => Ok(response),
             Err(error) => {
-                owner.complete(Err(&error), false);
-                Err(error)
+                let report = owner.complete(Err(&error), false);
+                Err(error.with_retry_report(report))
             }
         }
     }
@@ -1072,16 +1155,24 @@ impl HttpClientInner {
     pub(crate) async fn stream_request_with_middleware(
         self: &Arc<Self>,
         request: HttpRequest,
+        operation_start: Instant,
     ) -> Result<HttpStreamResponse, NetError> {
-        let operation_start = Instant::now();
-        let policy = request
-            .retry_setting()
-            .resolve(&self.config.default_retry_policy);
-        let resolved =
-            self.config
-                .timeouts()
-                .resolve(request.timeouts(), self.config.timeout, &policy)?;
+        let policy = request.retry_setting().resolve(
+            &self.config.default_retry_policy,
+            crate::api::http::HttpRetryPolicy::no_retry(),
+        );
         let mut owner = StreamOwner::new(&policy, operation_start);
+        let resolved = match self
+            .config
+            .timeouts()
+            .resolve(request.timeouts(), self.config.timeout)
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let report = owner.complete(Err(&error), false);
+                return Err(error.with_retry_report(report));
+            }
+        };
         let admission = self
             .admit_stream(
                 self.future_admission_policy(&request),
@@ -1093,8 +1184,8 @@ impl HttpClientInner {
         let (request_id, control) = match admission {
             Ok(admission) => admission,
             Err(error) => {
-                owner.complete(Err(&error), false);
-                return Err(error);
+                let report = owner.complete(Err(&error), false);
+                return Err(error.with_retry_report(report));
             }
         };
         let total = StreamBudget::total(operation_start, resolved.total)?;
@@ -1134,9 +1225,23 @@ impl HttpClientInner {
                         mode,
                     ));
                 }
-                let policy = request
-                    .retry_setting()
-                    .resolve(&inner.config.default_retry_policy);
+                let policy = request.retry_setting().resolve(
+                    &inner.config.default_retry_policy,
+                    crate::api::http::HttpRetryPolicy::no_retry(),
+                );
+                // Middleware may replace the policy before the first attempt. Retire
+                // the unstarted placeholder without emitting a second terminal event.
+                if let Some(mut previous) = owner.lifecycle.take() {
+                    previous.completed = true;
+                }
+                let mut lifecycle = RetryObserverLifecycle::new(
+                    policy.observer(),
+                    operation_start,
+                    policy.schedule().clone(),
+                );
+                lifecycle.control = Some(Arc::clone(&control));
+                lifecycle.deferred = control.middleware_completion.get().cloned();
+                owner.lifecycle = Some(lifecycle);
                 let result = inner
                     .open_stream_after_admission(
                         request,
@@ -1157,21 +1262,16 @@ impl HttpClientInner {
                 match result {
                     Ok(response) => Ok(HttpMiddlewareResponse::Streaming(response)),
                     Err(error) => {
-                        owner.complete(Err(&error), false);
-                        Err(error)
+                        let report = owner.complete(Err(&error), false);
+                        Err(error.with_retry_report(report))
                     }
                 }
             })
         });
         let runner = build_middleware_runner(chain, 0, terminal);
-        let result = run_middleware_runner(runner, call, control, total, lease).await?;
-        if !terminal_called.load(Ordering::Acquire) {
-            return Err(middleware_mode_error(
-                request_id,
-                HttpResponseMode::Streaming,
-                result.mode(),
-            ));
-        }
+        let result =
+            run_middleware_runner(runner, call, control, total, lease, Some(terminal_called))
+                .await?;
         match result {
             HttpMiddlewareResponse::Streaming(response) => Ok(response),
             other => Err(middleware_mode_error(
@@ -1185,7 +1285,7 @@ impl HttpClientInner {
     async fn open_stream_after_admission(
         &self,
         request: HttpRequest,
-        policy: &crate::api::http::RetryPolicy,
+        policy: &crate::api::http::HttpRetryPolicy,
         resolved: ResolvedTimeouts,
         operation_start: Instant,
         owner: &mut StreamOwner,
@@ -1194,21 +1294,23 @@ impl HttpClientInner {
     ) -> Result<HttpStreamResponse, NetError> {
         let total = StreamBudget::total(operation_start, resolved.total)?;
         let method = request.method.clone();
-        let retry_allowed = policy.max_retries() > 0 && policy.allows_method(&method, true);
-        let mut attempt = 1_u32;
-        let mut retry_attempt = 1_u32;
+        let retry_allowed =
+            policy.schedule().max_attempts() > 1 && policy.allows_method(&method, true);
         #[cfg(feature = "http-client-auth")]
         let mut auth_retry_used = false;
         #[cfg(feature = "http-client-auth")]
         let mut auth_do_not_retry = false;
         loop {
             check_stream_start(total, &control)?;
+            let lifecycle = owner
+                .lifecycle
+                .as_mut()
+                .ok_or_else(|| NetError::from(ErrorKind::Internal))?;
+            lifecycle.control = Some(Arc::clone(&control));
+            let attempt = lifecycle.attempt_started()?;
             control.attempt.store(attempt, Ordering::Release);
             let budget =
                 total.with_phase(Instant::now(), resolved.attempt, TimeoutPhase::Attempt)?;
-            if let Some(lifecycle) = owner.lifecycle.as_mut() {
-                lifecycle.attempt_started(attempt);
-            }
             check_stream_start(total, &control)?;
             let build_future = build_spec_request(
                 &request,
@@ -1226,7 +1328,8 @@ impl HttpClientInner {
             let (result, _auth_generation) = match prepared {
                 Ok((built, generation)) => (
                     run_budget(headers_budget, &control, ErrorStage::Response, async {
-                        self.client.execute(built).await.map_err(map_response_error)
+                        control.record_transport_send()?;
+                        self.client.execute(built).await.map_err(map_execute_error)
                     })
                     .await,
                     generation,
@@ -1237,7 +1340,6 @@ impl HttpClientInner {
             let mut response_auth_generation = _auth_generation;
             #[cfg(feature = "http-client-auth")]
             let mut response_auth_allowed = self.config.auth().is_some();
-            #[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
             let result = match result {
                 Ok(response) => {
                     let hops = ResponseHops {
@@ -1275,6 +1377,7 @@ impl HttpClientInner {
                     && !auth_retry_used
                     && response_auth_allowed
                     && policy.allows_method(&method, true)
+                    && attempt < policy.schedule().max_attempts()
                 {
                     if let Some(auth) = self.config.auth() {
                         let www_authenticate = response
@@ -1308,15 +1411,22 @@ impl HttpClientInner {
                         };
                         if action == AuthAction::RetryWithFreshCredentials {
                             auth_retry_used = true;
-                            drop(result);
+                            let delay = stream_retry_delay(
+                                owner,
+                                policy,
+                                parse_retry_after(response.headers()),
+                            )?;
                             if let Some(lifecycle) = owner.lifecycle.as_mut() {
                                 lifecycle.retry_scheduled(
                                     attempt,
-                                    Duration::ZERO,
+                                    delay,
                                     RetryReason::HttpStatus(http::StatusCode::UNAUTHORIZED),
                                 );
                             }
-                            attempt = attempt.saturating_add(1);
+                            drop(result);
+                            if !wait_for_retry(delay, total.deadline(), &control).await {
+                                check_stream_start(total, &control)?;
+                            }
                             continue;
                         } else {
                             auth_do_not_retry = true;
@@ -1334,18 +1444,19 @@ impl HttpClientInner {
             let retry = match &result {
                 Ok(response)
                     if retry_allowed
-                        && policy.can_retry_attempt(retry_attempt)
+                        && attempt < policy.schedule().max_attempts()
                         && policy.should_retry_status(response.status())
                         && !auth_retry_status_blocked =>
                 {
                     Some((
                         RetryReason::HttpStatus(response.status()),
-                        policy.retry_delay(retry_attempt, parse_retry_after(response.headers())),
+                        stream_retry_delay(owner, policy, parse_retry_after(response.headers()))?,
                     ))
                 }
                 Err(error)
                     if retry_allowed
-                        && policy.can_retry_attempt(retry_attempt)
+                        && attempt < policy.schedule().max_attempts()
+                        && retry_error_is_eligible(error)
                         && policy.should_retry_error(error)
                         && !matches!(
                             error.timeout_phase(),
@@ -1354,7 +1465,7 @@ impl HttpClientInner {
                 {
                     Some((
                         retry_reason_for_error(error),
-                        policy.retry_delay(retry_attempt, None),
+                        stream_retry_delay(owner, policy, None)?,
                     ))
                 }
                 _ => None,
@@ -1371,18 +1482,34 @@ impl HttpClientInner {
                         .with_timeout_phase(TimeoutPhase::Total)
                         .with_stage(ErrorStage::Receive));
                 }
-                attempt = attempt.saturating_add(1);
-                retry_attempt = retry_attempt.saturating_add(1);
                 continue;
             }
             let response = match result {
                 Ok(response) => response,
                 Err(error) => {
-                    owner.complete(Err(&error), policy.max_attempts() == retry_attempt);
-                    return Err(error);
+                    if retry_error_is_eligible(&error) && policy.should_retry_error(&error) {
+                        if let Some(lifecycle) = owner.lifecycle.as_mut() {
+                            lifecycle.stop(if !policy.allows_method(&method, true) {
+                                RetryStopReason::UnsafeToReplay
+                            } else {
+                                RetryStopReason::AttemptsExhausted
+                            });
+                        }
+                    }
+                    let report = owner.complete(Err(&error), false);
+                    return Err(error.with_retry_report(report));
                 }
             };
             let status = response.status();
+            if policy.should_retry_status(status) && !auth_retry_status_blocked {
+                owner.status_stop_reason = Some(if !policy.allows_method(&method, true) {
+                    RetryStopReason::UnsafeToReplay
+                } else if attempt == policy.schedule().max_attempts() {
+                    RetryStopReason::AttemptsExhausted
+                } else {
+                    RetryStopReason::NotRetryable
+                });
+            }
             let headers = response.headers().clone();
             #[cfg(feature = "http-client-http2")]
             let response_info =
@@ -1400,6 +1527,8 @@ impl HttpClientInner {
                 lease: owner.lease.take(),
                 supervisor_slot: owner.supervisor_slot.take(),
                 lifecycle: owner.lifecycle.take(),
+                report: owner.report.take(),
+                status_stop_reason: owner.status_stop_reason.take(),
             };
             let (stream, supervisor) = FusedHttpBody::new(
                 body,
@@ -1407,7 +1536,7 @@ impl HttpClientInner {
                 budget,
                 body_owner,
                 status,
-                policy.max_attempts() == retry_attempt,
+                attempt == policy.schedule().max_attempts() && policy.should_retry_status(status),
                 request_id,
                 attempt,
                 body_start,
@@ -1509,8 +1638,10 @@ async fn run_middleware_runner(
     control: Arc<CancellationSignal>,
     total: StreamBudget,
     lease: MiddlewareLease,
+    terminal_called: Option<Arc<AtomicBool>>,
 ) -> Result<HttpMiddlewareResponse, NetError> {
     let request_id = call.request_id();
+    let expected_mode = call.mode();
     // Construct user middleware inside the caught and budgeted future too.
     let future = async {
         match AssertUnwindSafe(async { runner(call).await })
@@ -1523,7 +1654,31 @@ async fn run_middleware_runner(
             }
         }
     };
-    let result = run_budget(total, &control, ErrorStage::Dispatch, future).await;
+    let result = run_budget(total, &control, ErrorStage::Dispatch, future)
+        .await
+        .and_then(|response| {
+            if response.mode() != expected_mode
+                || terminal_called
+                    .as_ref()
+                    .is_some_and(|called| !called.load(Ordering::Acquire))
+            {
+                return Err(middleware_mode_error(
+                    request_id,
+                    expected_mode,
+                    response.mode(),
+                ));
+            }
+            let actual_id = match &response {
+                HttpMiddlewareResponse::Buffered(response) => response.request_id(),
+                HttpMiddlewareResponse::Streaming(response) => response.request_id,
+            };
+            if actual_id != request_id {
+                return Err(NetError::from(ErrorKind::Protocol)
+                    .with_stage(ErrorStage::Response)
+                    .with_http_request_id(request_id));
+            }
+            Ok(response)
+        });
     if result
         .as_ref()
         .err()
@@ -1532,11 +1687,25 @@ async fn run_middleware_runner(
         control.cancel();
     }
     lease.finish(&result);
-    result.map_err(|error| {
-        error
-            .with_http_request_id(request_id)
-            .with_http_attempt(control.attempt.load(Ordering::Acquire))
-    })
+    let report = control.retry_report();
+    match result {
+        Ok(HttpMiddlewareResponse::Buffered(response)) => {
+            Ok(HttpMiddlewareResponse::Buffered(match report {
+                Some(report) => response.with_retry_report(report),
+                None => response,
+            }))
+        }
+        Ok(other) => Ok(other),
+        Err(error) => {
+            let error = error
+                .with_http_request_id(request_id)
+                .with_http_attempt(control.attempt.load(Ordering::Acquire));
+            Err(match report {
+                Some(report) => error.with_retry_report(report),
+                None => error,
+            })
+        }
+    }
 }
 
 #[cfg(feature = "http-client-middleware")]
@@ -1571,17 +1740,13 @@ impl Drop for HttpClientInner {
 }
 
 fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
-    let default_headers = config.common_headers.clone();
-    #[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
-    let default_headers = if uses_worker_redirects(config) {
-        http::HeaderMap::new()
-    } else {
-        default_headers
-    };
+    // The SDK merges common headers for the initial request and owns every
+    // redirect. Transport defaults would reinsert credentials removed on a hop.
     let builder = Client::builder()
         .tls_backend_preconfigured(config.tls.compile(config.tls_alpn_protocols())?)
         .tcp_keepalive(config.tcp_keepalive)
-        .default_headers(default_headers);
+        .https_only(config.transport_security() == HttpTransportSecurity::HttpsOnly)
+        .redirect(reqwest::redirect::Policy::none());
     #[cfg(not(feature = "http-client-http2"))]
     let builder = builder.http1_only();
     #[cfg(feature = "http-client-http2")]
@@ -1614,12 +1779,6 @@ fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
             proxy_builder = proxy_builder.basic_auth(username, password);
         }
         builder = builder.proxy(proxy_builder);
-    }
-    #[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
-    if uses_worker_redirects(config) {
-        // SDK requests already merge common headers. Keeping another copy in
-        // reqwest would reinsert credentials removed at a cross-origin hop.
-        builder = builder.redirect(reqwest::redirect::Policy::none());
     }
     builder
         .build()
@@ -1757,6 +1916,7 @@ async fn process_job(
     response_tx: mpsc::Sender<ReceiveJob>,
     initial_attempt: u32,
 ) {
+    job.control.defer_observer.store(true, Ordering::Release);
     // Keep ownership of the request outside the attempt future so a user implementation
     // unwinding while building a request still receives its terminal result.
     let result = match AssertUnwindSafe(run_request(&mut job, &client, &config, initial_attempt))
@@ -1764,16 +1924,31 @@ async fn process_job(
         .await
     {
         Ok(result) => result,
-        Err(_) => {
+        Err(payload) => {
+            discard_unwind_payload(payload);
             crate::log_e!(crate::LogType::HTTP; "http.process_job", "error|job_request_id|job_completion_present|client|config_timeout|config_max_response_bytes|response_tx|initial_attempt", "request_task_panicked", "<redacted>", job.completion.is_some(), "provided", config.timeout, config.max_response_bytes, "provided", initial_attempt);
             Err(NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Dispatch))
         }
     };
     let result = result.map_err(|error| {
+        let mut report = match job.control.retry_report() {
+            Some(report) => report,
+            None => RetryReport::new(),
+        };
+        if error.retry_report().is_none() {
+            report.attempts = job.control.attempt.load(Ordering::Acquire);
+            report.retry_count = report.attempts.saturating_sub(1);
+            report.transport_sends = job.control.transport_sends.load(Ordering::Acquire);
+            report.elapsed = job.operation_start.elapsed();
+            report.stop_reason = Some(stop_for_error(&error));
+            job.control.set_retry_report(report.clone());
+        }
         error
+            .with_retry_report(report)
             .with_http_request_id(job.request_id)
             .with_http_attempt(job.control.attempt.load(Ordering::Acquire))
     });
+    let inline_result = job.inline_result;
     let response = ReceiveJob {
         request: job.request,
         result,
@@ -1783,6 +1958,12 @@ async fn process_job(
         _permit: job.permit,
         completion: job.completion,
     };
+    if inline_result {
+        // This internal adapter contains no application callback or async work.
+        // Middleware retains its own registration and capacity until it exits.
+        run_callback(response).await;
+        return;
+    }
     if let Err(error) = response_tx.send(response).await {
         crate::log_e!(crate::LogType::HTTP; "http.process_job", "error|job_request_id|job_completion_present|client|config_timeout|config_max_response_bytes|response_tx|initial_attempt", "response_queue_closed", "<redacted>", error.0.completion.is_some(), "provided", config.timeout, config.max_response_bytes, "provided", initial_attempt);
         run_callback(error.0).await;
@@ -1795,28 +1976,39 @@ async fn run_request(
     config: &HttpClientConfig,
     initial_attempt: u32,
 ) -> HttpResponseResult {
-    let method: Method = job.request.get_method().try_into()?;
-    #[cfg(feature = "http-client-cookies")]
-    let cookie_context = job.request.cookie_context();
     let replayable = job.options.replayable_body;
-    let mut policy = job.options.retry_policy.clone();
-    if job.options.use_default_retry_policy && policy.max_retries() == 0 {
-        policy = config.default_retry_policy.clone();
-    }
-    let retry_allowed = policy.max_retries() > 0 && policy.allows_method(&method, replayable);
+    let policy = job.options.retry_setting().resolve(
+        &config.default_retry_policy,
+        crate::api::http::HttpRetryPolicy::no_retry(),
+    );
     let operation_start = job.operation_start;
-    let mut lifecycle = RetryObserverLifecycle::new(policy.observer(), operation_start);
+    let mut lifecycle = RetryObserverLifecycle::new(
+        policy.observer(),
+        operation_start,
+        policy.schedule().clone(),
+    );
+    lifecycle.control = Some(Arc::clone(&job.control));
     #[cfg(feature = "http-client-middleware")]
     {
         lifecycle.deferred = job.control.middleware_completion.get().cloned();
     }
-    let resolved = config
+    let method: Method = match job.request.get_method().try_into() {
+        Ok(method) => method,
+        Err(error) => return terminal_error(&mut lifecycle, error),
+    };
+    #[cfg(feature = "http-client-cookies")]
+    let cookie_context = job.request.cookie_context();
+    let retry_allowed = policy.allows_method(&method, replayable);
+    let resolved = match config
         .timeouts()
-        .resolve(job.options.timeouts(), config.timeout, &policy)?;
+        .resolve(job.options.timeouts(), config.timeout)
+    {
+        Ok(resolved) => resolved,
+        Err(error) => return terminal_error(&mut lifecycle, error),
+    };
     let total = StreamBudget::total(operation_start, resolved.total)?;
     let operation_deadline = total.deadline();
-    let mut attempt = initial_attempt.max(1);
-    let mut retry_attempt = 1_u32;
+    let _ = initial_attempt;
     #[cfg(feature = "http-client-auth")]
     let mut auth_retry_used = false;
     #[cfg(feature = "http-client-auth")]
@@ -1825,15 +2017,15 @@ async fn run_request(
         if let Err(error) = check_budget(total, &job.control, ErrorStage::Dispatch) {
             return terminal_error(&mut lifecycle, error);
         }
-        if attempt > 1 && !replayable {
+        if lifecycle.state.attempts() > 0 && !replayable {
             return terminal_error(
                 &mut lifecycle,
                 NetError::from(ErrorKind::BodyNotReplayable).with_stage(ErrorStage::RequestBuild),
             );
         }
+        let attempt = lifecycle.attempt_started()?;
         job.control.attempt.store(attempt, Ordering::Release);
         let budget = total.with_phase(Instant::now(), resolved.attempt, TimeoutPhase::Attempt)?;
-        lifecycle.attempt_started(attempt);
         let request_path = job.request.get_path();
         let request_headers = job.request.headers();
         let request_body = job.request.get_req_body();
@@ -1861,7 +2053,8 @@ async fn run_request(
         let (response, _auth_generation) = match prepared {
             Ok((request, _has_body, generation)) => (
                 run_budget(headers_budget, &job.control, ErrorStage::Response, async {
-                    client.execute(request).await.map_err(map_response_error)
+                    job.control.record_transport_send()?;
+                    client.execute(request).await.map_err(map_execute_error)
                 })
                 .await,
                 generation,
@@ -1872,7 +2065,6 @@ async fn run_request(
         let mut response_auth_generation = _auth_generation;
         #[cfg(feature = "http-client-auth")]
         let mut response_auth_allowed = config.auth().is_some();
-        #[cfg(any(feature = "http-client-auth", feature = "http-client-cookies"))]
         let response = match response {
             Ok(response) => {
                 let hops = ResponseHops {
@@ -1904,110 +2096,12 @@ async fn run_request(
             }
             Err(error) => Err(error),
         };
-        let auth_retry_status_blocked = false;
-        #[cfg(feature = "http-client-auth")]
-        let mut auth_retry_status_blocked = auth_retry_status_blocked;
+        let server_delay = response
+            .as_ref()
+            .ok()
+            .and_then(|response| parse_retry_after(response.headers()));
         let result = match response {
             Ok(response) => {
-                #[cfg(feature = "http-client-auth")]
-                if response.status() == http::StatusCode::UNAUTHORIZED
-                    && !auth_retry_used
-                    && response_auth_allowed
-                {
-                    if let Some(auth) = config.auth() {
-                        let allowed = replayable && policy.allows_method(&method, replayable);
-                        if allowed {
-                            let www_authenticate = response
-                                .headers()
-                                .get(http::header::WWW_AUTHENTICATE)
-                                .cloned();
-                            let context = AuthResponseContext::new(
-                                response.status(),
-                                www_authenticate.as_ref(),
-                                job.request_id,
-                                attempt,
-                                response_auth_generation,
-                            );
-                            let decision =
-                                run_budget(budget, &job.control, ErrorStage::Provider, async {
-                                    Ok(AssertUnwindSafe(auth.on_unauthorized(&context))
-                                        .catch_unwind()
-                                        .await)
-                                })
-                                .await?;
-                            let action = match decision {
-                                Ok(result) => result.map_err(|_| {
-                                    provider_failure_log("auth_unauthorized", "returned_error");
-                                    NetError::from(ErrorKind::ProviderFailed)
-                                        .with_stage(ErrorStage::Provider)
-                                })?,
-                                Err(_) => {
-                                    provider_failure_log("auth_unauthorized", "panicked");
-                                    return terminal_error(
-                                        &mut lifecycle,
-                                        NetError::from(ErrorKind::ProviderFailed)
-                                            .with_stage(ErrorStage::Provider),
-                                    );
-                                }
-                            };
-                            if matches!(action, AuthAction::RetryWithFreshCredentials) {
-                                auth_retry_used = true;
-                                drop(response);
-                                lifecycle.retry_scheduled(
-                                    attempt,
-                                    Duration::ZERO,
-                                    RetryReason::HttpStatus(http::StatusCode::UNAUTHORIZED),
-                                );
-                                attempt = attempt.saturating_add(1);
-                                continue;
-                            } else {
-                                auth_do_not_retry = true;
-                            }
-                        }
-                    }
-                }
-                #[cfg(feature = "http-client-auth")]
-                {
-                    auth_retry_status_blocked = (auth_retry_used || auth_do_not_retry)
-                        && response.status() == http::StatusCode::UNAUTHORIZED;
-                }
-                if retry_allowed
-                    && policy.can_retry_attempt(retry_attempt)
-                    && policy.should_retry_status(response.status())
-                    && !auth_retry_status_blocked
-                {
-                    if !replayable {
-                        lifecycle.note_reason(RetryReason::HttpStatus(response.status()));
-                        return terminal_error(
-                            &mut lifecycle,
-                            NetError::from(ErrorKind::BodyNotReplayable)
-                                .with_stage(ErrorStage::RequestBuild),
-                        );
-                    }
-                    let status = response.status();
-                    let retry_after = parse_retry_after(response.headers());
-                    drop(response);
-                    let delay = policy.retry_delay(retry_attempt, retry_after);
-                    lifecycle.retry_scheduled(attempt, delay, RetryReason::HttpStatus(status));
-                    if !wait_for_retry(delay, operation_deadline, &job.control).await {
-                        if job.control.is_cancelled() {
-                            return terminal_error(
-                                &mut lifecycle,
-                                NetError::from(ErrorKind::Cancelled)
-                                    .with_stage(ErrorStage::Dispatch),
-                            );
-                        }
-                        return terminal_error(
-                            &mut lifecycle,
-                            NetError::from(ErrorKind::DeadlineExceeded)
-                                .with_timeout_phase(TimeoutPhase::Total)
-                                .with_stage(ErrorStage::Receive),
-                        );
-                    }
-                    attempt = attempt.saturating_add(1);
-                    retry_attempt = retry_attempt.saturating_add(1);
-                    continue;
-                }
                 read_response(
                     response,
                     attempt,
@@ -2023,89 +2117,210 @@ async fn run_request(
             }
             Err(error) => Err(error),
         };
-        if let Ok(buffered) = &result {
-            if retry_allowed
-                && policy.can_retry_attempt(retry_attempt)
-                && policy.should_retry_application(buffered)
-                && !auth_retry_status_blocked
-            {
-                if !replayable {
-                    lifecycle.note_reason(RetryReason::Application);
-                    return terminal_error(
-                        &mut lifecycle,
-                        NetError::from(ErrorKind::BodyNotReplayable)
-                            .with_stage(ErrorStage::RequestBuild),
-                    );
-                }
-                let delay = policy.retry_delay(retry_attempt, None);
-                lifecycle.retry_scheduled(attempt, delay, RetryReason::Application);
-                if !wait_for_retry(delay, operation_deadline, &job.control).await {
-                    if job.control.is_cancelled() {
-                        return terminal_error(
-                            &mut lifecycle,
-                            NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Receive),
-                        );
-                    }
-                    return terminal_error(
-                        &mut lifecycle,
-                        NetError::from(ErrorKind::DeadlineExceeded)
-                            .with_timeout_phase(TimeoutPhase::Total)
-                            .with_stage(ErrorStage::Receive),
-                    );
-                }
-                attempt = attempt.saturating_add(1);
-                retry_attempt = retry_attempt.saturating_add(1);
-                continue;
-            }
-        }
-        if let Err(error) = &result {
-            if retry_allowed
-                && policy.can_retry_attempt(retry_attempt)
-                && policy.should_retry_error(error)
-                && !matches!(
-                    error.timeout_phase(),
-                    Some(TimeoutPhase::Admission | TimeoutPhase::Total)
-                )
-            {
-                if !replayable {
-                    lifecycle.note_reason(retry_reason_for_error(error));
-                    return terminal_error(
-                        &mut lifecycle,
-                        NetError::from(ErrorKind::BodyNotReplayable)
-                            .with_stage(ErrorStage::RequestBuild),
-                    );
-                }
-                let delay = policy.retry_delay(retry_attempt, None);
-                lifecycle.retry_scheduled(attempt, delay, retry_reason_for_error(error));
-                if !wait_for_retry(delay, operation_deadline, &job.control).await {
-                    if job.control.is_cancelled() {
-                        return terminal_error(
-                            &mut lifecycle,
-                            NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Receive),
-                        );
-                    }
-                    return terminal_error(
-                        &mut lifecycle,
-                        NetError::from(ErrorKind::DeadlineExceeded)
-                            .with_timeout_phase(TimeoutPhase::Total)
-                            .with_stage(ErrorStage::Receive),
-                    );
-                }
-                attempt = attempt.saturating_add(1);
-                retry_attempt = retry_attempt.saturating_add(1);
-                continue;
-            }
-        }
         let result = arbitrate_result(budget, &job.control, ErrorStage::Receive, result);
-        lifecycle.complete(&result, policy.max_attempts() == retry_attempt);
-        return result;
+        if let Err(error) = &result {
+            if !retry_error_is_eligible(error) {
+                let reason = stop_for_error(error);
+                return finish_http_result(&mut lifecycle, result, reason);
+            }
+        }
+        let decision = match policy.classify(crate::api::http::HttpRetryContext {
+            outcome: result.as_ref(),
+            attempt,
+            elapsed: operation_start.elapsed(),
+            remaining: operation_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+        }) {
+            Ok(decision) => decision,
+            Err(error) => return terminal_error(&mut lifecycle, error),
+        };
+        if let Err(error) = check_budget(total, &job.control, ErrorStage::Provider) {
+            return terminal_error(&mut lifecycle, error);
+        }
+        if decision == RetryDecision::Stop {
+            return finish_http_result(&mut lifecycle, result, RetryStopReason::ClassifierStopped);
+        }
+        let mut auth_retry = false;
+        #[cfg(feature = "http-client-auth")]
+        if let Ok(response) = &result {
+            if response.status == http::StatusCode::UNAUTHORIZED
+                && !auth_retry_used
+                && response_auth_allowed
+                && retry_allowed
+                && lifecycle.state.can_retry()
+            {
+                if let Some(auth) = config.auth() {
+                    let context = AuthResponseContext::new(
+                        response.status,
+                        response.headers.get(http::header::WWW_AUTHENTICATE),
+                        job.request_id,
+                        attempt,
+                        response_auth_generation,
+                    );
+                    let action = run_budget(budget, &job.control, ErrorStage::Provider, async {
+                        match AssertUnwindSafe(auth.on_unauthorized(&context))
+                            .catch_unwind()
+                            .await
+                        {
+                            Ok(action) => action.map_err(|_| {
+                                provider_failure_log("auth_unauthorized", "returned_error");
+                                NetError::from(ErrorKind::ProviderFailed)
+                                    .with_stage(ErrorStage::Provider)
+                            }),
+                            Err(payload) => {
+                                discard_unwind_payload(payload);
+                                provider_failure_log("auth_unauthorized", "panicked");
+                                Err(NetError::from(ErrorKind::ProviderFailed)
+                                    .with_stage(ErrorStage::Provider))
+                            }
+                        }
+                    })
+                    .await;
+                    match action {
+                        Ok(AuthAction::RetryWithFreshCredentials) => {
+                            auth_retry_used = true;
+                            auth_retry = true;
+                        }
+                        Ok(_) => auth_do_not_retry = true,
+                        Err(error) => return terminal_error(&mut lifecycle, error),
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "http-client-auth")]
+        let blocked_auth = !auth_retry
+            && (auth_retry_used || auth_do_not_retry)
+            && result
+                .as_ref()
+                .is_ok_and(|response| response.status == http::StatusCode::UNAUTHORIZED);
+        #[cfg(not(feature = "http-client-auth"))]
+        let blocked_auth = false;
+        let requested = auth_retry
+            || (!blocked_auth
+                && match decision {
+                    RetryDecision::Retry => true,
+                    RetryDecision::Default => match &result {
+                        Ok(response) => policy.should_retry_status(response.status),
+                        Err(error) => policy.should_retry_error(error),
+                    },
+                    RetryDecision::Stop => false,
+                });
+        if !requested {
+            let reason = match &result {
+                Ok(response) if response.status.is_success() => RetryStopReason::Completed,
+                Ok(_) => RetryStopReason::NotRetryable,
+                Err(error) => stop_for_error(error),
+            };
+            return finish_http_result(&mut lifecycle, result, reason);
+        }
+        if !retry_allowed {
+            return finish_http_result(&mut lifecycle, result, RetryStopReason::UnsafeToReplay);
+        }
+        if !lifecycle.state.can_retry() {
+            return finish_http_result(&mut lifecycle, result, RetryStopReason::AttemptsExhausted);
+        }
+        let base = match lifecycle.state.next_delay().map_err(retry_state_error)? {
+            Some(delay) => delay,
+            None => {
+                return finish_http_result(
+                    &mut lifecycle,
+                    result,
+                    RetryStopReason::AttemptsExhausted,
+                )
+            }
+        };
+        let delay = policy.retry_after().select(server_delay, base);
+        let reason = match &result {
+            Ok(response) => RetryReason::HttpStatus(response.status),
+            Err(error) => retry_reason_for_error(error),
+        };
+        drop(result);
+        lifecycle.retry_scheduled(attempt, delay, reason);
+        if !wait_for_retry(delay, operation_deadline, &job.control).await {
+            let error = if job.control.is_cancelled() {
+                NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Receive)
+            } else {
+                NetError::from(ErrorKind::DeadlineExceeded)
+                    .with_timeout_phase(TimeoutPhase::Total)
+                    .with_stage(ErrorStage::Receive)
+            };
+            return terminal_error(&mut lifecycle, error);
+        }
     }
 }
 
-fn terminal_error(lifecycle: &mut RetryObserverLifecycle, error: NetError) -> HttpResponseResult {
-    let result = Err(error);
+fn stream_retry_delay(
+    owner: &mut StreamOwner,
+    policy: &crate::api::http::HttpRetryPolicy,
+    server: Option<Duration>,
+) -> Result<Duration, NetError> {
+    let lifecycle = owner
+        .lifecycle
+        .as_mut()
+        .ok_or_else(|| NetError::from(ErrorKind::Internal))?;
+    let delay = lifecycle
+        .state
+        .next_delay()
+        .map_err(retry_state_error)?
+        .ok_or_else(|| NetError::from(ErrorKind::Internal))?;
+    Ok(policy.retry_after().select(server, delay))
+}
+fn discard_unwind_payload(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(second) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(second);
+    }
+}
+fn retry_error_is_eligible(error: &NetError) -> bool {
+    if matches!(
+        error.timeout_phase(),
+        Some(TimeoutPhase::Admission | TimeoutPhase::Total)
+    ) {
+        return false;
+    }
+    if matches!(
+        error.kind(),
+        ErrorKind::Cancelled
+            | ErrorKind::DeadlineExceeded
+            | ErrorKind::InvalidInput
+            | ErrorKind::InvalidConfig
+            | ErrorKind::InvalidPolicy
+            | ErrorKind::BodyNotReplayable
+            | ErrorKind::ProviderFailed
+            | ErrorKind::Internal
+            | ErrorKind::QueueClosed
+    ) {
+        return false;
+    }
+    let mut source = std::error::Error::source(error);
+    for _ in 0..32 {
+        let Some(cause) = source else {
+            break;
+        };
+        if cause
+            .downcast_ref::<crate::api::http::HttpRedirectError>()
+            .is_some()
+        {
+            return false;
+        }
+        source = cause.source();
+    }
+    true
+}
+fn finish_http_result(
+    lifecycle: &mut RetryObserverLifecycle,
+    result: HttpResponseResult,
+    reason: RetryStopReason,
+) -> HttpResponseResult {
+    lifecycle.stop(reason);
     lifecycle.complete(&result, false);
+    let report = lifecycle.report();
     result
+        .map(|response| response.with_retry_report(report.clone()))
+        .map_err(|error| error.with_retry_report(report))
+}
+fn terminal_error(lifecycle: &mut RetryObserverLifecycle, error: NetError) -> HttpResponseResult {
+    let reason = stop_for_error(&error);
+    finish_http_result(lifecycle, Err(error), reason)
 }
 
 async fn build_request(
@@ -2212,7 +2427,12 @@ async fn build_spec_request(
 }
 
 fn admission_error(error: NetError, request_id: Option<HttpRequestId>) -> NetError {
-    let error = error.with_stage(ErrorStage::Admission).with_http_attempt(0);
+    let mut report = RetryReport::new();
+    report.stop_reason = Some(stop_for_error(&error));
+    let error = error
+        .with_retry_report(report)
+        .with_stage(ErrorStage::Admission)
+        .with_http_attempt(0);
     match request_id {
         Some(id) => error.with_http_request_id(id),
         None => error,
@@ -2445,6 +2665,20 @@ async fn run_callback(job: CallbackJob) {
     } else {
         job.result
     };
+    let mut report = match job.control.retry_report() {
+        Some(report) => report,
+        None => RetryReport::new(),
+    };
+    if let Err(error) = &result {
+        if error.retry_report().is_none() {
+            report.stop_reason = Some(stop_for_error(error));
+        }
+    }
+    job.control.set_retry_report(report.clone());
+    let result = result
+        .map(|response| response.with_retry_report(report.clone()))
+        .map_err(|error| error.with_retry_report(report.clone()));
+    job.control.emit_pending_observation(report.clone());
     if let Some(completion) = completion.as_mut() {
         completion.delivered(
             result
@@ -2459,6 +2693,7 @@ async fn run_callback(job: CallbackJob) {
     let mut callback_result = Ok(());
     let callback_error = || {
         NetError::from(ErrorKind::CallbackPanicked)
+            .with_retry_report(report.clone())
             .with_stage(ErrorStage::Dispatch)
             .with_http_request_id(job.request_id)
             .with_http_attempt(job.control.attempt.load(Ordering::Acquire))
@@ -2746,6 +2981,56 @@ mod tests {
     async fn completion_reports_handler_panic_and_preserves_successful_response(
     ) -> Result<(), Box<dyn StdError + Send + Sync>> {
         verify_panicking_callback_completion(false, true).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_queue_delay_preserves_the_frozen_network_result(
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        let (worker, mut receiver) = paused_worker()?;
+        let (delivered, delivered_rx) = tokio::sync::oneshot::channel();
+        let handle = worker
+            .submit_request(
+                CompletionProbe {
+                    header_panics: false,
+                    handler_panics: false,
+                    delivered,
+                },
+                HttpRequestOptions::new().with_timeouts(
+                    crate::api::http::HttpTimeouts::new()
+                        .with_total_timeout(Duration::from_millis(5)),
+                )?,
+            )
+            .map_err(EnqueueError::into_error)?;
+        let Some(SendCommand::Job(job)) = receiver.recv().await else {
+            return Err(std::io::Error::other("missing accepted job").into());
+        };
+        let mut report = RetryReport::new();
+        report.attempts = 1;
+        report.transport_sends = 1;
+        report.elapsed = Duration::from_millis(1);
+        report.stop_reason = Some(RetryStopReason::Completed);
+        job.control.set_retry_report(report.clone());
+        let response = HttpResponse::new(
+            http::StatusCode::OK,
+            http::HeaderMap::new(),
+            bytes::Bytes::new(),
+            1,
+            handle.id(),
+        )
+        .with_retry_report(report.clone());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        run_callback(callback_job(job, Ok(response))).await;
+        let delivered = delivered_rx.await??;
+        let completion = handle.finished().await;
+        check(
+            delivered.status == http::StatusCode::OK
+                && delivered.retry_report() == Some(&report)
+                && completion.retry_report() == &report,
+            "callback queue delay changed the frozen transport result or report",
+        )?;
+        completion.response?;
+        completion.callback?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3196,6 +3481,7 @@ mod tests {
                 registry: worker.registry(),
                 permit: Arc::new(worker.try_acquire_permit()?),
                 operation_start: Instant::now(),
+                inline_result: false,
                 completion: None,
             },
             registration,
@@ -3332,3 +3618,107 @@ mod tests {
 #[cfg(test)]
 #[path = "http_regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(test)]
+mod retry_report_regression_tests {
+    use super::*;
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn check(value: bool, message: &str) -> TestResult {
+        if value {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(message).into())
+        }
+    }
+    #[test]
+    fn abandoned_callback_owner_publishes_one_report_and_terminal_event() -> TestResult {
+        let registry = Arc::new(RequestRegistry::new());
+        let (registered, guard) = registry.register(None)?;
+        guard.commit();
+        let control = registered.control;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let observer = RetryObserverHandle::new(move |event: &RetryEvent| {
+            if let RetryEvent::Completed(report) = event {
+                if let Ok(mut values) = captured.lock() {
+                    values.push(report.clone());
+                }
+            }
+        });
+        let mut report = RetryReport::new();
+        report.stop_reason = Some(RetryStopReason::Completed);
+        control.set_retry_report(report.clone());
+        *control
+            .pending_observation
+            .lock()
+            .map_err(NetError::from_poison)? = Some(PendingRetryObservation {
+            observer,
+            attempt: None,
+            report: report.clone(),
+        });
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(permits.clone().try_acquire_owned()?);
+        let lease = CompletionLease::new(registry.clone(), registered.id, control.clone(), permit);
+        drop(lease);
+        let completion = control
+            .completion
+            .get()
+            .ok_or_else(|| std::io::Error::other("fallback did not publish completion"))?;
+        check(
+            completion.retry_report() == &report,
+            "fallback completion report changed",
+        )?;
+        check(
+            observed.lock().map_err(NetError::from_poison)?.as_slice() == [report],
+            "fallback terminal observer was missing or duplicated",
+        )?;
+        check(
+            registry.is_empty()? && permits.available_permits() == 1,
+            "fallback retained operation resources",
+        )
+    }
+    #[tokio::test(start_paused = true)]
+    async fn terminal_report_is_frozen_for_response_control_and_observer() -> TestResult {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let observer = RetryObserverHandle::new(move |event: &RetryEvent| {
+            if let RetryEvent::Completed(report) = event {
+                if let Ok(mut values) = captured.lock() {
+                    values.push(report.clone());
+                }
+            }
+        });
+        let control = Arc::new(CancellationSignal::new());
+        let mut lifecycle = RetryObserverLifecycle::new(
+            Some(observer),
+            Instant::now(),
+            crate::api::retry::RetrySchedule::no_retry(),
+        );
+        lifecycle.control = Some(control.clone());
+        let attempt = lifecycle.attempt_started()?;
+        control.record_transport_send()?;
+        let response = HttpResponse::new(
+            http::StatusCode::OK,
+            http::HeaderMap::new(),
+            bytes::Bytes::new(),
+            attempt,
+            HttpRequestId(1),
+        );
+        let response =
+            finish_http_result(&mut lifecycle, Ok(response), RetryStopReason::Completed)?;
+        let report = response
+            .retry_report()
+            .ok_or_else(|| std::io::Error::other("missing response report"))?
+            .clone();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        check(
+            lifecycle.report() == report && control.retry_report() == Some(report.clone()),
+            "terminal report elapsed changed after completion",
+        )?;
+        check(
+            observed.lock().map_err(NetError::from_poison)?.as_slice() == [report],
+            "observer report differs from delivered response",
+        )?;
+        Ok(())
+    }
+}

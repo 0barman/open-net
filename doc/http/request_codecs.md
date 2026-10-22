@@ -1,14 +1,14 @@
 # Query, JSON, form and multipart requests
 
-Required feature: `http-client-codecs` (includes `http-client`). In a consumer project beside this checkout's `open-net` directory:
+Required feature: `http-client-codecs` (includes `http-client`). In your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-open-net = { path = "../open-net", default-features = false, features = ["http-client-codecs"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client-codecs"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-Adjust the local path. Examples construct requests offline. To send them, use the client from [requests and responses](requests_and_responses.md), with a server that accepts the specified endpoint and media type. Fallible builder and Multipart methods that take `self` consume that builder/form on both success and error; `Err(NetError)` does not return the original object. `HttpRequestBuilder` is not cloneable: retain the original input values to reconstruct it after an error. `Multipart` is cloneable, so clone a form before a fallible call if a retained copy is required. Borrowed serialization input is not consumed. These codecs encode outgoing requests. `HttpResponse::json` already works with basic `http-client`, and sending manually constructed JSON bytes also needs no codecs feature.
+Examples construct requests offline. To send them, use the client from [requests and responses](requests_and_responses.md), with a server that accepts the specified endpoint and media type. Fallible builder and Multipart methods that take `self` consume that builder/form on both success and error; `Err(NetError)` does not return the original object. `HttpRequestBuilder` is not cloneable: retain the original input values to reconstruct it after an error. `Multipart` is cloneable, so clone a form before a fallible call if a retained copy is required. Borrowed serialization input is not consumed. These codecs encode outgoing requests. `HttpResponse::json` already works with basic `http-client`, and sending manually constructed JSON bytes also needs no codecs feature.
 
 ## `HttpRequestBuilder::query()`
 

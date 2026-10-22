@@ -4,10 +4,9 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // --blocking exercises synchronous integration; --reachability-only skips
-    // the network-name query. Both flags can be combined.
+    // Reachability refresh never collects a network name. --blocking exercises
+    // synchronous integration; the old --reachability-only flag is unnecessary.
     let blocking = std::env::args().any(|argument| argument == "--blocking");
-    let reachability_only = std::env::args().any(|argument| argument == "--reachability-only");
     // With ws-client enabled, the engine also prepares application-chosen WS TLS defaults.
     #[cfg(feature = "ws-client")]
     let net = {
@@ -26,11 +25,10 @@ async fn main() -> Result<()> {
         let timeout = Duration::from_secs(3);
         // Blocking calls are supported on this application's Tokio runtime, but
         // occupy the calling thread. Prefer the async methods in async code.
-        let refreshed = match (blocking, reachability_only) {
-            (false, false) => client.refresh(timeout).await,
-            (false, true) => client.refresh_reachability(timeout).await,
-            (true, false) => client.refresh_blocking(timeout),
-            (true, true) => client.refresh_reachability_blocking(timeout),
+        let refreshed = if blocking {
+            client.refresh_reachability_blocking(timeout)
+        } else {
+            client.refresh_reachability(timeout).await
         };
         match refreshed {
             Ok(result) => {
@@ -43,19 +41,12 @@ async fn main() -> Result<()> {
                     result.sampled_reachability, result.snapshot.reachability,
                 );
                 println!(
-                    "Name: {:?} ({:?})",
-                    result.snapshot.network_name, result.network_name_source
-                );
-                println!(
                     "IP stack: {:?} ({:?}); snapshot revision={}, observed_at={:?}",
                     result.snapshot.ip_stack,
                     result.ip_stack_source,
                     result.snapshot.revision,
                     result.snapshot.observed_at
                 );
-                for diagnostic in result.network_name_diagnostics {
-                    eprintln!("Name query fallback: {diagnostic}");
-                }
             }
             Err(error) if error.kind() == ErrorKind::Unsupported => {
                 println!("Active refresh is available on Windows; cached state: {started:?}");

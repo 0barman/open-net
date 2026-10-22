@@ -8,18 +8,22 @@ use crate::api::http::request_codecs::{
     append_query, encode_form, encode_json, encode_query, ensure_body_slot,
     set_default_content_type, validate_multipart_header, BodyEncoding,
 };
-use crate::api::http::retry::{RetryPolicy, RetrySetting};
+use crate::api::http::retry::HttpRetryPolicy;
 use crate::api::http::{HttpAdmissionPolicy, HttpTimeouts};
+use crate::api::retry::RetrySetting;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 #[derive(Clone)]
-#[cfg_attr(not(feature = "http-client-cookies"), derive(Debug))]
 /// A concrete HTTP request accepted by [`crate::api::http::HttpClient`].
 ///
 /// Requests own their method, relative path, headers, body, and retry policy.
 /// Use [`HttpRequest::builder`] to validate the path and construct one without
 /// relying on unchecked field combinations.
+///
+/// `Debug` reports diagnostic settings and sizes, omitting the path, header
+/// names and values, and body contents in every HTTP feature combination.
+/// The public fields retain the original values for explicit access.
 ///
 /// Concrete requests return their responses through the Future API:
 ///
@@ -58,18 +62,15 @@ pub struct HttpRequest {
     pub headers: HeaderMap,
     /// Owned request body bytes.
     pub body: Bytes,
-    /// Retry and replay rules for this request.
-    pub retry_policy: RetryPolicy,
     /// SameSite context used when the configured Cookie store is queried.
     #[cfg(feature = "http-client-cookies")]
     pub(crate) cookie_context: CookieRequestContext,
     /// Whether this request inherits the client policy or carries an explicit override.
-    pub(crate) retry_setting: RetrySetting,
+    pub(crate) retry_setting: RetrySetting<HttpRetryPolicy>,
     pub(crate) timeouts: HttpTimeouts,
     admission_policy: Option<HttpAdmissionPolicy>,
 }
 
-#[cfg(feature = "http-client-cookies")]
 impl std::fmt::Debug for HttpRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -78,7 +79,7 @@ impl std::fmt::Debug for HttpRequest {
             .field("path_bytes", &self.path.len())
             .field("header_count", &self.headers.len())
             .field("body_bytes", &self.body.len())
-            .field("retry_policy", &self.retry_policy)
+            .field("retry_setting", &self.retry_setting)
             .field("timeouts", &self.timeouts)
             .field("admission_policy", &self.admission_policy)
             .finish_non_exhaustive()
@@ -95,8 +96,7 @@ pub struct HttpRequestBuilder {
     path: String,
     headers: HeaderMap,
     body: Bytes,
-    retry_policy: RetryPolicy,
-    retry_setting: RetrySetting,
+    retry_setting: RetrySetting<HttpRetryPolicy>,
     timeouts: HttpTimeouts,
     admission_policy: Option<HttpAdmissionPolicy>,
     #[cfg(feature = "http-client-cookies")]
@@ -121,7 +121,6 @@ impl HttpRequest {
             path: String::new(),
             headers: HeaderMap::new(),
             body: Bytes::new(),
-            retry_policy: RetryPolicy::no_retry(),
             retry_setting: RetrySetting::Inherit,
             timeouts: HttpTimeouts::new(),
             admission_policy: None,
@@ -150,16 +149,8 @@ impl HttpRequest {
         self.admission_policy
     }
 
-    pub(crate) fn retry_setting(&self) -> RetrySetting {
-        match &self.retry_setting {
-            RetrySetting::Inherit if self.retry_policy == RetryPolicy::no_retry() => {
-                RetrySetting::Inherit
-            }
-            RetrySetting::Inherit | RetrySetting::Policy(_) => {
-                RetrySetting::Policy(self.retry_policy.clone())
-            }
-            RetrySetting::None => RetrySetting::None,
-        }
+    pub fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> {
+        self.retry_setting.clone()
     }
 }
 
@@ -288,23 +279,12 @@ impl HttpRequestBuilder {
         Ok(self)
     }
     /// Set the retry policy carried by the request.
-    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
-        self.retry_policy = policy;
-        self.retry_setting = RetrySetting::Policy(self.retry_policy.clone());
+    /// Inherit, disable, or replace the client retry policy for this request.
+    pub fn retry_setting(mut self, setting: RetrySetting<HttpRetryPolicy>) -> Self {
+        self.retry_setting = setting;
         self
     }
 
-    /// Select whether the request inherits, disables, or replaces the client policy.
-    pub fn retry_setting(mut self, setting: RetrySetting) -> Self {
-        self.retry_setting = setting.clone();
-        self.retry_policy = match setting {
-            RetrySetting::Policy(policy) => policy,
-            RetrySetting::Inherit | RetrySetting::None => RetryPolicy::no_retry(),
-        };
-        self
-    }
-
-    /// Set the SameSite context for this logical request.
     #[cfg(feature = "http-client-cookies")]
     pub fn cookie_context(mut self, context: CookieRequestContext) -> Self {
         self.cookie_context = context;
@@ -374,7 +354,6 @@ impl HttpRequestBuilder {
             path: self.path,
             headers: self.headers,
             body: self.body,
-            retry_policy: self.retry_policy,
             retry_setting: self.retry_setting,
             timeouts: self.timeouts,
             admission_policy: self.admission_policy,

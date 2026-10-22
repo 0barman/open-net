@@ -1,12 +1,8 @@
 use crate::error::NetError;
+use crate::module::transport::NativeWebSocketStream;
 use crate::module::ws_client::ws_client_worker::connection_budget::{
     BudgetDeadline, HandshakeAdmission,
 };
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-
-/// 当前平台上握手成功后得到的原生 TCP 或 TLS WebSocket 流。
-type NativeWebSocketStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// 连接任务及读写任务发送给 WebSocket worker 的生命周期事件。
 ///

@@ -1,17 +1,16 @@
-use super::{failure, TransportFailure};
+use super::{classify_tls_io_with_diagnostics, failure, TransportFailure};
 use crate::api::network_config::ProxyBasicAuth;
 use crate::error::NetError;
 use crate::module::transport::failure::{ConnectStage, ConnectionFailure};
 use crate::ws::{HandshakeDiagnostic, HandshakeDiagnosticKind, HandshakeDiagnosticOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_HEADERS: usize = 64;
 const MAX_INFORMATIONAL_RESPONSES: usize = 4;
 
-pub(super) async fn establish_tunnel_with_diagnostics(
-    socket: &mut TcpStream,
+pub(super) async fn establish_tunnel_with_diagnostics<S: AsyncBufRead + AsyncWrite + Unpin>(
+    socket: &mut S,
     host: &str,
     port: u16,
     auth: Option<&ProxyBasicAuth>,
@@ -36,8 +35,8 @@ pub(super) async fn establish_tunnel_with_diagnostics(
 }
 
 #[cfg(test)]
-pub(super) async fn establish_tunnel(
-    socket: &mut TcpStream,
+pub(super) async fn establish_tunnel<S: AsyncBufRead + AsyncWrite + Unpin>(
+    socket: &mut S,
     host: &str,
     port: u16,
     auth: Option<&ProxyBasicAuth>,
@@ -47,8 +46,8 @@ pub(super) async fn establish_tunnel(
         .map_err(|error| error.failure)
 }
 
-async fn establish_tunnel_inner(
-    socket: &mut TcpStream,
+async fn establish_tunnel_inner<S: AsyncBufRead + AsyncWrite + Unpin>(
+    socket: &mut S,
     host: &str,
     port: u16,
     auth: Option<&ProxyBasicAuth>,
@@ -69,7 +68,14 @@ async fn establish_tunnel_inner(
     socket
         .write_all(request.as_bytes())
         .await
-        .map_err(|error| TransportFailure::io(error, ConnectStage::ProxyConnect, options))?;
+        .map_err(|error| {
+            classify_tls_io_with_diagnostics(error, ConnectStage::ProxyConnect, options)
+        })?;
+    // TLS may accept writes into its own buffer without writing all ciphertext.
+    // Flush the complete CONNECT before waiting for the proxy's response.
+    socket.flush().await.map_err(|error| {
+        classify_tls_io_with_diagnostics(error, ConnectStage::ProxyConnect, options)
+    })?;
     let mut remaining_bytes = MAX_RESPONSE_BYTES;
     let mut remaining_headers = MAX_RESPONSE_HEADERS;
     let mut informational_responses = 0usize;
@@ -126,11 +132,10 @@ async fn establish_tunnel_inner(
     }
 }
 
-/// Peek in chunks, consume exactly through CRLFCRLF, leave tunnel bytes in TCP.
-/// Keeping the TcpStream intact avoids a buffered stream type spreading into the
-/// existing WebSocket read/write/socket-option implementation.
-async fn read_header_exactly(
-    socket: &mut TcpStream,
+/// Consume exactly through CRLFCRLF. The caller retains this buffered stream,
+/// so a read containing both the response and tunnel data cannot lose bytes.
+async fn read_header_exactly<S: AsyncBufRead + Unpin>(
+    socket: &mut S,
     max_bytes: usize,
     options: Option<&HandshakeDiagnosticOptions>,
 ) -> Result<Vec<u8>, TransportFailure> {
@@ -138,27 +143,24 @@ async fn read_header_exactly(
     response
         .try_reserve(max_bytes)
         .map_err(|_| proxy_protocol())?;
-    let mut scratch = [0u8; 1024];
     loop {
         let previous = response.len();
-        let available = max_bytes
+        let remaining = max_bytes
             .checked_sub(previous)
             .filter(|size| *size > 0)
-            .ok_or_else(proxy_protocol)?
-            .min(scratch.len());
-        let buffer = scratch.get_mut(..available).ok_or_else(proxy_protocol)?;
-        let peeked = socket
-            .peek(buffer)
-            .await
-            .map_err(|error| TransportFailure::io(error, ConnectStage::ProxyConnect, options))?;
-        if peeked == 0 {
+            .ok_or_else(proxy_protocol)?;
+        let buffer = socket.fill_buf().await.map_err(|error| {
+            classify_tls_io_with_diagnostics(error, ConnectStage::ProxyConnect, options)
+        })?;
+        if buffer.is_empty() {
             return Err(TransportFailure::io(
                 std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
                 ConnectStage::ProxyConnect,
                 options,
             ));
         }
-        response.extend_from_slice(buffer.get(..peeked).ok_or_else(proxy_protocol)?);
+        let available = buffer.len().min(remaining);
+        response.extend_from_slice(buffer.get(..available).ok_or_else(proxy_protocol)?);
         let search_start = previous.saturating_sub(3);
         let found = response
             .get(search_start..)
@@ -172,12 +174,9 @@ async fn read_header_exactly(
                 response.truncate(end);
                 end.checked_sub(previous).ok_or_else(proxy_protocol)?
             }
-            None => peeked,
+            None => available,
         };
-        socket
-            .read_exact(scratch.get_mut(..consume).ok_or_else(proxy_protocol)?)
-            .await
-            .map_err(|error| TransportFailure::io(error, ConnectStage::ProxyConnect, options))?;
+        socket.consume(consume);
         if found.is_some() {
             return Ok(response);
         }

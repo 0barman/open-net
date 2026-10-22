@@ -1,8 +1,9 @@
 use super::http_client_inner::{HttpClientInner, SendJob};
 use crate::api::http::{
-    Backoff, HttpClientConfig, HttpRequestMethod, HttpRequestOptions, HttpRequestTrait,
-    HttpResponseResult, RetryEvent, RetryOn, RetryPolicy,
+    HttpClientConfig, HttpRequestMethod, HttpRequestOptions, HttpRequestTrait, HttpResponseResult,
+    HttpRetryPolicy, RetryOn,
 };
+use crate::api::retry::{Backoff, RetryEvent, RetrySchedule, RetrySetting};
 use crate::error::{ErrorKind, NetError};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -169,6 +170,7 @@ async fn callback_runs_on_dedicated_runtime_thread() -> Result<(), NetError> {
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        inline_result: false,
         completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
@@ -219,11 +221,17 @@ async fn retry_budget_delivers_only_the_final_response() -> Result<(), NetError>
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        inline_result: false,
         completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
         }),
-        options: HttpRequestOptions::default().with_retry_policy(RetryPolicy::new(2)),
+        options: HttpRequestOptions::default().with_retry_setting(RetrySetting::Policy(
+            HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(3).build()?)
+                .retry_on(RetryOn::standard())
+                .build()?,
+        )),
         request_id,
         control,
         registry: worker.registry(),
@@ -269,18 +277,23 @@ async fn retry_keeps_admission_permit_until_terminal_callback() -> Result<(), Ne
     let (registered, registration) = worker.register_request(None)?;
     let request_id = registered.id;
     let control = registered.control;
-    let policy = RetryPolicy::builder()
-        .max_attempts(2)
-        .backoff(Backoff::constant(Duration::from_millis(200)))
+    let policy = HttpRetryPolicy::builder()
+        .schedule(
+            RetrySchedule::builder()
+                .max_attempts(2)
+                .backoff(Backoff::constant(Duration::from_millis(200)))
+                .build()?,
+        )
         .retry_on(RetryOn::standard())
         .build()
         .map_err(|_| failure("quota policy was rejected"))?;
     worker.submit(SendJob {
+        inline_result: false,
         completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
         }),
-        options: HttpRequestOptions::default().with_retry_policy(policy),
+        options: HttpRequestOptions::default().with_retry_setting(RetrySetting::Policy(policy)),
         request_id,
         control,
         registry: worker.registry(),
@@ -362,14 +375,20 @@ async fn request_body_provider_is_materialized_once_per_attempt() -> Result<(), 
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        inline_result: false,
         completion: None,
         request: Box::new(BodyCountingRequest {
             calls: Arc::clone(&calls),
             callback: callback_tx,
             method: Method::POST,
         }),
-        options: HttpRequestOptions::default()
-            .with_retry_policy(RetryPolicy::new(1).with_non_idempotent(true)),
+        options: HttpRequestOptions::default().with_retry_setting(RetrySetting::Policy(
+            HttpRetryPolicy::builder()
+                .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+                .retry_on(RetryOn::standard())
+                .safety(crate::api::http::RequestSafety::IdempotentByContract)
+                .build()?,
+        )),
         request_id,
         control,
         registry: worker.registry(),
@@ -422,6 +441,7 @@ async fn non_replayable_body_stops_before_a_second_send() -> Result<(), NetError
     let request_id = registered.id;
     let control = registered.control;
     worker.submit(SendJob {
+        inline_result: false,
         completion: None,
         request: Box::new(BodyCountingRequest {
             calls: Arc::clone(&calls),
@@ -429,7 +449,13 @@ async fn non_replayable_body_stops_before_a_second_send() -> Result<(), NetError
             method: Method::GET,
         }),
         options: HttpRequestOptions::default()
-            .with_retry_policy(RetryPolicy::new(1).with_non_idempotent(true))
+            .with_retry_setting(RetrySetting::Policy(
+                HttpRetryPolicy::builder()
+                    .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+                    .retry_on(RetryOn::standard())
+                    .safety(crate::api::http::RequestSafety::IdempotentByContract)
+                    .build()?,
+            ))
             .with_replayable_body(false),
         request_id,
         control,
@@ -441,12 +467,15 @@ async fn non_replayable_body_stops_before_a_second_send() -> Result<(), NetError
     let result = callback_rx
         .recv_timeout(Duration::from_secs(5))
         .map_err(|_| failure("one-shot body callback timeout"))?;
-    let error = match result {
-        Ok(_) => return Err(failure("one-shot body was retried successfully")),
-        Err(error) => error,
-    };
-    if error.kind() != ErrorKind::BodyNotReplayable {
-        return Err(failure("one-shot body returned the wrong error"));
+    let response = result?;
+    if response.status != StatusCode::SERVICE_UNAVAILABLE
+        || response.retry_report().is_none_or(|report| {
+            report.stop_reason != Some(crate::api::retry::RetryStopReason::UnsafeToReplay)
+        })
+    {
+        return Err(failure(
+            "one-shot body must retain its final response and safety stop report",
+        ));
     }
     if calls.load(Ordering::SeqCst) != 1 {
         return Err(failure("one-shot body provider was called more than once"));
@@ -462,8 +491,8 @@ async fn non_replayable_body_stops_before_a_second_send() -> Result<(), NetError
 async fn cancelled_request_emits_one_terminal_retry_event() -> Result<(), NetError> {
     let events = Arc::new(Mutex::new(Vec::<RetryEvent>::new()));
     let observed = Arc::clone(&events);
-    let policy = RetryPolicy::builder()
-        .max_attempts(2)
+    let policy = HttpRetryPolicy::builder()
+        .schedule(RetrySchedule::builder().max_attempts(2).build()?)
         .retry_on(RetryOn::standard())
         .observer(move |event: &RetryEvent| {
             if let Ok(mut stored) = observed.lock() {
@@ -482,11 +511,12 @@ async fn cancelled_request_emits_one_terminal_retry_event() -> Result<(), NetErr
     let control = registered.control;
     worker.cancel(request_id)?;
     worker.submit(SendJob {
+        inline_result: false,
         completion: None,
         request: Box::new(CallbackRequest {
             callback: callback_tx,
         }),
-        options: HttpRequestOptions::default().with_retry_policy(policy),
+        options: HttpRequestOptions::default().with_retry_setting(RetrySetting::Policy(policy)),
         request_id,
         control,
         registry: worker.registry(),

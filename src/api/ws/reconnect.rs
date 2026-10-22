@@ -26,7 +26,8 @@ impl ReconnectPolicy {
     /// The delay caps remain the safe defaults from [`BackoffConfig::default`],
     /// so an unavailable endpoint does not turn retries into a busy loop. A
     /// session still stops promptly when it is cancelled or closed.
-    /// The policy does not change [`ConnectOptions::connect_timeout`]; callers
+    /// The policy does not change
+    /// [`ConnectOptions::connect_timeout`](crate::ws::ConnectOptions::connect_timeout); callers
     /// that also want an unlimited initial connection wait must set that option
     /// to `None` explicitly.
     pub fn long_running() -> Self {

@@ -55,6 +55,119 @@ async fn connected_worker() -> TestResult<(Arc<WSClientInner>, WSClientWorker, C
     Ok((inner, worker, events))
 }
 
+#[tokio::test]
+async fn fatal_tls_io_ends_session_without_advertising_or_starting_reconnect() -> TestResult {
+    use crate::error::{ErrorKind, ErrorStage};
+
+    for stage in [ErrorStage::Tls, ErrorStage::ProxyTls] {
+        for kind in [ErrorKind::Tls, ErrorKind::DeliveryUnknown] {
+            for write_event in [false, true] {
+                let (_inner, mut worker, mut events) = connected_worker().await?;
+                let target = worker
+                    .connect_target
+                    .as_mut()
+                    .ok_or_else(|| test_error("target missing"))?;
+                target.options.reconnect = ReconnectPolicy::Backoff(Default::default());
+                let session = Arc::clone(&target.session);
+                let error = NetError::from(kind).with_stage(stage);
+                let event = if write_event {
+                    IoEvent::WriteEnded {
+                        generation: GENERATION,
+                        error,
+                        kind: IoEndKind::Other,
+                    }
+                } else {
+                    IoEvent::ReadEnded {
+                        generation: GENERATION,
+                        error,
+                        kind: IoEndKind::Other,
+                    }
+                };
+                worker.handle_io_event(event).await;
+                check_eq!(worker.current_status(), ConnectionStatus::Disconnected)?;
+                check_eq!(worker.generation, GENERATION)?;
+                check!(worker.connect_handle.is_none())?;
+                check!(worker.connect_cancel.is_none())?;
+                check!(worker.connect_target.is_none())?;
+                check!(matches!(
+                    session.snapshot()?.state,
+                    crate::ws::ConnectionState::Closed(Err(ref error))
+                        if error.kind() == kind && error.context().stage == Some(stage)
+                ))?;
+                // Exactly AttemptStarted, Established, Disconnected, Closed:
+                // the journal cannot promise a next attempt that never runs.
+                let terminal = physical_terminal(&mut events).await?;
+                let error = terminal
+                    .error
+                    .ok_or_else(|| test_error("TLS terminal lost its failure"))?;
+                check_eq!(error.kind(), kind)?;
+                check_eq!(error.context().stage, Some(stage))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_io_end_still_advertises_and_starts_reconnect() -> TestResult {
+    use crate::error::{ErrorKind, ErrorStage};
+
+    for write_event in [false, true] {
+        let (_inner, mut worker, mut events) = connected_worker().await?;
+        let target = worker
+            .connect_target
+            .as_mut()
+            .ok_or_else(|| test_error("target missing"))?;
+        target.options.reconnect = ReconnectPolicy::Backoff(Default::default());
+        let session = Arc::clone(&target.session);
+        let error = if write_event {
+            NetError::from(ErrorKind::DeliveryUnknown).with_stage(ErrorStage::Write)
+        } else {
+            NetError::from(ErrorKind::Io).with_stage(ErrorStage::Receive)
+        };
+        worker
+            .handle_io_event(if write_event {
+                IoEvent::WriteEnded {
+                    generation: GENERATION,
+                    error,
+                    kind: IoEndKind::ConnectionReset,
+                }
+            } else {
+                IoEvent::ReadEnded {
+                    generation: GENERATION,
+                    error,
+                    kind: IoEndKind::ConnectionReset,
+                }
+            })
+            .await;
+        check_eq!(worker.current_status(), ConnectionStatus::Reconnecting)?;
+        check_eq!(worker.generation, GENERATION + 1)?;
+        check!(worker.connect_handle.is_some())?;
+        check!(worker.connect_target.is_some())?;
+        check!(matches!(
+            session.snapshot()?.state,
+            crate::ws::ConnectionState::Reconnecting { cycle_id, .. }
+                if cycle_id.as_u64() == GENERATION + 1
+        ))?;
+        worker.cancel_connect();
+        check!(matches!(
+            next(&mut events).await?.kind,
+            Kind::AttemptStarted { .. }
+        ))?;
+        check!(matches!(
+            next(&mut events).await?.kind,
+            Kind::Established { .. }
+        ))?;
+        check!(matches!(
+            next(&mut events).await?.kind,
+            Kind::Disconnected { .. }
+        ))?;
+        worker.finish_context_session(TerminationReason::Cancelled, None);
+        worker.connect_target = None;
+    }
+    Ok(())
+}
+
 /// The real reader sees Close; the test holds its reply acknowledgement so a
 /// competing terminal is selected deterministically before ReadEnded exists.
 fn install_reader(

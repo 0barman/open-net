@@ -419,7 +419,10 @@ async fn send<W: Sink<Message, Error = WsError> + Unpin>(
         Message::Binary(payload),
         frame,
         MAX_READY_CONTROLS_PER_BOUNDARY,
-        Instant::now() + LIMIT,
+        super::TimeoutBudget::new(
+            (Instant::now() + LIMIT).into_std(),
+            crate::ws::WsTimeoutPhase::Write,
+        ),
         controls,
         LIMIT,
         LIMIT,
@@ -782,7 +785,10 @@ async fn request_and_frame_deadlines_keep_absolute_order_during_pending_flush() 
             Message::Binary(body(513)?),
             None,
             MAX_READY_CONTROLS_PER_BOUNDARY,
-            Instant::now() + Duration::from_millis(request_ms),
+            super::TimeoutBudget::new(
+                (Instant::now() + Duration::from_millis(request_ms)).into_std(),
+                crate::ws::WsTimeoutPhase::Write,
+            ),
             &mut rx,
             LIMIT,
             Duration::from_millis(frame_ms),

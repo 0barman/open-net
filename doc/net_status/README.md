@@ -18,8 +18,9 @@ Choose the observation contract your application needs:
 | Display the latest state | `snapshot()` reads cached state; `subscribe()` and `on_change()` deliver state updates and can coalesce intermediate changes. |
 | Handle each committed reachability transition | `subscribe_events()` and `on_event()` preserve a bounded ordered prefix. Overflow ends that raw subscription; register again to obtain a new baseline. |
 | Continue observing after event-queue overflow | [`on_recoverable_event()`](#netstatusclienton_recoverable_event) automatically installs a new baseline under the same subscription ID and reports `Reconciled`; missed events are not replayed. |
-| Request a fresh Windows observation | `refresh()` samples reachability and the network name while the calling view is `Running`; `refresh_reachability()` skips the name query. IP-stack capability remains the current shared netwatch value. |
-| Query from an existing synchronous interface | `refresh_blocking()` and `refresh_reachability_blocking()` expose the same query results and budgets while blocking the calling thread. |
+| Request a fresh Windows observation | `refresh_reachability()` samples reachability while the calling view is `Running`. IP-stack capability remains the current shared netwatch value. No network name is collected. |
+| Query from an existing synchronous interface | `refresh_reachability_blocking()` exposes the same reachability results and budgets while blocking the calling thread. |
+| Explicitly observe Windows network names | [`observe_network_names()`](#netstatusclientobserve_network_names) creates a separate owned observer. It does not start connectivity monitoring or put names in ordinary snapshots. |
 | Inspect local LAN IPv4 addresses | [`query_lan_ipv4()`](#netstatusclientquery_lan_ipv4) makes a fresh synchronous OS query, including while monitoring is stopped. It returns candidates and an optional recommendation without changing network observations. |
 
 The event guarantee begins at an SDK commit. An operating system or its monitor can merge notifications before the SDK samples them, so events are not a complete history of physical cable, Wi-Fi, VPN, or sleep/resume changes.
@@ -28,12 +29,12 @@ The event guarantee begins at an SDK commit. An operating system or its monitor 
 
 Use Rust 1.89 or later and a supported platform: macOS, Windows, or Ubuntu with Linux kernel 5.0 or later. Native build tools must be available; the macOS monitor includes a C component. Validate monitoring on the platforms and kernels your application supports.
 
-Create a consumer project with `cargo new network-observer`, then use this dependency configuration. Replace the path with the location of the `open-net` package directory in your checkout, which contains its `Cargo.toml`:
+Create a consumer project with `cargo new network-observer`, then use this dependency configuration:
 
 ```toml
 [dependencies]
-# Use the local source checkout.
-open-net = { path = "../open-net-test/open-net", default-features = false, features = ["net-status"] }
+# Network observation without the default WebSocket transport.
+open-net = { version = "0.3.3", default-features = false, features = ["net-status"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 ```
 
@@ -578,7 +579,8 @@ remain application responsibilities.
 ### Example
 
 This complete program queries a stopped client on a blocking worker. It still
-attempts engine cleanup if the query or blocking task fails.
+attempts engine cleanup if the query or blocking task fails. It reports summary
+fields without printing host addresses, interface names or raw diagnostics.
 
 ```rust
 use open_net::OpenNet;
@@ -592,13 +594,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = queried??;
     cleanup?;
     println!("Collection: {:?}", snapshot.completeness());
-    for diagnostic in snapshot.diagnostics() {
-        eprintln!("Collection detail: {diagnostic}");
-    }
+    println!("Candidates: {}; diagnostic count: {}",
+        snapshot.candidates().len(), snapshot.diagnostics().len());
     match snapshot.recommended() {
         Some(candidate) => println!(
-            "Candidate for LAN use: {} on {} ({:?})",
-            candidate.address(), candidate.interface_name(), candidate.recommendation_reason()
+            "Candidate available for LAN use: {:?}", candidate.recommendation_reason()
         ),
         None => println!("No default LAN recommendation; inspect candidates explicitly"),
     }
@@ -766,7 +766,8 @@ again and using the new baseline; the missing interval cannot be replayed.
 
 Both limits must be positive and within supported semaphore limits; `max_bytes`
 is also limited to `u32::MAX`. Accounted bytes include the event value and owned
-network-name bytes; this is not a bound on total process memory. An individual
+compatibility string storage, if present in a caller-created value; SDK-produced
+connectivity events contain no network names. This is not a bound on total process memory. An individual
 event must fit, including the initial baseline.
 
 ### Callback parameters
@@ -1040,8 +1041,7 @@ async fn main() -> Result<()> {
 
 ## NetStatusClient::refresh()
 
-Request new Windows reachability and network-name samples and commit them to
-shared network state. `snapshot()` remains a cheap cache read.
+Deprecated compatibility alias for [`refresh_reachability()`](#netstatusclientrefresh_reachability). It now samples and commits Windows reachability only. It never queries a network name. Use [`observe_network_names()`](#netstatusclientobserve_network_names) when the application explicitly needs names. See the [migration guide](network_name_migration.md) for the behavior change. `snapshot()` remains a cheap cache read.
 
 ### Required features
 
@@ -1057,16 +1057,7 @@ pub async fn refresh(&self, timeout: Duration) -> Result<NetworkRefreshResult>
 
 ### Steps
 
-Start the named client and check its `Running` state. Await `refresh()` with a
-positive timeout, inspect the sampling result, and handle errors independently
-from network unavailability.
-
-Use `refresh_reachability()` when only Windows' Internet-connectivity observation is needed. It uses
-an independent bounded worker which never runs network-name queries. A failed,
-slow, or stuck name query therefore cannot block this operation. The returned
-name is the latest cached value, identified by `CachedObservation`; it is not
-claimed as a newly queried SSID. Lifecycle, cancellation and timeout rules are
-the same as for `refresh()`.
+Start the named client and check its `Running` state. Await `refresh_reachability()` with a positive timeout, inspect the sampling result, and handle errors independently from network unavailability. Its bounded worker never runs network-name queries. The compatibility `snapshot.network_name` field is `None`, `network_name_source` is `NotCollected`, and `network_name_diagnostics` is empty, even while a separate name observer is active.
 
 ### Parameters
 
@@ -1105,25 +1096,15 @@ running query and cancelled queries whose blocking work has not yet retired.
 Further requests return `QueueFull`. Background monitoring has separate admission
 capacity and does not consume these manual-query slots.
 
-Every accepted full `refresh()` samples Windows Network List Manager reachability and
-queries the network name again. An active Wi-Fi SSID is preferred; a freshly
-queried connected NLM name is the fallback. A successful absence is represented
-by `None`. A query failure is not a disconnection and does not clear the last
-valid state or manufacture an `Unavailable` event. If a name-query fault is
-bypassed by a successful fresh fallback, `network_name_diagnostics` retains it.
+Every accepted refresh samples Windows Network List Manager reachability only. A query failure is not a disconnection and does not clear the last valid state or manufacture an `Unavailable` event.
 
-Reachability and name queries form a sampling window, not an atomic operating
+The query and cached IP-stack evidence form a sampling window, not an atomic operating
 system snapshot. `ip_stack_source` is `BackgroundObservation`: `ip_stack` remains
 the latest background netwatch capability and is not freshly measured by this
 operation. A successful result with unchanged values has a new `sample_id` and
 sampling window, while `snapshot.revision` and `snapshot.observed_at` can remain
 unchanged. Do not infer request freshness from the snapshot revision alone.
-Reachability and name have independent sampling watermarks. If a full query's
-name finishes after a newer reachability query, its fresh name is merged without
-rolling reachability back. `sampled_reachability` is the result of this query's
-own NLM call; `snapshot.reachability` may retain a later observation. A newer
-name sample supersedes an older full query with `Cancelled`; a newer
-reachability sample similarly supersedes an older reachability-only query.
+`sampled_reachability` is the result of this query's own NLM call. A newer committed reachability sample supersedes an older query with `Cancelled`. Name observations have a separate lifecycle and never participate in this commit path.
 
 The active query and background monitor share one ordered commit path. Active
 views observe the same new source facts, using their own local revisions;
@@ -1131,10 +1112,7 @@ stopped views stay stopped. Dropping a pending refresh invalidates its
 uncommitted result. Deadline expiry, stop/restart, shutdown, and engine closure
 also prevent late results from committing. A blocking COM query cannot be
 forcibly interrupted: it runs on a dedicated worker rather than blocking a Tokio
-worker, may finish later, and its expired result is rejected. Shutdown does not
-wait for an uninterruptible COM call; its worker releases resources after it
-returns. The `netsh` subprocess is terminated and reaped when its query is cancelled or
-expires. These cleanup limits do not extend the successful query contract.
+worker, may finish later, and its expired result is rejected. Native calls release resources after they return; cancellation prevents late publication but cannot forcibly interrupt COM. Engine shutdown waits for registered worker retirement. Reachability refresh does not launch `netsh`.
 
 The timeout is a validity budget for admission, sampling, and commit, not a hard
 wall-clock return deadline. Expired work cannot commit a late result, but lock
@@ -1145,16 +1123,13 @@ a query failure.
 ### Example
 
 The runnable [network_refresh example](../../examples/network_refresh.rs) also
-prints the sampling window, sampled and merged reachability, name provenance,
-cached-IP provenance, and fallback diagnostics. Pass `--blocking` to use the
-synchronous API, and `--reachability-only` to skip the name query. From the
-repository root:
+prints the sampling window, sampled and merged reachability, and cached-IP provenance. Pass `--blocking` to use the synchronous API. Both modes omit network names; the old `--reachability-only` argument is unnecessary. From the matching library source directory containing its `Cargo.toml`:
 
 ```bash
-cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_events
-cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_refresh
-cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_refresh -- --blocking
-cargo run --manifest-path open-net/Cargo.toml --no-default-features --features net-status --example network_refresh -- --blocking --reachability-only
+cargo run --manifest-path Cargo.toml --no-default-features --features net-status --example network_events
+cargo run --manifest-path Cargo.toml --no-default-features --features net-status --example network_refresh
+cargo run --manifest-path Cargo.toml --no-default-features --features net-status --example network_refresh -- --blocking
+cargo run --manifest-path Cargo.toml --no-default-features --features net-status --example network_refresh -- --blocking --reachability-only
 ```
 
 ```rust
@@ -1171,7 +1146,7 @@ async fn main() -> Result<()> {
         if !matches!(started.state, MonitorState::Running) {
             return Ok::<(), open_net::NetError>(());
         }
-        match client.refresh(Duration::from_secs(3)).await {
+        match client.refresh_reachability(Duration::from_secs(3)).await {
             Ok(result) => println!(
                 "Sample {} ({:?} to {:?}): sampled={:?}, merged={:?}",
                 result.sample_id, result.sample_started_at, result.sampled_at,
@@ -1191,7 +1166,7 @@ async fn main() -> Result<()> {
 
 ## NetStatusClient::refresh_reachability()
 
-Query fresh Windows reachability without waiting for a network-name query.
+Query fresh Windows reachability without collecting a network name.
 
 ### Required features
 
@@ -1206,8 +1181,7 @@ pub async fn refresh_reachability(&self, timeout: Duration) -> Result<NetworkRef
 
 ### Steps
 
-Start this named view, confirm `Running`, and await the method. Use it when the
-network name does not need a fresh query.
+Start this named view, confirm `Running`, and await the method.
 
 ### Parameters
 
@@ -1222,8 +1196,7 @@ for their callbacks to complete.
 ### Return values
 
 `Ok(NetworkRefreshResult)` includes the fresh `sampled_reachability` and merged
-`snapshot`. The network name retains `CachedObservation` provenance and the IP
-stack retains `BackgroundObservation` provenance. `Err(NetError)` reports this
+`snapshot`. The compatibility network-name field is `None`, its source is `NotCollected`, and its diagnostics are empty. The IP stack retains `BackgroundObservation` provenance. `Err(NetError)` reports this
 query's failure without substituting cached success.
 
 ### Errors and behavior
@@ -1238,15 +1211,11 @@ with `Cancelled`. Dropping the future invalidates its uncommitted result.
 The complete [async refresh example](#netstatusclientrefresh) shows lifecycle
 and result handling; use `refresh_reachability(timeout).await` for its query.
 Run the complete [network_refresh example](../../examples/network_refresh.rs)
-with `--reachability-only` to select this async method.
+without `--blocking` to select this async method.
 
 ## NetStatusClient::refresh_blocking()
 
-Use these methods when an existing synchronous interface needs a fresh Windows
-query. They drive the same operation as the corresponding async methods; they
-do not start monitoring, select a fallback policy, or create a second cache.
-Prefer `refresh().await` or `refresh_reachability().await` in async application
-code, and keep blocking queries off the UI thread.
+Deprecated compatibility alias for `refresh_reachability_blocking()`. Both methods collect reachability only. Use `refresh_reachability_blocking()` for an existing synchronous interface, and prefer `refresh_reachability().await` in async application code. Keep blocking queries off the UI thread.
 
 ### Required features
 
@@ -1264,8 +1233,7 @@ pub fn refresh_blocking(&self, timeout: Duration) -> Result<NetworkRefreshResult
 ### Steps
 
 Start the named view, check that it is `Running`, then call the method from a
-supported thread. Use the reachability-only variant below when no fresh name
-query is needed.
+supported thread. New code should call `refresh_reachability_blocking()`.
 
 ### Parameters
 
@@ -1313,7 +1281,7 @@ data.
 See the complete [synchronous refresh example](#synchronous-refresh-example)
 below for synchronous lifecycle integration. Run the complete
 [network_refresh example](../../examples/network_refresh.rs) with `--blocking`
-to select a full synchronous query.
+to select a synchronous reachability query.
 
 ## NetStatusClient::refresh_reachability_blocking()
 
@@ -1349,8 +1317,7 @@ application work to complete.
 ### Return values
 
 `Ok(NetworkRefreshResult)` includes the fresh sampled reachability and merged
-snapshot. The name retains `CachedObservation` provenance, and IP-stack data
-retains `BackgroundObservation` provenance. `Err(NetError)` never carries a
+snapshot. The compatibility network-name field is `None`, its source is `NotCollected`, and its diagnostics are empty. IP-stack data retains `BackgroundObservation` provenance. `Err(NetError)` never carries a
 cached snapshot as fresh success.
 
 ### Errors and behavior
@@ -1367,14 +1334,76 @@ callback-pool threads are supported. It does not start or restart the monitor.
 The complete [synchronous refresh example](#synchronous-refresh-example) calls
 this method on an ordinary thread. The runnable
 [network_refresh example](../../examples/network_refresh.rs) selects it with
-`--blocking --reachability-only`.
+`--blocking`.
+
+## NetStatusClient::observe_network_names()
+
+Explicitly start a separate Windows network-name observer. This opt-in operation is independent of `start()` and `stop()`: creating or subscribing to an ordinary connectivity monitor never collects names.
+
+### Required features
+
+`net-status`. Native name observation is implemented on Windows only.
+
+### Function signature
+
+```text
+pub fn observe_network_names(&self, options: NetworkNameOptions) -> Result<NetworkNameObserver>
+```
+
+### Steps
+
+Create an ordinary named client, explicitly request a name observer, and retain
+the returned owner while names are needed. Read `snapshot()` or await `recv()` on
+that owner. Await `close()` when observation is no longer needed.
+
+### Parameters
+
+`options: NetworkNameOptions` controls sampling interval and query timeout. The
+defaults are 30 seconds and 10 seconds. Intervals accept 1 second through 1 hour;
+timeouts accept 100 milliseconds through 30 seconds. Configure them with
+`with_interval` and `with_timeout`; validation occurs when observation is requested.
+The interval runs after sampling completes. The timeout covers that observer's
+native query once the serial worker starts it; it does not bound time waiting
+behind another observer.
+
+### Callback parameters
+
+None. The observer exposes a latest-state receiver with `recv()` and no callback.
+Ordinary state/event subscriptions, HTTP network observations and
+`NetworkStatusContext` never receive these name values.
+
+### Return values
+
+`Ok(NetworkNameObserver)` owns one independent, non-cloneable observation
+lifetime; construction does not wait for a native query. Initial state is
+`Pending`; native query success/failure is delivered by the observer.
+`Err(NetError)` means admission failed and no name observation was created.
+
+### Errors and behavior
+
+Invalid options return `InvalidInput` before lifecycle checks. A closed client or
+engine returns `Closed`; otherwise non-Windows calls return `Unsupported`.
+Observation does not require `Running`. Ordinary `stop()` leaves name observation
+active. Client shutdown/destroy and engine shutdown close their observers.
+
+`close().await` clears SDK-held names, rejects late results and waits for cleanup.
+`Drop` initiates cancellation without blocking. Native COM work may delay
+retirement because cancellation cannot forcibly interrupt an in-flight call.
+Already returned caller-owned values cannot be revoked.
+
+### Example
+
+The complete [network-name observation example](network_name_migration.md#example)
+shows explicit admission, state handling and cleanup without printing names.
+See the [migration and lifecycle guide](network_name_migration.md) for result
+accessors and compatibility behavior.
 
 ## Event and refresh values
 
 `NetworkEvent`, `NetworkEventKind`, `NetworkEventOptions`, `NetworkObservation`, `NetworkRefreshResult`,
 `NetworkNameSource`, and `NetworkIpStackSource` are available from
 `open_net::net_status` and the crate root. Existing `NetworkSnapshot` fields and
-state-subscription behavior are unchanged.
+state-subscription behavior remain source compatible; the network-name field is now always `None` in SDK-produced values.
 
 | Event field | Meaning |
 | --- | --- |
@@ -1399,12 +1428,12 @@ counter domain. `loss_epoch` is retained shared history, not the event count.
 
 | Refresh field | Meaning |
 | --- | --- |
-| `snapshot` | The calling view's latest snapshot after merging the sample; a slow full query preserves later reachability observations. |
+| `snapshot` | The calling view's latest snapshot after committing the reachability sample; its network-name field is always `None`. |
 | `sampled_reachability` | This sampling window's own NLM result, which can differ from a later observation retained in `snapshot.reachability`. |
 | `sample_id` | Increasing sampling-start identifier within one engine; completion can be out of order and failures/cancellations can leave gaps. It is not an event sequence or snapshot revision. |
 | `sample_started_at`, `sampled_at` | Wall-clock bounds of the system-query window. Clock corrections may reverse wall time; use sample IDs for ordering. |
-| `network_name_source` | `WifiSsid`, `NetworkListManager`, or `None` after a successful name query; `CachedObservation` when reachability-only sampling preserved the cached name. |
-| `network_name_diagnostics` | Query faults bypassed by a successful fresh name fallback. |
+| `network_name_source` | Always `NotCollected` for reachability refresh, including the deprecated aliases. `CachedObservation` remains an older compatibility variant. |
+| `network_name_diagnostics` | Always empty for reachability refresh. Name diagnostics belong to the explicit name observer. |
 | `ip_stack_source` | `BackgroundObservation`, explicitly identifying the IP-stack value as cached background evidence. |
 
 The new enums and refresh result are non-exhaustive. Include a wildcard when
@@ -1446,7 +1475,7 @@ Not applicable.
 
 ### Errors and behavior
 
-Normal stop publishes `Stopped`, clears reachability, IP stack, time and name, and preserves the loss epoch. Repeating it is harmless. It does not stop other active consumers of the shared detector and does not wait for application callbacks. `stop()` on a closed view cannot reopen it. Runtime cleanup failures and internal errors may propagate.
+Normal stop publishes `Stopped`, clears reachability, IP stack and time, and preserves the loss epoch. It does not close explicitly created network-name observers; close those owners separately. Repeating it is harmless. It does not stop other active consumers of the shared detector and does not wait for application callbacks. `stop()` on a closed view cannot reopen it. Runtime cleanup failures and internal errors may propagate.
 
 Once a polled stop has requested cleanup, cancelling its wait does not undo that request. A concurrent `start()` can activate the view again; serialize lifecycle calls when your application needs a stable stopped state.
 
@@ -1508,7 +1537,7 @@ Not applicable.
 
 ### Errors and behavior
 
-Normal shutdown publishes `Closed` with absent observation fields, ends subscriptions after their final state, and prevents future starts. Repeated shutdown is harmless. Every clone of this named view sees closure; other named clients stay independent. The name remains registered until `destroy_net_status_client()` runs.
+Normal shutdown publishes `Closed` with absent observation fields, ends subscriptions after their final state, and prevents future starts. It also closes this client's explicit network-name observers and waits for their cleanup. Repeated shutdown is harmless. Every clone of this named view sees closure; other named clients stay independent. The name remains registered until `destroy_net_status_client()` runs.
 
 This method awaits monitoring cleanup, not arbitrary application work or callback retirement. Use each callback handle's `close().await` for that purpose; closing immediately can cancel a terminal callback that has not started. If you must process the final state, explicitly wait for its delivery before closing. Runtime cleanup and internal errors can propagate. Once closure is requested, dropping its waiting future does not reopen the view.
 
@@ -1544,7 +1573,7 @@ Import these types from `open_net::net_status` or the root re-exports: `NetworkS
 | `reachability` | `Option<NetworkStatus>` | `Some` for a current host-level observation; `None` when none exists. |
 | `ip_stack` | `Option<IpStack>` | `Some` for observed local protocol capability; `None` for no current observation. `Some(IpStack::None)` is distinct from `None`. |
 | `observed_at` | `Option<std::time::SystemTime>` | Wall-clock time of collection, or `None`. It is not a monotonic duration clock. |
-| `network_name` | `Option<String>` | Best-effort platform name, or `None` when unavailable. It is not a portable Wi-Fi SSID field. |
+| `network_name` | `Option<String>` | Compatibility placeholder, always `None` in SDK-produced snapshots. Use a separate explicit name observer for Windows names; see the [migration guide](network_name_migration.md). |
 
 | `MonitorState` variant | Meaning |
 | --- | --- |
@@ -1576,7 +1605,7 @@ fn describe(snapshot: &NetworkSnapshot) {
         println!("IPv4: {}, IPv6: {}", stack.has_ipv4(), stack.has_ipv6());
     }
     println!("Revision {}, loss epoch {}", snapshot.revision, snapshot.loss_epoch);
-    println!("Time {:?}, name {:?}", snapshot.observed_at, snapshot.network_name);
+    println!("Time {:?}", snapshot.observed_at);
 }
 
 #[tokio::main]
@@ -2698,7 +2727,7 @@ use open_net::Result;
 
 fn main() -> Result<()> {
     match open_net::network::preferred_lan_ipv4()? {
-        Some(address) => println!("LAN candidate: {address}"),
+        Some(_address) => println!("A LAN candidate is available for application use"),
         None => println!("No eligible LAN IPv4 address"),
     }
     Ok(())
@@ -2711,29 +2740,25 @@ These notes describe the current implementation rather than a cross-platform val
 
 | Platform | Observation behavior |
 | --- | --- |
-| macOS | `Available` requires netwatch to report a default-route interface and at least one IPv4/IPv6 capability. This is local route/interface evidence, not an Internet probe. A supplementary native path monitor triggers refreshes; failure to initialize that extra hint source is logged and leaves the netwatch path in use. `network_name` is currently `None`. |
-| Windows | Background reachability and `refresh_reachability()` use a dedicated sampler, independent of the full `refresh()` and background name sampler. Reachability requires NetworkListManager Internet connectivity flags; a failed NLM query is not replaced with cached or netwatch reachability. Names prefer a newly queried active Wi-Fi SSID, then a connected name from that sampling round's NLM query. IP-stack capability remains background netwatch evidence. |
-| Ubuntu / Linux | Uses netwatch capability flags plus a reachability query that checks operational interfaces and IPv4/IPv6 default routes from `/proc/net/route` and `/proc/net/ipv6_route`. This establishes local route/interface capability, not end-to-end Internet access. Missing route files permit a less detailed default-interface fallback; other read errors are retained as monitor errors. `network_name` is currently `None`. |
+| macOS | `Available` requires netwatch to report a default-route interface and at least one IPv4/IPv6 capability. This is local route/interface evidence, not an Internet probe. A supplementary native path monitor triggers refreshes; failure to initialize that extra hint source is logged and leaves the netwatch path in use. The compatibility `network_name` field is always `None` in SDK-produced snapshots. |
+| Windows | Background reachability and all refresh methods use a dedicated sampler and never collect names. Reachability requires NetworkListManager Internet connectivity flags; a failed NLM query is not replaced with cached or netwatch reachability. IP-stack capability remains background netwatch evidence. Only an explicit name observer collects Wi-Fi SSID / NLM names through a separate service. |
+| Ubuntu / Linux | Uses netwatch capability flags plus a reachability query that checks operational interfaces and IPv4/IPv6 default routes from `/proc/net/route` and `/proc/net/ipv6_route`. This establishes local route/interface capability, not end-to-end Internet access. Missing route files permit a less detailed default-interface fallback; other read errors are retained as monitor errors. The compatibility `network_name` field is always `None` in SDK-produced snapshots. |
 
 After Windows monitoring is already `Running`, background sampling that encounters
 `TimedOut`, `QueueFull`, or sampling resource exhaustion retains its last
 successful snapshot and retries on a later monitoring cycle. These conditions
 do not themselves establish a network failure. Initial startup still requires a
 successful first reachability sample; native reachability query failures can
-produce `Failed`. Background names are independently retried and cannot delay
-startup or fail an otherwise running reachability monitor. Stopping the monitor
-cancels both sampling futures; late native work cannot update a later generation. Manual
-`refresh()` always reports its own failure and never returns the retained
-snapshot as fresh success.
+produce `Failed`. Ordinary monitoring never schedules name sampling. An explicit name observer is independent of connectivity start/stop; name failures cannot fail the reachability monitor. Stopping connectivity cancels its sampling future, and late native work cannot update a later generation. Manual `refresh_reachability()` always reports its own failure and never returns a retained snapshot as fresh success.
 
 The locally available `IpStack` uses netwatch's IPv4/IPv6 capability flags consistently across platforms. Reachability has platform-specific evidence. None of these mechanisms sends a request to your target server to prove that service healthy. A captive portal, DNS error, TLS error, or firewall can still make a request fail while the monitor says `Available`.
 
 | Symptom | Check and next step |
 | --- | --- |
 | All observation fields are `None` | Inspect `state`. Call and await `start()` if the view is `Stopped`; do not label it offline. |
-| Startup returns an error or state is `Failed` | Log the `NetError` kind, context, and source. Correct OS/runtime access issues, then explicitly retry `start()` for a recoverable failure. |
+| Startup returns an error or state is `Failed` | Inspect the `NetError` kind, context and I/O kind. Keep raw error sources out of logs unless reviewed and sanitized. Correct OS/runtime access issues, then explicitly retry `start()` for a recoverable failure. |
 | `Available` but requests fail | Inspect the actual request's DNS, connection, TLS, timeout, and HTTP response errors. Monitor availability is host-level evidence. |
-| Missing or unexpected network name | Names are best effort; use `None` handling and do not assume a Wi-Fi SSID on every platform. |
+| Ordinary snapshot has no network name | Expected: this compatibility field is always `None`. Explicitly create a Windows name observer if your application needs names. An observer's `Ready` result may still contain no name. |
 | A callback never appears | Retain its `Subscription` handle; dropping it unsubscribes. Check callback registration errors and ensure the engine remains alive. |
 | Fewer state changes than expected | State updates are coalesced. Use `subscribe_events()` for ordered SDK commits; upstream OS notifications can still merge physical changes. |
 | Event receive fails with `CallbackOverflow` | The bounded queue ended after its retained prefix. Subscribe again for a new Initial baseline; the missing interval is not replayed. |
@@ -2751,6 +2776,11 @@ The locally available `IpStack` uses netwatch's IPv4/IPv6 capability flags consi
 
 For diagnostics, `NetError::kind(&self) -> ErrorKind` identifies the category, `context(&self) -> &ErrorContext` exposes additional structured details, and `io_kind(&self) -> Option<std::io::ErrorKind>` provides a retained OS I/O kind when present. `NetError` implements `std::error::Error`; `source()` can expose the original cause. An error is not the same as an `Unavailable` observation.
 
+Raw error sources and LAN inventory values may include host or application data.
+The SDK's summary formatting does not sanitize values obtained through these
+accessors. The following report records source presence rather than its text;
+use application-specific redaction before exporting more detailed diagnostics.
+
 ```rust
 use open_net::NetError;
 use std::error::Error;
@@ -2758,14 +2788,12 @@ use std::error::Error;
 fn report(error: &NetError) {
     eprintln!("Kind: {:?}, context: {:?}", error.kind(), error.context());
     eprintln!("I/O kind: {:?}", error.io_kind());
-    if let Some(source) = error.source() {
-        eprintln!("Cause: {source}");
-    }
+    eprintln!("Underlying source present: {}", error.source().is_some());
 }
 
 fn main() {
     match open_net::network::preferred_lan_ipv4() {
-        Ok(address) => println!("LAN candidate: {address:?}"),
+        Ok(address) => println!("LAN candidate available: {}", address.is_some()),
         Err(error) => report(&error),
     }
 }
@@ -2776,7 +2804,8 @@ fn main() {
 | Area | APIs covered |
 | --- | --- |
 | Engine ownership | `OpenNet::new`, `new_with_config`, `create_net_status_client`, `get_net_status_client`, `destroy_net_status_client` |
-| Client methods | `start`, `snapshot`, `subscribe`, `on_change`, `subscribe_events`, `on_event`, `on_recoverable_event`, `refresh`, `refresh_reachability`, `refresh_blocking`, `refresh_reachability_blocking`, `stop`, `shutdown` |
+| Client methods | `start`, `snapshot`, `subscribe`, `on_change`, `subscribe_events`, `on_event`, `on_recoverable_event`, `refresh` (deprecated), `refresh_reachability`, `refresh_blocking` (deprecated), `refresh_reachability_blocking`, `observe_network_names`, `stop`, `shutdown` |
+| Explicit name observation | `NetworkNameOptions`, `NetworkNameObserver`, `NetworkNameSnapshot`, `NetworkNameState`; see the [migration guide](network_name_migration.md). |
 | Event and refresh values | `NetworkEvent`, `NetworkEventKind`, `NetworkEventOptions`, `NetworkObservation`, `NetworkRefreshResult`, `NetworkNameSource`, `NetworkIpStackSource` |
 | Snapshot values | All seven `NetworkSnapshot` fields; all current `MonitorState`, `NetworkStatus`, and `IpStack` variants |
 | Value helpers | `NetworkStatus::name`; `IpStack::name`, `has_ipv4`, `has_ipv6`, `is_dual_stack` |
@@ -2784,7 +2813,7 @@ fn main() {
 | Callback ownership | `Subscription::id`, `is_active`, `unsubscribe`, `close`; `CallbackContext::id`, `unsubscribe`; `SubscriptionId::as_u64` |
 | Shared state and discovery | `OpenNet::network_status_context`, `NetworkStatusContext::snapshot`, `network::preferred_lan_ipv4` |
 
-The contracts were checked against the [client API](../../src/api/net_status/net_status_client.rs), [snapshot types](../../src/api/net_status/mod.rs), [engine API](../../src/api/open_net.rs), [subscription API](../../src/api/subscription/mod.rs), [view lifecycle](../../src/module/net_status/inner/facade.rs), [shared context](../../src/module/net_status/inner/shared.rs), [LAN selection](../../src/module/net_status/lan_addr.rs), and [public integration tests](../../tests/net_status_integration.rs).
+The contracts were checked against the [client API](../../src/api/net_status/net_status_client.rs), [snapshot types](../../src/api/net_status/mod.rs), [engine API](../../src/api/open_net.rs), [subscription API](../../src/api/subscription/mod.rs), [view lifecycle](../../src/module/net_status/inner/facade.rs), [shared context](../../src/module/net_status/inner/shared.rs), [LAN selection](../../src/module/net_status/lan_addr.rs).
 
 
 ## Engine configuration example
@@ -3145,9 +3174,9 @@ fn main() -> Result<()> {
         }
         match client.refresh_reachability_blocking(Duration::from_secs(3)) {
             Ok(result) => println!(
-                "Sample {}: sampled={:?}, merged={:?}, name source={:?}",
+                "Sample {}: sampled={:?}, merged={:?}",
                 result.sample_id, result.sampled_reachability,
-                result.snapshot.reachability, result.network_name_source
+                result.snapshot.reachability
             ),
             Err(error) if error.kind() == ErrorKind::Unsupported => {
                 println!("Fresh queries require Windows; no query result returned");

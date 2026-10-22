@@ -188,7 +188,7 @@ impl CommonEngine {
     }
 
     pub(crate) fn management_is_closed(&self) -> bool {
-        *self.management_close.borrow()
+        *::tokio::sync::watch::Sender::borrow(&self.management_close)
     }
 
     /// Stop management admission and finish every already accepted factory.

@@ -11,7 +11,7 @@ Add these dependencies, replacing the local library path.
 
 ```toml
 [dependencies]
-open-net = { path = "/path/to/open-net", default-features = false, features = ["http-client"] }
+open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
 rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
@@ -272,7 +272,7 @@ explicit start/stop and independent named views.
 | `reachability` | `Option<NetworkStatus>` | Current host-level observation; None means no current observation. |
 | `ip_stack` | `Option<IpStack>` | Local protocol availability; None means unknown. |
 | `observed_at` | `Option<SystemTime>` | Observation timestamp when available. |
-| `network_name` | `Option<String>` | Platform-supplied label, not a portable promise of Wi-Fi SSID. Current macOS/Linux implementations return None; Windows supplies a name according to its implementation. |
+| `network_name` | `Option<String>` | Compatibility field, always `None` in snapshots produced by open-net 0.3.3 on every platform. Windows names require a separate explicit observer; see the [versioned migration guide](../net_status/network_name_migration.md). |
 
 `MonitorState` is non-exhaustive: Stopped, Starting, Running, Failed(NetError),
 Closed. Match it with a fallback arm. A monitor failure in `Ok(snapshot)` is

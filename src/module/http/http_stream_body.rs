@@ -17,24 +17,45 @@ pub(super) struct StreamOwner {
     pub(super) lease: Option<StreamRegistrationLease>,
     pub(super) supervisor_slot: Option<mpsc::OwnedPermit<StreamSupervisor>>,
     pub(super) lifecycle: Option<RetryObserverLifecycle>,
+    pub(super) report: Option<RetryReport>,
+    pub(super) status_stop_reason: Option<RetryStopReason>,
 }
 impl StreamOwner {
-    pub(super) fn new(policy: &crate::api::http::RetryPolicy, start: Instant) -> Self {
+    pub(super) fn new(policy: &crate::api::http::HttpRetryPolicy, start: Instant) -> Self {
         Self {
             lease: None,
             supervisor_slot: None,
-            lifecycle: Some(RetryObserverLifecycle::new(policy.observer(), start)),
+            report: None,
+            status_stop_reason: None,
+            lifecycle: Some(RetryObserverLifecycle::new(
+                policy.observer(),
+                start,
+                policy.schedule().clone(),
+            )),
         }
     }
     pub(super) fn complete(
         &mut self,
         result: Result<http::StatusCode, &NetError>,
         exhausted: bool,
-    ) {
+    ) -> RetryReport {
         drop(self.supervisor_slot.take());
         drop(self.lease.take());
         if let Some(mut lifecycle) = self.lifecycle.take() {
+            if result.is_ok() {
+                if let Some(reason) = self.status_stop_reason.take() {
+                    lifecycle.stop(reason);
+                }
+            }
             lifecycle.complete_summary(result, exhausted);
+            let report = lifecycle.report();
+            self.report = Some(report.clone());
+            report
+        } else {
+            match &self.report {
+                Some(report) => report.clone(),
+                None => RetryReport::new(),
+            }
         }
     }
 }
@@ -51,8 +72,11 @@ struct BodyState {
     base_budget: StreamBudget,
     budget: StreamBudget,
     idle_timeout: Option<Duration>,
+    polling: bool,
     finished: bool,
+    terminal_ready: bool,
     terminal_error: Option<NetError>,
+    pending_cleanup: Option<Cleanup>,
 }
 
 struct SharedBody {
@@ -75,7 +99,7 @@ struct Cleanup {
     exhausted: bool,
 }
 impl Cleanup {
-    fn run(self) {
+    fn run(self) -> Option<RetryReport> {
         let Self {
             body,
             owner,
@@ -84,9 +108,7 @@ impl Cleanup {
             exhausted,
         } = self;
         drop(body);
-        if let Some(mut owner) = owner {
-            owner.complete(error.as_ref().map_or(Ok(status), Err), exhausted);
-        }
+        owner.map(|mut owner| owner.complete(error.as_ref().map_or(Ok(status), Err), exhausted))
     }
 }
 
@@ -108,9 +130,13 @@ impl SharedBody {
     }
 
     fn annotate(&self, error: NetError) -> NetError {
-        error
+        let error = error
             .with_http_request_id(self.request_id)
-            .with_http_attempt(self.attempt)
+            .with_http_attempt(self.attempt);
+        match self.control.retry_report() {
+            Some(report) => error.with_retry_report(report),
+            None => error,
+        }
     }
 
     fn cancelled(&self) -> NetError {
@@ -135,26 +161,76 @@ impl SharedBody {
         }
         state.finished = true;
         state.terminal_error = error.clone();
-        Some(Cleanup {
+        let cleanup = Cleanup {
             body: state.body.take(),
             owner: state.owner.take(),
             error,
             status: self.status,
             exhausted: self.exhausted,
-        })
+        };
+        if state.polling {
+            // The checked-out body must be destroyed before releasing its owner.
+            // Its poll guard takes responsibility for cleanup, including unwind.
+            state.pending_cleanup = Some(cleanup);
+            None
+        } else {
+            Some(cleanup)
+        }
     }
 
     fn clean_and_wake(&self, cleanup: Option<Cleanup>) {
         if let Some(cleanup) = cleanup {
-            cleanup.run();
+            let report = cleanup.run();
+            self.with_state(|state| {
+                if let Some(report) = report {
+                    if let Some(error) = state.terminal_error.take() {
+                        state.terminal_error = Some(error.with_retry_report(report));
+                    }
+                }
+                state.terminal_ready = true;
+            });
             self.consumer.wake();
             self.progress.notify_one();
         }
     }
 
+    fn poll_terminal(&self) -> Poll<Option<Result<Bytes, NetError>>> {
+        self.with_state(|state| {
+            if state.terminal_ready {
+                Poll::Ready(state.terminal_error.take())
+            } else {
+                Poll::Pending
+            }
+        })
+        .map(|terminal| terminal.map(|error| Err(self.annotate(error))))
+    }
+
     fn cancel(&self) {
         let cleanup = self.with_state(|state| self.finish_locked(state, Some(self.cancelled())));
         self.clean_and_wake(cleanup);
+    }
+}
+
+/// Own a body while transport polling runs outside the state mutex. Complete
+/// deferred cleanup after dropping that body, including when polling unwinds.
+struct BodyPoll {
+    shared: Arc<SharedBody>,
+    body: Option<HttpByteStream>,
+}
+impl Drop for BodyPoll {
+    fn drop(&mut self) {
+        let checked_out = self.body.is_some();
+        drop(self.body.take());
+        let cleanup = self.shared.with_state(|state| {
+            state.polling = false;
+            if checked_out && !state.finished {
+                self.shared
+                    .finish_locked(state, Some(self.shared.cancelled()))
+            } else {
+                state.pending_cleanup.take()
+            }
+        });
+        self.shared.clean_and_wake(cleanup);
     }
 }
 
@@ -208,8 +284,11 @@ impl FusedHttpBody {
                 base_budget: budget,
                 budget: active_budget,
                 idle_timeout,
+                polling: false,
                 finished: false,
+                terminal_ready: false,
                 terminal_error: None,
+                pending_cleanup: None,
             }),
             control,
             progress: Notify::new(),
@@ -260,7 +339,7 @@ impl Stream for FusedHttpBody {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let shared = &self.get_mut().shared;
         shared.consumer.register(cx.waker());
-        let (mut body, terminal, cleanup) = shared.with_state(|state| {
+        let (body, cleanup) = shared.with_state(|state| {
             let cleanup = if state.finished {
                 None
             } else {
@@ -269,19 +348,28 @@ impl Stream for FusedHttpBody {
                     .and_then(|error| shared.finish_locked(state, Some(error)))
             };
             if state.finished {
-                (None, state.terminal_error.take(), cleanup)
+                (None, cleanup)
             } else {
-                (state.body.take(), None, cleanup)
+                let body = state.body.take();
+                state.polling = body.is_some();
+                (body, cleanup)
             }
         });
         shared.clean_and_wake(cleanup);
-        let result = match body.as_mut() {
+        let Some(body) = body else {
+            return shared.poll_terminal();
+        };
+        let mut body = BodyPoll {
+            shared: Arc::clone(shared),
+            body: Some(body),
+        };
+        let result = match body.body.as_mut() {
             Some(body) => body.as_mut().poll_next(cx),
-            None => return Poll::Ready(terminal.map(Err)),
+            None => return Poll::Pending,
         };
         // Transport polling is outside the mutex. A concurrent supervisor may
         // commit a terminal state while poll is running; discard any late bytes.
-        let (finished, terminal, cleanup, progressed) = shared.with_state(|state| {
+        let (finished, cleanup, progressed) = shared.with_state(|state| {
             let mut cleanup = None;
             let mut progressed = false;
             if !state.finished {
@@ -315,14 +403,9 @@ impl Stream for FusedHttpBody {
                 }
             }
             if !state.finished {
-                state.body = body.take();
+                state.body = body.body.take();
             }
-            (
-                state.finished,
-                state.terminal_error.take(),
-                cleanup,
-                progressed,
-            )
+            (state.finished, cleanup, progressed)
         });
         // Destroy the checked-out body before completing the observer lifecycle.
         drop(body);
@@ -331,7 +414,7 @@ impl Stream for FusedHttpBody {
             shared.progress.notify_one();
         }
         if finished {
-            Poll::Ready(terminal.map(Err))
+            shared.poll_terminal()
         } else {
             result
         }
@@ -351,6 +434,16 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    struct TerminalWake(AtomicUsize);
+    impl std::task::Wake for TerminalWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     struct ProbeBody {
         items: VecDeque<Result<Bytes, NetError>>,
@@ -403,12 +496,27 @@ mod tests {
         let callback_completed = Arc::clone(&completed);
         let callback_clean = Arc::clone(&clean_at_observer);
         let callback_drops = Arc::clone(&drops);
-        let policy = crate::api::http::RetryPolicy::builder()
+        let observed_shared = Arc::new(std::sync::OnceLock::<std::sync::Weak<SharedBody>>::new());
+        let callback_shared = Arc::clone(&observed_shared);
+        let policy = crate::api::http::HttpRetryPolicy::builder()
             .observer(move |event: &RetryEvent| {
                 if matches!(event, RetryEvent::Completed(_)) {
                     callback_completed.fetch_add(1, Ordering::SeqCst);
+                    let unlocked = callback_shared
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .is_some_and(|shared| {
+                            let unlocked = shared.state.try_lock().is_ok();
+                            if unlocked {
+                                // Cancellation/destruction reentry must not wait for
+                                // this observer to finish publishing the terminal item.
+                                shared.cancel();
+                            }
+                            unlocked
+                        });
                     callback_clean.store(
-                        callback_worker.registry.is_empty().is_ok_and(|empty| empty)
+                        unlocked
+                            && callback_worker.registry.is_empty().is_ok_and(|empty| empty)
                             && callback_worker.in_flight.available_permits() == 128
                             && callback_drops.load(Ordering::SeqCst) == 1,
                         Ordering::SeqCst,
@@ -421,6 +529,9 @@ mod tests {
         let control = registered.control;
         let start = Instant::now();
         let mut owner = StreamOwner::new(&policy, start);
+        if let Some(lifecycle) = owner.lifecycle.as_mut() {
+            lifecycle.control = Some(Arc::clone(&control));
+        }
         owner.lease = Some(StreamRegistrationLease {
             registry: worker.registry(),
             request_id: registered.id,
@@ -445,6 +556,9 @@ mod tests {
             start,
             idle,
         )?;
+        observed_shared
+            .set(Arc::downgrade(&stream.shared))
+            .map_err(|_| std::io::Error::other("stream observation was already installed"))?;
         Ok(Fixture {
             worker,
             stream,
@@ -456,6 +570,157 @@ mod tests {
             completed,
             clean_at_observer,
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_waits_for_cleanup_and_the_final_report_before_delivery() -> TestResult {
+        for cancelled in [false, true] {
+            let Fixture {
+                worker,
+                mut stream,
+                supervisor,
+                control,
+                drops,
+                completed,
+                clean_at_observer,
+                ..
+            } = fixture(vec![], false, None, Some(Duration::from_secs(1)))?;
+            if cancelled {
+                control.cancel();
+            } else {
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            // Suspend the supervisor after its terminal decision, before cleanup.
+            let cleanup = stream
+                .shared
+                .with_state(|state| {
+                    stream
+                        .shared
+                        .boundary_error(state, Instant::now())
+                        .and_then(|error| stream.shared.finish_locked(state, Some(error)))
+                })
+                .ok_or_else(|| std::io::Error::other("terminal cleanup missing"))?;
+            let wake = Arc::new(TerminalWake(AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(Arc::clone(&wake));
+            let mut cx = Context::from_waker(&waker);
+            check(
+                Pin::new(&mut stream).poll_next(&mut cx).is_pending(),
+                "consumer received a terminal item before cleanup published its report",
+            )?;
+            stream.shared.clean_and_wake(Some(cleanup));
+            check(
+                wake.0.load(Ordering::SeqCst) > 0,
+                "terminal publication did not wake the waiting consumer",
+            )?;
+            let error = match Pin::new(&mut stream).poll_next(&mut cx) {
+                Poll::Ready(Some(Err(error))) => error,
+                _ => return Err(std::io::Error::other("terminal error missing").into()),
+            };
+            let report = control
+                .retry_report()
+                .ok_or_else(|| std::io::Error::other("final report missing"))?;
+            check(
+                error.retry_report() == Some(&report)
+                    && report.stop_reason
+                        == Some(if cancelled {
+                            RetryStopReason::Cancelled
+                        } else {
+                            RetryStopReason::TimedOut
+                        })
+                    && error.timeout_phase()
+                        == if cancelled {
+                            None
+                        } else {
+                            Some(TimeoutPhase::Total)
+                        },
+                "delivered error lost its terminal reason or final report",
+            )?;
+            check(
+                worker.registry.is_empty()?
+                    && worker.in_flight.available_permits() == 128
+                    && clean_at_observer.load(Ordering::SeqCst),
+                "terminal publication preceded resource release",
+            )?;
+            check(
+                matches!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None)),
+                "terminal error was delivered more than once",
+            )?;
+            drop(supervisor);
+            drop(stream);
+            check(
+                drops.load(Ordering::SeqCst) == 1 && completed.load(Ordering::SeqCst) == 1,
+                "terminal cleanup or observer completion ran more than once",
+            )?;
+        }
+        Ok(())
+    }
+
+    struct CancelDuringPoll {
+        shared: std::sync::Weak<SharedBody>,
+        drops: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+        completed_during_poll: Arc<AtomicUsize>,
+    }
+    impl Stream for CancelDuringPoll {
+        type Item = Result<Bytes, NetError>;
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(shared) = self.shared.upgrade() {
+                // Run the supervisor's cancellation while this body is checked out.
+                shared.cancel();
+                self.completed_during_poll
+                    .store(self.completed.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            Poll::Ready(Some(Ok(Bytes::from_static(b"late bytes"))))
+        }
+    }
+    impl Drop for CancelDuringPoll {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_body_poll_releases_body_before_completing() -> TestResult {
+        let Fixture {
+            mut stream,
+            supervisor,
+            drops,
+            completed,
+            clean_at_observer,
+            ..
+        } = fixture(vec![], false, None, None)?;
+        let completed_during_poll = Arc::new(AtomicUsize::new(0));
+        let body = CancelDuringPoll {
+            shared: Arc::downgrade(&stream.shared),
+            drops: Arc::clone(&drops),
+            completed: Arc::clone(&completed),
+            completed_during_poll: Arc::clone(&completed_during_poll),
+        };
+        let previous = stream
+            .shared
+            .with_state(|state| state.body.replace(Box::pin(body)));
+        drop(previous);
+        drops.store(0, Ordering::SeqCst);
+        check(
+            matches!(stream.next().await, Some(Err(error)) if error.kind() == ErrorKind::Cancelled),
+            "cancellation did not discard the checked-out body's late bytes",
+        )?;
+        check(
+            completed_during_poll.load(Ordering::SeqCst) == 0,
+            "observer completed while the transport body was still being polled",
+        )?;
+        check(
+            clean_at_observer.load(Ordering::SeqCst)
+                && completed.load(Ordering::SeqCst) == 1
+                && drops.load(Ordering::SeqCst) == 1,
+            "cleanup did not release the body before completing exactly once",
+        )?;
+        check(
+            stream.next().await.is_none(),
+            "cancelled body was not fused",
+        )?;
+        drop(supervisor);
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
@@ -472,7 +737,7 @@ mod tests {
             let callback_drops = Arc::clone(&drops);
             let callback_completed = Arc::clone(&completed);
             let callback_clean = Arc::clone(&clean_at_observer);
-            let policy = crate::api::http::RetryPolicy::builder()
+            let policy = crate::api::http::HttpRetryPolicy::builder()
                 .observer(move |event: &RetryEvent| {
                     if matches!(event, RetryEvent::Completed(_)) {
                         callback_completed.fetch_add(1, Ordering::SeqCst);
@@ -740,6 +1005,19 @@ mod tests {
             } = fixture(items, true, None, None)?;
             let task = tokio::spawn(supervisor);
             let next = stream.next().await;
+            if body_error {
+                check(
+                    next.as_ref()
+                        .and_then(|item| item.as_ref().err())
+                        .and_then(NetError::retry_report)
+                        == control.retry_report().as_ref(),
+                    "body failure was delivered before its final report",
+                )?;
+            }
+            check(
+                control.retry_report().is_some(),
+                "EOF or body failure did not finalize its report",
+            )?;
             check(
                 if body_error {
                     matches!(next, Some(Err(_)))

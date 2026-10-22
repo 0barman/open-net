@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Worker tests use explicit gates and never invoke an operating-system monitor.
 use super::*;
 use std::future::Future;
@@ -11,9 +13,6 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 fn observation() -> SampleObservation {
     SampleObservation {
         reachability: NetworkStatus::Available,
-        network_name: Some("worker-test".into()),
-        name_source: NetworkNameSource::NetworkListManager,
-        name_diagnostics: Vec::new(),
     }
 }
 
@@ -169,10 +168,7 @@ async fn cancelling_one_running_query_does_not_cancel_the_next() -> TestResult {
         ErrorKind::Cancelled
     );
     let completed = bounded(next).await??;
-    assert_eq!(
-        completed.observation.network_name.as_deref(),
-        Some("worker-test")
-    );
+    assert_eq!(completed.observation.reachability, NetworkStatus::Available);
     assert_eq!(fixture.calls.load(Ordering::Acquire), 2);
     assert!(!fixture.changed_thread.load(Ordering::Acquire));
     Ok(())

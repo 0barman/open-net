@@ -2,7 +2,8 @@
 use crate::api::http::cookies::CookieRequestContext;
 use crate::api::http::http_request_method::HttpRequestMethod;
 use crate::api::http::http_response::HttpResponseResult;
-use crate::api::http::retry::RetryPolicy;
+use crate::api::http::retry::HttpRetryPolicy;
+use crate::api::retry::RetrySetting;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
@@ -71,15 +72,9 @@ pub trait HttpRequestTrait: Send + 'static {
         CookieRequestContext::default()
     }
 
-    /// Return the retry policy requested by this request.
-    ///
-    /// A policy with no retries allows the client default to remain in effect
-    /// when using [`crate::api::http::HttpClient::send`]; explicit options can always override it.
-    /// `send` and `send_wait` evaluate this provider before admission, on the
-    /// caller's thread or submitting future. A provider panic unwinds there;
-    /// ownership recovery is guaranteed for returned errors, not for panics.
-    fn retry_policy(&self) -> RetryPolicy {
-        RetryPolicy::no_retry()
+    /// Select the client policy, explicitly disable retries, or provide a complete override.
+    fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> {
+        RetrySetting::Inherit
     }
 
     /// Observe response headers on the callback lane.  The default implementation is a no-op.
@@ -130,8 +125,8 @@ where
     fn cookie_context(&self) -> CookieRequestContext {
         (**self).cookie_context()
     }
-    fn retry_policy(&self) -> RetryPolicy {
-        (**self).retry_policy()
+    fn retry_setting(&self) -> RetrySetting<HttpRetryPolicy> {
+        (**self).retry_setting()
     }
     fn on_response_headers(&self, headers: &HeaderMap) {
         (**self).on_response_headers(headers);
@@ -191,7 +186,7 @@ mod tests {
             "default headers must be empty",
         )?;
         check(
-            request.retry_policy().max_retries() == 0,
+            matches!(request.retry_setting(), RetrySetting::Inherit),
             "default requests must not retry",
         )
     }

@@ -3,7 +3,7 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.89"
 description = "A cross-platform async networking library with WebSocket clients and network status monitoring."
@@ -15,7 +15,7 @@ categories = ["network-programming", "asynchronous"]
 readme = "README.md"
 # Integration tests stay in the repository. Shared unit-test fixtures under
 # src/test_fixtures keep the published crate's library tests self-contained.
-include = ["/src/**", "/libs/common/src/**", "/examples/**", "/doc/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/rust-toolchain.toml", "/rustfmt.toml"]
+include = ["/src/**", "/libs/common/src/**", "/libs/retry/src/**", "/examples/**", "/doc/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/rust-toolchain.toml", "/rustfmt.toml"]
 
 [[example]]
 name = "examples_messages"
@@ -23,6 +23,14 @@ required-features = ["ws-client"]
 
 [[example]]
 name = "examples_requests"
+required-features = ["ws-client"]
+
+[[example]]
+name = "http_retry"
+required-features = ["http-client"]
+
+[[example]]
+name = "ws_request_retry"
 required-features = ["ws-client"]
 
 [[example]]
@@ -35,6 +43,10 @@ required-features = ["net-status"]
 
 [[example]]
 name = "network_refresh"
+required-features = ["net-status"]
+
+[[example]]
+name = "network_names"
 required-features = ["net-status"]
 
 [features]
@@ -113,7 +125,7 @@ tower-layer = { version = "=0.3.3", optional = true }
 
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Networking_NetworkListManager", "Win32_System_Com", "Win32_System_Pipes", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"], optional = true }
+windows = { version = "0.62.2", features = ["Win32_Networking_NetworkListManager", "Win32_System_Com", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { version = "0.10.1", optional = true }

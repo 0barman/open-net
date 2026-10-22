@@ -1,7 +1,5 @@
 use crate::module::ws_client::operation_control::OperationControl;
-use crate::ws::{
-    DisconnectedPolicy, Priority, RequestRegistration, SendOptions, SendRetryPolicy, TaskEndCause,
-};
+use crate::ws::{DisconnectedPolicy, Priority, RequestRegistration, SendOptions, TaskEndCause};
 use crate::{NetError, Result};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -14,6 +12,7 @@ pub(crate) struct QueuedRequest {
     pub(crate) message: Message,
     pub(crate) config: SendOptions,
     pub(crate) attempt: u32,
+    pub(crate) ready_at: Option<std::time::Instant>,
     pub(crate) dispatch_cancel: CancellationToken,
     pub(crate) dispatch_phase: Arc<OperationControl>,
     pub(crate) admission_cancel: Option<CancellationToken>,
@@ -100,10 +99,7 @@ impl QueuedRequest {
     }
     pub(crate) fn can_wait_for_reconnect(&self) -> bool {
         self.config.disconnected == DisconnectedPolicy::WaitForReconnect
-            || (self.attempt > 0 && matches!(self.config.retry, SendRetryPolicy::Idempotent { .. }))
-    }
-    pub(crate) fn can_retry(&self) -> bool {
-        matches!(self.config.retry, SendRetryPolicy::Idempotent { max_retries } if self.attempt < max_retries)
+            || (self.attempt > 0 && self.dispatch_phase.raw_replay_allowed())
     }
 }
 impl Drop for QueuedRequest {
@@ -158,21 +154,112 @@ mod tests {
     use crate::ws::{DeliveryEvidence, OperationPhase};
     #[test]
     fn retry_and_disconnect_policy_are_independent_and_bounded() -> TestResult {
+        use crate::api::retry::{RetrySchedule, RetrySetting};
+        use crate::ws::{WsReplaySafety, WsSendRetryOn, WsSendRetryPolicy};
+        let policy = WsSendRetryPolicy::builder()
+            .schedule(RetrySchedule::builder().max_attempts(2).build()?)
+            .retry_on(WsSendRetryOn::none().with_write_errors(true))
+            .safety(WsReplaySafety::IdempotentByContract)
+            .build()?;
         let mut request = fixture::queued(
             1,
             SendOptions {
-                retry: SendRetryPolicy::Idempotent { max_retries: 2 },
+                retry_setting: RetrySetting::Policy(policy),
                 ..Default::default()
             },
         )?;
-        check!(request.can_retry())?;
         check!(!request.can_wait_for_reconnect())?;
+        let control = &request.dispatch_phase;
+        check!(control.mark_writing(crate::ws::ConnectionId::from_allocated(1)))?;
+        check!(control.start_data_write(false)?)?;
+        check!(control
+            .raw_retry_after(&NetError::from(crate::error::ErrorKind::Io))?
+            .is_some())?;
+        check!(control.requeue())?;
         request.attempt = 1;
         check!(request.can_wait_for_reconnect())?;
-        request.attempt = 2;
-        check!(!request.can_retry())?;
+        check!(control.mark_writing(crate::ws::ConnectionId::from_allocated(2)))?;
+        check!(control.start_data_write(false)?)?;
+        check!(control
+            .raw_retry_after(&NetError::from(crate::error::ErrorKind::Io))?
+            .is_none())?;
+        check_eq!(control.retry_report().attempts, 2)?;
+        check_eq!(control.retry_report().transport_sends, 2)?;
         Ok(())
     }
+    #[test]
+    fn classifier_decisions_respect_disable_budget_and_replay_safety() -> TestResult {
+        use crate::api::retry::{RetryDecision, RetrySchedule, RetrySetting, RetryStopReason};
+        use crate::ws::{WsReplaySafety, WsSendRetryOn, WsSendRetryPolicy};
+        for (decision, safe, max_attempts, expected) in [
+            (
+                RetryDecision::Stop,
+                true,
+                2,
+                RetryStopReason::ClassifierStopped,
+            ),
+            (
+                RetryDecision::Retry,
+                false,
+                2,
+                RetryStopReason::UnsafeToReplay,
+            ),
+            (
+                RetryDecision::Retry,
+                true,
+                1,
+                RetryStopReason::AttemptsExhausted,
+            ),
+        ] {
+            let policy = WsSendRetryPolicy::builder()
+                .schedule(
+                    RetrySchedule::builder()
+                        .max_attempts(max_attempts)
+                        .build()?,
+                )
+                .retry_on(WsSendRetryOn::none().with_write_errors(true))
+                .safety(if safe {
+                    WsReplaySafety::IdempotentByContract
+                } else {
+                    WsReplaySafety::Never
+                })
+                .classifier(move |_| decision)
+                .build()?;
+            let request = fixture::queued(
+                1,
+                SendOptions {
+                    retry_setting: RetrySetting::Policy(policy),
+                    ..Default::default()
+                },
+            )?;
+            let control = request.dispatch_phase.clone();
+            check!(control.mark_writing(crate::ws::ConnectionId::from_allocated(1)))?;
+            check!(control.start_data_write(false)?)?;
+            let error = NetError::from(crate::error::ErrorKind::Io);
+            check!(control.raw_retry_after(&error)?.is_none())?;
+            request.complete(Err(error));
+            check_eq!(control.retry_report().stop_reason, Some(expected))?;
+        }
+        let request = fixture::queued(
+            2,
+            SendOptions {
+                retry_setting: RetrySetting::Disabled,
+                ..Default::default()
+            },
+        )?;
+        let control = request.dispatch_phase.clone();
+        check!(control.mark_writing(crate::ws::ConnectionId::from_allocated(1)))?;
+        check!(control.start_data_write(false)?)?;
+        let error = NetError::from(crate::error::ErrorKind::Io);
+        check!(control.raw_retry_after(&error)?.is_none())?;
+        request.complete(Err(error));
+        check_eq!(
+            control.retry_report().stop_reason,
+            Some(RetryStopReason::Disabled)
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn dropping_started_work_preserves_unknown_delivery_and_selects_terminal_once() -> TestResult {
         let request = fixture::queued(1, SendOptions::default())?;

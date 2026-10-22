@@ -252,7 +252,8 @@ impl WSClientWorker {
             Some(failure) => failure.error(),
             None => NetError::from(crate::error::ErrorKind::Cancelled),
         };
-        self.end_runtime(operation_error.clone(), TaskEndCause::Shutdown);
+        self.end_runtime(operation_error.clone(), TaskEndCause::Shutdown)
+            .await;
         self.begin_session_closing();
         self.cancel_connect();
         let peer_close = self.stop_active_io(false).await;
@@ -411,7 +412,8 @@ impl WSClientWorker {
                     Some(failure) => failure.error(),
                     None => NetError::from(crate::error::ErrorKind::Cancelled),
                 };
-                self.end_runtime(error.clone(), TaskEndCause::Shutdown);
+                self.end_runtime(error.clone(), TaskEndCause::Shutdown)
+                    .await;
                 self.begin_session_closing();
                 self.set_status(ConnectionStatus::Closing).await;
                 self.cancel_connect();
@@ -672,7 +674,7 @@ impl WSClientWorker {
                 }
                 self.connect_cancel.take();
                 self.connect_handle.take();
-                self.end_runtime(error.clone(), TaskEndCause::Failed);
+                self.end_runtime(error.clone(), TaskEndCause::Failed).await;
                 self.set_status(ConnectionStatus::Disconnected).await;
                 fail_requests(
                     self.urgent_queue.drain_with_error(error.clone()),
@@ -785,12 +787,18 @@ impl WSClientWorker {
         };
         let failure =
             (!normal_peer_close).then(|| ConnectionFailure::new(error.clone(), stage, None, false));
-        let next_cycle = if self.connect_target.as_ref().is_some_and(|target| {
+        // A fatal alert can arrive after either TLS handshake completed. Keep
+        // its nonretryable contract even when a write has unknown delivery.
+        let should_reconnect = !matches!(
+            error.context().stage,
+            Some(crate::error::ErrorStage::Tls | crate::error::ErrorStage::ProxyTls)
+        ) && self.connect_target.as_ref().is_some_and(|target| {
             matches!(
                 target.options.reconnect,
                 crate::ws::ReconnectPolicy::Backoff(_)
             )
-        }) {
+        });
+        let next_cycle = if should_reconnect {
             self.generation.checked_add(1)
         } else {
             None
@@ -827,15 +835,11 @@ impl WSClientWorker {
                 .drain_rejected_on_disconnect_with_error(error.clone()),
             error.clone(),
         );
-        if self.connect_target.as_ref().is_some_and(|target| {
-            matches!(
-                target.options.reconnect,
-                crate::ws::ReconnectPolicy::Backoff(_)
-            )
-        }) {
+        if should_reconnect {
             self.start_connection(true).await;
         } else {
-            self.end_runtime(error.clone(), TaskEndCause::Disconnected);
+            self.end_runtime(error.clone(), TaskEndCause::Disconnected)
+                .await;
             self.set_status(ConnectionStatus::Disconnected).await;
             fail_requests(
                 self.urgent_queue.drain_with_error(error.clone()),
@@ -867,9 +871,10 @@ impl WSClientWorker {
             .map(|target| Arc::clone(&target.runtime))
     }
 
-    fn end_runtime(&self, error: NetError, cause: TaskEndCause) {
+    async fn end_runtime(&self, error: NetError, cause: TaskEndCause) {
         if let Some(runtime) = self.context_runtime() {
             runtime.end(error, cause);
+            runtime.wait_requests().await;
         }
     }
 
@@ -997,7 +1002,7 @@ impl WSClientWorker {
         ) {
             Ok(budget) => budget,
             Err(error) => {
-                self.end_runtime(error.clone(), TaskEndCause::Failed);
+                self.end_runtime(error.clone(), TaskEndCause::Failed).await;
                 self.set_status(ConnectionStatus::Disconnected).await;
                 self.finish_context_session(
                     TerminationReason::ConnectFailed,
@@ -1018,7 +1023,8 @@ impl WSClientWorker {
                 self.end_runtime(
                     NetError::from(crate::error::ErrorKind::ResourceExhausted),
                     TaskEndCause::Failed,
-                );
+                )
+                .await;
                 self.set_status(ConnectionStatus::Disconnected).await;
                 self.finish_context_session(
                     TerminationReason::ConnectFailed,
@@ -1502,9 +1508,7 @@ async fn publish_connected(
     events: &mpsc::Sender<IoEvent>,
     generation: u64,
     attempt_id: u64,
-    stream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    stream: crate::module::transport::NativeWebSocketStream,
     network_loss_epoch: Option<u64>,
     deadline: BudgetDeadline,
 ) -> Result<(), NetError> {
@@ -1545,14 +1549,12 @@ async fn publish_connected(
 /// 发送缓冲和 keepalive 在平台不支持或参数设置失败时保持连接可用；操作系统可能调整
 /// 请求的缓冲大小，应用层仍须以对端观测到的 Ping/Pong 延迟作为最终验收指标。
 fn configure_tcp_socket(
-    stream: &tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    stream: &crate::module::transport::NativeWebSocketStream,
     send_buffer_size: Option<usize>,
     config: Option<&crate::ws::TcpKeepaliveConfig>,
 ) {
     crate::log_t!(LogType::WSC; "ws.worker.configure_tcp_socket", "arg_stream_present|send_buffer_size|arg_config_idle|arg_config_interval|keepalive_enabled", true, send_buffer_size, config.map(|config| config.idle), config.map(|config| config.interval), config.is_some());
-    let socket = SockRef::from(stream.get_ref().get_ref());
+    let socket = SockRef::from(crate::module::transport::tcp_ref(stream));
     if let Some(send_buffer_size) = send_buffer_size {
         if let Err(error) = socket.set_send_buffer_size(send_buffer_size) {
             crate::log_e!(LogType::WSC; "ws.worker.configure_tcp_socket", "option|requested_size|error", "send_buffer_size", send_buffer_size, crate::common::log::summary::error(&error));

@@ -51,8 +51,8 @@ async fn zero_retry_default_inherits_observer() -> TestResult {
     let events = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&events);
     let mut config = (*worker.config).clone();
-    config.default_retry_policy = crate::api::http::RetryPolicy::builder()
-        .with_observer(move |event: &RetryEvent| {
+    config.default_retry_policy = crate::api::http::HttpRetryPolicy::builder()
+        .observer(move |event: &RetryEvent| {
             if let Ok(mut events) = recorded.lock() {
                 events.push(event.clone());
             }
@@ -171,14 +171,15 @@ fn concurrent_auto_registration_preserves_identity() -> TestResult {
 }
 
 #[tokio::test]
-async fn legacy_option_assignment_and_explicit_policy_precedence_remain_stable() -> TestResult {
-    use crate::api::http::{RetryPolicy, RetrySetting};
-    for case in 0..7 {
+async fn retry_setting_has_one_authoritative_source() -> TestResult {
+    use crate::api::http::HttpRetryPolicy;
+    use crate::api::retry::RetrySetting;
+    for case in 0..4 {
         let (worker, _receiver) = paused_worker()?;
         let (mut job, _registration) = test_job(&worker, 100 + case)?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let default_seen = Arc::clone(&seen);
-        let default = RetryPolicy::builder()
+        let default = HttpRetryPolicy::builder()
             .observer(move |event: &RetryEvent| {
                 if matches!(event, RetryEvent::Completed(_)) {
                     if let Ok(mut values) = default_seen.lock() {
@@ -188,8 +189,7 @@ async fn legacy_option_assignment_and_explicit_policy_precedence_remain_stable()
             })
             .build()?;
         let request_seen = Arc::clone(&seen);
-        let explicit = RetryPolicy::builder()
-            .max_attempts(if case == 3 { 2 } else { 1 })
+        let explicit = HttpRetryPolicy::builder()
             .observer(move |event: &RetryEvent| {
                 if matches!(event, RetryEvent::Completed(_)) {
                     if let Ok(mut values) = request_seen.lock() {
@@ -201,28 +201,17 @@ async fn legacy_option_assignment_and_explicit_policy_precedence_remain_stable()
         let expected = match case {
             0 => vec!["default"],
             1 => {
-                job.options = HttpRequestOptions::new().with_retry_setting(RetrySetting::None);
+                job.options = HttpRequestOptions::new().with_retry_setting(RetrySetting::Disabled);
                 vec![]
             }
             2 => {
-                job.options = HttpRequestOptions::new().with_retry_policy(RetryPolicy::no_retry());
+                job.options = HttpRequestOptions::new()
+                    .with_retry_setting(RetrySetting::Policy(HttpRetryPolicy::no_retry()));
                 vec![]
             }
-            3 => {
-                job.options.retry_policy = explicit;
-                vec!["request"]
-            }
-            4 => {
-                job.options.retry_policy = explicit;
-                vec!["default"]
-            }
-            5 => {
-                job.options = HttpRequestOptions::new().with_retry_policy(explicit);
-                vec!["request"]
-            }
             _ => {
-                job.options = HttpRequestOptions::new().with_retry_setting(RetrySetting::None);
-                job.options.retry_policy = explicit;
+                job.options =
+                    HttpRequestOptions::new().with_retry_setting(RetrySetting::Policy(explicit));
                 vec!["request"]
             }
         };
@@ -231,7 +220,7 @@ async fn legacy_option_assignment_and_explicit_policy_precedence_remain_stable()
         let _ = run_request(&mut job, &worker.client, &config, 1).await;
         check(
             *seen.lock().map_err(NetError::from_poison)? == expected,
-            "legacy options selection changed",
+            "retry selection ignored authoritative setting",
         )?;
     }
     Ok(())

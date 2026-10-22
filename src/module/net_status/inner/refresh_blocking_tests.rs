@@ -1,3 +1,5 @@
+#![allow(deprecated)] // Compatibility entry points retain reachability-only behavior.
+
 // Explicit gates also identify test helpers when the production-source guard scans this file.
 use super::super::shared::SharedNetworkService;
 use super::*;
@@ -22,34 +24,23 @@ fn running() -> Result<(Arc<SharedNetworkService>, Arc<NetworkObservationOwner>)
     let (publisher, initial) = service.context().observation_source()?.begin_generation()?;
     initial.dispatch()?;
     publisher
-        .prepare_observation(
-            NetworkStatus::Available,
-            Some(IpStack::DualStack),
-            Some("initial".into()),
-        )?
+        .prepare_observation(NetworkStatus::Available, Some(IpStack::DualStack))?
         .dispatch()?;
     owner.activate_view_for_test()?;
     Ok((service, owner))
 }
 
 #[cfg(test)]
-fn observation(status: NetworkStatus, name: Option<&str>) -> SampleObservation {
+fn observation(status: NetworkStatus) -> SampleObservation {
     SampleObservation {
         reachability: status,
-        network_name: name.map(str::to_owned),
-        name_source: if name.is_some() {
-            NetworkNameSource::NetworkListManager
-        } else {
-            NetworkNameSource::CachedObservation
-        },
-        name_diagnostics: Vec::new(),
     }
 }
 
 #[cfg(test)]
 fn fresh(owner: &Arc<NetworkObservationOwner>) -> Result<NetworkRefreshResult, NetError> {
     let sampler = Arc::new(WindowsSampler::with_provider(Arc::new(|_, _| {
-        Ok(observation(NetworkStatus::Unavailable, None))
+        Ok(observation(NetworkStatus::Unavailable))
     })));
     wait_for_refresh(refresh_with_sampler(
         owner.clone(),
@@ -66,11 +57,8 @@ fn check_fresh(result: NetworkRefreshResult) {
         result.snapshot.reachability,
         Some(NetworkStatus::Unavailable)
     );
-    assert_eq!(result.snapshot.network_name.as_deref(), Some("initial"));
-    assert_eq!(
-        result.network_name_source,
-        NetworkNameSource::CachedObservation
-    );
+    assert!(result.snapshot.network_name.is_none());
+    assert_eq!(result.network_name_source, NetworkNameSource::NotCollected);
     assert_eq!(
         result.ip_stack_source,
         NetworkIpStackSource::BackgroundObservation
@@ -143,7 +131,7 @@ fn gated_sampler(counter: Arc<AtomicU64>) -> GatedSampler {
                 .recv_timeout(WAIT)
                 .map_err(|_| error(ErrorKind::Internal))?;
             let _ = finished.send(cancelled.load(Ordering::Acquire));
-            Ok(observation(NetworkStatus::Available, Some("sampled-name")))
+            Ok(observation(NetworkStatus::Available))
         }),
         counter,
     ));
@@ -295,7 +283,7 @@ fn blocking_refresh_rejects_reentry_from_a_sampler_thread() -> TestResult {
         if result.err().map(|error| error.kind()) != Some(ErrorKind::InvalidInput) {
             return Err(error(ErrorKind::Internal));
         }
-        Ok(observation(NetworkStatus::Unavailable, None))
+        Ok(observation(NetworkStatus::Unavailable))
     })));
     check_fresh(wait_for_refresh(refresh_with_sampler(
         owner.clone(),
@@ -382,12 +370,12 @@ fn closing_the_root_wakes_a_blocking_caller_before_native_work_returns() -> Test
 
 #[test]
 #[cfg(test)]
-fn blocking_reachability_completes_while_name_lane_is_blocked() -> TestResult {
+fn blocking_refresh_rejects_a_late_sample_after_newer_reachability() -> TestResult {
     let (service, owner) = running()?;
     let counter = Arc::new(AtomicU64::new(0));
-    let mut names = gated_sampler(counter.clone());
+    let mut slow = gated_sampler(counter.clone());
     let query_owner = owner.clone();
-    let sampler = names.sampler.clone();
+    let sampler = slow.sampler.clone();
     let (sent, received) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         let result = (|| {
@@ -400,9 +388,9 @@ fn blocking_reachability_completes_while_name_lane_is_blocked() -> TestResult {
         })();
         let _ = sent.send(result);
     });
-    names.entered.recv_timeout(WAIT)?;
+    slow.entered.recv_timeout(WAIT)?;
     let status = Arc::new(WindowsSampler::with_counter(
-        Arc::new(|_, _| Ok(observation(NetworkStatus::Unavailable, None))),
+        Arc::new(|_, _| Ok(observation(NetworkStatus::Unavailable))),
         counter,
     ));
     let fresh = wait_for_refresh(refresh_with_sampler(
@@ -412,17 +400,21 @@ fn blocking_reachability_completes_while_name_lane_is_blocked() -> TestResult {
         deadline(WAIT)?,
     ))?;
     check_fresh(fresh.clone());
-    names.release.release()?;
-    let named = received.recv_timeout(WAIT)??;
-    assert!(named.sample_id < fresh.sample_id);
-    assert_eq!(named.sampled_reachability, NetworkStatus::Available);
+    slow.release.release()?;
+    let late = received.recv_timeout(WAIT)?;
     assert_eq!(
-        named.snapshot.reachability,
+        late.err()
+            .ok_or("older sample overwrote fresh facts")?
+            .kind(),
+        ErrorKind::Cancelled
+    );
+    assert!(owner.snapshot()?.network_name.is_none());
+    assert_eq!(
+        owner.snapshot()?.reachability,
         Some(NetworkStatus::Unavailable)
     );
-    assert_eq!(named.snapshot.network_name.as_deref(), Some("sampled-name"));
-    assert!(!names.completed.recv_timeout(WAIT)?);
-    worker.join().map_err(|_| "name query caller panicked")?;
+    assert!(!slow.completed.recv_timeout(WAIT)?);
+    worker.join().map_err(|_| "refresh caller panicked")?;
     futures::executor::block_on(service.shutdown())?;
     Ok(())
 }

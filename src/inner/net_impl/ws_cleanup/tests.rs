@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use std::sync::mpsc;
 use std::time::Duration;
