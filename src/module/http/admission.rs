@@ -12,6 +12,8 @@ pub(super) struct Admission<T> {
 }
 
 struct PendingAdmission {
+    #[cfg(feature = "quality-doctor")]
+    quality_admission: Option<QualityPhaseGuard>,
     registered: RegisteredRequest,
     registration: RegistrationGuard,
     budget: StreamBudget,
@@ -24,14 +26,45 @@ impl HttpClientInner {
         requested: Option<HttpRequestId>,
         resolved: ResolvedTimeouts,
         operation_start: Instant,
+        streaming: bool,
     ) -> Result<PendingAdmission, NetError> {
-        let budget = StreamBudget::total(operation_start, resolved.total)?.with_phase(
-            operation_start,
-            resolved.admission,
-            TimeoutPhase::Admission,
-        )?;
-        let (registered, registration) = self.reserve_request(requested)?;
+        #[cfg(feature = "quality-doctor")]
+        let quality = self.begin_quality(streaming);
+        #[cfg(not(feature = "quality-doctor"))]
+        let _ = streaming;
+        #[cfg(feature = "quality-doctor")]
+        let mut quality_admission = quality
+            .as_ref()
+            .map(|probe| probe.phase(PhaseKind::Admission));
+        let prepared: Result<_, NetError> = (|| {
+            let budget = StreamBudget::total(operation_start, resolved.total)?.with_phase(
+                operation_start,
+                resolved.admission,
+                TimeoutPhase::Admission,
+            )?;
+            let (registered, registration) = self.reserve_request(requested)?;
+            Ok((budget, registered, registration))
+        })();
+        #[cfg(feature = "quality-doctor")]
+        let prepared = prepared.map_err(|error| {
+            if let Some(probe) = &quality {
+                drop(quality_admission.take());
+                probe.error(&error);
+                // This operation never acquired a registration. End observation here.
+                probe.finish();
+                error.with_quality_ref(probe.reference())
+            } else {
+                error
+            }
+        });
+        let (budget, registered, registration) = prepared?;
+        #[cfg(feature = "quality-doctor")]
+        if let Some(quality) = quality {
+            let _ = registered.control.quality.set(quality);
+        }
         Ok(PendingAdmission {
+            #[cfg(feature = "quality-doctor")]
+            quality_admission,
             registered,
             registration,
             budget,
@@ -60,7 +93,13 @@ impl HttpClientInner {
             }
             self.registry.activate(id, &pending.registered.control)
         })();
-        accepted.map_err(|error| admission_error(error, Some(id)))?;
+        accepted.map_err(|error| {
+            #[cfg(feature = "quality-doctor")]
+            let error = pending.registered.control.quality_error(error);
+            admission_error(error, Some(id))
+        })?;
+        #[cfg(feature = "quality-doctor")]
+        drop(pending.quality_admission);
         Ok(Admission {
             slot,
             request: RequestAdmission {
@@ -78,9 +117,10 @@ impl HttpClientInner {
         requested: Option<HttpRequestId>,
         resolved: ResolvedTimeouts,
         operation_start: Instant,
+        streaming: bool,
     ) -> Result<Admission<T>, NetError> {
         let pending = self
-            .begin_admission(requested, resolved, operation_start)
+            .begin_admission(requested, resolved, operation_start, streaming)
             .map_err(|error| admission_error(error, requested))?;
         let id = pending.registered.id;
         let resources = (|| {
@@ -98,7 +138,11 @@ impl HttpClientInner {
             })?;
             Ok((permit, slot))
         })();
-        let (permit, slot) = resources.map_err(|error| admission_error(error, Some(id)))?;
+        let (permit, slot) = resources.map_err(|error| {
+            #[cfg(feature = "quality-doctor")]
+            let error = pending.registered.control.quality_error(error);
+            admission_error(error, Some(id))
+        })?;
         self.accept_admission(pending, permit, slot, lane)
     }
 
@@ -126,7 +170,11 @@ impl HttpClientInner {
             },
         )
         .await
-        .map_err(|error| admission_error(error, Some(pending.registered.id)))
+        .map_err(|error| {
+            #[cfg(feature = "quality-doctor")]
+            let error = pending.registered.control.quality_error(error);
+            admission_error(error, Some(pending.registered.id))
+        })
     }
 
     async fn admit<T>(
@@ -136,16 +184,29 @@ impl HttpClientInner {
         requested: Option<HttpRequestId>,
         resolved: ResolvedTimeouts,
         operation_start: Instant,
+        streaming: bool,
     ) -> Result<Admission<T>, NetError> {
         if policy == HttpAdmissionPolicy::FailFast {
-            return self.try_admission(lane, requested, resolved, operation_start);
+            return self.try_admission(lane, requested, resolved, operation_start, streaming);
         }
         let pending = self
-            .begin_admission(requested, resolved, operation_start)
+            .begin_admission(requested, resolved, operation_start, streaming)
             .map_err(|error| admission_error(error, requested))?;
+        #[cfg(feature = "quality-doctor")]
+        let permit_phase = pending
+            .registered
+            .control
+            .quality_phase(PhaseKind::PermitWait);
         let permit = self
             .wait_admission_resource(&pending, self.acquire_permit())
             .await?;
+        #[cfg(feature = "quality-doctor")]
+        drop(permit_phase);
+        #[cfg(feature = "quality-doctor")]
+        let queue_phase = pending
+            .registered
+            .control
+            .quality_phase(PhaseKind::QueueWait);
         let slot = self
             .wait_admission_resource(&pending, async {
                 lane.clone()
@@ -154,6 +215,8 @@ impl HttpClientInner {
                     .map_err(|_| NetError::from(ErrorKind::QueueClosed))
             })
             .await?;
+        #[cfg(feature = "quality-doctor")]
+        drop(queue_phase);
         self.accept_admission(pending, permit, slot, lane)
     }
 
@@ -183,7 +246,7 @@ impl HttpClientInner {
             .resolve(request.timeouts(), self.config.timeout)
             .map_err(|error| admission_report(admission_error(error, None), start))?;
         let admission = self
-            .admit(&self.request_tx, policy, None, resolved, start)
+            .admit(&self.request_tx, policy, None, resolved, start, false)
             .await
             .map_err(|error| admission_report(error, start))?;
         Ok((admission, resolved))
@@ -206,7 +269,7 @@ impl HttpClientInner {
         let prepared = (|| {
             let resolved = self.resolve_timeouts(&options)?;
             options = options.clone().with_timeouts(resolved.as_overrides())?;
-            self.try_admission(&self.request_tx, options.request_id, resolved, start)
+            self.try_admission(&self.request_tx, options.request_id, resolved, start, false)
         })();
         match prepared {
             Ok(admission) => Ok(self.publish_buffered(request, options, admission)),
@@ -241,6 +304,7 @@ impl HttpClientInner {
                 options.request_id,
                 resolved,
                 start,
+                false,
             )
             .await
         }
@@ -274,6 +338,8 @@ impl HttpClientInner {
             Arc::clone(&job.permit),
         ));
         registration.commit();
+        #[cfg(feature = "quality-doctor")]
+        job.control.quality_mark(PhaseKind::Published);
         drop(slot.send(SendCommand::Job(job)));
         handle
     }
@@ -289,7 +355,14 @@ impl HttpClientInner {
             slot,
             request: admission,
         } = self
-            .admit(&self.supervisor_tx, policy, None, resolved, operation_start)
+            .admit(
+                &self.supervisor_tx,
+                policy,
+                None,
+                resolved,
+                operation_start,
+                true,
+            )
             .await?;
         let RequestAdmission {
             registered,

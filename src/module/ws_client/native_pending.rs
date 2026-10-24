@@ -155,16 +155,32 @@ impl Completion {
         if let Some(pending) = entry.registration.pending().upgrade() {
             pending.before_completion_for_test();
         }
+        #[cfg(feature = "quality-doctor")]
+        let response = response.map(|response| response.with_quality_ref(entry.core.quality_ref()));
+        #[cfg(feature = "quality-doctor")]
+        let quality_control = entry.core.clone();
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = entry.core.quality() {
+            if response.is_ok() {
+                probe.mark(crate::api::quality::PhaseKind::ResponseMatched);
+            }
+        }
         let PendingEntry {
             response: sender,
             permit,
             ..
         } = entry;
         drop(permit);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = quality_control.quality() {
+            probe.mark(crate::api::quality::PhaseKind::ResourcesReleased);
+        }
         publication.dispatch();
         if sender.send(response).is_err() {
             crate::log_s!(LogType::WSC; "native_response", "state", "observer_dropped");
         }
+        #[cfg(feature = "quality-doctor")]
+        quality_control.quality_delivery_finished();
     }
 }
 
@@ -568,6 +584,8 @@ impl NativePending {
                     NetError::from(ErrorKind::EngineDropped),
                     TaskEndCause::Shutdown,
                 );
+                #[cfg(feature = "quality-doctor")]
+                let publication = publication.quality_without_pending_response();
                 deferred.outcome = Some(outcome);
                 deferred.publication = Some(publication);
             } else {
@@ -586,7 +604,11 @@ impl NativePending {
                     response: Err(response_error),
                 })
             }
-            None => deferred.publication = Some(publication),
+            None => {
+                #[cfg(feature = "quality-doctor")]
+                let publication = publication.quality_without_pending_response();
+                deferred.publication = Some(publication);
+            }
         }
         deferred
     }
@@ -854,6 +876,10 @@ impl NativePending {
         state.dispatches.remove(&identity.id);
         drop(state);
         if let Some(entry) = entry {
+            #[cfg(feature = "quality-doctor")]
+            if let Some(probe) = entry.core.quality() {
+                probe.mark(crate::api::quality::PhaseKind::ManualResolve);
+            }
             Completion {
                 entry,
                 publication,

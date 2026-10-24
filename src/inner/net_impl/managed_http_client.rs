@@ -81,6 +81,8 @@ struct State {
 }
 
 pub(crate) struct ManagedHttpClientInner {
+    #[cfg(feature = "quality-doctor")]
+    quality: crate::module::quality::QualityContext,
     log_id: u64,
     reported_failures: AtomicU8,
     name: String,
@@ -105,7 +107,16 @@ impl OpenNetInner {
         config: HttpClientConfig,
     ) -> Outcome<ManagedHttpClient> {
         config.validate()?;
+        #[cfg(feature = "quality-doctor")]
+        if config.has_standalone_quality_doctor() {
+            return Err(NetError::config(
+                "quality_doctor",
+                "standalone diagnostic configuration cannot be used by an engine client",
+            ));
+        }
         let inner = Arc::new(ManagedHttpClientInner {
+            #[cfg(feature = "quality-doctor")]
+            quality: self.quality.context(),
             log_id: NEXT_LOG_ID.fetch_add(1, Ordering::Relaxed),
             reported_failures: AtomicU8::new(0),
             name: name.clone(),
@@ -411,10 +422,18 @@ impl Creation {
             if self.owner.with_state(|state| state.closed) || self.owner.context.is_closed() {
                 return Err(closed());
             }
+            #[cfg(not(feature = "quality-doctor"))]
             let client = crate::module::http::http_client_inner::create_http_client(
                 self.owner.name.clone(),
                 self.owner.config.clone(),
                 self.owner.context.clone(),
+            )?;
+            #[cfg(feature = "quality-doctor")]
+            let client = crate::module::http::http_client_inner::create_http_client_with_quality(
+                self.owner.name.clone(),
+                self.owner.config.clone(),
+                self.owner.context.clone(),
+                self.owner.quality.clone(),
             )?;
             #[cfg(test)]
             {

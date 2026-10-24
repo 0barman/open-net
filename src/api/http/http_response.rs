@@ -48,6 +48,8 @@ impl fmt::Debug for HttpResponseHead {
 /// is known.
 #[derive(Clone)]
 pub struct HttpResponse {
+    #[cfg(feature = "quality-doctor")]
+    quality_ref: Option<crate::api::quality::QualityReportRef>,
     retry_report: Option<crate::api::retry::RetryReport>,
     /// Response status code returned by the peer.
     pub status: StatusCode,
@@ -64,6 +66,33 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    /// Returns the diagnostic reference attached by the producing HTTP operation.
+    ///
+    /// This identifies the request's observation across its execution and retries,
+    /// rather than the response body or a newly allocated response-only report.
+    /// Callback or resource-release phases may still be pending when this response
+    /// is delivered, so a successful HTTP result does not imply the diagnostic
+    /// report has reached its final state.
+    ///
+    /// `None` means this response carries no reference, for example because it was
+    /// manually constructed or collection was Off/dormant, filtered out, or unable
+    /// to allocate an observation. The accessor does not activate collection.
+    /// Resolve a reference with the same owner's `QualityDoctor::lookup`; the value
+    /// neither pins retained history nor proves complete diagnostic coverage.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_ref(&self) -> Option<crate::api::quality::QualityReportRef> {
+        self.quality_ref
+    }
+
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn with_quality_ref(
+        mut self,
+        reference: crate::api::quality::QualityReportRef,
+    ) -> Self {
+        self.quality_ref = Some(reference);
+        self
+    }
+
     /// Final retry statistics, absent only on manually constructed responses.
     pub fn retry_report(&self) -> Option<&crate::api::retry::RetryReport> {
         self.retry_report.as_ref()
@@ -87,7 +116,13 @@ impl HttpResponse {
         if policy.accepts(self.status) {
             Ok(())
         } else {
-            Err(NetError::from_http_status(self.status))
+            let error = NetError::from_http_status(self.status);
+            #[cfg(feature = "quality-doctor")]
+            let error = match self.quality_ref {
+                Some(reference) => error.with_quality_ref(reference),
+                None => error,
+            };
+            Err(error)
         }
     }
     /// Construct a buffered response from its transport metadata and body.
@@ -99,6 +134,8 @@ impl HttpResponse {
         request_id: HttpRequestId,
     ) -> Self {
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality_ref: None,
             retry_report: None,
             status,
             headers,

@@ -730,6 +730,9 @@ where
     W: Sink<Message, Error = WsError> + Unpin,
 {
     let connection = crate::ws::ConnectionId::from_allocated(generation);
+    // Observation ownership spans flush/continuations even if a response wins first.
+    #[cfg(feature = "quality-doctor")]
+    let _quality_write = request.dispatch_phase.quality_scope_guard();
     if request
         .admission_cancel
         .as_ref()
@@ -1912,6 +1915,8 @@ where
     }
     let mut frame = Some(frame);
     let send = async {
+        #[cfg(feature = "quality-doctor")]
+        let readiness = dispatch_phase.quality().map(|probe| probe.phase(crate::api::quality::PhaseKind::SinkReadiness));
         std::future::poll_fn(|cx| {
             match Pin::new(&mut *write).poll_ready(cx) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
@@ -1950,6 +1955,16 @@ where
                 RequestWriteFailure::connection(unknown_delivery_error(error), true)
             }))
         }).await?;
+        // The cancellation CAS -> start_send sequence above stays untouched.
+        #[cfg(feature = "quality-doctor")]
+        {
+            drop(readiness);
+            if let Some(probe) = dispatch_phase.quality() {
+                probe.mark(crate::api::quality::PhaseKind::StartSend);
+            }
+        }
+        #[cfg(feature = "quality-doctor")]
+        let _flush = dispatch_phase.quality().map(|probe| probe.phase(crate::api::quality::PhaseKind::Flush));
         write.flush().await.map_err(|error| {
             crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", crate::common::log::summary::error(&error), "unknown");
             RequestWriteFailure::connection(unknown_delivery_error(error), true)

@@ -14,6 +14,12 @@ pub(super) type StreamSupervisor = Pin<Box<dyn Future<Output = ()> + Send + 'sta
 /// Opening futures and delivered streams use the same lifecycle owner. Capacity
 /// is returned before an observer can reenter the client.
 pub(super) struct StreamOwner {
+    #[cfg(feature = "quality-doctor")]
+    pub(super) quality_body_phase: Option<QualityPhaseGuard>,
+    // An uncompleted middleware continuation defers its implicit drop result
+    // to the middleware lease. Explicit transport/body results still win.
+    #[cfg(feature = "quality-doctor")]
+    pub(super) quality_result_on_drop: bool,
     pub(super) lease: Option<StreamRegistrationLease>,
     pub(super) supervisor_slot: Option<mpsc::OwnedPermit<StreamSupervisor>>,
     pub(super) lifecycle: Option<RetryObserverLifecycle>,
@@ -23,6 +29,10 @@ pub(super) struct StreamOwner {
 impl StreamOwner {
     pub(super) fn new(policy: &crate::api::http::HttpRetryPolicy, start: Instant) -> Self {
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality_body_phase: None,
+            #[cfg(feature = "quality-doctor")]
+            quality_result_on_drop: true,
             lease: None,
             supervisor_slot: None,
             report: None,
@@ -39,15 +49,47 @@ impl StreamOwner {
         result: Result<http::StatusCode, &NetError>,
         exhausted: bool,
     ) -> RetryReport {
+        self.complete_inner(
+            result,
+            exhausted,
+            #[cfg(feature = "quality-doctor")]
+            true,
+        )
+    }
+
+    fn complete_inner(
+        &mut self,
+        result: Result<http::StatusCode, &NetError>,
+        exhausted: bool,
+        #[cfg(feature = "quality-doctor")] record_quality_result: bool,
+    ) -> RetryReport {
+        #[cfg(feature = "quality-doctor")]
+        let quality_control = self.lease.as_ref().map(|lease| Arc::clone(&lease.control));
+        #[cfg(feature = "quality-doctor")]
+        {
+            drop(self.quality_body_phase.take());
+            if record_quality_result {
+                if let Some(control) = &quality_control {
+                    control.quality_result(result);
+                }
+            }
+        }
         drop(self.supervisor_slot.take());
         drop(self.lease.take());
-        if let Some(mut lifecycle) = self.lifecycle.take() {
+        let report = if let Some(mut lifecycle) = self.lifecycle.take() {
             if result.is_ok() {
                 if let Some(reason) = self.status_stop_reason.take() {
                     lifecycle.stop(reason);
                 }
             }
-            lifecycle.complete_summary(result, exhausted);
+            // Retry bookkeeping also publishes quality results. Carry the same
+            // selection decision through it without changing retry completion.
+            lifecycle.complete_summary(
+                result,
+                exhausted,
+                #[cfg(feature = "quality-doctor")]
+                record_quality_result,
+            );
             let report = lifecycle.report();
             self.report = Some(report.clone());
             report
@@ -56,13 +98,31 @@ impl StreamOwner {
                 Some(report) => report.clone(),
                 None => RetryReport::new(),
             }
+        };
+        #[cfg(feature = "quality-doctor")]
+        if let Some(control) = &quality_control {
+            #[cfg(feature = "http-client-middleware")]
+            let middleware_pending = control.middleware_active.load(Ordering::SeqCst);
+            #[cfg(not(feature = "http-client-middleware"))]
+            let middleware_pending = false;
+            if !middleware_pending {
+                control.quality_finish();
+            }
         }
+        report
     }
 }
 impl Drop for StreamOwner {
     fn drop(&mut self) {
         let error = NetError::from(ErrorKind::Cancelled).with_stage(ErrorStage::Receive);
-        self.complete(Err(&error), false);
+        #[cfg(feature = "quality-doctor")]
+        let record_quality_result = self.quality_result_on_drop;
+        self.complete_inner(
+            Err(&error),
+            false,
+            #[cfg(feature = "quality-doctor")]
+            record_quality_result,
+        );
     }
 }
 
@@ -130,6 +190,8 @@ impl SharedBody {
     }
 
     fn annotate(&self, error: NetError) -> NetError {
+        #[cfg(feature = "quality-doctor")]
+        let error = self.control.quality_annotate(error);
         let error = error
             .with_http_request_id(self.request_id)
             .with_http_attempt(self.attempt);
@@ -277,6 +339,12 @@ impl FusedHttpBody {
         idle_timeout: Option<Duration>,
     ) -> Result<(Self, StreamSupervisor), NetError> {
         let active_budget = budget.with_phase(body_start, idle_timeout, TimeoutPhase::IdleRead)?;
+        #[cfg(feature = "quality-doctor")]
+        let owner = {
+            let mut owner = owner;
+            owner.quality_body_phase = control.quality_phase(PhaseKind::ResponseBody);
+            owner
+        };
         let shared = Arc::new(SharedBody {
             state: Mutex::new(BodyState {
                 body: Some(body),
@@ -416,6 +484,10 @@ impl Stream for FusedHttpBody {
         if finished {
             shared.poll_terminal()
         } else {
+            #[cfg(feature = "quality-doctor")]
+            if let Poll::Ready(Some(Ok(bytes))) = &result {
+                shared.control.quality_chunk(bytes.len());
+            }
             result
         }
     }

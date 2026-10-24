@@ -22,6 +22,33 @@ pub struct OpenNet {
 }
 
 impl OpenNet {
+    /// Activates this engine's configured passive diagnostics and returns a reader.
+    ///
+    /// Configure diagnostics with [`OpenNetConfig::with_quality_doctor`] before
+    /// creating the engine. The default `QualityMode::Off` returns `None` without
+    /// initializing diagnostic storage. In Basic or Detailed mode, the first call
+    /// allocates bounded storage and establishes a collector-local monotonic clock
+    /// on this caller's path. Call it before the work to observe, outside a
+    /// latency-sensitive path. Network operations do not activate collection and
+    /// observations from before activation are not reconstructed.
+    ///
+    /// Repeated calls share one collector and scope for this engine's managed
+    /// HTTP and WebSocket clients, subject to configured protocol selection.
+    /// A managed HTTP client's `quality_doctor()` activates that same collector.
+    /// Independently constructed HTTP clients have their own diagnostic owner.
+    /// Diagnostic reads drive aggregation and retention; activation creates no
+    /// background diagnostic task and sends no test traffic.
+    ///
+    /// The returned handle retains diagnostic storage, not the engine or its
+    /// network workers. After engine shutdown, a handle can still read retained
+    /// evidence subject to TTL and capacity. Calling this method after owner
+    /// closure returns a closed collector when diagnostics were configured; it
+    /// does not restart networking or collection.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_doctor(&self) -> Option<crate::quality::QualityDoctor> {
+        self.inner.quality.doctor()
+    }
+
     /// Permanently close this engine's admission and request cancellation.
     ///
     /// Idempotent and safe inside SDK callbacks. It does not wait for callback,

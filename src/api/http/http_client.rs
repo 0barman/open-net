@@ -28,6 +28,32 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
+    /// Activates this client's configured diagnostic owner and returns its reader.
+    ///
+    /// With standalone workers, policy comes from
+    /// [`HttpClientConfig::with_standalone_quality_doctor`]; clones share that
+    /// client's collector. Engine-managed clients inherit the engine's policy and
+    /// return the same collector as [`crate::OpenNet::quality_doctor`], including
+    /// observations from other managed clients allowed by the protocol filter.
+    /// A standalone client constructed with a network-status context still uses
+    /// its own diagnostic owner.
+    ///
+    /// Returns `None` when diagnostics are Off or the inherited owner no longer
+    /// exists. The first call in Basic or Detailed mode allocates bounded storage
+    /// and starts a collector-local monotonic epoch. Activate before submitting
+    /// requests, outside a latency-sensitive path: requests never activate
+    /// collection and prior observations are not reconstructed. Repeated calls
+    /// share existing storage and do not reset retained history.
+    ///
+    /// The reader does not keep the client, engine, or network workers alive.
+    /// Owner closure stops new observations, while retained evidence remains
+    /// readable subject to diagnostic TTL and capacity. This call does not send
+    /// probes or create a background diagnostic worker.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_doctor(&self) -> Option<crate::api::quality::QualityDoctor> {
+        self.inner.quality_doctor()
+    }
+
     /// Create standalone HTTP worker lanes.
     ///
     /// The thread name must be non-empty and contain no NUL. Application state
@@ -329,6 +355,56 @@ impl HttpClient {
     /// Consume to a terminal item or drop the stream to return admission capacity.
     pub async fn stream(&self, request: HttpRequest) -> Result<HttpStreamResponse, NetError> {
         self.stream_at(request, Instant::now()).await
+    }
+
+    /// Starts a streaming request and also returns its diagnostic report reference.
+    ///
+    /// Request admission, retries, deadlines, and body polling have the same
+    /// semantics as [`Self::stream`]. The second tuple element identifies the
+    /// `HttpStream` observation for this operation, covering its stream lifecycle;
+    /// returning it does not read or prefetch response-body chunks. The report can
+    /// remain in progress while the caller owns the stream. Consume to EOF, receive
+    /// a terminal error, or drop the stream to end its observation lifecycle.
+    ///
+    /// Activate collection through [`Self::quality_doctor`] before the request.
+    /// `None` means no report reference was allocated, for example because
+    /// diagnostics were Off/dormant, HTTP was excluded, the owner had closed, or
+    /// diagnostic capacity was unavailable. It does not indicate request failure.
+    /// A reference does not pin report storage or guarantee complete retention;
+    /// resolve it using the same owner's `QualityDoctor::lookup`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same request/admission/transport errors as [`Self::stream`].
+    /// When the failing path allocated an observation, its [`NetError::quality_ref`]
+    /// may identify that report; errors before observation begins can have no
+    /// reference. Diagnostic unavailability does not itself fail the request.
+    #[cfg(feature = "quality-doctor")]
+    pub async fn stream_with_quality_ref(
+        &self,
+        request: HttpRequest,
+    ) -> Result<
+        (
+            HttpStreamResponse,
+            Option<crate::api::quality::QualityReportRef>,
+        ),
+        NetError,
+    > {
+        let start = Instant::now();
+        let mut reference = None;
+        #[cfg(feature = "http-client-middleware")]
+        if self.inner.has_middleware() {
+            let response = self
+                .inner
+                .stream_request_with_middleware_observed(request, start, Some(&mut reference))
+                .await?;
+            return Ok((response, reference));
+        }
+        let response = self
+            .inner
+            .stream_request_observed(request, start, Some(&mut reference))
+            .await?;
+        Ok((response, reference))
     }
     async fn stream_at(
         &self,

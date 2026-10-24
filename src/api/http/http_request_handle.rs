@@ -23,6 +23,25 @@ impl std::fmt::Debug for HttpRequestHandle {
 }
 
 impl HttpRequestHandle {
+    /// Returns the diagnostic reference assigned to this accepted HTTP operation.
+    ///
+    /// The reference comes from the operation's admission-time observation and is
+    /// shared by cloned handles. It identifies the whole `HttpRequest` lifecycle,
+    /// including retries and callback phases that were actually observed, rather
+    /// than a separate report for each retry. A response can already be available
+    /// while callback or cleanup observations are still in progress.
+    ///
+    /// `None` means no observation was allocated: collection may have been
+    /// Off/dormant, HTTP excluded, the diagnostic owner unavailable, or diagnostic
+    /// capacity exhausted. This accessor neither activates collection nor waits
+    /// for completion. Pass a returned reference to the same owner's
+    /// `QualityDoctor::lookup`; it does not pin a report, guarantee complete
+    /// coverage, or keep network workers alive.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_ref(&self) -> Option<crate::api::quality::QualityReportRef> {
+        self.control.quality_ref()
+    }
+
     pub(crate) fn new(request_id: HttpRequestId, control: Arc<CancellationSignal>) -> Self {
         Self {
             request_id,

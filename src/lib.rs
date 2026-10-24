@@ -25,6 +25,8 @@ pub(crate) mod inner;
 pub(crate) mod module;
 
 // Keep existing import paths as re-exports of the canonical API modules.
+#[cfg(feature = "quality-doctor")]
+pub use api::quality;
 #[cfg(any(feature = "ws-client", feature = "http-client"))]
 pub use api::tls;
 pub use api::{config, error, network, retry, subscription};

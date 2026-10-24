@@ -67,11 +67,29 @@ impl ContextConnectTask {
         let mut attempt = 0usize;
         let mut next_backoff = None;
         loop {
+            #[cfg(feature = "quality-doctor")]
+            let mut observation = crate::module::ws_client::quality::QualityScope::new(
+                self.target.runtime.quality_begin(crate::api::quality::QualityOperationKind::Connection),
+            );
+            #[cfg(feature = "quality-doctor")]
+            let quality = observation.probe.as_ref();
+            #[cfg(feature = "quality-doctor")]
+            if let Some(probe) = quality {
+                probe.cycle(self.generation);
+            }
             if let Some(after) = next_backoff {
+                #[cfg(feature = "quality-doctor")]
+                let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::Backoff));
                 gate.backoff(after, &self.network_available, cycle_deadline)
                     .await?;
             }
+            #[cfg(feature = "quality-doctor")]
+            let network_wait = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::NetworkWait));
             let epoch = gate.wait_available(cycle_deadline).await?;
+            #[cfg(feature = "quality-doctor")]
+            drop(network_wait);
+            #[cfg(feature = "quality-doctor")]
+            let admission = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::ConnectionAdmission));
             let reservation = match gate
                 .run_until(epoch, cycle_deadline, self.target.session.reserve_attempt())
                 .await
@@ -88,6 +106,10 @@ impl ContextConnectTask {
                 .target
                 .session
                 .handshake_attempt(self.generation, attempt_id);
+            #[cfg(feature = "quality-doctor")]
+            if let Some(probe) = quality {
+                probe.attempt(metadata.attempt_id.as_u64());
+            }
             let deadline = self
                 .budget
                 .attempt_deadline(self.target.options.handshake_timeout)?;
@@ -101,9 +123,14 @@ impl ContextConnectTask {
                 accepted,
             })
             .await?;
+            #[cfg(feature = "quality-doctor")]
+            drop(admission);
             let operation = async {
                 let request = self
-                    .build_request(metadata, deadline)
+                    .build_request_observed(metadata, deadline,
+                        #[cfg(feature = "quality-doctor")]
+                        quality,
+                    )
                     .await
                     .map_err(TransportFailure::from)?;
                 let protocol = WebSocketConfig::default()
@@ -113,12 +140,14 @@ impl ContextConnectTask {
                     .max_message_size(self.client_config.frames.max_message_size)
                     .max_frame_size(self.client_config.frames.max_frame_size);
                 self.network
-                    .dial_with_diagnostics(
+                    .dial_observed(
                         request,
                         protocol,
                         self.client_config.tcp.nodelay,
                         deadline.at(),
                         self.target.options.diagnostics.as_ref(),
+                        #[cfg(feature = "quality-doctor")]
+                        quality,
                     )
                     .await
             };
@@ -147,7 +176,16 @@ impl ContextConnectTask {
                 Err(error) => Err(error),
             };
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(feature = "quality-doctor")]
+                    {
+                        if let Some(probe) = quality {
+                            probe.connection(self.generation);
+                        }
+                        observation.outcome = crate::api::quality::QualityOutcome::Success;
+                    }
+                    return Ok(());
+                }
                 Err(result) => {
                     let original_failure = result.failure;
                     let diagnostic =
@@ -157,6 +195,12 @@ impl ContextConnectTask {
                             })
                         });
                     let failure = reclassify_expired_timeout(original_failure, deadline);
+                    #[cfg(feature = "quality-doctor")]
+                    {
+                        let error = failure.error();
+                        if let Some(probe) = quality { probe.error(&error); }
+                        observation.outcome = crate::api::quality::QualityOutcome::from_error(&error);
+                    }
                     let exhausted = self
                         .budget
                         .deadline()
@@ -212,11 +256,26 @@ impl ContextConnectTask {
         }
     }
 
+    #[cfg(test)]
     async fn build_request(
         &self,
         attempt: HandshakeAttempt,
         deadline: BudgetDeadline,
     ) -> Result<Request<()>, ConnectionFailure> {
+        self.build_request_observed(attempt, deadline,
+            #[cfg(feature = "quality-doctor")]
+            None,
+        ).await
+    }
+
+    async fn build_request_observed(
+        &self,
+        attempt: HandshakeAttempt,
+        deadline: BudgetDeadline,
+        #[cfg(feature = "quality-doctor")] quality: Option<&crate::module::quality::QualityProbe>,
+    ) -> Result<Request<()>, ConnectionFailure> {
+        #[cfg(feature = "quality-doctor")]
+        let _build = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::RequestBuild));
         let annotate = |error: NetError| {
             let mut context = error.context().clone();
             context.client_id = Some(attempt.client_id);
@@ -244,6 +303,8 @@ impl ContextConnectTask {
         // Keep the provider future inline: deadline, network interruption, and
         // session cancellation must drop it rather than detach a user task.
         let snapshot = if let Some(provider) = self.target.options.handshake_provider.as_ref() {
+            #[cfg(feature = "quality-doctor")]
+            let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::Provider));
             if Instant::now() >= deadline.at() {
                 return Err(provider_error(NetError::from(
                     crate::error::ErrorKind::TimedOut,

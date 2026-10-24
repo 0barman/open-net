@@ -181,6 +181,11 @@ impl MiddlewareLease {
             Ok(HttpMiddlewareResponse::Streaming(_)) => None,
             Err(error) => Some(Err(error.clone())),
         };
+        #[cfg(feature = "quality-doctor")]
+        if let Some(result) = &outcome {
+            self.control.quality_result(result.as_ref().copied());
+            self.control.quality_mark(PhaseKind::ReportFrozen);
+        }
         let mut report = match self.control.retry_report() {
             Some(report) => report,
             None => RetryReport::new(),
@@ -209,11 +214,19 @@ impl MiddlewareLease {
             self.control.attempt.load(Ordering::Acquire),
             report,
         );
+        #[cfg(feature = "quality-doctor")]
+        if self.control.transport_finished.load(Ordering::SeqCst) {
+            self.control.quality_finish();
+        }
     }
 }
 impl Drop for MiddlewareLease {
     fn drop(&mut self) {
         if !self.finished {
+            #[cfg(feature = "quality-doctor")]
+            if let Some(probe) = self.control.quality.get() {
+                probe.result(QualityOutcome::Cancelled);
+            }
             self.control.cancel();
             self.release();
             self.completion.finish(
@@ -232,6 +245,10 @@ impl Drop for MiddlewareLease {
                     report
                 },
             );
+            #[cfg(feature = "quality-doctor")]
+            if self.control.transport_finished.load(Ordering::SeqCst) {
+                self.control.quality_finish();
+            }
         }
     }
 }

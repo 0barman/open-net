@@ -77,6 +77,8 @@ impl IncomingOrigin {
 /// Immutable inbound item; clones share one payload allocation.
 #[derive(Clone, Debug)]
 pub struct IncomingMessage {
+    #[cfg(feature = "quality-doctor")]
+    quality: Option<crate::api::quality::QualityReportRef>,
     /// Client, session, and physical connection that produced the item.
     origin: IncomingOrigin,
     /// Business or control payload shared by all clones.
@@ -103,11 +105,37 @@ impl IncomingMessage {
         received_at: SystemTime,
     ) -> Self {
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality: None,
             origin,
             payload: Arc::new(payload),
             received_at,
             dispatch: None,
         }
+    }
+    /// Returns the `WsReceive` report reference attached during SDK message routing.
+    ///
+    /// Its observation begins after the transport has supplied a complete decoded
+    /// message, and measures SDK routing/publication boundaries. It does not
+    /// measure time spent waiting for socket bytes, frame assembly, or the peer's
+    /// send time. The `PayloadReceived` marker uses the collector's monotonic
+    /// clock; [`Self::received_at`] is a separate wall-clock timestamp.
+    ///
+    /// Only text/binary business messages currently receive this routing report;
+    /// Ping, Pong, and Close items carry no `WsReceive` reference. This observation
+    /// is distinct from the request report attached to a matching
+    /// [`super::Response`]. Cloning the incoming message preserves its reference.
+    /// `None` can also mean collection was inactive, WebSocket was excluded, or
+    /// diagnostic allocation was unavailable. Reading it neither starts collection nor
+    /// performs routing. Resolve it through the owning engine's
+    /// `QualityDoctor::lookup`; history can be incomplete or already evicted.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_ref(&self) -> Option<crate::api::quality::QualityReportRef> {
+        self.quality
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn bind_quality(&mut self, reference: crate::api::quality::QualityReportRef) {
+        self.quality = Some(reference);
     }
 
     pub(crate) fn bind_dispatch(

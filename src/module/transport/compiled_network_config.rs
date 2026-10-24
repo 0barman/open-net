@@ -60,13 +60,29 @@ impl CompiledNetworkConfig {
 
     /// Each stage uses the caller's original attempt deadline. Dropping the
     /// future also drops its owned TCP/TLS stream, including a partial tunnel.
+    #[cfg(test)]
     pub(crate) async fn dial_with_diagnostics(
+        &self,
+        request: Request,
+        protocol_config: WebSocketConfig,
+        tcp_nodelay: bool,
+        deadline: Instant,
+        options: Option<&crate::ws::HandshakeDiagnosticOptions>,
+    ) -> Result<NativeWebSocketStream, TransportFailure> {
+        self.dial_observed(request, protocol_config, tcp_nodelay, deadline, options,
+            #[cfg(feature = "quality-doctor")]
+            None,
+        ).await
+    }
+
+    pub(crate) async fn dial_observed(
         &self,
         mut request: Request,
         protocol_config: WebSocketConfig,
         tcp_nodelay: bool,
         deadline: Instant,
         options: Option<&crate::ws::HandshakeDiagnosticOptions>,
+        #[cfg(feature = "quality-doctor")] quality: Option<&crate::module::quality::QualityProbe>,
     ) -> Result<NativeWebSocketStream, TransportFailure> {
         let fail = |failure| TransportFailure::with_options(failure, options);
         // Recheck the immutable policy at the transport boundary before DNS/TCP.
@@ -105,7 +121,10 @@ impl CompiledNetworkConfig {
             Some(proxy) => (proxy.host.as_str(), proxy.port),
             None => (host.as_str(), port),
         };
-        let socket = connect_tcp(connect_host, connect_port, deadline)
+        let socket = connect_tcp(connect_host, connect_port, deadline,
+            #[cfg(feature = "quality-doctor")]
+            quality,
+        )
             .await
             .map_err(fail)?;
         if tcp_nodelay {
@@ -118,6 +137,8 @@ impl CompiledNetworkConfig {
                 tls, server_name, ..
             } => {
                 ensure_deadline(deadline, ConnectStage::ProxyTls).map_err(fail)?;
+                #[cfg(feature = "quality-doctor")]
+                let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::ProxyTls));
                 let stream = timeout_at(
                     deadline,
                     TlsConnector::from(Arc::clone(tls)).connect(server_name.clone(), socket),
@@ -134,6 +155,8 @@ impl CompiledNetworkConfig {
         let mut socket = tunnel_io(io);
         if let Some(proxy) = self.proxy.endpoint() {
             ensure_deadline(deadline, ConnectStage::ProxyConnect).map_err(fail)?;
+            #[cfg(feature = "quality-doctor")]
+            let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::ProxyConnect));
             timeout_at(
                 deadline,
                 proxy::establish_tunnel_with_diagnostics(
@@ -154,6 +177,8 @@ impl CompiledNetworkConfig {
         }
         let stream = if tls_required {
             ensure_deadline(deadline, ConnectStage::Tls).map_err(fail)?;
+            #[cfg(feature = "quality-doctor")]
+            let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::Tls));
             let name = ServerName::try_from(host).map_err(|_| {
                 fail(failure(
                     NetError::from(crate::error::ErrorKind::InvalidInput),
@@ -173,6 +198,8 @@ impl CompiledNetworkConfig {
             MaybeTlsStream::Plain(socket)
         };
         ensure_deadline(deadline, ConnectStage::WebSocketUpgrade).map_err(fail)?;
+        #[cfg(feature = "quality-doctor")]
+        let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::WebSocketUpgrade));
         let (stream, _) = timeout_at(
             deadline,
             tokio_tungstenite::client_async_with_config(request, stream, Some(protocol_config)),

@@ -777,6 +777,24 @@ pub struct MessageReceipt {
     core: Arc<OperationControl>,
 }
 impl MessageReceipt {
+    /// Returns the `WsMessage` diagnostic reference for this local message operation.
+    ///
+    /// The SDK allocates the observation during message admission and binds it to
+    /// the operation shared by receipt clones. It can include admission, queue,
+    /// local write, and retry observations. Successful local writing is not proof
+    /// of peer receipt or application processing, and this report does not invent
+    /// an application response boundary for a raw message.
+    ///
+    /// `None` means no report was allocated, for example because collection was
+    /// Off/dormant, WebSocket was excluded, the owner was unavailable, or a
+    /// diagnostic budget prevented collection. Reading it does not activate
+    /// diagnostics or wait for delivery. Use the owning engine's
+    /// `QualityDoctor::lookup` to inspect retained evidence; the reference does
+    /// not pin history or guarantee that every observation was retained.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_ref(&self) -> Option<crate::api::quality::QualityReportRef> {
+        self.core.quality_ref()
+    }
     /// Snapshot of the raw message operation's attempts, transport writes and final stop reason.
     /// The report remains stable after completion and is shared by receipt clones.
     pub fn retry_report(&self) -> crate::api::retry::RetryReport {

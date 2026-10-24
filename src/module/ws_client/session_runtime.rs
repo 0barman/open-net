@@ -25,6 +25,8 @@ type RequestResultCheckHook = Box<dyn FnOnce(&crate::ws::RequestHandle) -> Resul
 /// All authorities captured before the worker is allowed to begin networking.
 /// Shared senders retain this identity; receipts retain only OperationControl.
 pub(crate) struct SessionRuntime {
+    #[cfg(feature = "quality-doctor")]
+    quality: OnceLock<crate::module::quality::QualityContext>,
     pub(crate) config: Arc<WebSocketClientConfig>,
     pub(crate) client_id: ClientId,
     pub(crate) id: SessionId,
@@ -66,6 +68,8 @@ impl SessionRuntime {
         config: Arc<WebSocketClientConfig>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(feature = "quality-doctor")]
+            quality: OnceLock::new(),
             config,
             client_id,
             id,
@@ -89,6 +93,27 @@ impl SessionRuntime {
             #[cfg(test)]
             before_request_result_check: Mutex::new(None),
         })
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn bind_quality(&self, quality: crate::module::quality::QualityContext) {
+        let _ = self.quality.set(quality);
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality_context(&self) -> Option<crate::module::quality::QualityContext> {
+        self.quality.get().cloned()
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality_begin(
+        &self,
+        kind: crate::api::quality::QualityOperationKind,
+    ) -> Option<crate::module::quality::QualityProbe> {
+        let probe = self.quality.get()?.begin(
+            crate::api::quality::QualityProtocol::WebSocket,
+            kind,
+            self.client_id.as_u64(),
+        )?;
+        probe.session(self.id.as_u64());
+        Some(probe)
     }
     #[cfg(test)]
     pub(crate) fn set_before_request_result_check_for_test(

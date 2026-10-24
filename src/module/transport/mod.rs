@@ -189,21 +189,51 @@ async fn connect_tcp(
     host: &str,
     port: u16,
     deadline: Instant,
+    #[cfg(feature = "quality-doctor")] quality: Option<&crate::module::quality::QualityProbe>,
 ) -> Result<TcpStream, ConnectionFailure> {
-    resolve_and_connect(
-        tokio::net::lookup_host((host, port)),
-        TcpStream::connect,
+    resolve_and_connect_observed(
+        async {
+            #[cfg(feature = "quality-doctor")]
+            let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::Dns));
+            tokio::net::lookup_host((host, port)).await
+        },
+        |address| async move {
+            #[cfg(feature = "quality-doctor")]
+            let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::TcpCandidate));
+            TcpStream::connect(address).await
+        },
         deadline,
+        #[cfg(feature = "quality-doctor")]
+        quality,
     )
     .await
 }
 
 /// The same resolver/connector path is exercised with injected pending futures
 /// in unit tests, so DNS and TCP timeout tests never depend on an external host.
+#[cfg(test)]
 async fn resolve_and_connect<R, A, C, F, S>(
     resolver: R,
     connector: C,
     deadline: Instant,
+) -> Result<S, ConnectionFailure>
+where
+    R: Future<Output = std::io::Result<A>>,
+    A: IntoIterator<Item = SocketAddr>,
+    C: FnMut(SocketAddr) -> F,
+    F: Future<Output = std::io::Result<S>>,
+{
+    resolve_and_connect_observed(resolver, connector, deadline,
+        #[cfg(feature = "quality-doctor")]
+        None,
+    ).await
+}
+
+async fn resolve_and_connect_observed<R, A, C, F, S>(
+    resolver: R,
+    connector: C,
+    deadline: Instant,
+    #[cfg(feature = "quality-doctor")] quality: Option<&crate::module::quality::QualityProbe>,
 ) -> Result<S, ConnectionFailure>
 where
     R: Future<Output = std::io::Result<A>>,
@@ -224,6 +254,8 @@ where
             true,
         ));
     }
+    #[cfg(feature = "quality-doctor")]
+    let _phase = quality.map(|probe| probe.phase(crate::api::quality::PhaseKind::TcpConnect));
     race_tcp_addresses(addresses, connector, deadline).await
 }
 

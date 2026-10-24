@@ -222,6 +222,17 @@ impl WsRequestOperationBuilder {
         }
     }
     async fn admit(&self, started: Instant) -> Result<WsRequestOperationReceipt> {
+        #[cfg(feature = "quality-doctor")]
+        let mut quality_scope = crate::module::ws_client::quality::QualityScope::new(
+            self.client
+                .runtime
+                .quality_begin(crate::api::quality::QualityOperationKind::WsRequestOperation),
+        );
+        #[cfg(feature = "quality-doctor")]
+        let admission = quality_scope
+            .probe
+            .as_ref()
+            .map(|probe| probe.phase(crate::api::quality::PhaseKind::Admission));
         self.options.validate()?;
         let runtime = &self.client.runtime;
         let deadline = earlier(
@@ -267,7 +278,11 @@ impl WsRequestOperationBuilder {
             RetrySetting::Policy(policy) => policy.clone(),
         };
         let (sender, receiver) = oneshot::channel();
+        #[cfg(feature = "quality-doctor")]
+        drop(admission);
         let control = Arc::new(LogicalControl {
+            #[cfg(feature = "quality-doctor")]
+            quality: quality_scope.probe.take(),
             id: runtime.allocate_operation()?,
             runtime: runtime.clone(),
             started,
@@ -292,6 +307,10 @@ impl WsRequestOperationBuilder {
                 hook: None,
             }),
         });
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = &control.quality {
+            probe.operation(control.id.as_u64());
+        }
         if let Some(group) = &self.options.cancellation {
             let weak = Arc::downgrade(&control);
             let hook = group.inner.bind_cancel_hook(Arc::new(move || {
@@ -336,6 +355,32 @@ pub struct WsRequestOperationHandle {
     control: Arc<LogicalControl>,
 }
 impl WsRequestOperationHandle {
+    /// Returns the stable `WsRequestOperation` reference for this logical request.
+    ///
+    /// The observation is created during logical-operation admission and is shared
+    /// by all clones of this handle. It spans retries, backoff, final result
+    /// selection, and observed delivery boundaries. Individual request
+    /// registrations have separate `WsRequest` reports whose parent field links
+    /// to this reference when their link events are retained. Bounded retention
+    /// and event loss can leave either side of that relationship unavailable.
+    ///
+    /// The final response or error selected by this logical operation carries
+    /// this logical reference when one exists. To inspect one registration's
+    /// observation, use that registration's [`super::RequestHandle::quality_ref`].
+    /// `None` means the logical observation was not allocated because collection
+    /// was inactive, filtered out, unavailable, or over its diagnostic budget; it
+    /// does not prevent retries or change the operation's result.
+    ///
+    /// This accessor neither starts collection nor waits for completion. Resolve
+    /// the reference using the owning engine's `QualityDoctor::lookup`; retaining
+    /// it does not pin history or keep the engine's workers alive.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_ref(&self) -> Option<crate::api::quality::QualityReportRef> {
+        self.control
+            .quality
+            .as_ref()
+            .map(crate::module::quality::QualityProbe::reference)
+    }
     pub fn id(&self) -> OperationId {
         self.control.id
     }
@@ -383,6 +428,8 @@ impl WsRequestOperationReceipt {
 }
 
 struct LogicalControl {
+    #[cfg(feature = "quality-doctor")]
+    quality: Option<crate::module::quality::QualityProbe>,
     id: OperationId,
     runtime: Arc<SessionRuntime>,
     started: Instant,
@@ -536,6 +583,31 @@ impl LogicalControl {
         let result = result
             .map(|response| response.with_retry_report(report.clone()))
             .map_err(|error| error.with_retry_report(report.clone()));
+        #[cfg(feature = "quality-doctor")]
+        let result = {
+            let reference = self
+                .quality
+                .as_ref()
+                .map(crate::module::quality::QualityProbe::reference);
+            if let Some(probe) = &self.quality {
+                use crate::api::quality::{PhaseKind, QualityOutcome};
+                probe.mark(PhaseKind::ResultSelected);
+                probe.mark(PhaseKind::ResourcesReleased);
+                match &result {
+                    Ok(response) => {
+                        probe.connection(response.connection_id().as_u64());
+                        probe.result(QualityOutcome::Success);
+                    }
+                    Err(error) => probe.error(error),
+                }
+            }
+            result
+                .map(|response| response.with_quality_ref(reference))
+                .map_err(|error| match reference {
+                    Some(reference) => error.with_quality_ref(reference),
+                    None => error,
+                })
+        };
         if let Some(reservation) = reservation {
             if let Err(error) = reservation.publish(event) {
                 crate::log_e!(crate::LogType::WSC; "ws.request_operation.publish", "error", format!("{error:?}"));
@@ -544,6 +616,11 @@ impl LogicalControl {
         self.notify(RetryEvent::Completed(report));
         if let Some(sender) = sender {
             let _ = sender.send(result);
+        }
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = &self.quality {
+            probe.mark(crate::api::quality::PhaseKind::DeliveryFinished);
+            probe.finish();
         }
         outcome
     }
@@ -622,6 +699,10 @@ async fn run(
             }
         };
         let attempt_started = Instant::now();
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = &control.quality {
+            probe.attempt(attempt as u64);
+        }
         control.notify(RetryEvent::AttemptStarted { attempt });
         let result = attempt_once(
             &control,
@@ -709,7 +790,12 @@ async fn run(
             }
         };
         let sleep = control.runtime.wait_deadline(Some(ready));
-        if let Err(error) = admission_scope(
+        #[cfg(feature = "quality-doctor")]
+        let backoff = control
+            .quality
+            .as_ref()
+            .map(|probe| probe.phase(crate::api::quality::PhaseKind::Backoff));
+        let backoff_result = admission_scope(
             &control.connection_lease,
             &control.runtime,
             &control.options,
@@ -717,8 +803,10 @@ async fn run(
             control.deadline,
             sleep,
         )
-        .await
-        {
+        .await;
+        #[cfg(feature = "quality-doctor")]
+        drop(backoff);
+        if let Err(error) = backoff_result {
             let error = if error.kind() == ErrorKind::TimedOut {
                 error.with_ws_timeout_phase(WsTimeoutPhase::Total)
             } else {
@@ -754,7 +842,14 @@ async fn attempt_once(
         request_id: RequestId::random()?,
         idempotency_key: key,
     };
+    #[cfg(feature = "quality-doctor")]
+    let build = control
+        .quality
+        .as_ref()
+        .map(|probe| probe.phase(crate::api::quality::PhaseKind::RequestBuild));
     let built = super::retry::isolate_classifier(|| factory(&context));
+    #[cfg(feature = "quality-doctor")]
+    drop(build);
     // A synchronous factory cannot be preempted, so arbitrate its elapsed time
     // before accepting either its success or its returned construction error.
     check_attempt_budget(control, started)?;
@@ -835,6 +930,10 @@ async fn attempt_once(
         .request
         .take()
         .ok_or_else(|| NetError::from(ErrorKind::Internal))?;
+    #[cfg(feature = "quality-doctor")]
+    if let Some(probe) = &control.quality {
+        handle.quality_parent(probe.reference());
+    }
     {
         let mut state = lock_recover(&control.state);
         if state.terminal {

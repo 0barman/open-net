@@ -12,6 +12,18 @@ responses, and `WebSocketClient` for persistent WebSocket connections. `OpenNet`
 manages named clients and shared engine resources. HTTP clients can also be
 constructed independently with `HttpClient::new`.
 
+Reuse open-net's HTTP and WebSocket clients, network status subscriptions,
+configurable retry policies, WebSocket reconnection and heartbeats, and client
+lifecycle management across applications. These shared capabilities let you
+focus on business logic while avoiding repeated implementation and debugging of
+common networking infrastructure.
+
+For AI-assisted development, this reuse is designed to save development time and
+AI coding tokens by reducing the amount of networking code that needs to be
+generated, reviewed, and debugged for each project. Enable the Cargo features
+your application needs and configure retry and connection policies for its
+requirements; see the feature table and integration guides below.
+
 ## Supported Platforms
 
 | Platform | Support scope |
@@ -26,6 +38,7 @@ constructed independently with `HttpClient::new`.
 | --- | --- | --- |
 | Engine, basic configuration, logging, errors, shared subscription types | None | Available with `default-features = false` |
 | Shared retry schedules, built-in backoff, jitter and reports | None | Import from `open_net::api::retry`; transport policies remain protocol-specific |
+| Passive HTTP/WS phase diagnostics | `quality-doctor` | Default Off; explicit accessor activates bounded storage lazily; does not enable transports. See [QualityDoctor](doc/quality_doctor.md). |
 | Network monitoring, snapshots, IPv4/IPv6 capability, state subscriptions and ordered events | `net-status` | Create a named `NetStatusClient` through `OpenNet` |
 | Recoverable event callbacks | `net-status` | Stable subscription identity; queue overflow reconciles to a new atomic baseline |
 | On-demand network observation | `net-status` | Windows; async and blocking reachability refresh, with cached IP-stack capability; no network-name collection |

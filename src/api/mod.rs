@@ -10,6 +10,8 @@ pub mod log;
 #[cfg(feature = "net-status")]
 pub mod net_status;
 pub mod network;
+#[cfg(feature = "quality-doctor")]
+pub mod quality;
 pub mod retry;
 pub mod subscription;
 #[cfg(any(feature = "ws-client", feature = "http-client"))]
