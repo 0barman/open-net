@@ -146,6 +146,8 @@ async fn retiring_attempt_freezes_transport_count_before_releasing_registration(
         retry.begin_attempt()?;
         let (sender, _response) = oneshot::channel();
         let control = LogicalControl {
+            #[cfg(feature = "quality-doctor")]
+            quality: None,
             id: runtime.allocate_operation()?,
             runtime: runtime.clone(),
             started: Instant::now(),

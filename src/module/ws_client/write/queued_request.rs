@@ -60,6 +60,10 @@ impl QueuedRequest {
         }
         self.completed = true;
         drop((self.slot_permit.take(), self.byte_permit.take()));
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = self.dispatch_phase.quality() {
+            probe.mark(crate::api::quality::PhaseKind::ResourcesReleased);
+        }
         let result = match (result, self.registration.as_ref()) {
             (Ok(()), Some(registration)) => match registration.pending().upgrade() {
                 Some(pending) => pending

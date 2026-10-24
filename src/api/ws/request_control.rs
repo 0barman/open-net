@@ -184,6 +184,31 @@ pub struct RequestHandle {
 }
 
 impl RequestHandle {
+    /// Returns the `WsRequest` diagnostic reference for this request registration.
+    ///
+    /// The SDK allocates the observation while preparing admission and binds it to
+    /// this registration's operation control. It can include queueing, local
+    /// transport writing, response matching, and delivery boundaries when those
+    /// phases were observed. For a retried logical request, this reference belongs
+    /// to an individual registration; the enclosing
+    /// [`super::WsRequestOperationHandle::quality_ref`] identifies its parent
+    /// logical operation when both observations were retained.
+    ///
+    /// `None` means no observation was allocated, including Off/dormant or excluded
+    /// WebSocket collection, unavailable owner, or exhausted diagnostic capacity.
+    /// Reading this value does not activate collection or wait for a response.
+    /// Resolve it with the owning engine's `QualityDoctor::lookup`; references
+    /// neither pin reports nor guarantee that all phase events were retained.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_ref(&self) -> Option<crate::api::quality::QualityReportRef> {
+        self.core.quality_ref()
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality_parent(&self, parent: crate::api::quality::QualityReportRef) {
+        if let Some(probe) = self.core.quality() {
+            probe.parent(parent);
+        }
+    }
     pub(crate) fn retry_report(&self) -> crate::api::retry::RetryReport {
         self.core.retry_report()
     }

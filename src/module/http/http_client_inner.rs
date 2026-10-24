@@ -42,6 +42,10 @@ use crate::api::http::{
 };
 #[cfg(feature = "http-client-http2")]
 use crate::api::http::{HttpResponseInfo, HttpVersionPolicy};
+#[cfg(feature = "quality-doctor")]
+use crate::api::quality::{PhaseKind, QualityOperationKind, QualityOutcome, QualityProtocol};
+#[cfg(feature = "quality-doctor")]
+use crate::module::quality::{QualityContext, QualityOwner, QualityPhaseGuard, QualityProbe};
 use bytes::BytesMut;
 use futures_util::{FutureExt, StreamExt};
 use http::Method;
@@ -62,6 +66,9 @@ use tokio::time::Instant;
 #[cfg(feature = "http-client-cookies")]
 #[path = "cookie_hooks.rs"]
 mod cookie_hooks;
+#[cfg(feature = "quality-doctor")]
+#[path = "quality_observation.rs"]
+mod quality_observation;
 #[cfg(feature = "http-client-cookies")]
 use cookie_hooks::{apply_cookie_header, update_response_cookies};
 #[path = "response_hops.rs"]
@@ -113,6 +120,31 @@ pub(crate) fn create_http_client(
     })
 }
 
+#[cfg(feature = "quality-doctor")]
+pub(crate) fn create_http_client_with_quality(
+    thread_name: String,
+    config: HttpClientConfig,
+    context: NetworkStatusContext,
+    quality: QualityContext,
+) -> Result<HttpClient, NetError> {
+    if config.has_standalone_quality_doctor() {
+        return Err(NetError::config(
+            "http.quality_doctor",
+            "engine clients inherit QualityDoctor",
+        ));
+    }
+    let threads = context.common_engine()?.resource_threads();
+    Ok(HttpClient {
+        inner: HttpClientInner::new_with_quality(
+            thread_name,
+            config,
+            Some(context),
+            Some(threads),
+            Some(quality),
+        )?,
+    })
+}
+
 pub(crate) struct SendJob {
     pub(crate) request: Box<dyn HttpRequestTrait>,
     pub(crate) options: HttpRequestOptions,
@@ -143,6 +175,10 @@ enum SendCommand {
 }
 
 pub(crate) struct HttpClientInner {
+    #[cfg(feature = "quality-doctor")]
+    quality: QualityContext,
+    #[cfg(feature = "quality-doctor")]
+    quality_client_id: u64,
     request_tx: mpsc::Sender<SendCommand>,
     supervisor_tx: mpsc::Sender<StreamSupervisor>,
     shutdown_sent: Arc<AtomicBool>,
@@ -230,13 +266,29 @@ impl RetryObserverLifecycle {
         self.state.finish(reason);
     }
     fn complete(&mut self, result: &HttpResponseResult, exhausted: bool) {
-        self.complete_summary(result.as_ref().map(|r| r.status), exhausted);
+        self.complete_summary(
+            result.as_ref().map(|r| r.status),
+            exhausted,
+            #[cfg(feature = "quality-doctor")]
+            true,
+        );
     }
-    fn complete_summary(&mut self, result: Result<http::StatusCode, &NetError>, exhausted: bool) {
+    fn complete_summary(
+        &mut self,
+        result: Result<http::StatusCode, &NetError>,
+        exhausted: bool,
+        #[cfg(feature = "quality-doctor")] record_quality_result: bool,
+    ) {
         if self.completed {
             return;
         }
         self.completed = true;
+        #[cfg(feature = "quality-doctor")]
+        if record_quality_result {
+            if let Some(control) = &self.control {
+                control.quality_result(result);
+            }
+        }
         let reason = match result {
             Err(error) => stop_for_error(error),
             Ok(status) if status.is_success() => RetryStopReason::Completed,
@@ -251,6 +303,8 @@ impl RetryObserverLifecycle {
         self.frozen_report = Some(report.clone());
         if let Some(control) = &self.control {
             control.set_retry_report(report.clone());
+            #[cfg(feature = "quality-doctor")]
+            control.quality_mark(PhaseKind::ReportFrozen);
         }
         let Some(observer) = &self.observer else {
             return;
@@ -309,6 +363,14 @@ impl Drop for RegistrationGuard {
     fn drop(&mut self) {
         if !self.committed.load(Ordering::Acquire) {
             self.registry.finish(self.request_id, &self.control);
+            #[cfg(feature = "quality-doctor")]
+            {
+                #[cfg(feature = "http-client-middleware")]
+                if self.control.middleware_active.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.control.quality_finish();
+            }
         }
     }
 }
@@ -330,6 +392,10 @@ impl PendingRetryObservation {
     }
 }
 pub(crate) struct CancellationSignal {
+    #[cfg(feature = "quality-doctor")]
+    quality: std::sync::OnceLock<QualityProbe>,
+    #[cfg(feature = "quality-doctor")]
+    quality_first_chunk: AtomicBool,
     phase: std::sync::atomic::AtomicU8,
     completion: std::sync::OnceLock<HttpCompletion>,
     completion_notify: Notify,
@@ -351,6 +417,10 @@ pub(crate) struct CancellationSignal {
 impl CancellationSignal {
     fn new() -> Self {
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality: std::sync::OnceLock::new(),
+            #[cfg(feature = "quality-doctor")]
+            quality_first_chunk: AtomicBool::new(false),
             phase: std::sync::atomic::AtomicU8::new(0),
             completion: std::sync::OnceLock::new(),
             completion_notify: Notify::new(),
@@ -437,6 +507,11 @@ impl CancellationSignal {
     fn publish_completion(&self, completion: HttpCompletion) {
         self.phase.fetch_or(2, Ordering::AcqRel);
         if self.completion.set(completion).is_ok() {
+            #[cfg(feature = "quality-doctor")]
+            {
+                self.quality_mark(PhaseKind::CompletionPublished);
+                self.quality_finish();
+            }
             self.completion_notify.notify_waiters();
         }
     }
@@ -676,6 +751,8 @@ impl RequestRegistry {
             }
         };
         if removed.is_some() {
+            #[cfg(feature = "quality-doctor")]
+            control.quality_mark(PhaseKind::ResourcesReleased);
             self.changed.notify_waiters();
         }
         drop(removed);
@@ -753,7 +830,40 @@ impl HttpClientInner {
         context: Option<NetworkStatusContext>,
         threads: Option<Arc<crate::common::retirement::ThreadRegistry>>,
     ) -> Result<Arc<Self>, NetError> {
+        Self::new_with_quality(
+            thread_name,
+            config,
+            context,
+            threads,
+            #[cfg(feature = "quality-doctor")]
+            None,
+        )
+    }
+
+    fn new_with_quality(
+        thread_name: String,
+        config: HttpClientConfig,
+        context: Option<NetworkStatusContext>,
+        threads: Option<Arc<crate::common::retirement::ThreadRegistry>>,
+        #[cfg(feature = "quality-doctor")] inherited_quality: Option<QualityContext>,
+    ) -> Result<Arc<Self>, NetError> {
         config.validate()?;
+        #[cfg(feature = "quality-doctor")]
+        let quality_owner = inherited_quality
+            .is_none()
+            .then(|| QualityOwner::new(config.standalone_quality_config()));
+        #[cfg(feature = "quality-doctor")]
+        let quality = inherited_quality.unwrap_or_else(|| {
+            quality_owner
+                .as_ref()
+                .map(QualityOwner::context)
+                .unwrap_or_default()
+        });
+        #[cfg(feature = "quality-doctor")]
+        let quality_client_id = quality.allocate_client_id();
+        #[cfg(feature = "quality-doctor")]
+        let client = build_client_with_quality(&config, quality.clone(), quality_client_id)?;
+        #[cfg(not(feature = "quality-doctor"))]
         let client = build_client(&config)?;
         let network_observation = context.map(HttpNetworkObservation::new).transpose()?;
         let (request_tx, request_rx) = mpsc::channel(config.request_queue_capacity);
@@ -838,16 +948,21 @@ impl HttpClientInner {
             return Err(error);
         }
 
+        let shutdown_state =
+            WorkerShutdown::from_joins(vec![send_thread, receive_thread, callback_thread], threads);
+        #[cfg(feature = "quality-doctor")]
+        shutdown_state.set_quality_owner(quality_owner);
         Ok(Arc::new(Self {
+            #[cfg(feature = "quality-doctor")]
+            quality,
+            #[cfg(feature = "quality-doctor")]
+            quality_client_id,
             request_tx,
             supervisor_tx,
             shutdown_sent,
             admission_gate: Mutex::new(()),
             shutdown_notify,
-            shutdown_state: Arc::new(WorkerShutdown::from_joins(
-                vec![send_thread, receive_thread, callback_thread],
-                threads,
-            )),
+            shutdown_state: Arc::new(shutdown_state),
             observation_cleanup_reported: AtomicBool::new(false),
             client,
             config,
@@ -1095,67 +1210,22 @@ impl HttpClientInner {
         request: HttpRequest,
         operation_start: Instant,
     ) -> Result<HttpStreamResponse, NetError> {
-        let policy = request.retry_setting().resolve(
-            &self.config.default_retry_policy,
-            crate::api::http::HttpRetryPolicy::no_retry(),
-        );
-        let mut owner = StreamOwner::new(&policy, operation_start);
-        let resolved = match self
-            .config
-            .timeouts()
-            .resolve(request.timeouts(), self.config.timeout)
-        {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let report = owner.complete(Err(&error), false);
-                return Err(error.with_retry_report(report));
-            }
-        };
-        let admission = self
-            .admit_stream(
-                self.future_admission_policy(&request),
-                resolved,
-                operation_start,
-                &mut owner,
-            )
-            .await;
-        let (request_id, control) = match admission {
-            Ok(admission) => admission,
-            Err(error) => {
-                let report = owner.complete(Err(&error), false);
-                return Err(error.with_retry_report(report));
-            }
-        };
-        let result = self
-            .open_stream_after_admission(
-                request,
-                &policy,
-                resolved,
-                operation_start,
-                &mut owner,
-                request_id,
-                Arc::clone(&control),
-            )
-            .await
-            .map_err(|error| {
-                error
-                    .with_http_request_id(request_id)
-                    .with_http_attempt(control.attempt.load(Ordering::Acquire))
-            });
-        match result {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                let report = owner.complete(Err(&error), false);
-                Err(error.with_retry_report(report))
-            }
-        }
+        self.stream_request_observed(
+            request,
+            operation_start,
+            #[cfg(feature = "quality-doctor")]
+            None,
+        )
+        .await
     }
 
-    #[cfg(feature = "http-client-middleware")]
-    pub(crate) async fn stream_request_with_middleware(
-        self: &Arc<Self>,
+    pub(crate) async fn stream_request_observed(
+        &self,
         request: HttpRequest,
         operation_start: Instant,
+        #[cfg(feature = "quality-doctor")] reference: Option<
+            &mut Option<crate::api::quality::QualityReportRef>,
+        >,
     ) -> Result<HttpStreamResponse, NetError> {
         let policy = request.retry_setting().resolve(
             &self.config.default_retry_policy,
@@ -1188,6 +1258,96 @@ impl HttpClientInner {
                 return Err(error.with_retry_report(report));
             }
         };
+        #[cfg(feature = "quality-doctor")]
+        if let Some(reference) = reference {
+            *reference = control.quality_ref();
+        }
+        let result = self
+            .open_stream_after_admission(
+                request,
+                &policy,
+                resolved,
+                operation_start,
+                &mut owner,
+                request_id,
+                Arc::clone(&control),
+            )
+            .await
+            .map_err(|error| {
+                #[cfg(feature = "quality-doctor")]
+                let error = control.quality_error(error);
+                error
+                    .with_http_request_id(request_id)
+                    .with_http_attempt(control.attempt.load(Ordering::Acquire))
+            });
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let report = owner.complete(Err(&error), false);
+                Err(error.with_retry_report(report))
+            }
+        }
+    }
+
+    #[cfg(feature = "http-client-middleware")]
+    pub(crate) async fn stream_request_with_middleware(
+        self: &Arc<Self>,
+        request: HttpRequest,
+        operation_start: Instant,
+    ) -> Result<HttpStreamResponse, NetError> {
+        self.stream_request_with_middleware_observed(
+            request,
+            operation_start,
+            #[cfg(feature = "quality-doctor")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "http-client-middleware")]
+    pub(crate) async fn stream_request_with_middleware_observed(
+        self: &Arc<Self>,
+        request: HttpRequest,
+        operation_start: Instant,
+        #[cfg(feature = "quality-doctor")] reference: Option<
+            &mut Option<crate::api::quality::QualityReportRef>,
+        >,
+    ) -> Result<HttpStreamResponse, NetError> {
+        let policy = request.retry_setting().resolve(
+            &self.config.default_retry_policy,
+            crate::api::http::HttpRetryPolicy::no_retry(),
+        );
+        let mut owner = StreamOwner::new(&policy, operation_start);
+        let resolved = match self
+            .config
+            .timeouts()
+            .resolve(request.timeouts(), self.config.timeout)
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let report = owner.complete(Err(&error), false);
+                return Err(error.with_retry_report(report));
+            }
+        };
+        let admission = self
+            .admit_stream(
+                self.future_admission_policy(&request),
+                resolved,
+                operation_start,
+                &mut owner,
+            )
+            .await;
+        let (request_id, control) = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                let report = owner.complete(Err(&error), false);
+                return Err(error.with_retry_report(report));
+            }
+        };
+        #[cfg(feature = "quality-doctor")]
+        if let Some(reference) = reference {
+            *reference = control.quality_ref();
+        }
         let total = StreamBudget::total(operation_start, resolved.total)?;
         let permit = owner
             .lease
@@ -1205,6 +1365,13 @@ impl HttpClientInner {
         )?;
         if let Some(lifecycle) = owner.lifecycle.as_mut() {
             lifecycle.deferred = control.middleware_completion.get().cloned();
+        }
+        // Dropping an unused Next, or its opening future on middleware timeout,
+        // is cleanup rather than a selected Cancelled result. The middleware
+        // lease records the actual outcome. A delivered body owns its fallback.
+        #[cfg(feature = "quality-doctor")]
+        {
+            owner.quality_result_on_drop = false;
         }
         let call = HttpCall::new(request, request_id, HttpResponseMode::Streaming);
         let chain = self.middleware_chain();
@@ -1309,9 +1476,16 @@ impl HttpClientInner {
             lifecycle.control = Some(Arc::clone(&control));
             let attempt = lifecycle.attempt_started()?;
             control.attempt.store(attempt, Ordering::Release);
+            #[cfg(feature = "quality-doctor")]
+            if let Some(probe) = control.quality.get() {
+                probe.attempt(u64::from(attempt));
+                probe.hop(0);
+            }
             let budget =
                 total.with_phase(Instant::now(), resolved.attempt, TimeoutPhase::Attempt)?;
             check_stream_start(total, &control)?;
+            #[cfg(feature = "quality-doctor")]
+            let preparation = control.quality_phase(PhaseKind::Preparation);
             let build_future = build_spec_request(
                 &request,
                 &self.config,
@@ -1323,13 +1497,15 @@ impl HttpClientInner {
                 &control,
             );
             let prepared = run_budget(budget, &control, ErrorStage::Provider, build_future).await;
+            #[cfg(feature = "quality-doctor")]
+            drop(preparation);
             let headers_budget =
                 budget.with_phase(Instant::now(), resolved.headers, TimeoutPhase::Headers)?;
             let (result, _auth_generation) = match prepared {
                 Ok((built, generation)) => (
                     run_budget(headers_budget, &control, ErrorStage::Response, async {
                         control.record_transport_send()?;
-                        self.client.execute(built).await.map_err(map_execute_error)
+                        execute_request(&self.client, built, &control, 0).await
                     })
                     .await,
                     generation,
@@ -1524,6 +1700,10 @@ impl HttpClientInner {
                 budget.with_phase(body_start, resolved.idle_read, TimeoutPhase::IdleRead)?;
             check_budget(active_budget, &control, ErrorStage::Receive)?;
             let body_owner = StreamOwner {
+                #[cfg(feature = "quality-doctor")]
+                quality_result_on_drop: true,
+                #[cfg(feature = "quality-doctor")]
+                quality_body_phase: owner.quality_body_phase.take(),
                 lease: owner.lease.take(),
                 supervisor_slot: owner.supervisor_slot.take(),
                 lifecycle: owner.lifecycle.take(),
@@ -1690,6 +1870,8 @@ async fn run_middleware_runner(
     let report = control.retry_report();
     match result {
         Ok(HttpMiddlewareResponse::Buffered(response)) => {
+            #[cfg(feature = "quality-doctor")]
+            let response = control.quality_response(response);
             Ok(HttpMiddlewareResponse::Buffered(match report {
                 Some(report) => response.with_retry_report(report),
                 None => response,
@@ -1697,6 +1879,8 @@ async fn run_middleware_runner(
         }
         Ok(other) => Ok(other),
         Err(error) => {
+            #[cfg(feature = "quality-doctor")]
+            let error = control.quality_error(error);
             let error = error
                 .with_http_request_id(request_id)
                 .with_http_attempt(control.attempt.load(Ordering::Acquire));
@@ -1740,6 +1924,29 @@ impl Drop for HttpClientInner {
 }
 
 fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
+    build_client_impl(
+        config,
+        #[cfg(feature = "quality-doctor")]
+        QualityContext::default(),
+        #[cfg(feature = "quality-doctor")]
+        0,
+    )
+}
+
+#[cfg(feature = "quality-doctor")]
+fn build_client_with_quality(
+    config: &HttpClientConfig,
+    quality: QualityContext,
+    client_id: u64,
+) -> Result<Client, NetError> {
+    build_client_impl(config, quality, client_id)
+}
+
+fn build_client_impl(
+    config: &HttpClientConfig,
+    #[cfg(feature = "quality-doctor")] quality: QualityContext,
+    #[cfg(feature = "quality-doctor")] quality_client_id: u64,
+) -> Result<Client, NetError> {
     // The SDK merges common headers for the initial request and owns every
     // redirect. Transport defaults would reinsert credentials removed on a hop.
     let builder = Client::builder()
@@ -1768,6 +1975,15 @@ fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
         builder =
             builder.connector_layer(super::connect_timeout::ConnectTimeoutLayer::new(timeout));
     }
+    #[cfg(feature = "quality-doctor")]
+    if quality.is_enabled_for(QualityProtocol::Http) {
+        // Added after the existing timeout layer: observe its result without
+        // changing its deadline, error source, cancellation or service calls.
+        builder = builder.connector_layer(quality_observation::ConnectorLayer::new(
+            quality,
+            quality_client_id,
+        ));
+    }
     if !config.environment_proxy {
         builder = builder.no_proxy();
     }
@@ -1783,6 +1999,23 @@ fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
     builder
         .build()
         .map_err(|error| map_reqwest_error(error, ErrorStage::Configuration))
+}
+
+async fn execute_request(
+    client: &Client,
+    request: reqwest::Request,
+    control: &CancellationSignal,
+    hop: u64,
+) -> Result<Response, NetError> {
+    #[cfg(feature = "quality-doctor")]
+    {
+        quality_observation::execute(client, request, control, hop).await
+    }
+    #[cfg(not(feature = "quality-doctor"))]
+    {
+        let _ = (control, hop);
+        client.execute(request).await.map_err(map_execute_error)
+    }
 }
 
 type RuntimeReady = (WorkerJoin, std::sync::mpsc::Receiver<Result<(), NetError>>);
@@ -1862,6 +2095,8 @@ async fn send_loop(
             command = request_rx.recv() => {
                 match command {
                     Some(SendCommand::Job(job)) => {
+                        #[cfg(feature = "quality-doctor")]
+                        job.control.quality_mark(PhaseKind::Dequeued);
                         let client = client.clone();
                         let config = Arc::clone(&config);
                         let response_tx = response_tx.clone();
@@ -1893,6 +2128,8 @@ async fn send_loop(
             },
             command = request_rx.recv(), if !requests_done => match command {
                 Some(SendCommand::Job(job)) => {
+                    #[cfg(feature = "quality-doctor")]
+                    job.control.quality_mark(PhaseKind::Dequeued);
                     let client = client.clone();
                     let config = Arc::clone(&config);
                     let response_tx = response_tx.clone();
@@ -1917,6 +2154,8 @@ async fn process_job(
     initial_attempt: u32,
 ) {
     job.control.defer_observer.store(true, Ordering::Release);
+    #[cfg(feature = "quality-doctor")]
+    job.control.quality_mark(PhaseKind::WorkerStarted);
     // Keep ownership of the request outside the attempt future so a user implementation
     // unwinding while building a request still receives its terminal result.
     let result = match AssertUnwindSafe(run_request(&mut job, &client, &config, initial_attempt))
@@ -1942,6 +2181,8 @@ async fn process_job(
             report.elapsed = job.operation_start.elapsed();
             report.stop_reason = Some(stop_for_error(&error));
             job.control.set_retry_report(report.clone());
+            #[cfg(feature = "quality-doctor")]
+            job.control.quality_mark(PhaseKind::ReportFrozen);
         }
         error
             .with_retry_report(report)
@@ -1949,6 +2190,15 @@ async fn process_job(
             .with_http_attempt(job.control.attempt.load(Ordering::Acquire))
     });
     let inline_result = job.inline_result;
+    #[cfg(feature = "quality-doctor")]
+    job.control
+        .quality_result(result.as_ref().map(|response| response.status));
+    #[cfg(feature = "quality-doctor")]
+    let result = result
+        .map(|response| job.control.quality_response(response))
+        .map_err(|error| job.control.quality_error(error));
+    #[cfg(feature = "quality-doctor")]
+    job.control.quality_mark(PhaseKind::ResponseQueue);
     let response = ReceiveJob {
         request: job.request,
         result,
@@ -1992,10 +2242,14 @@ async fn run_request(
     {
         lifecycle.deferred = job.control.middleware_completion.get().cloned();
     }
+    #[cfg(feature = "quality-doctor")]
+    let method_getter = job.control.quality_phase(PhaseKind::RequestGetters);
     let method: Method = match job.request.get_method().try_into() {
         Ok(method) => method,
         Err(error) => return terminal_error(&mut lifecycle, error),
     };
+    #[cfg(feature = "quality-doctor")]
+    drop(method_getter);
     #[cfg(feature = "http-client-cookies")]
     let cookie_context = job.request.cookie_context();
     let retry_allowed = policy.allows_method(&method, replayable);
@@ -2025,11 +2279,24 @@ async fn run_request(
         }
         let attempt = lifecycle.attempt_started()?;
         job.control.attempt.store(attempt, Ordering::Release);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = job.control.quality.get() {
+            probe.attempt(u64::from(attempt));
+            probe.hop(0);
+        }
         let budget = total.with_phase(Instant::now(), resolved.attempt, TimeoutPhase::Attempt)?;
+        #[cfg(feature = "quality-doctor")]
+        let preparation = job.control.quality_phase(PhaseKind::Preparation);
+        #[cfg(feature = "quality-doctor")]
+        let getters = job.control.quality_phase(PhaseKind::RequestGetters);
         let request_path = job.request.get_path();
         let request_headers = job.request.headers();
         let request_body = job.request.get_req_body();
         let request_body_present = !request_body.is_empty() || job.request.has_req_body();
+        #[cfg(feature = "quality-doctor")]
+        drop(getters);
+        #[cfg(feature = "quality-doctor")]
+        let request_build = job.control.quality_phase(PhaseKind::RequestBuild);
         let build = build_request(
             request_path,
             request_headers.clone(),
@@ -2046,6 +2313,10 @@ async fn run_request(
             &job.control,
         );
         let prepared = run_budget(budget, &job.control, ErrorStage::Provider, build).await;
+        #[cfg(feature = "quality-doctor")]
+        drop(request_build);
+        #[cfg(feature = "quality-doctor")]
+        drop(preparation);
         let headers_budget =
             budget.with_phase(Instant::now(), resolved.headers, TimeoutPhase::Headers)?;
         // Preparation and transport failures share the existing retry policy, while
@@ -2054,7 +2325,7 @@ async fn run_request(
             Ok((request, _has_body, generation)) => (
                 run_budget(headers_budget, &job.control, ErrorStage::Response, async {
                     job.control.record_transport_send()?;
-                    client.execute(request).await.map_err(map_execute_error)
+                    execute_request(client, request, &job.control, 0).await
                 })
                 .await,
                 generation,
@@ -2523,6 +2794,8 @@ async fn wait_for_retry(
     deadline: Option<Instant>,
     control: &CancellationSignal,
 ) -> bool {
+    #[cfg(feature = "quality-doctor")]
+    let _backoff = control.quality_phase(PhaseKind::Backoff);
     let delay = match deadline {
         Some(limit) => match limit.checked_duration_since(Instant::now()) {
             Some(remaining) => remaining.min(delay),
@@ -2541,6 +2814,8 @@ async fn receive_loop(
     callback_tx: mpsc::Sender<CallbackJob>,
 ) {
     while let Some(job) = response_rx.recv().await {
+        #[cfg(feature = "quality-doctor")]
+        job.control.quality_mark(PhaseKind::CallbackQueue);
         if let Err(error) = callback_tx.send(job).await {
             crate::log_e!(crate::LogType::HTTP; "http.receive_loop", "error|response_rx|callback_tx", "callback_queue_closed", "provided", "provided");
             run_callback(error.0).await;
@@ -2558,6 +2833,8 @@ async fn read_response(
     budget: StreamBudget,
     idle_timeout: Option<Duration>,
 ) -> HttpResponseResult {
+    #[cfg(feature = "quality-doctor")]
+    let _body_phase = control.quality_phase(PhaseKind::ResponseBody);
     let status = response.status();
     let headers = response.headers().clone();
     #[cfg(feature = "http-client-http2")]
@@ -2576,6 +2853,8 @@ async fn read_response(
             let Some(chunk) = next else {
                 break;
             };
+            #[cfg(feature = "quality-doctor")]
+            control.quality_chunk(chunk.len());
             if !chunk.is_empty() {
                 read_budget =
                     budget.with_phase(Instant::now(), idle_timeout, TimeoutPhase::IdleRead)?;
@@ -2636,6 +2915,8 @@ async fn run_callback(job: CallbackJob) {
     // Declare the unique completion owner before operation resources so unwind
     // and future-drop paths release those resources before publishing completion.
     let mut completion = job.completion;
+    #[cfg(feature = "quality-doctor")]
+    let callback_phase = job.control.quality_phase(PhaseKind::Callback);
     let registration = RegistrationGuard {
         registry: job.registry,
         request_id: job.request_id,
@@ -2678,6 +2959,10 @@ async fn run_callback(job: CallbackJob) {
     let result = result
         .map(|response| response.with_retry_report(report.clone()))
         .map_err(|error| error.with_retry_report(report.clone()));
+    #[cfg(feature = "quality-doctor")]
+    let result = result
+        .map(|response| job.control.quality_response(response))
+        .map_err(|error| job.control.quality_annotate(error));
     job.control.emit_pending_observation(report.clone());
     if let Some(completion) = completion.as_mut() {
         completion.delivered(
@@ -2692,11 +2977,14 @@ async fn run_callback(job: CallbackJob) {
     }
     let mut callback_result = Ok(());
     let callback_error = || {
-        NetError::from(ErrorKind::CallbackPanicked)
+        let error = NetError::from(ErrorKind::CallbackPanicked)
             .with_retry_report(report.clone())
             .with_stage(ErrorStage::Dispatch)
             .with_http_request_id(job.request_id)
-            .with_http_attempt(job.control.attempt.load(Ordering::Acquire))
+            .with_http_attempt(job.control.attempt.load(Ordering::Acquire));
+        #[cfg(feature = "quality-doctor")]
+        let error = job.control.quality_annotate(error);
+        error
     };
     let request = job.request;
     if let Ok(response) = &result {
@@ -2718,6 +3006,10 @@ async fn run_callback(job: CallbackJob) {
         callback_result = Err(callback_error());
         crate::log_e!(crate::LogType::HTTP; "http.run_callback", "error|job_request_id|job_completion_present", "callback_panicked", "<redacted>", completion.is_some());
     }
+    #[cfg(feature = "quality-doctor")]
+    drop(callback_phase);
+    #[cfg(feature = "quality-doctor")]
+    job.control.quality_mark(PhaseKind::DeliveryFinished);
     drop(permit);
     drop(registration);
     if let Some(completion) = completion.as_mut() {
@@ -3448,6 +3740,10 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel(1);
         Ok((
             HttpClientInner {
+                #[cfg(feature = "quality-doctor")]
+                quality: QualityContext::default(),
+                #[cfg(feature = "quality-doctor")]
+                quality_client_id: 0,
                 network_observation: None,
                 request_tx,
                 supervisor_tx: mpsc::channel(1).0,

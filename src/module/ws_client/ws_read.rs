@@ -222,6 +222,47 @@ fn route_and_publish(
     runtime: &Arc<SessionRuntime>,
     incoming: IncomingMessage,
 ) -> crate::Result<()> {
+    #[cfg(feature = "quality-doctor")]
+    let mut observation = crate::module::ws_client::quality::QualityScope::new(
+        runtime.quality_begin(crate::api::quality::QualityOperationKind::WsReceive),
+    );
+    #[cfg(feature = "quality-doctor")]
+    let incoming = {
+        let mut incoming = incoming;
+        if let Some(probe) = &observation.probe {
+            probe.connection(incoming.connection_id().as_u64());
+            probe.bytes(incoming.message().map_or(0, |message| message.len()) as u64);
+            probe.mark(crate::api::quality::PhaseKind::PayloadReceived);
+            incoming.bind_quality(probe.reference());
+        }
+        incoming
+    };
+    #[cfg(feature = "quality-doctor")]
+    let routing = observation.probe.as_ref().map(|probe| probe.phase(crate::api::quality::PhaseKind::ResponseRouting));
+    let result = route_and_publish_inner(runtime, incoming);
+    #[cfg(feature = "quality-doctor")]
+    {
+        drop(routing);
+        if result.is_ok() && matches!(runtime.routing, ResponseRouting::Manual) {
+            if let Some(probe) = &observation.probe {
+                probe.mark(crate::api::quality::PhaseKind::ManualDispatch);
+            }
+        }
+        observation.outcome = match &result {
+            Ok(()) => crate::api::quality::QualityOutcome::Success,
+            Err(error) => {
+                if let Some(probe) = &observation.probe { probe.error(error); }
+                crate::api::quality::QualityOutcome::from_error(error)
+            }
+        };
+    }
+    result
+}
+
+fn route_and_publish_inner(
+    runtime: &Arc<SessionRuntime>,
+    incoming: IncomingMessage,
+) -> crate::Result<()> {
     // The application protocol runs outside every pending/operation table lock.
     match runtime.routing.route(&incoming)? {
         ResponseRoute::Final { request_id } => {

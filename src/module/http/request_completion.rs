@@ -54,12 +54,20 @@ impl Drop for CompletionLease {
             .with_stage(ErrorStage::Dispatch)
             .with_http_request_id(self.request_id)
             .with_http_attempt(self.control.attempt.load(Ordering::Acquire));
+        #[cfg(feature = "quality-doctor")]
+        let fallback = self.control.quality_annotate(fallback);
+        #[cfg(feature = "quality-doctor")]
+        if self.response.is_none() {
+            self.control.quality_result(Err(&fallback));
+        }
         let mut report = match self.control.retry_report() {
             Some(report) => report,
             None => crate::api::retry::RetryReport::new(),
         };
         if report.stop_reason.is_none() {
             report.stop_reason = Some(crate::api::retry::RetryStopReason::PolicyFailed);
+            #[cfg(feature = "quality-doctor")]
+            self.control.quality_mark(super::PhaseKind::ReportFrozen);
         }
         let result = HttpCompletion {
             retry_report: report.clone(),

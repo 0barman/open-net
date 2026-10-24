@@ -58,6 +58,8 @@ impl OpenNetInner {
             config.runtime_worker_threads, config.async_queue_capacity, config.sync_queue_capacity);
         let result: Result<Self, NetError> = (|| {
             config.validate()?;
+            #[cfg(feature = "quality-doctor")]
+            let quality = crate::module::quality::QualityOwner::new(config.quality_doctor);
             #[cfg(feature = "ws-client")]
             let network = Arc::new(CompiledNetworkConfig::new(config.network_config)?);
             let common_engine = Arc::new(CommonEngine::new_with_runtime_worker_threads(
@@ -71,6 +73,8 @@ impl OpenNetInner {
                     common_engine.clone(),
                 )?;
             let mut inner = Self {
+                #[cfg(feature = "quality-doctor")]
+                quality,
                 shutdown: None,
                 common_engine,
                 #[cfg(feature = "net-status")]
@@ -123,6 +127,8 @@ impl OpenNetInner {
         let clients_changed = Arc::clone(&self.clients_changed);
         let default_network = Arc::clone(&self.network);
         let network_status = self.network_status.context();
+        #[cfg(feature = "quality-doctor")]
+        let quality = self.quality.context();
         let operation_engine = self.common_engine.clone();
         self.common_engine.post(async move {
             // Accepted creation owns its runtime through failure cleanup without
@@ -137,7 +143,11 @@ impl OpenNetInner {
                 None => Ok(default_network),
             };
             let created = network.and_then(|network| {
-                create_client_worker(thread_name.as_str(), config, network, network_status.clone())
+                create_client_worker(
+                    thread_name.as_str(), config, network, network_status.clone(),
+                    #[cfg(feature = "quality-doctor")]
+                    quality,
+                )
             });
             let result =
                 match created {
@@ -368,6 +378,13 @@ impl OpenNetInner {
     ) -> Result<HttpClient, NetError> {
         crate::log_t!(LogType::HTTP; "create_http_client", "config", format!("{config:?}"));
         config.validate()?;
+        #[cfg(feature = "quality-doctor")]
+        if config.has_standalone_quality_doctor() {
+            return Err(NetError::config(
+                "quality_doctor",
+                "standalone diagnostic configuration cannot be used by an engine client",
+            ));
+        }
         self.http_clients
             .lock()
             .map_err(NetError::from_poison)
@@ -387,9 +404,18 @@ impl OpenNetInner {
         let clients = Arc::clone(&self.http_clients);
         let name = thread_name.clone();
         let network_status = self.network_status.context();
+        #[cfg(feature = "quality-doctor")]
+        let quality = self.quality.context();
         self.common_engine.post(async move {
             let creation_context = network_status.clone();
             let created = match tokio::task::spawn_blocking(move || {
+                #[cfg(feature = "quality-doctor")]
+                {
+                    crate::module::http::http_client_inner::create_http_client_with_quality(
+                        name, config, creation_context, quality,
+                    )
+                }
+                #[cfg(not(feature = "quality-doctor"))]
                 crate::module::http::http_client_inner::create_http_client(name, config, creation_context)
             })
             .await
@@ -652,6 +678,7 @@ fn create_client_worker(
     config: WebSocketClientConfig,
     network: Arc<CompiledNetworkConfig>,
     network_status: crate::net_status::NetworkStatusContext,
+    #[cfg(feature = "quality-doctor")] quality: crate::module::quality::QualityContext,
 ) -> Result<(WebSocketClient, ThreadHandle), NetError> {
     crate::log_t!(LogType::WSC; "ws.create_client_worker",
         "config_close_timeout|config_command_capacity|config_heartbeat_enabled|network_status_policy|network_status",
@@ -674,6 +701,8 @@ fn create_client_worker(
             network_observation,
             threads.clone(),
         )?;
+        #[cfg(feature = "quality-doctor")]
+        inner.bind_quality(quality);
         let client = WebSocketClient::from_inner(inner);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker_thread = threads.spawn_tracked(thread_name, move || worker.run(ready_tx))

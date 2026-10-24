@@ -59,6 +59,8 @@ impl ShutdownReason {
 /// Client-wide worker and resource ownership. Session admission retains only a
 /// weak lifecycle reference and therefore never keeps a completed session alive.
 pub(crate) struct WSClientInner {
+    #[cfg(feature = "quality-doctor")]
+    quality: std::sync::OnceLock<crate::module::quality::QualityContext>,
     config: Arc<WebSocketClientConfig>,
     network_config: Arc<NetworkConfig>,
     close_timeout: std::time::Duration,
@@ -154,6 +156,8 @@ impl WSClientInner {
             ::tokio::sync::watch::Receiver::borrow(receiver).loss_epoch
         });
         let inner = Arc::new(Self {
+            #[cfg(feature = "quality-doctor")]
+            quality: std::sync::OnceLock::new(),
             config: Arc::new(config.clone()),
             network_config: network.original(),
             close_timeout: config.close_timeout,
@@ -212,6 +216,10 @@ impl WSClientInner {
 
     pub(crate) fn id(&self) -> ClientId {
         self.instance_id
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn bind_quality(&self, quality: crate::module::quality::QualityContext) {
+        let _ = self.quality.set(quality);
     }
     pub(crate) fn config(&self) -> &WebSocketClientConfig {
         &self.config
@@ -306,6 +314,10 @@ impl WSClientInner {
                 self.shutdown.clone(),
                 Arc::clone(&self.config),
             );
+            #[cfg(feature = "quality-doctor")]
+            if let Some(quality) = self.quality.get() {
+                runtime.bind_quality(quality.clone());
+            }
             *admission = Arc::downgrade(&lifecycle);
             (runtime, journal)
         };

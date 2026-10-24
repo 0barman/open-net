@@ -52,6 +52,8 @@ struct OperationState {
 }
 
 pub(crate) struct OperationControl {
+    #[cfg(feature = "quality-doctor")]
+    quality: std::sync::OnceLock<Arc<super::quality::QualityOperation>>,
     client_id: ClientId,
     session_id: SessionId,
     id: OperationId,
@@ -71,6 +73,10 @@ pub(crate) struct OperationControl {
 #[must_use]
 #[derive(Default)]
 pub(crate) struct OperationPublication {
+    #[cfg(feature = "quality-doctor")]
+    quality: Option<super::quality::QualityPublication>,
+    #[cfg(feature = "quality-doctor")]
+    quality_written: Option<crate::module::quality::QualityProbe>,
     task: Option<(TaskEventReservation, TaskEvent)>,
     cancelled: Option<CancellationToken>,
     written: Option<CancellationToken>,
@@ -82,8 +88,17 @@ pub(crate) struct OperationPublication {
 }
 
 impl OperationPublication {
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality_without_pending_response(mut self) -> Self {
+        if let Some(quality) = &mut self.quality { quality.deferred = false; }
+        self
+    }
     pub(crate) fn dispatch(self) {
         let Self {
+            #[cfg(feature = "quality-doctor")]
+            quality,
+            #[cfg(feature = "quality-doctor")]
+            quality_written,
             task,
             cancelled,
             written,
@@ -93,6 +108,10 @@ impl OperationPublication {
             retired_error,
             retry,
         } = self;
+        #[cfg(feature = "quality-doctor")]
+        if let Some(quality) = &quality {
+            quality.select();
+        }
         // Queue ownership and its capacity retire before waking terminal waiters.
         if let Some((queue, token, error)) = queue {
             if let Some(queue) = queue.upgrade() {
@@ -119,6 +138,15 @@ impl OperationPublication {
                 observer.notify(attempt);
             }
             observer.notify(completed);
+        }
+        #[cfg(feature = "quality-doctor")]
+        {
+            if let Some(probe) = quality_written {
+                probe.mark(crate::api::quality::PhaseKind::Written);
+            }
+            if let Some(quality) = quality {
+                quality.publish();
+            }
         }
     }
 }
@@ -163,6 +191,8 @@ impl OperationControl {
             .as_ref()
             .map_or_else(RetrySchedule::no_retry, |policy| policy.schedule().clone());
         Arc::new(Self {
+            #[cfg(feature = "quality-doctor")]
+            quality: std::sync::OnceLock::new(),
             client_id,
             session_id,
             id,
@@ -198,6 +228,32 @@ impl OperationControl {
             cancelled: CancellationToken::new(),
             written: CancellationToken::new(),
         })
+    }
+
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn bind_quality(&self, quality: Option<crate::module::quality::QualityProbe>) {
+        if let Some(probe) = quality {
+            probe.operation(self.id.as_u64());
+            let _ = self.quality.set(super::quality::QualityOperation::new(probe));
+        }
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality(&self) -> Option<&crate::module::quality::QualityProbe> {
+        self.quality.get().map(|quality| &quality.probe)
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality_scope_guard(&self) -> Option<super::quality::QualityActivityGuard> {
+        self.quality.get().map(|quality| quality.observe_scope())
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality_delivery_finished(&self) {
+        if let Some(quality) = self.quality.get() {
+            quality.published();
+        }
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn quality_ref(&self) -> Option<crate::api::quality::QualityReportRef> {
+        self.quality().map(crate::module::quality::QualityProbe::reference)
     }
 
     /// Record the original SDK submission instant, including admission waiting.
@@ -409,6 +465,12 @@ impl OperationControl {
         }
         state.snapshot.phase = OperationPhase::Writing;
         state.connection = Some(connection);
+        drop(state);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = self.quality() {
+            probe.connection(connection.as_u64());
+            probe.mark(crate::api::quality::PhaseKind::Dequeued);
+        }
         true
     }
     /// A write attempt begins only after connection and control-frame scheduling,
@@ -425,6 +487,10 @@ impl OperationControl {
             .map_err(|error| NetError::with_source(ErrorKind::InvalidPolicy, error))?;
         state.retry_attempt_open = true;
         drop(state);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = self.quality() {
+            probe.attempt(attempt as u64);
+        }
         if let Some(observer) = self
             .retry_policy
             .as_ref()
@@ -548,6 +614,10 @@ impl OperationControl {
         let retired = state.retirement.take();
         drop(state);
         drop(retired);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = self.quality() {
+            probe.mark(crate::api::quality::PhaseKind::Requeue);
+        }
         true
     }
     pub(crate) fn select_written(&self) -> (bool, OperationPublication) {
@@ -575,6 +645,8 @@ impl OperationControl {
         state.snapshot.delivery = DeliveryEvidence::Written;
         state.data_in_flight = false;
         publication.written = Some(self.written.clone());
+        #[cfg(feature = "quality-doctor")]
+        { publication.quality_written = self.quality().cloned(); }
         if self.tracked {
             state.snapshot.phase = OperationPhase::AwaitingResponse;
         } else {
@@ -712,6 +784,24 @@ impl OperationControl {
         state.retry.finish(stop);
         let report = state.retry.report(state.retry_started.elapsed());
         let result = result.map_err(|error| error.with_retry_report(report.clone()));
+        #[cfg(feature = "quality-doctor")]
+        let result = result.map_err(|error| match self.quality_ref() {
+            Some(reference) => error.with_quality_ref(reference),
+            None => error,
+        });
+        #[cfg(feature = "quality-doctor")]
+        if let Some(quality) = self.quality.get() {
+            use crate::api::quality::QualityOutcome;
+            let outcome = match &result {
+                Ok(_) => QualityOutcome::Success,
+                Err(error) => QualityOutcome::from_error(error),
+            };
+            publication.quality = Some(super::quality::QualityPublication {
+                observation: quality.clone(), outcome,
+                failure: result.as_ref().err().map(|error| (error.kind(), error.context().stage)),
+                deferred: self.tracked && state.pending.is_some(),
+            });
+        }
         if let Some(observer) = self
             .retry_policy
             .as_ref()
@@ -799,6 +889,8 @@ impl OperationControl {
                 NetError::from(ErrorKind::EngineDropped),
                 TaskEndCause::Shutdown,
             );
+            #[cfg(feature = "quality-doctor")]
+            let publication = publication.quality_without_pending_response();
             return DeferredTermination {
                 publication: Some(publication),
                 retired_error: Some(error),
@@ -830,6 +922,8 @@ impl OperationControl {
                 return table.terminate(&identity.id, identity.token, error, cause);
             }
             let (outcome, publication) = self.select_failure(error, cause);
+            #[cfg(feature = "quality-doctor")]
+            let publication = publication.quality_without_pending_response();
             publication.dispatch();
             return Ok(outcome);
         }

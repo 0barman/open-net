@@ -3,10 +3,10 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 rust-version = "1.89"
-description = "A cross-platform async networking library with WebSocket clients and network status monitoring."
+description = "A cross-platform async networking library for Rust with HTTP and WebSocket clients, network status monitoring, configurable retries, WebSocket reconnection and heartbeats, and managed client lifecycles. Reuse common networking infrastructure across applications to avoid repeated implementation and debugging, helping save development time and AI coding tokens."
 license = "Apache-2.0"
 repository = "https://github.com/0barman/open-net"
 documentation = "https://docs.rs/open-net"
@@ -30,6 +30,10 @@ name = "http_retry"
 required-features = ["http-client"]
 
 [[example]]
+name = "quality_doctor"
+required-features = ["http-client", "quality-doctor"]
+
+[[example]]
 name = "ws_request_retry"
 required-features = ["ws-client"]
 
@@ -51,6 +55,8 @@ required-features = ["net-status"]
 
 [features]
 default = ["ws-client"]
+# Passive, lazily activated diagnostics. This feature enables no transport.
+quality-doctor = []
 # Shared monitoring and LAN discovery. Transports enable this capability because
 # their existing network observation and lifecycle contracts depend on it.
 net-status = ["dep:if-addrs", "dep:n0-watcher", "dep:netwatch", "dep:windows", "dep:core-foundation", "dep:cc"]

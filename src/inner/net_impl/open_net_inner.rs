@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 pub(crate) struct OpenNetInner {
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) quality: crate::module::quality::QualityOwner,
     pub(super) shutdown: Option<super::engine_shutdown::EngineShutdown>,
     #[cfg(feature = "ws-client")]
     pub(super) network: Arc<CompiledNetworkConfig>,

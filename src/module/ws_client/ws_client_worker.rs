@@ -596,6 +596,10 @@ impl WSClientWorker {
                 let (control_tx, control_rx) = mpsc::channel(32);
                 let cancel = session_cancel.child_token();
                 let heartbeat = Arc::new(HeartbeatState::new(generation));
+                #[cfg(feature = "quality-doctor")]
+                if let Some(quality) = runtime.quality_context() {
+                    heartbeat.bind_quality(quality, runtime.client_id.as_u64(), runtime.id.as_u64());
+                }
                 let peer_close = Arc::new(PeerCloseObservation::new());
                 let read_handle = spawn(run_read_loop(
                     read,

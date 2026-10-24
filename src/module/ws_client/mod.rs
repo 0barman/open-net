@@ -19,6 +19,8 @@ mod connection_history_tests;
 pub(crate) mod connection_session;
 pub(crate) mod connection_status;
 pub(crate) mod data_subscription_executor;
+#[cfg(all(test, feature = "quality-doctor"))]
+mod heartbeat_quality_tests;
 mod heartbeat_schedule;
 pub(crate) mod heartbeat_state;
 pub(crate) mod io_diagnostics;
@@ -42,6 +44,8 @@ pub(crate) mod operation_control;
 pub(crate) mod timeout_budget;
 
 pub(crate) mod message_source;
+#[cfg(feature = "quality-doctor")]
+pub(crate) mod quality;
 
 pub(crate) mod session_runtime;
 

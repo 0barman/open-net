@@ -352,6 +352,8 @@ impl fmt::Debug for HttpTlsConfig {
 /// [`HttpClientConfig::new`] and the `with_*` methods to construct values from untrusted input.
 #[derive(Clone)]
 pub struct HttpClientConfig {
+    #[cfg(feature = "quality-doctor")]
+    standalone_quality: Option<crate::api::quality::QualityDoctorConfig>,
     /// Base URL used to resolve request paths.
     pub base_url: reqwest::Url,
     /// Headers copied into every request before request-specific headers are merged.
@@ -415,6 +417,48 @@ pub struct HttpClientConfig {
 }
 
 impl HttpClientConfig {
+    /// Sets passive diagnostics for an independently constructed HTTP client.
+    ///
+    /// Use with [`super::HttpClient::new`] or
+    /// [`super::HttpClient::new_with_network_status`]. The supplied configuration
+    /// determines the standalone collector's mode, protocol filter, bounded
+    /// storage, retention, sampling, and finding thresholds. Omitting this setting
+    /// uses `QualityMode::Off`; HTTP observations also require HTTP to be included
+    /// in the configured protocol selection.
+    ///
+    /// This builder stores the value without validation. [`Self::validate`] and
+    /// client construction validate it, returning `InvalidConfig` with field
+    /// `http.quality_doctor` on failure. Use the diagnostic configuration's own
+    /// `validate()` method to inspect its specific invalid field.
+    ///
+    /// Collection stays dormant until [`super::HttpClient::quality_doctor`] is
+    /// called; activate before submitting work because earlier observations are
+    /// not reconstructed. Client clones share this standalone diagnostic owner.
+    /// Passing a network-status context does not make its diagnostics part of the
+    /// context's engine collector.
+    ///
+    /// Engine-managed clients inherit the engine's diagnostic configuration and
+    /// reject this setting, even when the supplied mode is Off. Configure those
+    /// clients through [`crate::OpenNetConfig::with_quality_doctor`] instead.
+    #[cfg(feature = "quality-doctor")]
+    pub fn with_standalone_quality_doctor(
+        mut self,
+        config: crate::api::quality::QualityDoctorConfig,
+    ) -> Self {
+        self.standalone_quality = Some(config);
+        self
+    }
+
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn has_standalone_quality_doctor(&self) -> bool {
+        self.standalone_quality.is_some()
+    }
+
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn standalone_quality_config(&self) -> crate::api::quality::QualityDoctorConfig {
+        self.standalone_quality.clone().unwrap_or_default()
+    }
+
     /// Construct a validated configuration from an absolute HTTP or HTTPS URL.
     pub fn new(base_url: impl AsRef<str>) -> Result<Self, NetError> {
         let value = base_url.as_ref();
@@ -431,6 +475,8 @@ impl HttpClientConfig {
             return Err(invalid_config("base_url"));
         }
         Ok(Self {
+            #[cfg(feature = "quality-doctor")]
+            standalone_quality: None,
             base_url: parsed,
             common_headers: HeaderMap::new(),
             timeout: Duration::from_secs(30),
@@ -754,6 +800,12 @@ impl HttpClientConfig {
     /// TLS provider availability and client certificate/key compatibility are
     /// checked once when the HTTP client is created.
     pub fn validate(&self) -> Result<(), NetError> {
+        #[cfg(feature = "quality-doctor")]
+        if let Some(config) = &self.standalone_quality {
+            config
+                .validate()
+                .map_err(|_| invalid_config("http.quality_doctor"))?;
+        }
         let scheme = self.base_url.scheme();
         if (scheme != "http" && scheme != "https") || self.base_url.host_str().is_none() {
             return Err(invalid_config("base_url"));

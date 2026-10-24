@@ -191,7 +191,17 @@ async fn follow(
             .map_err(|error| map_reqwest_error(error, ErrorStage::RequestBuild))?;
         drop(response);
         hops.control.record_transport_send()?;
-        response = client.execute(request).await.map_err(map_execute_error)?;
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = hops.control.quality.get() {
+            probe.hop((followed as u64).saturating_add(1));
+        }
+        response = execute_request(
+            client,
+            request,
+            hops.control,
+            (followed as u64).saturating_add(1),
+        )
+        .await?;
     }
     Err(redirect_error(HttpRedirectError::TooManyRedirects))
 }

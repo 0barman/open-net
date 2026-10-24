@@ -174,6 +174,8 @@ impl EngineShutdown {
 }
 
 struct Resources {
+    #[cfg(feature = "quality-doctor")]
+    quality: crate::module::quality::QualityOwner,
     common: Arc<CommonEngine>,
     #[cfg(feature = "net-status")]
     network: Arc<crate::module::net_status::inner::shared::SharedNetworkService>,
@@ -192,6 +194,8 @@ struct Resources {
 impl Resources {
     fn new(inner: &OpenNetInner) -> Self {
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality: inner.quality.clone(),
             common: inner.common_engine.clone(),
             #[cfg(feature = "net-status")]
             network: inner.network_status.clone(),
@@ -282,6 +286,8 @@ impl Resources {
                     .block_on(self.network.shutdown()),
             );
         }
+        #[cfg(feature = "quality-doctor")]
+        self.quality.close();
         record(
             &mut outcome,
             self.common.shutdown_blocking().map_err(NetError::from),
@@ -293,6 +299,15 @@ impl Resources {
 fn record(result: &mut Outcome, next: Outcome) {
     if result.is_ok() {
         *result = next;
+    }
+}
+
+#[cfg(feature = "quality-doctor")]
+impl Drop for Resources {
+    fn drop(&mut self) {
+        // Also close diagnostics if the retirement coordinator unwinds. This
+        // only closes diagnostic ingress; it never waits on consumer work.
+        self.quality.close();
     }
 }
 

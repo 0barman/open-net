@@ -235,6 +235,8 @@ impl fmt::Debug for ErrorContext {
 /// when the original third-party or application details are required.
 #[derive(Clone)]
 pub struct NetError {
+    #[cfg(feature = "quality-doctor")]
+    quality_ref: Option<crate::quality::QualityReportRef>,
     kind: ErrorKind,
     context: ErrorContext,
     config_error: Option<Arc<ConfigError>>,
@@ -245,6 +247,35 @@ pub struct NetError {
 }
 
 impl NetError {
+    /// Returns the passive report reference attached by an observed failure path.
+    ///
+    /// HTTP and WebSocket adapters attach the reference of the operation they
+    /// observed; its operation kind distinguishes a request, stream, message, or
+    /// logical retry operation. A logical operation can select its own reference
+    /// when returning an underlying attempt's error. The error classification and
+    /// context remain the authority for the operation's actual failure.
+    ///
+    /// `None` means this error has no associated reference. Common causes include
+    /// errors created before observation begins, Off/dormant diagnostics, excluded
+    /// protocols, exhausted diagnostic capacity, or errors constructed directly by
+    /// application code. This accessor neither activates collection nor creates a
+    /// report. A reference may outlive retained evidence and does not guarantee
+    /// that the collector accepted every event.
+    ///
+    /// Use the originating owner's `QualityDoctor::lookup` to resolve it; another
+    /// owner's collector reports a scope mismatch. The reference retains no
+    /// request, owner, response payload, or network resource.
+    #[cfg(feature = "quality-doctor")]
+    pub fn quality_ref(&self) -> Option<crate::quality::QualityReportRef> {
+        self.quality_ref.clone()
+    }
+
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn with_quality_ref(mut self, reference: crate::quality::QualityReportRef) -> Self {
+        self.quality_ref = Some(reference);
+        self
+    }
+
     /// Creates an error classified from an HTTP status returned by a protocol or upgrade operation.
     pub fn from_http_status(status: http::StatusCode) -> Self {
         let mut context = ErrorContext::default();
@@ -253,6 +284,8 @@ impl NetError {
     }
     pub(crate) fn new(kind: ErrorKind) -> Self {
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality_ref: None,
             kind,
             context: ErrorContext::default(),
             config_error: None,

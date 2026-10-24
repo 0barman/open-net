@@ -64,6 +64,10 @@ impl Admission {
         // already been released before reading the operation state.
         result.map_err(|error| self.control.selected_error().unwrap_or(error))?;
         self.armed = false;
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = self.control.quality() {
+            probe.mark(crate::api::quality::PhaseKind::Published);
+        }
         Ok(())
     }
 }
@@ -271,6 +275,17 @@ async fn prepare_inner(
     if !wait {
         return try_prepare(runtime, message, options, started, request);
     }
+    #[cfg(feature = "quality-doctor")]
+    let mut quality_scope = crate::module::ws_client::quality::QualityScope::new(runtime.quality_begin(if request.is_some() {
+        crate::api::quality::QualityOperationKind::WsRequest
+    } else {
+        crate::api::quality::QualityOperationKind::WsMessage
+    }));
+    // Drop the phase interval before its observation owner on every exit path.
+    #[cfg(feature = "quality-doctor")]
+    let _quality_admission_owner;
+    #[cfg(feature = "quality-doctor")]
+    let _quality_admission = quality_scope.probe.as_ref().map(|probe| probe.phase(crate::api::quality::PhaseKind::Admission));
     if let Some((request, options)) = request {
         options.validate()?;
         super::validate_metadata(request.metadata())?;
@@ -330,6 +345,10 @@ async fn prepare_inner(
         deadline_phase,
     );
     control.set_retry_started(started);
+    #[cfg(feature = "quality-doctor")]
+    control.bind_quality(quality_scope.probe.take());
+    #[cfg(feature = "quality-doctor")]
+    { _quality_admission_owner = control.quality_scope_guard(); }
     let queue = context.queue();
     let mut admission = Admission {
         control: control.clone(),
@@ -396,6 +415,11 @@ async fn prepare_inner(
             None => error,
         };
         admission.fail(error.clone());
+        #[cfg(feature = "quality-doctor")]
+        let error = match control.quality_ref() {
+            Some(reference) => error.with_quality_ref(reference),
+            None => error,
+        };
         return Err(error);
     }
     Ok(admission)
@@ -408,6 +432,17 @@ pub(super) fn try_prepare(
     started: Instant,
     request: Option<(&Request, &RequestOptions)>,
 ) -> Result<Admission> {
+    #[cfg(feature = "quality-doctor")]
+    let mut quality_scope = crate::module::ws_client::quality::QualityScope::new(runtime.quality_begin(if request.is_some() {
+        crate::api::quality::QualityOperationKind::WsRequest
+    } else {
+        crate::api::quality::QualityOperationKind::WsMessage
+    }));
+    // Declaration order keeps the phase interval alive until admission ends.
+    #[cfg(feature = "quality-doctor")]
+    let _quality_admission_owner;
+    #[cfg(feature = "quality-doctor")]
+    let _quality_admission = quality_scope.probe.as_ref().map(|probe| probe.phase(crate::api::quality::PhaseKind::Admission));
     if let Some((request, options)) = request {
         options.validate()?;
         super::validate_metadata(request.metadata())?;
@@ -437,6 +472,10 @@ pub(super) fn try_prepare(
         reservation,
     );
     control.set_retry_started(started);
+    #[cfg(feature = "quality-doctor")]
+    control.bind_quality(quality_scope.probe.take());
+    #[cfg(feature = "quality-doctor")]
+    { _quality_admission_owner = control.quality_scope_guard(); }
     let queue = context.queue();
     let mut admission = Admission {
         control: control.clone(),
@@ -472,6 +511,11 @@ pub(super) fn try_prepare(
     })();
     if let Err(error) = outcome {
         admission.fail(error.clone());
+        #[cfg(feature = "quality-doctor")]
+        let error = match control.quality_ref() {
+            Some(reference) => error.with_quality_ref(reference),
+            None => error,
+        };
         return Err(error);
     }
     Ok(admission)
@@ -510,7 +554,14 @@ fn install(
         retirement: None,
     };
     match queue.prepare(queued) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(feature = "quality-doctor")]
+            if let Some(probe) = admission.control.quality() {
+                probe.bytes(message.len() as u64);
+                probe.mark(crate::api::quality::PhaseKind::Prepared);
+            }
+            Ok(())
+        }
         Err((request, error)) => {
             request.complete(Err(error.clone()));
             Err(error)

@@ -33,6 +33,8 @@ struct State {
 }
 
 pub(super) struct WorkerShutdown {
+    #[cfg(feature = "quality-doctor")]
+    quality_owner: std::sync::OnceLock<crate::module::quality::QualityOwner>,
     log_id: u64,
     launch_failure_reported: AtomicBool,
     state: Mutex<State>,
@@ -52,6 +54,8 @@ impl WorkerShutdown {
     ) -> Self {
         let retired = joins.is_empty();
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality_owner: std::sync::OnceLock::new(),
             log_id: NEXT_LOG_ID.fetch_add(1, Ordering::Relaxed),
             launch_failure_reported: AtomicBool::new(false),
             state: Mutex::new(State {
@@ -67,6 +71,13 @@ impl WorkerShutdown {
 
     fn locked(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[cfg(feature = "quality-doctor")]
+    pub(super) fn set_quality_owner(&self, owner: Option<crate::module::quality::QualityOwner>) {
+        if let Some(owner) = owner {
+            let _ = self.quality_owner.set(owner);
+        }
     }
 
     pub(super) fn workers_joined(&self) -> bool {
@@ -167,6 +178,10 @@ impl WorkerShutdown {
                 (true, false) => "worker_panicked",
                 _ => "join_panicked",
             }, worker_panics, join_panics);
+        }
+        #[cfg(feature = "quality-doctor")]
+        if let Some(owner) = self.quality_owner.get() {
+            owner.close();
         }
         let result = if failed {
             Err(NetError::from(ErrorKind::Internal).with_stage(ErrorStage::Close))

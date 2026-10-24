@@ -22,6 +22,8 @@ pub(crate) enum HeartbeatTick {
 /// phase. Only after the send succeeds does `sent_at` start the Pong timeout.
 /// The reader clears a probe only when the Pong payload exactly matches it.
 pub(crate) struct HeartbeatState {
+    #[cfg(feature = "quality-doctor")]
+    quality: std::sync::OnceLock<(crate::module::quality::QualityContext, u64, u64)>,
     generation: u64,
     inner: Mutex<HeartbeatStateInner>,
 }
@@ -32,6 +34,8 @@ struct HeartbeatStateInner {
 }
 
 struct OutstandingProbe {
+    #[cfg(feature = "quality-doctor")]
+    quality: Option<crate::module::quality::QualityProbe>,
     payload: Bytes,
     pong_timeout: Duration,
     phase: ProbePhase,
@@ -47,11 +51,43 @@ impl HeartbeatState {
     pub(crate) fn new(generation: u64) -> Self {
         crate::log_t!(LogType::WSC; "new", "generation", generation);
         Self {
+            #[cfg(feature = "quality-doctor")]
+            quality: std::sync::OnceLock::new(),
             generation,
             inner: Mutex::new(HeartbeatStateInner {
                 next_sequence: 1,
                 outstanding: None,
             }),
+        }
+    }
+    #[cfg(feature = "quality-doctor")]
+    pub(crate) fn bind_quality(&self, context: crate::module::quality::QualityContext, client: u64, session: u64) {
+        let _ = self.quality.set((context, client, session));
+    }
+    #[cfg(feature = "quality-doctor")]
+    fn observe_probe(&self, payload: &[u8]) {
+        let Some((context, client, session)) = self.quality.get() else { return; };
+        let Some(probe) = context.begin(
+            crate::api::quality::QualityProtocol::WebSocket,
+            crate::api::quality::QualityOperationKind::WsHeartbeat,
+            *client,
+        ) else { return; };
+        probe.session(*session);
+        probe.connection(self.generation);
+        // Do not contend with Pong handling merely to attach diagnostics.
+        let installed = match self.inner.try_lock() {
+            Ok(mut inner) => match inner.outstanding.as_mut() {
+                Some(outstanding) if outstanding.payload.as_ref() == payload => {
+                    outstanding.quality = Some(probe.clone());
+                    true
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        };
+        if !installed {
+            probe.result(crate::api::quality::QualityOutcome::Unknown);
+            probe.finish();
         }
     }
 
@@ -77,6 +113,8 @@ impl HeartbeatState {
                 inner.next_sequence = inner.next_sequence.wrapping_add(1).max(1);
                 let payload = heartbeat_payload(self.generation, sequence);
                 inner.outstanding = Some(OutstandingProbe {
+                    #[cfg(feature = "quality-doctor")]
+                    quality: None,
                     payload: payload.clone(),
                     pong_timeout,
                     phase: ProbePhase::Sending,
@@ -84,7 +122,21 @@ impl HeartbeatState {
                 HeartbeatTick::SendProbe(payload)
             }
         };
+        #[cfg(feature = "quality-doctor")]
+        let expired_quality = if tick == HeartbeatTick::TimedOut {
+            inner.outstanding.as_mut().and_then(|outstanding| outstanding.quality.take())
+        } else { None };
         drop(inner);
+        #[cfg(feature = "quality-doctor")]
+        {
+            if let Some(probe) = expired_quality {
+                probe.result(crate::api::quality::QualityOutcome::Timeout);
+                probe.finish();
+            }
+            if let HeartbeatTick::SendProbe(payload) = &tick {
+                self.observe_probe(payload);
+            }
+        }
         match &tick {
             HeartbeatTick::SendProbe(payload) => {
                 crate::log_s!(LogType::WSC; "on_tick", "generation|state|payload_bytes", self.generation, "Sending", payload.len())
@@ -121,12 +173,24 @@ impl HeartbeatState {
         let sequence = inner.next_sequence;
         inner.next_sequence = inner.next_sequence.wrapping_add(1).max(1);
         let payload = heartbeat_payload(self.generation, sequence);
+        #[cfg(feature = "quality-doctor")]
+        let expired_quality = inner.outstanding.as_mut().and_then(|outstanding| outstanding.quality.take());
         inner.outstanding = Some(OutstandingProbe {
+            #[cfg(feature = "quality-doctor")]
+            quality: None,
             payload: payload.clone(),
             pong_timeout,
             phase: ProbePhase::Sending,
         });
         drop(inner);
+        #[cfg(feature = "quality-doctor")]
+        {
+            if let Some(probe) = expired_quality {
+                probe.result(crate::api::quality::QualityOutcome::Timeout);
+                probe.finish();
+            }
+            self.observe_probe(&payload);
+        }
         crate::log_s!(LogType::WSC; "ws.heartbeat_state.start_recovery_probe", "now|pong_timeout|generation|payload_bytes", format!("{now:?}"), pong_timeout, self.generation, payload.len());
         Some(payload)
     }
@@ -154,7 +218,13 @@ impl HeartbeatState {
             return false;
         }
         outstanding.phase = ProbePhase::AwaitingPong { sent_at };
+        #[cfg(feature = "quality-doctor")]
+        let quality = outstanding.quality.clone();
         drop(inner);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = quality {
+            probe.mark(crate::api::quality::PhaseKind::Written);
+        }
         crate::log_s!(LogType::WSC; "mark_sent", "generation|state", self.generation, "AwaitingPong");
         true
     }
@@ -173,10 +243,20 @@ impl HeartbeatState {
                         .is_some_and(|deadline| now < deadline),
                 }
         });
+        #[cfg(feature = "quality-doctor")]
+        let quality = if matches {
+            inner.outstanding.as_mut().and_then(|outstanding| outstanding.quality.take())
+        } else { None };
         if matches {
             inner.outstanding = None;
         }
         drop(inner);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = quality {
+            probe.mark(crate::api::quality::PhaseKind::Heartbeat);
+            probe.result(crate::api::quality::QualityOutcome::Success);
+            probe.finish();
+        }
         crate::log_s!(LogType::WSC; "acknowledge_pong", "generation|accepted", self.generation, matches);
         matches
     }
@@ -190,8 +270,15 @@ impl HeartbeatState {
             .as_ref()
             .is_some_and(|probe| probe.payload.as_ref() == payload)
         {
+            #[cfg(feature = "quality-doctor")]
+            let quality = inner.outstanding.as_mut().and_then(|outstanding| outstanding.quality.take());
             inner.outstanding = None;
             drop(inner);
+            #[cfg(feature = "quality-doctor")]
+            if let Some(probe) = quality {
+                probe.result(crate::api::quality::QualityOutcome::Unknown);
+                probe.finish();
+            }
             crate::log_s!(LogType::WSC; "abandon_probe", "generation|state", self.generation, "probe_abandoned");
         }
     }
@@ -203,6 +290,10 @@ impl HeartbeatState {
     pub(crate) fn pong_deadline(&self) -> Option<Instant> {
         crate::log_t!(LogType::WSC; "pong_deadline");
         let inner = self.lock_inner();
+        self.pong_deadline_locked(&inner)
+    }
+
+    fn pong_deadline_locked(&self, inner: &HeartbeatStateInner) -> Option<Instant> {
         inner
             .outstanding
             .as_ref()
@@ -223,10 +314,35 @@ impl HeartbeatState {
             })
     }
 
-    /// Checks the exact deadline without creating a new heartbeat probe.
+    /// Checks the exact deadline without changing the outstanding transport probe.
+    ///
+    /// Observe expiration here as well as on interval ticks: the writer can retire
+    /// the connection, or exhaust recovery, before another tick/replacement probe.
     pub(crate) fn is_timed_out(&self, now: Instant) -> bool {
         crate::log_t!(LogType::WSC; "is_timed_out", "now", format!("{:?}", now));
-        let timed_out = self.pong_deadline().is_some_and(|deadline| now >= deadline);
+        #[allow(unused_mut)] // Mutable only when quality-doctor is compiled in.
+        let mut inner = self.lock_inner();
+        let timed_out = self
+            .pong_deadline_locked(&inner)
+            .is_some_and(|deadline| now >= deadline);
+        // Claim the diagnostic probe under the same lock as the deadline check.
+        // A matching Pong or a replacement cannot make us finish another probe,
+        // and repeated deadline/tick checks cannot publish the result twice.
+        #[cfg(feature = "quality-doctor")]
+        let expired_quality = if timed_out {
+            inner
+                .outstanding
+                .as_mut()
+                .and_then(|outstanding| outstanding.quality.take())
+        } else {
+            None
+        };
+        drop(inner);
+        #[cfg(feature = "quality-doctor")]
+        if let Some(probe) = expired_quality {
+            probe.result(crate::api::quality::QualityOutcome::Timeout);
+            probe.finish();
+        }
         if timed_out {
             crate::log_e!(LogType::WSC; "is_timed_out", "generation|error", self.generation, "PongTimeout");
         }
