@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use super::coordinated_view::{event_size, CoordinatedView, ViewPublication};
 use super::network_view::NetworkView;
+#[cfg(test)]
 use crate::common::log::log_def::LogType;
 use crate::common::retirement::{ExecutionScope, WorkLease, WorkTracker};
 use crate::error::{ErrorKind, NetError};
@@ -16,8 +17,10 @@ use crate::net_status::{
 };
 use crate::subscription::{
     event_channel, CallbackExecutor, EventOverflow, EventQueueLimit, EventReceiver, EventSeed,
-    StatePublication, StatePublisher, StateReceiver, StateSource,
+    StatePublication, StatePublisher, StateSource,
 };
+#[cfg(test)]
+use crate::subscription::StateReceiver;
 use tokio::sync::watch;
 
 /// Only SDK-owned WebSocket tasks consume this projection. Its revision keeps
@@ -37,6 +40,8 @@ struct SourceState {
     gating: NetworkStatusSnapshot,
     publication_error: Option<NetError>,
     views: Vec<Weak<Mutex<CoordinatedView>>>,
+    // Ordered sampling is consumed by the Windows worker and its platform-neutral tests.
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     last_sample_id: u64,
 }
 
@@ -47,6 +52,8 @@ pub(super) struct NetworkStatusSource {
     facts: watch::Sender<NetworkSnapshot>,
     failure: watch::Sender<Option<NetError>>,
     publisher: StatePublisher<NetworkSnapshot>,
+    // Retain the state source's ownership even when only the publisher is used.
+    #[cfg_attr(not(test), allow(dead_code))]
     observations: StateSource<NetworkSnapshot>,
     retirement: Option<Arc<WorkTracker>>,
 }
@@ -63,6 +70,9 @@ pub(super) struct NetworkViewHandle {
 }
 
 /// Captured before an asynchronous platform query and revalidated at commit.
+// Other platforms still construct this target before returning Unsupported;
+// preserve the invalidation receiver and the same validation/retirement boundary.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct NetworkRefreshTarget {
     pub(crate) owner_generation: u64,
@@ -71,6 +81,7 @@ pub(crate) struct NetworkRefreshTarget {
     invalidated: watch::Receiver<u64>,
 }
 impl NetworkRefreshTarget {
+    #[cfg(any(target_os = "windows", test))]
     pub(crate) async fn invalidated(&mut self) {
         loop {
             if *self.invalidated.borrow_and_update() > self.invalidation_epoch {
@@ -194,6 +205,7 @@ impl NetworkStatusSource {
     pub(super) fn subscribe_failure(&self) -> watch::Receiver<Option<NetError>> {
         self.failure.subscribe()
     }
+    #[cfg(test)]
     pub(super) fn observe(&self) -> Result<StateReceiver<NetworkSnapshot>, NetError> {
         self.observations.subscribe()
     }
@@ -487,6 +499,7 @@ impl NetworkStatusPublisher {
         self.source.commit(&mut state, next, false)
     }
     /// Ordered samples from the shared Windows worker, including unchanged facts.
+    #[cfg(any(target_os = "windows", test))]
     pub(super) fn prepare_sampled_observation(
         &self,
         sample_id: u64,
@@ -768,6 +781,7 @@ impl NetworkViewHandle {
             invalidated: view.invalidated.subscribe(),
         })
     }
+    #[cfg(any(target_os = "windows", test))]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn commit_refresh(
         &self,
@@ -852,6 +866,7 @@ impl NetworkViewHandle {
         publisher.finish(snapshot)
     }
 }
+#[cfg(any(target_os = "windows", test))]
 fn same_observation(
     snapshot: &NetworkSnapshot,
     reachability: NetworkStatus,
@@ -894,7 +909,9 @@ fn next_snapshot(
 }
 
 /// The task owns this before its first poll, so cancellation also retires its generation.
+#[cfg(test)]
 pub(super) struct NetworkStatusMonitorGuard(pub(super) NetworkStatusPublisher);
+#[cfg(test)]
 impl Drop for NetworkStatusMonitorGuard {
     fn drop(&mut self) {
         let result = self

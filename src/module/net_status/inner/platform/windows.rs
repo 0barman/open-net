@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+#[cfg(target_os = "windows")]
+use crate::error::{ErrorContext, WindowsReachabilityDiagnostic, WindowsReachabilityOperation};
 use crate::error::{ErrorKind, ErrorStage, NetError};
 use crate::net_status::{NetworkNameSource, NetworkStatus};
 
@@ -158,14 +160,32 @@ pub(crate) fn sample_reachability(
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> Result<WindowsObservation, NetError> {
-    with_manager(deadline, cancelled, |manager| {
-        // SAFETY: manager remains live in this apartment; no raw output buffer is used.
-        let connectivity = unsafe { manager.GetConnectivity() }.map_err(monitor_io)?;
-        check_request(deadline, cancelled)?;
-        Ok(WindowsObservation {
-            reachability: reachability_from_bits(connectivity.0 as u32),
-        })
-    })
+    sample_reachability_using(&NativeWindowsApi, deadline, cancelled)
+}
+
+#[cfg(target_os = "windows")]
+fn sample_reachability_using(
+    api: &impl WindowsApi,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<WindowsObservation, NetError> {
+    with_manager_using(
+        api,
+        deadline,
+        cancelled,
+        QueryKind::Reachability,
+        |manager| {
+            QueryKind::Reachability.record(WindowsReachabilityOperation::NlmGetConnectivity);
+            let connectivity = api.get_connectivity(manager).map_err(|error| {
+                QueryKind::Reachability
+                    .error(WindowsReachabilityOperation::NlmGetConnectivity, error)
+            })?;
+            check_request(deadline, cancelled)?;
+            Ok(WindowsObservation {
+                reachability: reachability_from_bits(connectivity),
+            })
+        },
+    )
 }
 
 /// Query names only for the separate, explicitly enabled name service.
@@ -200,36 +220,141 @@ fn with_manager<T>(
         &windows::Win32::Networking::NetworkListManager::INetworkListManager,
     ) -> Result<T, NetError>,
 ) -> Result<T, NetError> {
-    use windows::Win32::Networking::NetworkListManager::{INetworkListManager, NetworkListManager};
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
-    };
+    with_manager_using(
+        &NativeWindowsApi,
+        deadline,
+        cancelled,
+        QueryKind::Name,
+        query,
+    )
+}
 
-    struct ComApartment;
-    impl Drop for ComApartment {
-        fn drop(&mut self) {
-            // SAFETY: This guard lives on the initializing worker thread and
-            // exists only after successful CoInitializeEx, including S_FALSE.
-            unsafe { CoUninitialize() };
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum QueryKind {
+    Reachability,
+    Name,
+}
+
+#[cfg(target_os = "windows")]
+impl QueryKind {
+    fn record(self, operation: WindowsReachabilityOperation) {
+        if matches!(self, Self::Reachability) {
+            super::super::sample_diagnostics::native_operation(operation);
         }
     }
 
+    fn error(
+        self,
+        operation: WindowsReachabilityOperation,
+        source: windows::core::Error,
+    ) -> NetError {
+        match self {
+            Self::Name => monitor_io(source),
+            Self::Reachability => {
+                let diagnostic = WindowsReachabilityDiagnostic {
+                    operation,
+                    hresult: source.code().0 as u32,
+                };
+                let phase = match operation {
+                    WindowsReachabilityOperation::ComInit => {
+                        crate::error::NetworkMonitorPhase::ComInit
+                    }
+                    WindowsReachabilityOperation::NlmCreate => {
+                        crate::error::NetworkMonitorPhase::NlmCreate
+                    }
+                    WindowsReachabilityOperation::NlmGetConnectivity => {
+                        crate::error::NetworkMonitorPhase::NlmGetConnectivity
+                    }
+                };
+                NetError::with_source(ErrorKind::Io, source)
+                    .with_context(ErrorContext {
+                        stage: Some(ErrorStage::NetworkMonitor),
+                        windows_reachability: Some(diagnostic),
+                        ..ErrorContext::default()
+                    })
+                    .with_network_monitor_phase(phase)
+            }
+        }
+    }
+}
+
+// A private per-call boundary lets tests fail each native operation without
+// changing system services, global hooks, or the production sampling policy.
+#[cfg(target_os = "windows")]
+trait WindowsApi {
+    type Apartment;
+    type Manager;
+    fn initialize(&self) -> windows::core::Result<Self::Apartment>;
+    fn create_manager(&self) -> windows::core::Result<Self::Manager>;
+    fn get_connectivity(&self, manager: &Self::Manager) -> windows::core::Result<u32>;
+}
+
+#[cfg(target_os = "windows")]
+fn with_manager_using<A: WindowsApi, T>(
+    api: &A,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    kind: QueryKind,
+    query: impl FnOnce(&A::Manager) -> Result<T, NetError>,
+) -> Result<T, NetError> {
     check_request(deadline, cancelled)?;
-    // SAFETY: All COM objects are created, used and released on this worker
-    // thread before the apartment guard. An incompatible apartment is an error.
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-        .ok()
-        .map_err(monitor_io)?;
-    let _apartment = ComApartment;
+    kind.record(WindowsReachabilityOperation::ComInit);
+    let _apartment = api
+        .initialize()
+        .map_err(|error| kind.error(WindowsReachabilityOperation::ComInit, error))?;
     check_request(deadline, cancelled)?;
-    // SAFETY: COM is initialized on this thread; the SDK supplies the matching
-    // class/interface identifiers and owns the returned reference.
-    let manager: INetworkListManager =
-        unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }.map_err(monitor_io)?;
+    kind.record(WindowsReachabilityOperation::NlmCreate);
+    let manager = api
+        .create_manager()
+        .map_err(|error| kind.error(WindowsReachabilityOperation::NlmCreate, error))?;
     check_request(deadline, cancelled)?;
     let observation = query(&manager)?;
     check_request(deadline, cancelled)?;
     Ok(observation)
+}
+
+#[cfg(target_os = "windows")]
+struct NativeWindowsApi;
+
+#[cfg(target_os = "windows")]
+struct ComApartment;
+
+#[cfg(target_os = "windows")]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        use windows::Win32::System::Com::CoUninitialize;
+        // SAFETY: This guard lives on the initializing worker thread and
+        // exists only after successful CoInitializeEx, including S_FALSE.
+        unsafe { CoUninitialize() };
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsApi for NativeWindowsApi {
+    type Apartment = ComApartment;
+    type Manager = windows::Win32::Networking::NetworkListManager::INetworkListManager;
+
+    fn initialize(&self) -> windows::core::Result<ComApartment> {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        // SAFETY: with_manager_using creates, uses and releases all interfaces
+        // on this worker before dropping the guard. S_FALSE also owns one init.
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
+        Ok(ComApartment)
+    }
+
+    fn create_manager(&self) -> windows::core::Result<Self::Manager> {
+        use windows::Win32::Networking::NetworkListManager::NetworkListManager;
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+        // SAFETY: with_manager_using holds a successful COM initialization;
+        // the SDK supplies matching class/interface IDs and owns the reference.
+        unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }
+    }
+
+    fn get_connectivity(&self, manager: &Self::Manager) -> windows::core::Result<u32> {
+        // SAFETY: manager remains live in this apartment; no raw output buffer is used.
+        unsafe { manager.GetConnectivity() }.map(|connectivity| connectivity.0 as u32)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -389,6 +514,10 @@ fn command_output(
         );
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+#[path = "windows_diagnostics_tests.rs"]
+mod windows_diagnostics_tests;
 
 #[cfg(test)]
 mod tests {

@@ -5,9 +5,9 @@
 use super::heartbeat_state::{HeartbeatState, HeartbeatTick};
 use super::test_support::{check, check_eq, check_ne, test_error, TestResult};
 use crate::api::quality::{
-    QualityDoctor, QualityDoctorConfig, QualityDoctorState, QualityLimits, QualityLookup,
-    QualityObservationState, QualityOperationKind, QualityOutcome, QualityProtocols, QualityQuery,
-    QualityReport, QualityReportRef, QualitySnapshot,
+    PhaseKind, QualityDoctor, QualityDoctorConfig, QualityDoctorState, QualityLimits,
+    QualityLookup, QualityObservationState, QualityOperationKind, QualityOutcome, QualityProtocols,
+    QualityQuery, QualityReport, QualityReportRef, QualitySnapshot,
 };
 use crate::module::quality::QualityOwner;
 use bytes::Bytes;
@@ -17,9 +17,15 @@ use tokio::time::Instant;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn fixture() -> TestResult<(QualityOwner, QualityDoctor, HeartbeatState)> {
+    fixture_with_config(QualityDoctorConfig::detailed())
+}
+
+fn fixture_with_config(
+    config: QualityDoctorConfig,
+) -> TestResult<(QualityOwner, QualityDoctor, HeartbeatState)> {
     // A single active reservation also verifies that completed timeout reports
     // cannot prevent a recovery probe from being observed.
-    let config = QualityDoctorConfig::detailed()
+    let config = config
         .with_protocols(QualityProtocols::websocket())
         .with_limits(QualityLimits::default().with_active_capacity(1));
     config.validate()?;
@@ -104,6 +110,11 @@ async fn exact_deadline_completes_timeout_before_another_tick_or_owner_shutdown(
 
     let timeout = only_report(&doctor)?;
     completed(&timeout, QualityOutcome::Timeout)?;
+    let failure = timeout
+        .failure()
+        .ok_or_else(|| test_error("timeout cause missing"))?;
+    check_eq!(failure.kind(), crate::error::ErrorKind::TimedOut)?;
+    check_eq!(failure.stage(), Some(crate::error::ErrorStage::Heartbeat))?;
     check_eq!(timeout.reference(), pending.reference())?;
     check_eq!(doctor.state(), QualityDoctorState::Running)?;
     check_eq!(snapshot(&doctor)?.summary().timeouts(), 1)?;
@@ -157,6 +168,7 @@ async fn matched_pong_before_deadline_preserves_success_including_early_send_com
     for pong_before_mark_sent in [true, false] {
         let (_owner, doctor, heartbeat) = fixture()?;
         let payload = begin(&heartbeat)?;
+        heartbeat.observe_write_started(&payload);
         if !pong_before_mark_sent {
             check!(heartbeat.mark_sent(&payload, Instant::now()))?;
             tokio::time::advance(TIMEOUT - Duration::from_nanos(1)).await;
@@ -168,6 +180,25 @@ async fn matched_pong_before_deadline_preserves_success_including_early_send_com
         }
         let success = only_report(&doctor)?;
         completed(&success, QualityOutcome::Success)?;
+        check!(success
+            .phases()
+            .iter()
+            .any(|phase| phase.kind() == PhaseKind::HeartbeatObserved))?;
+        check!(success
+            .phases()
+            .iter()
+            .any(|phase| phase.kind() == PhaseKind::HeartbeatWriteStarted))?;
+        check_eq!(
+            success
+                .phases()
+                .iter()
+                .any(|phase| phase.kind() == PhaseKind::Written),
+            !pong_before_mark_sent
+        )?;
+        check!(success
+            .phases()
+            .iter()
+            .any(|phase| phase.kind() == PhaseKind::Heartbeat))?;
         tokio::time::advance(TIMEOUT).await;
         check!(!heartbeat.is_timed_out(Instant::now()))?;
         check_eq!(only_report(&doctor)?.revision(), success.revision())?;
@@ -234,6 +265,10 @@ async fn recovery_observes_a_new_probe_without_reopening_or_duplicating_the_expi
             .find(|report| report.reference() != first_ref)
             .ok_or_else(|| test_error("recovery diagnostic missing"))?
             .reference();
+        check_eq!(
+            report(&doctor, recovery_ref)?.heartbeat_schedule_delay(),
+            None
+        )?;
         check!(!heartbeat.is_timed_out(Instant::now()))?;
         check!(!heartbeat.acknowledge_pong(&first))?;
         check!(heartbeat.mark_sent(&next, Instant::now()))?;
@@ -259,7 +294,11 @@ async fn deadline_detection_does_not_activate_dormant_collection() -> TestResult
     );
     let heartbeat = HeartbeatState::new(42);
     heartbeat.bind_quality(owner.context(), 7, 9);
-    let payload = begin(&heartbeat)?;
+    let payload = match heartbeat.on_scheduled_tick(Instant::now(), TIMEOUT, Some(Instant::now())) {
+        HeartbeatTick::SendProbe(payload) => payload,
+        other => return Err(test_error(format!("unexpected dormant tick: {other:?}"))),
+    };
+    heartbeat.observe_write_started(&payload);
     check!(heartbeat.mark_sent(&payload, Instant::now()))?;
     tokio::time::advance(TIMEOUT).await;
     check!(heartbeat.is_timed_out(Instant::now()))?;
@@ -271,5 +310,144 @@ async fn deadline_detection_does_not_activate_dormant_collection() -> TestResult
     check_eq!(observed.counters().begin_attempted(), 0)?;
     check!(heartbeat.is_timed_out(Instant::now()))?;
     check!(snapshot(&doctor)?.reports().is_empty())?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn scheduled_delay_and_write_pong_milestones_share_one_probe_without_backdating() -> TestResult
+{
+    use super::heartbeat_schedule::HeartbeatSchedule;
+    for config in [
+        QualityDoctorConfig::basic(),
+        QualityDoctorConfig::detailed(),
+    ] {
+        let (_owner, doctor, heartbeat) = fixture_with_config(config)?;
+        let mut schedule = HeartbeatSchedule::new(Some(crate::ws::HeartbeatConfig {
+            interval: Duration::from_secs(5),
+            pong_timeout: TIMEOUT,
+            ..Default::default()
+        }))?;
+        tokio::time::advance(Duration::from_secs(12)).await;
+        let due = schedule.tick().await;
+        // A pre-existing ready control can run after taking the tick but before
+        // creating the probe. Its time is part of scheduled-to-observed delay.
+        tokio::time::advance(Duration::from_millis(3)).await;
+        let payload =
+            match heartbeat.on_scheduled_tick(Instant::now(), due.pong_timeout, due.scheduled_at) {
+                HeartbeatTick::SendProbe(payload) => payload,
+                other => return Err(test_error(format!("unexpected scheduled tick: {other:?}"))),
+            };
+        let created = only_report(&doctor)?;
+        check_eq!(
+            created.heartbeat_schedule_delay(),
+            Some(Duration::from_millis(7003))
+        )?;
+        check!(created.started_offset() >= Duration::from_secs(12))?;
+        let probe_ref = created.reference();
+        // Another tick while Sending must not overwrite the first probe's lag
+        // or create an observation for a Ping that was never emitted.
+        check_eq!(
+            heartbeat.on_scheduled_tick(
+                Instant::now(),
+                TIMEOUT,
+                Some(Instant::now() - Duration::from_secs(10))
+            ),
+            HeartbeatTick::Waiting
+        )?;
+        check_eq!(only_report(&doctor)?.revision(), created.revision())?;
+        tokio::time::advance(Duration::from_millis(2)).await;
+        heartbeat.observe_write_started(&payload);
+        tokio::time::advance(Duration::from_millis(4)).await;
+        check!(heartbeat.mark_sent(&payload, Instant::now()))?;
+        tokio::time::advance(Duration::from_millis(6)).await;
+        check!(heartbeat.acknowledge_pong(&payload))?;
+        let success = only_report(&doctor)?;
+        completed(&success, QualityOutcome::Success)?;
+        check_eq!(success.reference(), probe_ref)?;
+        let phases: Vec<_> = success.phases().iter().map(|phase| phase.kind()).collect();
+        check_eq!(
+            phases,
+            vec![
+                PhaseKind::HeartbeatObserved,
+                PhaseKind::HeartbeatWriteStarted,
+                PhaseKind::Written,
+                PhaseKind::Heartbeat
+            ]
+        )?;
+        let stamps: Vec<_> = success
+            .phases()
+            .iter()
+            .map(|phase| phase.start_offset())
+            .collect();
+        check_eq!(stamps[1] - stamps[0], Duration::from_millis(2))?;
+        check_eq!(stamps[2] - stamps[1], Duration::from_millis(4))?;
+        check_eq!(stamps[3] - stamps[2], Duration::from_millis(6))?;
+        check!(success
+            .phases()
+            .iter()
+            .all(|phase| phase.associations().connection() == Some(42)
+                && phase.associations().session() == Some(9)))?;
+        let json = serde_json::to_value(&success)?;
+        check_eq!(
+            json["heartbeat_schedule_delay"]["secs"],
+            serde_json::json!(7)
+        )?;
+        check_eq!(
+            json["heartbeat_schedule_delay"]["nanos"],
+            serde_json::json!(3_000_000)
+        )?;
+        check!(!json.to_string().contains("payload"))?;
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn safe_write_retry_milestones_keep_probe_identity_and_failure_cause() -> TestResult {
+    use crate::error::{ErrorKind, ErrorStage, NetError};
+    for (kind, outcome) in [
+        (ErrorKind::DeliveryUnknown, QualityOutcome::Failed),
+        (ErrorKind::Cancelled, QualityOutcome::Cancelled),
+    ] {
+        let (_owner, doctor, heartbeat) = fixture()?;
+        let payload = begin(&heartbeat)?;
+        let original = only_report(&doctor)?.reference();
+        heartbeat.observe_write_started(b"stale-probe");
+        heartbeat.observe_write_started(&payload);
+        tokio::time::advance(Duration::from_millis(5)).await;
+        // A retryable WriteBufferFull retains the same probe and does not start
+        // the Pong deadline; the writer emits another attempt milestone.
+        heartbeat.observe_write_started(&payload);
+        check_eq!(heartbeat.pong_deadline(), None)?;
+        let error = NetError::from(kind).with_stage(ErrorStage::Write);
+        heartbeat.fail_probe(&payload, &error);
+        let failed = only_report(&doctor)?;
+        completed(&failed, outcome)?;
+        check_eq!(failed.reference(), original)?;
+        check_eq!(failed.heartbeat_schedule_delay(), None)?;
+        check!(!serde_json::to_value(&failed)?
+            .as_object()
+            .ok_or_else(|| test_error("report was not an object"))?
+            .contains_key("heartbeat_schedule_delay"))?;
+        let failure = failed
+            .failure()
+            .ok_or_else(|| test_error("write failure missing"))?;
+        check_eq!(failure.kind(), kind)?;
+        check_eq!(failure.stage(), Some(ErrorStage::Write))?;
+        let phases: Vec<_> = failed.phases().iter().map(|phase| phase.kind()).collect();
+        check_eq!(
+            phases,
+            vec![
+                PhaseKind::HeartbeatObserved,
+                PhaseKind::HeartbeatWriteStarted,
+                PhaseKind::HeartbeatWriteStarted
+            ]
+        )?;
+        check!(!heartbeat.has_outstanding_probe())?;
+        heartbeat.observe_write_started(&payload);
+        heartbeat.fail_probe(&payload, &error);
+        check!(!heartbeat.mark_sent(&payload, Instant::now()))?;
+        check!(!heartbeat.acknowledge_pong(&payload))?;
+        check_eq!(only_report(&doctor)?.revision(), failed.revision())?;
+    }
     Ok(())
 }

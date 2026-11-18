@@ -111,11 +111,6 @@ impl QualityContext {
     pub(crate) fn doctor(&self) -> Option<QualityDoctor> {
         self.owner.upgrade().map(|owner| owner.doctor())
     }
-    pub(crate) fn close(&self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.close();
-        }
-    }
     /// Configuration only; does not activate storage or read a clock.
     pub(crate) fn is_enabled_for(&self, protocol: QualityProtocol) -> bool {
         self.owner.upgrade().is_some_and(|owner| {
@@ -347,6 +342,10 @@ impl QualityProbe {
             self.lease.bytes_saturated.store(true, Ordering::Relaxed);
         }
     }
+    #[cfg(feature = "ws-client")]
+    pub(crate) fn heartbeat_schedule_delay(&self, delay: Duration) {
+        self.emit(EventKind::HeartbeatScheduleDelay(delay));
+    }
     pub(crate) fn result(&self, outcome: QualityOutcome) {
         self.emit(EventKind::Result {
             outcome,
@@ -480,6 +479,7 @@ pub(crate) struct QualityPhaseGuard {
     finished: bool,
 }
 impl QualityPhaseGuard {
+    #[cfg(test)]
     pub(crate) fn finish(mut self) {
         self.complete();
     }
@@ -552,6 +552,10 @@ impl Event {
                 Some(*phase),
                 Some(*instance_id),
             ),
+            #[cfg(feature = "ws-client")]
+            EventKind::HeartbeatScheduleDelay(_) => {
+                (QualityEventKind::HeartbeatScheduleDelay, None, None)
+            }
             EventKind::Result { .. } => (QualityEventKind::Result, None, None),
             EventKind::Association(..) => (QualityEventKind::Association, None, None),
             EventKind::Parent(_) => (QualityEventKind::Parent, None, None),
@@ -587,6 +591,8 @@ enum EventKind {
     },
     #[cfg(feature = "http-client")]
     HttpVersion(QualityHttpVersion),
+    #[cfg(feature = "ws-client")]
+    HeartbeatScheduleDelay(Duration),
     Result {
         outcome: QualityOutcome,
         failure: Option<QualityFailure>,
@@ -1051,6 +1057,7 @@ impl Store {
                     outcome: None,
                     http_status: None,
                     http_version: None,
+                    heartbeat_schedule_delay: None,
                     failure: None,
                     state: QualityObservationState::InProgress,
                     detail: if config.mode == QualityMode::Basic {
@@ -1198,6 +1205,10 @@ impl Store {
             EventKind::Parent(value) => report.associations.parent = Some(value),
             #[cfg(feature = "http-client")]
             EventKind::HttpVersion(version) => report.http_version = Some(version),
+            #[cfg(feature = "ws-client")]
+            EventKind::HeartbeatScheduleDelay(delay) => {
+                report.heartbeat_schedule_delay = Some(delay)
+            }
             EventKind::Finish => {
                 close_phase_activity(report, QualityPhaseState::ReportCompleted);
                 report.state = QualityObservationState::Completed;
@@ -1813,6 +1824,8 @@ fn capabilities(config: &QualityDoctorConfig) -> QualityCapabilities {
             PhaseKind::ManualDispatch,
             PhaseKind::ManualResolve,
             PhaseKind::Requeue,
+            PhaseKind::HeartbeatObserved,
+            PhaseKind::HeartbeatWriteStarted,
             PhaseKind::Heartbeat,
             PhaseKind::ResponseWait,
             PhaseKind::PayloadReceived,
@@ -1926,6 +1939,8 @@ fn instrumented(protocol: QualityProtocol, phase: PhaseKind) -> bool {
                 | PhaseKind::Dequeued
                 | PhaseKind::Dns
                 | PhaseKind::Flush
+                | PhaseKind::HeartbeatObserved
+                | PhaseKind::HeartbeatWriteStarted
                 | PhaseKind::Heartbeat
                 | PhaseKind::ManualDispatch
                 | PhaseKind::ManualResolve

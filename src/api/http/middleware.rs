@@ -1,5 +1,3 @@
-#![cfg(feature = "http-client-middleware")]
-
 //! Composable middleware for concrete HTTP request and stream APIs.
 
 use crate::api::error::{ErrorKind, ErrorStage, NetError};

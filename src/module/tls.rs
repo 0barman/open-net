@@ -10,7 +10,11 @@ use std::sync::Arc;
 pub(crate) fn select_provider(
     explicit: Option<&Arc<CryptoProvider>>,
 ) -> Result<Arc<CryptoProvider>, NetError> {
-    if let Some(provider) = explicit.or_else(|| CryptoProvider::get_default()) {
+    let provider = match explicit {
+        Some(provider) => Some(provider),
+        None => CryptoProvider::get_default(),
+    };
+    if let Some(provider) = provider {
         return Ok(Arc::clone(provider));
     }
     Err(NetError::config(

@@ -625,6 +625,7 @@ impl WSClientWorker {
                         generation,
                         cancel: cancel.clone(),
                         data_frame_payload_size: self.config.frames.data_frame_payload_size,
+                        max_write_buffer_size: self.config.frames.max_write_buffer_size,
                         control_write_timeout: self.config.frames.control_write_timeout,
                         data_frame_write_timeout: self.config.frames.data_frame_write_timeout,
                         heartbeat_config: self.config.heartbeat.clone(),
@@ -689,9 +690,9 @@ impl WSClientWorker {
                 self.connect_target = None;
             }
             IoEvent::CallbackDispatchFailed { session_id } => {
-                if !self
+                if self
                     .context_runtime()
-                    .is_some_and(|runtime| runtime.id == session_id)
+                    .is_none_or(|runtime| runtime.id != session_id)
                     || self.current_status() != ConnectionStatus::Connected
                 {
                     crate::log_s!(LogType::WSC; "ws.worker.handle_io_event", "state|event_generation|current_generation", "stale_callback_failure_ignored", session_id.as_u64(), self.generation);

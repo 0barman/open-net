@@ -9,6 +9,12 @@ use std::sync::{Arc, Weak};
 /// Application-defined protocol that classifies inbound messages for request correlation.
 pub trait ResponseProtocol: Send + Sync + 'static {
     /// Classifies one inbound message without mutating the session.
+    ///
+    /// Runs synchronously on the connection's receive task, before publication
+    /// to application receivers. Keep it short and nonblocking: blocking I/O,
+    /// sleeping, or expensive parsing delays subsequent frames, including
+    /// heartbeat Pongs. Offload heavy processing after minimal classification,
+    /// or use [`ResponseRouting::Manual`] for application-owned resolution.
     fn route(&self, incoming: &IncomingMessage) -> std::result::Result<ResponseRoute, BoxError>;
 }
 

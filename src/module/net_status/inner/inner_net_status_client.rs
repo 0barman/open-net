@@ -15,13 +15,14 @@ use super::network_status_snapshot::{
 };
 use super::platform::PlatformNetworkMonitor;
 use super::refresh_trigger::{request_refresh_or_stop, RefreshWorkOutcome};
-use crate::error::NetError;
+use crate::error::{NetError, NetworkMonitorDiagnostic, NetworkMonitorPhase};
 use crate::module::net_status::logging::{Fault, FaultCycle};
 use crate::module::net_status::IpStack;
 #[cfg(any(not(target_os = "windows"), test))]
 use crate::module::net_status::NetworkStatus;
 use crate::net_status::{MonitorState as PublicMonitorState, NetworkSnapshot};
 use crate::subscription::common_executor::CommonCallbackExecutor;
+#[cfg(test)]
 use crate::subscription::StateReceiver;
 
 #[cfg(test)]
@@ -47,6 +48,8 @@ struct Lifecycle {
 
 // 在首次轮询之前即持有的一代退出守卫；清理不依赖 start 的等待者仍然存在。
 struct MonitorTaskCompletion {
+    // Monotonic elapsed startup/monitor time, retained on diagnostic failures.
+    started_at: std::time::Instant,
     // 弱引用避免后台任务与客户端形成所有权环，仅退休身份匹配的当前监控代。
     lifecycle: Weak<Mutex<Lifecycle>>,
     // 该代唯一有效性标志，其 Arc 身份同时用于防止旧代清理误删新代。
@@ -99,9 +102,19 @@ impl Drop for MonitorTaskCompletion {
                 }
             };
         }
-        let failure = self.initialization_error.clone().or_else(|| {
-            (!stopped).then(|| NetError::from(crate::error::ErrorKind::RuntimeUnavailable))
-        });
+        let failure = self
+            .initialization_error
+            .clone()
+            .or_else(|| {
+                (!stopped).then(|| NetError::from(crate::error::ErrorKind::RuntimeUnavailable))
+            })
+            .map(|error| {
+                error.with_network_monitor_diagnostic(NetworkMonitorDiagnostic {
+                    phase: NetworkMonitorPhase::MonitorTaskExit,
+                    elapsed: Some(self.started_at.elapsed()),
+                    timeout: None,
+                })
+            });
         let terminal = failure
             .clone()
             .map_or(PublicMonitorState::Stopped, PublicMonitorState::Failed);
@@ -115,9 +128,10 @@ impl Drop for MonitorTaskCompletion {
             *initial = match failure {
                 Some(error) => MonitorInitialization::Failed(error),
                 None if stopped => MonitorInitialization::Stopped,
-                None => MonitorInitialization::Failed(NetError::from(
-                    crate::error::ErrorKind::RuntimeUnavailable,
-                )),
+                None => MonitorInitialization::Failed(
+                    NetError::from(crate::error::ErrorKind::RuntimeUnavailable)
+                        .with_network_monitor_phase(NetworkMonitorPhase::MonitorTaskExit),
+                ),
             };
             true
         });
@@ -125,6 +139,15 @@ impl Drop for MonitorTaskCompletion {
         if let Err(error) = publication.and_then(NetworkPublication::dispatch) {
             crate::log_e!(LogType::Engine; "net_status.drop", "event|kind|stage", "network_status_monitor_exit", format!("{:?}", error.kind()), format!("{:?}", error.context().stage));
         }
+    }
+}
+
+fn take_monitor_completion(
+    handoff: &Mutex<Option<MonitorTaskCompletion>>,
+) -> Option<MonitorTaskCompletion> {
+    match handoff.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
     }
 }
 
@@ -143,6 +166,8 @@ pub(crate) struct InnerNetStatusClient {
     monitor_factory: Mutex<Option<initialization_tests::MonitorFactory>>,
     #[cfg(test)]
     monitor_task: Mutex<Option<tokio::task::AbortHandle>>,
+    #[cfg(test)]
+    startup_faults: Mutex<startup_diagnostic_tests::StartupFaults>,
 }
 
 impl InnerNetStatusClient {
@@ -164,6 +189,8 @@ impl InnerNetStatusClient {
             monitor_factory: Mutex::new(None),
             #[cfg(test)]
             monitor_task: Mutex::new(None),
+            #[cfg(test)]
+            startup_faults: Mutex::new(startup_diagnostic_tests::StartupFaults::default()),
         })
     }
 
@@ -242,7 +269,7 @@ impl InnerNetStatusClient {
     // 幂等启动并等待同代初始化结果；失败代先完成退休，再将错误交付所有等待者。
     // stop 取消初始化时返回当前快照；永久销毁优先返回 Closed。
     pub(crate) async fn start(&self) -> Result<NetworkSnapshot, NetError> {
-        let (mut initial_state, task, publication) = loop {
+        let (initial_state, task, publication) = loop {
             let retiring = {
                 let mut lifecycle = self.lifecycle.lock().map_err(NetError::from_poison)?;
                 if lifecycle.destroyed {
@@ -307,7 +334,7 @@ impl InnerNetStatusClient {
                     crate::log_e!(LogType::Engine; "net_status.start", "event|kind|stage", "network_status_start", format!("{:?}", dispatch_error.kind()), format!("{:?}", dispatch_error.context().stage));
                 }
             }
-            return Err(error);
+            return Err(error.with_network_monitor_phase(NetworkMonitorPhase::ObservationCommit));
         }
         // 退出守卫也会获取生命周期锁；在锁外提交，覆盖运行时拒绝未轮询任务的路径。
         if let Some(task) = task {
@@ -321,16 +348,11 @@ impl InnerNetStatusClient {
             drop(submitted);
         }
         if let Some(publication) = publication {
-            publication.dispatch()?;
+            publication.dispatch().map_err(|error| {
+                error.with_network_monitor_phase(NetworkMonitorPhase::ObservationCommit)
+            })?;
         }
-        while matches!(
-            *initial_state.borrow_and_update(),
-            MonitorInitialization::Pending
-        ) {
-            if initial_state.changed().await.is_err() {
-                break;
-            }
-        }
+        let initialization = Self::wait_for_initialization(initial_state).await;
         if self
             .lifecycle
             .lock()
@@ -339,13 +361,28 @@ impl InnerNetStatusClient {
         {
             return Err(NetError::from(crate::error::ErrorKind::Closed));
         }
-        let result = ::tokio::sync::watch::Receiver::borrow(&initial_state).clone();
-        match result {
+        match initialization? {
             MonitorInitialization::Ready | MonitorInitialization::Stopped => self.snapshot(),
             MonitorInitialization::Failed(error) => Err(error),
             MonitorInitialization::Pending => {
-                Err(NetError::from(crate::error::ErrorKind::RuntimeUnavailable))
+                Err(NetError::from(crate::error::ErrorKind::RuntimeUnavailable)
+                    .with_network_monitor_phase(NetworkMonitorPhase::InitialResultReceive))
             }
+        }
+    }
+
+    async fn wait_for_initialization(
+        mut initial_state: watch::Receiver<MonitorInitialization>,
+    ) -> Result<MonitorInitialization, NetError> {
+        loop {
+            let current = initial_state.borrow_and_update().clone();
+            if !matches!(current, MonitorInitialization::Pending) {
+                return Ok(current);
+            }
+            initial_state.changed().await.map_err(|source| {
+                NetError::with_source(crate::error::ErrorKind::RuntimeUnavailable, source)
+                    .with_network_monitor_phase(NetworkMonitorPhase::InitialResultReceive)
+            })?;
         }
     }
 
@@ -367,10 +404,14 @@ impl InnerNetStatusClient {
             .lock()
             .map_err(NetError::from_poison)?
             .clone();
+        #[cfg(test)]
+        let startup_faults = *self.startup_faults.lock().map_err(NetError::from_poison)?;
         let (stop_sender, stop_receiver) = oneshot::channel();
         let (initial_sender, initial_state) = watch::channel(MonitorInitialization::Pending);
         let (finished_sender, finished) = watch::channel(false);
-        let (publisher, publication) = self.observations.begin_generation()?;
+        let (publisher, publication) = self.observations.begin_generation().map_err(|error| {
+            error.with_network_monitor_phase(NetworkMonitorPhase::ObservationCommit)
+        })?;
         let state = MonitorState {
             observation: Some(publisher.clone()),
             ..MonitorState::default()
@@ -379,11 +420,14 @@ impl InnerNetStatusClient {
         let state = Arc::new(Mutex::new(state));
         let shared_state = Arc::clone(&state);
         let completion = MonitorTaskCompletion {
+            started_at: std::time::Instant::now(),
             lifecycle: Arc::downgrade(&self.lifecycle),
             active: Arc::clone(&active),
             state: Arc::clone(&state),
             initial_state: initial_sender.clone(),
-            initialization_error: publication.result().err(),
+            initialization_error: publication.result().err().map(|error| {
+                error.with_network_monitor_phase(NetworkMonitorPhase::ObservationCommit)
+            }),
             observation: publisher,
             completion: Some(MonitorCompletion(finished_sender)),
         };
@@ -397,27 +441,42 @@ impl InnerNetStatusClient {
         let task = async move {
             let (submission_alive, submission_cancelled) = oneshot::channel::<()>();
             let (thread_finished, thread_wait) = oneshot::channel();
-            let spawned = threads.spawn("open-net-network-monitor", move || {
+            // The submitter owns one reference until spawn returns. A rejected
+            // closure must not publish a generic failure before we retain its
+            // actual thread-creation error. Never destroy completion under this lock.
+            let handoff = Arc::new(Mutex::new(Some(completion)));
+            let worker_handoff = handoff.clone();
+            let spawned = Self::spawn_monitor_thread(
+                &threads,
+                move || {
                     // Declared before runtime: unwinding also destroys runtime
                     // resources before publishing this generation's completion.
-                    let mut completion = completion;
-                    let runtime = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
+                    let Some(mut completion) = take_monitor_completion(&worker_handoff) else {
+                        return;
+                    };
+                    let runtime = match Self::build_monitor_runtime(
+                        #[cfg(test)]
+                        startup_faults.runtime_build_os_error,
+                    ) {
                         Ok(runtime) => runtime,
                         Err(error) => {
-                            completion.initialization_error = Some(NetError::with_source(
-                                crate::error::ErrorKind::RuntimeUnavailable,
-                                error,
-                            ));
+                            completion.initialization_error = Some(
+                                NetError::with_source(
+                                    crate::error::ErrorKind::RuntimeUnavailable,
+                                    error,
+                                )
+                                .with_network_monitor_phase(NetworkMonitorPhase::RuntimeBuild),
+                            );
                             return;
                         }
                     };
                     let outcome = runtime.block_on(async move {
                         tokio::select! {
                             biased;
-                            _ = submission_cancelled => Err(NetError::from(crate::error::ErrorKind::RuntimeUnavailable)),
+                            _ = submission_cancelled => Err(
+                                NetError::from(crate::error::ErrorKind::RuntimeUnavailable)
+                                    .with_network_monitor_phase(NetworkMonitorPhase::MonitorTaskSubmit)
+                            ),
                             result = Self::monitor_until_stopped(
                                 shared_state,
                                 stop_receiver,
@@ -435,12 +494,20 @@ impl InnerNetStatusClient {
                     }
                     drop(completion);
                     let _ = thread_finished.send(());
-                });
+                },
+                #[cfg(test)]
+                startup_faults.thread_spawn_os_error,
+            );
             if let Err(error) = spawned {
-                // The rejected closure already dropped its unpolled guard;
-                // initialization waiters receive RuntimeUnavailable.
-                crate::log_e!(LogType::Engine; "net_status.prepare_monitor_task", "kind|stage", format!("{:?}", error.kind()), "NetworkMonitor");
+                if let Some(mut completion) = take_monitor_completion(&handoff) {
+                    completion.initialization_error = Some(
+                        NetError::with_source(crate::error::ErrorKind::RuntimeUnavailable, error)
+                            .with_network_monitor_phase(NetworkMonitorPhase::MonitorThreadSpawn),
+                    );
+                    drop(completion);
+                }
             }
+            drop(handoff);
             // Cancelling CommonEngine's task cancels the provider future, but
             // the independent thread retains ownership of its real exit guard.
             let _ = thread_wait.await;
@@ -454,6 +521,32 @@ impl InnerNetStatusClient {
             active,
         };
         Ok((monitor, task, publication))
+    }
+
+    fn spawn_monitor_thread(
+        threads: &Arc<crate::common::retirement::ThreadRegistry>,
+        run: impl FnOnce() + Send + 'static,
+        #[cfg(test)] injected_os_error: Option<i32>,
+    ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(code) = injected_os_error {
+            // Drop the rejected closure before returning, just like thread spawn.
+            drop(run);
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        threads.spawn("open-net-network-monitor", run)
+    }
+
+    fn build_monitor_runtime(
+        #[cfg(test)] injected_os_error: Option<i32>,
+    ) -> std::io::Result<tokio::runtime::Runtime> {
+        #[cfg(test)]
+        if let Some(code) = injected_os_error {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
     }
 
     // Commit the stop while holding the lifecycle lock; notify public observers afterwards.
@@ -518,6 +611,7 @@ impl InnerNetStatusClient {
     }
 
     // 停止当前监控并等待所有退役监控释放资源，之后允许重新启动；透传同步清理阶段的错误。
+    #[cfg(test)]
     pub(crate) async fn stop(&self) -> Result<(), NetError> {
         let (finished, error) = self.request_stop(false);
         Self::wait_until_finished(finished).await?;
@@ -530,12 +624,14 @@ impl InnerNetStatusClient {
     }
 
     // 永久销毁客户端并等待已有监控清理完成，返回停止过程中记录的错误。
+    #[cfg(test)]
     pub(crate) async fn destroy(&self) -> Result<(), NetError> {
         let (finished, error) = self.request_stop(true);
         Self::wait_until_finished(finished).await?;
         error.map_or(Ok(()), Err)
     }
 
+    #[cfg(test)]
     pub(crate) async fn shutdown(&self) -> Result<(), NetError> {
         self.destroy().await
     }
@@ -544,6 +640,7 @@ impl InnerNetStatusClient {
         self.observations.snapshot()
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe_state(&self) -> Result<StateReceiver<NetworkSnapshot>, NetError> {
         self.observations.observe()
     }
@@ -784,12 +881,15 @@ impl InnerNetStatusClient {
     ) -> Result<netwatch::netmon::Monitor, NetError> {
         #[cfg(test)]
         if let Some(factory) = factory {
-            return factory().await;
+            return factory().await.map_err(|error| {
+                error.with_network_monitor_phase(NetworkMonitorPhase::NetwatchCreate)
+            });
         }
         netwatch::netmon::Monitor::new().await.map_err(|error| {
             crate::log_e!(LogType::Engine; "net_status.create_monitor", "reason", "monitor_creation_failed");
             NetError::with_source(crate::error::ErrorKind::RuntimeUnavailable, error)
                 .with_stage(crate::error::ErrorStage::NetworkMonitor)
+                .with_network_monitor_phase(NetworkMonitorPhase::NetwatchCreate)
         })
     }
 
@@ -857,14 +957,15 @@ impl InnerNetStatusClient {
         {
             let cancel = super::refresh::Cancellation::new();
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let progress = Arc::new(super::sample_diagnostics::SampleProgress::new(deadline));
             let sampled = tokio::select! {
                 biased;
                 _ = &mut *stop => return Ok(false),
                 result = async {
                     tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        sampler.sample_background(deadline, cancel.flag.clone()),
-                    ).await.map_err(|_| NetError::from(crate::error::ErrorKind::TimedOut))?
+                        sampler.sample_background_tracked(deadline, cancel.flag.clone(), progress.clone()),
+                    ).await.map_err(|_| progress.annotate(NetError::from(crate::error::ErrorKind::TimedOut)))?
                 } => result,
             };
             let failure = sampled.as_ref().err().map(Fault::from_error);
@@ -886,7 +987,12 @@ impl InnerNetStatusClient {
                 sampled,
                 Self::ip_stack_from_state(snapshot),
                 &mut commit_fault,
-            )?;
+            )
+            .map_err(|error| {
+                progress.annotate(error.with_network_monitor_phase(
+                    crate::error::NetworkMonitorPhase::ObservationCommit,
+                ))
+            })?;
             if !keep_running {
                 return Ok(false);
             }
@@ -894,7 +1000,11 @@ impl InnerNetStatusClient {
                 faults.failure("reachability_sample", failure);
             }
             if let Some(publication) = publication {
-                publication.dispatch()?;
+                publication.dispatch().map_err(|error| {
+                    progress.annotate(
+                        error.with_network_monitor_phase(NetworkMonitorPhase::ObservationCommit),
+                    )
+                })?;
                 if commit_fault.is_none() {
                     faults.recovered("reachability_sample");
                 }
@@ -988,9 +1098,17 @@ impl Drop for InnerNetStatusClient {
 mod tests;
 
 #[cfg(test)]
+#[path = "startup_diagnostic_tests.rs"]
+mod startup_diagnostic_tests;
+
+#[cfg(test)]
 #[path = "resample_tests.rs"]
 mod resample_tests;
 
 #[cfg(test)]
 #[path = "background_name_tests.rs"]
 mod connectivity_minimization_tests;
+
+#[cfg(all(test, target_os = "windows"))]
+#[path = "windows_startup_diagnostics_tests.rs"]
+mod windows_startup_diagnostics_tests;

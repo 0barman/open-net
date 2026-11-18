@@ -95,13 +95,16 @@ impl<T> Clone for EventPublisher<T> {
     }
 }
 impl<T> EventPublisher<T> {
+    #[cfg(test)]
     pub(crate) fn try_publish(&self, value: T, bytes: usize) -> Result<()> {
         self.prepare_try_publish(value, bytes).dispatch()
     }
+    #[cfg(test)]
     pub(crate) async fn publish(&self, value: T, bytes: usize) -> Result<()> {
         self.publish_with_resources(value, bytes, EventResources::default())
             .await
     }
+    #[cfg(test)]
     pub(crate) async fn publish_with_resources(
         &self,
         value: T,

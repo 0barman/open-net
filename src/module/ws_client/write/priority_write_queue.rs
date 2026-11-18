@@ -156,10 +156,8 @@ impl PriorityWriteQueue {
             state
                 .delayed
                 .insert(request.dispatch_cancel.clone(), request);
-        } else {
-            if let Err(request) = state.heap.push(request) {
-                return Err((request, NetError::from(ErrorKind::ResourceExhausted)));
-            }
+        } else if let Err(request) = state.heap.push(request) {
+            return Err((request, NetError::from(ErrorKind::ResourceExhausted)));
         }
         drop(group_guard);
         drop(state);

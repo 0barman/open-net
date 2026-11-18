@@ -8,6 +8,10 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use super::facade::NetworkObservationOwner;
+#[cfg(any(target_os = "windows", test))]
+use super::sample_diagnostics::{with_progress, SampleProgress};
+#[cfg(any(target_os = "windows", test))]
+use crate::error::NetworkMonitorPhase;
 use crate::error::{ErrorKind, ErrorStage, NetError};
 use crate::net_status::NetworkRefreshResult;
 
@@ -39,11 +43,13 @@ pub(crate) fn refresh_reachability_blocking(
 fn wait_for_refresh<T>(future: impl Future<Output = Result<T, NetError>>) -> Result<T, NetError> {
     if crate::common::common_engine::is_engine_runtime_thread() || IS_SAMPLER_THREAD.with(Cell::get)
     {
-        return Err(NetError::input(
+        let error = NetError::input(
             "network_status.refresh_blocking.context",
             "blocking refresh cannot run on an SDK runtime or sampling thread",
         )
-        .with_stage(ErrorStage::NetworkMonitor));
+        .with_stage(ErrorStage::NetworkMonitor);
+        crate::module::net_status::logging::emit_monitor_error("refresh_reachability", &error);
+        return Err(error);
     }
 
     struct RefreshWake {
@@ -90,6 +96,17 @@ pub(crate) async fn refresh(
 }
 
 pub(crate) async fn refresh_reachability(
+    owner: Arc<NetworkObservationOwner>,
+    timeout: Duration,
+) -> Result<NetworkRefreshResult, NetError> {
+    let result = refresh_reachability_inner(owner, timeout).await;
+    if let Err(error) = &result {
+        crate::module::net_status::logging::emit_monitor_error("refresh_reachability", error);
+    }
+    result
+}
+
+async fn refresh_reachability_inner(
     owner: Arc<NetworkObservationOwner>,
     timeout: Duration,
 ) -> Result<NetworkRefreshResult, NetError> {
@@ -178,6 +195,7 @@ struct Request {
     cancelled: Arc<AtomicBool>,
     reply: tokio::sync::oneshot::Sender<Result<CompletedSample, NetError>>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    progress: Arc<SampleProgress>,
 }
 
 /// One lazy ordinary thread per sampling lane, with a bounded waiting queue.
@@ -271,7 +289,9 @@ impl WindowsSampler {
                         }
                     };
                     if closed {
-                        let _ = request.reply.send(Err(error(ErrorKind::Closed)));
+                        let _ = request
+                            .reply
+                            .send(Err(request.progress.annotate(error(ErrorKind::Closed))));
                         continue;
                     }
                     let result = (|| {
@@ -281,13 +301,21 @@ impl WindowsSampler {
                                 value.checked_add(1)
                             })
                             .map(|previous| previous + 1)
-                            .map_err(|_| error(ErrorKind::ResourceExhausted))?;
+                            .map_err(|_| {
+                                error(ErrorKind::ResourceExhausted).with_network_monitor_phase(
+                                    NetworkMonitorPhase::SampleAdmission,
+                                )
+                            })?;
                         let started_at = SystemTime::now();
+                        request.progress.sampling();
                         let observation =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                provider(request.deadline, &request.cancelled)
+                                with_progress(request.progress.clone(), || {
+                                    provider(request.deadline, &request.cancelled)
+                                })
                             }))
                             .map_err(|_| error(ErrorKind::Internal))??;
+                        request.progress.completed();
                         let sampled_at = SystemTime::now();
                         check(request.deadline, &request.cancelled)?;
                         Ok(CompletedSample {
@@ -304,12 +332,15 @@ impl WindowsSampler {
                         };
                         state.running = None;
                     }
-                    let _ = request.reply.send(result);
+                    let _ = request
+                        .reply
+                        .send(result.map_err(|error| request.progress.annotate(error)));
                 }
             })
             .map_err(|cause| {
                 NetError::with_source(ErrorKind::RuntimeUnavailable, cause)
                     .with_stage(ErrorStage::NetworkMonitor)
+                    .with_network_monitor_phase(NetworkMonitorPhase::SamplerWorkerSpawn)
             })?;
         Ok(sender)
     }
@@ -330,36 +361,63 @@ impl WindowsSampler {
         // work owns its cancellation flag and remains covered by engine join.
         drop(sender);
     }
+    #[cfg(test)]
     pub(super) async fn sample(
         &self,
         deadline: Instant,
         cancelled: Arc<AtomicBool>,
+    ) -> Result<CompletedSample, NetError> {
+        self.sample_tracked(deadline, cancelled, Arc::new(SampleProgress::new(deadline)))
+            .await
+    }
+    pub(super) async fn sample_tracked(
+        &self,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        progress: Arc<SampleProgress>,
     ) -> Result<CompletedSample, NetError> {
         let permit = self
             .admission
             .clone()
             .try_acquire_owned()
             .map_err(|cause| {
-                error(match cause {
-                    tokio::sync::TryAcquireError::Closed => ErrorKind::Closed,
-                    tokio::sync::TryAcquireError::NoPermits => ErrorKind::QueueFull,
-                })
+                progress.annotate(
+                    error(match cause {
+                        tokio::sync::TryAcquireError::Closed => ErrorKind::Closed,
+                        tokio::sync::TryAcquireError::NoPermits => ErrorKind::QueueFull,
+                    })
+                    .with_network_monitor_phase(NetworkMonitorPhase::SampleAdmission),
+                )
             })?;
-        self.sample_inner(deadline, cancelled, Some(permit)).await
+        self.sample_inner(deadline, cancelled, Some(permit), progress.clone())
+            .await
+            .map_err(|error| progress.annotate(error))
     }
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(test)]
     pub(super) async fn sample_background(
         &self,
         deadline: Instant,
         cancelled: Arc<AtomicBool>,
     ) -> Result<CompletedSample, NetError> {
-        self.sample_inner(deadline, cancelled, None).await
+        self.sample_background_tracked(deadline, cancelled, Arc::new(SampleProgress::new(deadline)))
+            .await
+    }
+    pub(super) async fn sample_background_tracked(
+        &self,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        progress: Arc<SampleProgress>,
+    ) -> Result<CompletedSample, NetError> {
+        self.sample_inner(deadline, cancelled, None, progress.clone())
+            .await
+            .map_err(|error| progress.annotate(error))
     }
     async fn sample_inner(
         &self,
         deadline: Instant,
         cancelled: Arc<AtomicBool>,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        progress: Arc<SampleProgress>,
     ) -> Result<CompletedSample, NetError> {
         check(deadline, &cancelled)?;
         let (reply, result) = tokio::sync::oneshot::channel();
@@ -377,20 +435,27 @@ impl WindowsSampler {
                 .ok_or_else(|| error(ErrorKind::Internal))?
                 .as_ref()
                 .map_err(Clone::clone)?;
+            // Set before submission: the worker may already run when try_send
+            // returns, so the caller must never overwrite its newer progress.
+            progress.queued();
             sender.try_send(Request {
                 deadline,
                 cancelled,
                 reply,
                 _permit: permit,
+                progress,
             })
         };
         submitted.map_err(|cause| match cause {
-            mpsc::TrySendError::Full(_) => error(ErrorKind::QueueFull),
-            mpsc::TrySendError::Disconnected(_) => error(ErrorKind::RuntimeUnavailable),
+            mpsc::TrySendError::Full(_) => error(ErrorKind::QueueFull)
+                .with_network_monitor_phase(NetworkMonitorPhase::SampleQueueSubmit),
+            mpsc::TrySendError::Disconnected(_) => error(ErrorKind::RuntimeUnavailable)
+                .with_network_monitor_phase(NetworkMonitorPhase::SampleQueueSubmit),
         })?;
-        result
-            .await
-            .map_err(|_| error(ErrorKind::RuntimeUnavailable))?
+        result.await.map_err(|cause| {
+            NetError::with_source(ErrorKind::RuntimeUnavailable, cause)
+                .with_network_monitor_phase(NetworkMonitorPhase::SampleResultReceive)
+        })?
     }
 }
 
@@ -409,6 +474,7 @@ async fn refresh_with_sampler(
     deadline: Instant,
 ) -> Result<NetworkRefreshResult, NetError> {
     let cancel = Cancellation::new();
+    let progress = Arc::new(SampleProgress::new(deadline));
     let engine = owner.context().common_engine()?;
     // Construct the timer on the library runtime, also allowing an executor
     // other than Tokio to poll this public future.
@@ -417,17 +483,17 @@ async fn refresh_with_sampler(
         let _entered = handle.enter();
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            sampler.sample(deadline, cancel.flag.clone()),
+            sampler.sample_tracked(deadline, cancel.flag.clone(), progress.clone()),
         )
     };
     let sampled = tokio::select! {
         biased;
         _ = target.invalidated() => {
-            return Err(error(if matches!(owner.snapshot()?.state, crate::net_status::MonitorState::Closed) {
+            return Err(progress.annotate(error(if matches!(owner.snapshot()?.state, crate::net_status::MonitorState::Closed) {
                 ErrorKind::Closed
-            } else { ErrorKind::Cancelled }));
+            } else { ErrorKind::Cancelled })));
         }
-        result = sampling => result.map_err(|_| error(ErrorKind::TimedOut))??,
+        result = sampling => result.map_err(|_| progress.annotate(error(ErrorKind::TimedOut)))??,
     };
     let observation = sampled.observation;
     let snapshot = owner
@@ -439,7 +505,13 @@ async fn refresh_with_sampler(
             sampled.sampled_at,
             || cancel.check(deadline),
         )
-        .map_err(|error| error.with_stage(ErrorStage::NetworkMonitor))?;
+        .map_err(|error| {
+            progress.annotate(
+                error
+                    .with_stage(ErrorStage::NetworkMonitor)
+                    .with_network_monitor_phase(NetworkMonitorPhase::ObservationCommit),
+            )
+        })?;
     Ok(NetworkRefreshResult {
         snapshot,
         sampled_reachability: observation.reachability,
@@ -467,3 +539,7 @@ mod reachability_tests;
 #[cfg(test)]
 #[path = "refresh_blocking_tests.rs"]
 mod blocking_tests;
+
+#[cfg(test)]
+#[path = "sampling_diagnostic_tests.rs"]
+mod sampling_diagnostic_tests;

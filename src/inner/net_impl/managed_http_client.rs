@@ -190,11 +190,11 @@ impl ManagedHttpClientInner {
             }
             match &state.phase {
                 Phase::Ready(client) => {
-                    return if client.inner.is_shutdown_requested() {
+                    if client.inner.is_shutdown_requested() {
                         Err(closed())
                     } else {
                         Ok(Action::Ready(client.clone()))
-                    };
+                    }
                 }
                 Phase::Creating(round) => Ok(Action::Wait(round.clone(), None)),
                 Phase::Idle => {
@@ -209,7 +209,7 @@ impl ManagedHttpClientInner {
                     };
                     Ok(Action::Wait(round, Some(work)))
                 }
-                Phase::Closing(_) | Phase::Closed => return Err(closed()),
+                Phase::Closing(_) | Phase::Closed => Err(closed()),
             }
         })?;
         let (round, start) = match action {

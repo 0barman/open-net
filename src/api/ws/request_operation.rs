@@ -944,7 +944,7 @@ async fn attempt_once(
     }
     admission
         .commit()
-        .map_err(|error| preserve_timeout_phase(error))?;
+        .map_err(preserve_timeout_phase)?;
     let result = scope_attempt(
         &control.runtime,
         &control.options,

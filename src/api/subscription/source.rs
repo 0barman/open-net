@@ -57,6 +57,7 @@ impl<T> Clone for StatePublisher<T> {
     }
 }
 impl<T> StateSource<T> {
+    #[cfg(test)]
     pub(crate) fn new(
         initial: T,
         executor: Arc<dyn CallbackExecutor>,
@@ -165,6 +166,7 @@ impl<T: Clone> StateSource<T> {
         };
         Ok((*value).clone())
     }
+    #[cfg(test)]
     pub(crate) fn current(&self) -> T {
         let value = lock(&self.core.state).current.clone();
         (*value).clone()
@@ -226,12 +228,15 @@ impl<T> StatePublisher<T> {
     pub(crate) fn exhaust_revision_for_test(&self) {
         lock(&self.owner.core.state).revision = u64::MAX;
     }
+    #[cfg(test)]
     pub(crate) fn publish(&self, value: T) -> Result<()> {
         self.prepare_arc(Arc::new(value)).dispatch()
     }
+    #[cfg(test)]
     pub(crate) fn finish(&self, final_value: T) -> Result<()> {
         self.prepare_finish_arc(Arc::new(final_value)).dispatch()
     }
+    #[cfg(test)]
     pub(crate) fn fail(&self, error: NetError) -> Result<()> {
         self.prepare_failure(error).dispatch()
     }

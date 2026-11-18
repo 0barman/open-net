@@ -104,6 +104,7 @@ fn provider_failure_log(operation: &'static str, reason: &'static str) {
     crate::log_e!(crate::LogType::HTTP; "http.provider_failure_log", "operation|reason", operation, reason);
 }
 
+#[cfg(not(feature = "quality-doctor"))]
 pub(crate) fn create_http_client(
     thread_name: String,
     config: HttpClientConfig,
@@ -1923,6 +1924,7 @@ impl Drop for HttpClientInner {
     }
 }
 
+#[cfg(any(not(feature = "quality-doctor"), test))]
 fn build_client(config: &HttpClientConfig) -> Result<Client, NetError> {
     build_client_impl(
         config,

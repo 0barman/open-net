@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use crate::common::CommonEngine;
 use crate::error::{ErrorKind, NetError};
 use crate::net_status::{
-    IpStack, MonitorState, NetworkEvent, NetworkEventOptions, NetworkObservation, NetworkSnapshot,
-    NetworkStatus,
+    MonitorState, NetworkEvent, NetworkEventOptions, NetworkObservation, NetworkSnapshot,
 };
+#[cfg(any(target_os = "windows", test))]
+use crate::net_status::{IpStack, NetworkStatus};
 use crate::subscription::common_executor::CommonCallbackExecutor;
 use crate::subscription::{
     CallbackContext, EventReceiver, StateReceiver, StateSource, Subscription,
@@ -459,6 +460,7 @@ impl NetworkObservationOwner {
         }
         snapshot
     }
+    #[cfg(any(target_os = "windows", test))]
     pub(super) fn context(&self) -> &NetworkStatusContext {
         &self.context
     }
@@ -499,6 +501,7 @@ impl NetworkObservationOwner {
     pub(crate) fn refresh_target(&self) -> Result<NetworkRefreshTarget, NetError> {
         self.view.refresh_target()
     }
+    #[cfg(any(target_os = "windows", test))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_refresh(
         &self,

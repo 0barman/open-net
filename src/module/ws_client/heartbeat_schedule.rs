@@ -3,6 +3,24 @@ use crate::ws::HeartbeatConfig;
 use std::time::Duration;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
+/// The existing interval result plus optional passive diagnostic timing.
+#[derive(Clone, Copy)]
+pub(super) struct HeartbeatDue {
+    pub(super) pong_timeout: Duration,
+    #[cfg(feature = "quality-doctor")]
+    pub(super) scheduled_at: Option<Instant>,
+}
+
+impl From<Duration> for HeartbeatDue {
+    fn from(pong_timeout: Duration) -> Self {
+        Self {
+            pong_timeout,
+            #[cfg(feature = "quality-doctor")]
+            scheduled_at: None,
+        }
+    }
+}
+
 /// The writer's optional timer, owned and polled on its existing runtime.
 pub(super) struct HeartbeatSchedule {
     enabled: Option<(Interval, Duration)>,
@@ -29,11 +47,17 @@ impl HeartbeatSchedule {
 
     /// Returns the timeout associated with this due probe. Disabled schedules
     /// create no interval and remain pending without waking the writer.
-    pub(super) async fn tick(&mut self) -> Duration {
+    pub(super) async fn tick(&mut self) -> HeartbeatDue {
         match &mut self.enabled {
             Some((interval, timeout)) => {
-                interval.tick().await;
-                *timeout
+                let scheduled_at = interval.tick().await;
+                #[cfg(not(feature = "quality-doctor"))]
+                let _ = scheduled_at;
+                HeartbeatDue {
+                    pong_timeout: *timeout,
+                    #[cfg(feature = "quality-doctor")]
+                    scheduled_at: Some(scheduled_at),
+                }
             }
             None => std::future::pending().await,
         }
@@ -63,7 +87,7 @@ mod tests {
             return Err(NetError::input("heartbeat", "first probe was immediate"));
         }
         tokio::time::advance(Duration::from_secs(60)).await;
-        if timer.tick().await != Duration::from_secs(1) {
+        if timer.tick().await.pong_timeout != Duration::from_secs(1) {
             return Err(NetError::input("heartbeat", "probe lost its Pong timeout"));
         }
         if timer.tick().now_or_never().is_some() {

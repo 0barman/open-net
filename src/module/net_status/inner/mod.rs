@@ -8,6 +8,8 @@ mod platform;
 mod recoverable;
 pub(crate) mod refresh;
 mod refresh_trigger;
+#[cfg(any(target_os = "windows", test))]
+mod sample_diagnostics;
 
 mod coordinated_view;
 mod network_view;

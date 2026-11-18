@@ -726,6 +726,7 @@ async fn failed_writer_close_ack_preserves_error(code: u16) -> TestResult {
             generation: GENERATION,
             cancel: active.cancel.clone(),
             data_frame_payload_size: Some(1024),
+            max_write_buffer_size: 4 * 1024 * 1024,
             control_write_timeout: Duration::from_secs(1),
             data_frame_write_timeout: Duration::from_secs(1),
             heartbeat_config: None,

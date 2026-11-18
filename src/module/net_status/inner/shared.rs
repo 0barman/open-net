@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::inner_net_status_client::InnerNetStatusClient;
 use super::network_status_snapshot::NetworkStatusSnapshot;
 use crate::common::CommonEngine;
-use crate::error::{ErrorKind, NetError};
+use crate::error::{ErrorKind, NetError, NetworkMonitorPhase};
 use crate::net_status::{MonitorState, NetworkSnapshot};
 
 /// A read-only handle to the network facts owned by one `OpenNet` engine.
@@ -70,7 +70,7 @@ impl NetworkStatusContext {
             .ok_or_else(|| NetError::from(ErrorKind::Closed))
     }
     pub(crate) fn is_closed(&self) -> bool {
-        self.service.upgrade().map_or(true, |service| {
+        self.service.upgrade().is_none_or(|service| {
             match service.admission.lock() {
                 Ok(state) => state.closed,
                 Err(_) => {
@@ -171,9 +171,10 @@ impl NetworkLease {
     pub(crate) async fn wait_started(&self) -> Result<NetworkSnapshot, NetError> {
         let (sender, received) = oneshot::channel();
         self.inner.ensure(Some(sender))?;
-        received
-            .await
-            .map_err(|_| NetError::from(ErrorKind::RuntimeUnavailable))?
+        received.await.map_err(|source| {
+            NetError::with_source(ErrorKind::RuntimeUnavailable, source)
+                .with_network_monitor_phase(NetworkMonitorPhase::InitialResultReceive)
+        })?
     }
     pub(crate) fn release(&self) -> CleanupTicket {
         self.inner.release()
@@ -200,7 +201,12 @@ impl LeaseState {
         service
             .commands
             .send(Command::Ensure(self.id, waiter))
-            .map_err(|_| NetError::from(ErrorKind::RuntimeUnavailable))
+            .map_err(|_| {
+                // A SendError owns the command, waiter and application state;
+                // retain the fixed failure location without retaining that payload.
+                NetError::from(ErrorKind::RuntimeUnavailable)
+                    .with_network_monitor_phase(NetworkMonitorPhase::MonitorTaskSubmit)
+            })
     }
     fn release(&self) -> CleanupTicket {
         let mut released = match self.released.lock() {

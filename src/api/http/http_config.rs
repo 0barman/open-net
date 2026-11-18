@@ -996,8 +996,8 @@ fn validate_root_certificates(bytes: &[u8]) -> Result<(), NetError> {
     Ok(())
 }
 
-fn parse_certificates<'a>(
-    bytes: &'a [u8],
+fn parse_certificates(
+    bytes: &[u8],
     field: &'static str,
 ) -> Result<Vec<CertificateDer<'static>>, NetError> {
     let blocks = strict_pem_blocks(bytes, "CERTIFICATE", field)?;

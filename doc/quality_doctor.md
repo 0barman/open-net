@@ -667,6 +667,8 @@ in every operation.
 | `SinkReadiness`, `StartSend`, `Flush`, `Written` | WebSocket sink readiness interval, local submission/flush, and existing written milestone. SinkReadiness can include the synchronous start-send attempt; StartSend marks that attempt rather than confirming delivery. These do not acknowledge remote processing. |
 | `ResponseMatched`, `ManualDispatch`, `ManualResolve` | Detailed WebSocket protocol matching, manual response dispatch, and resolution-retirement milestones. ManualDispatch can occur when no receiver is present and does not guarantee delivery. ManualResolve can occur for a stale or failed resolution path and does not certify successful matching. Application processing can contribute to manual-resolution delay. |
 | `Requeue` | WebSocket operation transition toward requeueing; the subsequent queue push can still fail. This does not introduce a diagnostic retry. |
+| `HeartbeatObserved` | The writer observed heartbeat work and created this probe. This is not the timer's scheduled due instant. |
+| `HeartbeatWriteStarted` | The writer is about to attempt a Ping write for this probe. May repeat on a safe write retry; does not establish sink acceptance or peer receipt. |
 | `Heartbeat` | Existing WebSocket heartbeat response-match milestone; no extra heartbeat is sent. |
 | `PayloadReceived`, `ResponseRouting` | Complete WebSocket text/binary message observation and synchronous SDK response-routing boundary. This is not the arrival time of the first TCP byte. |
 | `ResponseWait` | Public phase vocabulary without an instrumented boundary in the adapters. Consult capabilities rather than assuming it is emitted. |
@@ -676,6 +678,49 @@ error must not rewrite that accepted response. Connection reports observe
 attempts, not how long an established connection stays open. Manual dispatch and
 manual resolution can be milestones on different receive/request reports, so
 their timestamps require explicit association and appropriate interpretation.
+
+### WebSocket heartbeat timeline
+
+Each `WsHeartbeat` report identifies one existing SDK probe, associated with its
+client, session, and physical connection. Observation does not schedule an extra
+Ping, extend a deadline, or alter data-frame scheduling. Basic and Detailed
+modes retain the following milestones when collection succeeds:
+
+1. `HeartbeatObserved`: the writer observed due work and created the probe.
+2. `HeartbeatWriteStarted`: entry to an attempt to write that probe's Ping,
+   including local readiness and flushing of preceding buffered data.
+3. `Written`: the local Ping write completed and the Pong deadline began.
+4. `Heartbeat`: the receive task accepted the matching Pong before its deadline.
+
+For a normal interval-triggered probe, `heartbeat_schedule_delay()` is the
+observed duration from the existing interval's scheduled tick to the writer's
+probe-creation observation. It can include socket backpressure and runtime
+scheduling. The report's start is not backdated to that tick. Recovery probes
+have no normal interval tick and return `None`; missing or dropped diagnostics
+also must not be interpreted as a zero delay. The optional JSON key is
+`heartbeat_schedule_delay` and follows the report's duration serialization.
+
+Compare milestones **within the same report**. The time from write start to
+`Written` covers local write work, not server processing. `Written` to
+`Heartbeat` includes remaining TCP/TLS queues, network and peer work, and local
+receive processing; it is not pure network RTT. A matching Pong can be handled
+before the local write future returns. That successful report may legitimately
+have no `Written` milestone; do not invent it or require this sequence to be
+strictly complete. Write-start milestones can repeat for a safely retried Ping.
+
+A completed `Timeout` probe with `Written` and without `Heartbeat` is evidence
+that the SDK did not accept a timely matching Pong. It does not prove the peer
+was dead or never sent a response. A late or unrelated Pong cannot turn that
+probe into a success, and a recovery probe has a separate report. Incomplete
+diagnostics and diagnostic loss counters remain part of the interpretation.
+
+These records do not contain probe payload bytes, server timestamps, packet
+arrival timestamps, or kernel queue depth. To locate a delay precisely, collect
+the peer's receive/reply evidence for the same exchange. A server-initiated
+Ping/client-Pong measurement is a different exchange and cannot substitute for
+the timed-out client-initiated probe. See the
+[WebSocket heartbeat contract](websocket/README.md#large-messages-backpressure-and-heartbeat-deadlines)
+for fragmentation, application-level heartbeats, and synchronous routing limits.
 
 ## Summary calculations and findings
 

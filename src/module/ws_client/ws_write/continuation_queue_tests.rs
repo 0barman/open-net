@@ -163,6 +163,7 @@ async fn check_writer_interruption(deadline: bool, urgent_followup: bool) -> Tes
             generation: GENERATION,
             cancel: CancellationToken::new(),
             data_frame_payload_size: Some(3),
+            max_write_buffer_size: 4 * 1024 * 1024,
             control_write_timeout: Duration::from_secs(10),
             data_frame_write_timeout: Duration::from_secs(10),
             heartbeat_config: Some(crate::ws::HeartbeatConfig {
