@@ -30,6 +30,8 @@ pub(crate) struct WriteLoopContext {
     pub(crate) cancel: CancellationToken,
     /// 大消息的 data frame payload 上限；`None` 表示不主动分帧。
     pub(crate) data_frame_payload_size: Option<usize>,
+    /// Existing transport capacity, used to bound private data-frame batches.
+    pub(crate) max_write_buffer_size: usize,
     /// 单个 Ping、Pong、Close 写入或 sink 关闭的最长等待时间。
     pub(crate) control_write_timeout: Duration,
     /// 单个业务 data frame 写入的最长等待时间。

@@ -96,13 +96,17 @@ impl HandshakeProvider {
     ) -> Result<HandshakeHeaders> {
         let identity = (attempt.client_id, attempt.session_id, attempt.attempt_id);
         let result = match &self.inner {
-            ProviderKind::Async(provider) => match {
-                let _scope = crate::common::retirement::ExecutionScope::enter();
-                provider(attempt)
-            } {
-                Ok(future) => GuardedFuture::new(future).await,
-                Err(error) => Err(error),
-            },
+            ProviderKind::Async(provider) => {
+                let provided = {
+                    let _scope = crate::common::retirement::ExecutionScope::enter();
+                    provider(attempt)
+                };
+                // End the synchronous invocation scope before awaiting the future.
+                match provided {
+                    Ok(future) => GuardedFuture::new(future).await,
+                    Err(error) => Err(error),
+                }
+            }
             ProviderKind::Blocking(provider) => {
                 run_blocking_with_spawn(provider.clone(), attempt, slots, |job| {
                     threads.spawn("open-net-ws-context-provider", job)

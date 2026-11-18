@@ -431,6 +431,79 @@ Not applicable.
 
 Repeated starts reuse the active shared monitor and concurrent starts share pending initialization. A recoverable initialization failure is exposed by `Err(error)` and a `Failed(error)` state; subscriptions remain usable and another explicit `start()` can retry. Failure to create the detector is classified `RuntimeUnavailable`; platform reads can return `Io`. These are examples, not an exhaustive error list.
 
+Capture `error.network_monitor_diagnostics()` before replacing the error with
+`to_string()`. It returns an optional JSON object containing only the following
+fields. Unknown values are `null`; an error unrelated to monitoring returns
+`None`.
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | Existing `ErrorKind` enum name, such as `Io`, `TimedOut`, or `RuntimeUnavailable`. |
+| `stage` | Existing `ErrorStage` enum name, normally `NetworkMonitor`. |
+| `phase` | The SDK step associated with the failure, or last observed progress at a timeout. |
+| `elapsed_ms` | Measured elapsed time for the observed operation, when available. This is not an isolated duration for the reported phase. |
+| `timeout_ms` | Remaining deadline budget when the observed operation's timing began, when available; this may be shorter than the caller's configured timeout. |
+| `operation` | Windows reachability call that returned an error: `com_init`, `nlm_create`, or `nlm_get_connectivity`. |
+| `hresult` | That call's original 32-bit HRESULT, formatted as `0xXXXXXXXX`. |
+| `os_error_code` | A raw OS error code from an original `std::io::Error` in the bounded source chain, when available. This is a separate namespace from HRESULT. |
+
+Phases cover monitor task submission and thread creation, runtime construction,
+netwatch creation, sampling worker creation, sample admission and queueing,
+native sampling, result receipt, observation commit, and early monitor exit.
+On Windows, the native sampling phase also distinguishes COM initialization,
+NLM creation, and connectivity retrieval. A timeout records the last observed
+phase: the native call may still be running, so the phase alone does not prove
+that call failed. If no native failure returned, `operation` and `hresult`
+remain `null`; the SDK never fabricates an HRESULT from a timeout or OS code.
+
+For typed access, inspect `error.context().network_monitor.as_deref()` for
+`phase`, optional `elapsed`, and optional `timeout`, and inspect
+`error.context().windows_reachability` for `operation` and `hresult`. Both phase
+and operation enums expose stable `as_str()` identifiers. The public types live
+in `open_net::error` and are available on every platform. Windows reachability
+details are absent for other failures, including explicit network-name queries.
+
+The JSON payload does not format arbitrary `source` messages or include network
+names, machine names, or application metadata. The original `source` remains
+available to the caller. Windows native sampling failures retain `ErrorKind::Io`
+and their existing error string; a failed sample remains an error. A successful
+offline sample still allows startup with `Unavailable`. These diagnostic fields
+do not change startup, retry, offline-state, or macOS sampling behavior.
+
+Applications using the library logger can register an
+`OpenNetLogger::register_log_listener` or `register_shared_log_listener` before
+starting the monitor, include `LogType::Engine` and `LogLevel::Error`, and retain
+the returned subscription. The terminal errors returned by `start()` and
+`refresh_reachability()` emit the `net_status.error` tag. The deprecated refresh
+aliases and blocking refresh methods use the same refresh boundary, with one
+terminal event per returned error. The `LogInfo.content` JSON has this shape:
+
+```json
+{
+  "boundary": "start",
+  "diagnostics": {
+    "kind": "Io",
+    "stage": "NetworkMonitor",
+    "phase": "nlm_create",
+    "elapsed_ms": 12,
+    "timeout_ms": 5000,
+    "operation": "nlm_create",
+    "hresult": "0x80004005",
+    "os_error_code": null
+  }
+}
+```
+
+`boundary` is `start` or `refresh_reachability`. For lifecycle errors without
+monitor evidence, such as a closed view, `diagnostics` contains only `kind` and
+`stage`; it does not invent a phase. Periodic sampler failures keep their
+existing bounded logs rather than emitting a terminal event on every poll.
+Without an interested listener, the SDK skips constructing this event. Logging
+does not write to stdout or disk and does not send to Sentry automatically.
+Listener queues are bounded and dropping the subscription can discard pending
+records, so collecting the returned error directly is the reliable application
+boundary. Choose one primary reporting path or deduplicate if collecting both.
+
 A closed or destroyed view returns `Closed`. If `shutdown()` races startup it can terminate the wait with `Closed`; if `stop()` races it, inspect the successful snapshot's state rather than assuming `Running`. Dropping a started wait does not itself request `stop()`; perform explicit cleanup. An `Unavailable` observation is a successful monitor result, not a startup error.
 
 ### Example
@@ -445,7 +518,14 @@ async fn main() -> Result<()> {
     let result = client.start().await;
     match &result {
         Ok(snapshot) => println!("{:?}: {:?}", snapshot.state, snapshot.reachability),
-        Err(error) => eprintln!("Startup: {:?}: {error}", error.kind()),
+        Err(error) => {
+            if let Some(diagnostics) = error.network_monitor_diagnostics() {
+                // Pass this structured object to your application's event reporter.
+                eprintln!("{diagnostics}");
+            } else {
+                eprintln!("Startup: {:?}", error.kind());
+            }
+        }
     }
     net.destroy_net_status_client("status").await?;
     result?;

@@ -352,8 +352,10 @@ fn classify(error: reqwest::Error, boundary: FailureBoundary) -> NetError {
             RetryReason::Transport(TransportErrorKind::Protocol),
         )
     };
-    let mut context = ErrorContext::default();
-    context.stage = stage;
+    let mut context = ErrorContext {
+        stage,
+        ..ErrorContext::default()
+    };
     if causes.connect_timeout.is_some() {
         context.http_timeout_phase = Some(TimeoutPhase::Connect);
     }

@@ -3,6 +3,13 @@
 //! WebSocket control Ping/Pong frames are handled by the transport heartbeat.
 //! This module provides a separate, bounded loop for exchanges that require a
 //! text or binary heartbeat message at the application protocol level.
+//!
+//! These are ordinary data messages: they share application queue admission and
+//! wait for an already-started fragmented message to finish. They do not have
+//! the interleaving privileges of RFC 6455 Ping/Pong control frames. If the
+//! application protocol needs scheduling opportunities within a large payload,
+//! it must define multiple complete messages or use a separate connection; SDK
+//! frame fragmentation preserves the original logical message.
 
 use super::{
     DisconnectedPolicy, IncomingMessage, Message, MessageReceiver, ReceiveOptions, ReceiveOverflow,

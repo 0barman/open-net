@@ -136,8 +136,8 @@ async fn check_in_flight_continuation(interruption: InFlightInterruption) -> Tes
         &dispatch_cancel,
     ));
 
-    // The first poll completes a non-FIN first frame and yields. The second
-    // starts the continuation and reaches its pending flush before interruption.
+    // The explicit second-frame flush gate is reached within these polls for
+    // either per-frame or bounded yielding; repeated polls cannot cross it.
     check!(sending.as_mut().now_or_never().is_none())?;
     check!(sending.as_mut().now_or_never().is_none())?;
     entered_rx

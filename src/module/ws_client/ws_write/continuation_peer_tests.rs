@@ -195,6 +195,7 @@ fn context(
         generation,
         cancel: CancellationToken::new(),
         data_frame_payload_size: Some(3),
+        max_write_buffer_size: 4 * 1024 * 1024,
         control_write_timeout: REQUEST_TIMEOUT,
         data_frame_write_timeout: REQUEST_TIMEOUT,
         heartbeat_config: Some(crate::ws::HeartbeatConfig {

@@ -357,6 +357,7 @@ impl MessageSource {
         self.close(None);
     }
 
+    #[cfg(test)]
     pub(crate) fn fail(&self, error: NetError) {
         self.close(Some(error));
     }

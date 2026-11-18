@@ -1,5 +1,3 @@
-#![cfg(feature = "http-client")]
-
 use super::managed_http_client::ManagedHttpClientInner;
 use crate::api::http::http_client::HttpClient;
 use std::sync::Arc;

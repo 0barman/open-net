@@ -1,6 +1,8 @@
+#[path = "ws_write/data_frame_batch.rs"]
+mod data_frame_batch;
 use crate::common::log::log_def::LogType;
 use crate::error::NetError;
-use crate::module::ws_client::heartbeat_schedule::HeartbeatSchedule;
+use crate::module::ws_client::heartbeat_schedule::{HeartbeatDue, HeartbeatSchedule};
 use crate::module::ws_client::heartbeat_state::{HeartbeatState, HeartbeatTick};
 use crate::module::ws_client::io_diagnostics::{classify_io_error, ClassifiedSink};
 use crate::module::ws_client::io_event::IoEvent;
@@ -14,6 +16,7 @@ use crate::module::ws_client::write::write_loop_context::WriteLoopContext;
 use crate::ws::HeartbeatRetryConfig;
 use crate::ws::IoEndKind;
 use bytes::Bytes;
+use data_frame_batch::{flush_pending_data_with_phase, DataFrameBatch};
 use futures_util::{FutureExt, Sink, SinkExt};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,6 +39,37 @@ use tokio_util::sync::CancellationToken;
 /// 两段控制处理叠加成双倍窗口。控制通道本身仍保持高优先级，下一帧边界会
 /// 继续处理剩余项。
 const MAX_READY_CONTROLS_PER_BOUNDARY: usize = 16;
+
+/// Bound uninterrupted ready data work without scheduling once per small frame.
+/// These are cooperative boundaries, not a timeout for an in-flight frame: the
+/// frame's existing write deadline and all per-frame control checks still apply.
+const MAX_READY_DATA_FRAMES: usize = 4;
+const MAX_READY_DATA_BYTES: usize = 128 * 1024;
+const MAX_READY_DATA_TIME: Duration = Duration::from_millis(1);
+
+struct DataWriteFairness {
+    frames: usize,
+    bytes: usize,
+    started: Instant,
+}
+
+impl DataWriteFairness {
+    fn new() -> Self {
+        Self {
+            frames: 0,
+            bytes: 0,
+            started: Instant::now(),
+        }
+    }
+
+    fn record(&mut self, bytes: usize) -> bool {
+        self.frames = self.frames.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.frames >= MAX_READY_DATA_FRAMES
+            || self.bytes >= MAX_READY_DATA_BYTES
+            || self.started.elapsed() >= MAX_READY_DATA_TIME
+    }
+}
 
 struct HeartbeatRecovery {
     config: HeartbeatRetryConfig,
@@ -170,9 +204,11 @@ impl HeartbeatRecovery {
 /// 循环以“取消、控制指令、心跳、业务请求”的有偏顺序选择就绪事件。大业务消息
 /// 按配置拆成一个首帧和若干 continuation frame；同一逻辑消息的数据帧不会与
 /// 其他业务消息交错，但每个数据帧写入前都会处理有界批次的就绪控制指令及
-/// 已到期的心跳。这样不能抢占正在执行的单帧写入，却能把控制帧最坏等待窗口
-/// 限制在一个 data frame 的有界写入时间内。每个成功 data frame 后还会主动让出
-/// 一次调度权，让刚就绪的读循环有机会把 Pong/Close 指令送入控制通道。
+/// 已到期的心跳。已开始的帧写入/flush 不可抢占；批量 flush 会排空此前已缓冲的数据。
+/// 批次以 4 帧、128 KiB 和安全边界处的 250µs 检查为阈值，首尾帧强制 flush；
+/// 这些阈值不是自定义大帧的字节上限或实时延迟保证。公平性预算达到 4 帧、128 KiB
+/// 或 1ms 后才 yield，让读循环和其他任务推进。控制优先级不能越过已提交的 TCP
+/// 字节，也不保证对端在单帧写超时内收到 Ping/Pong。
 ///
 /// 控制指令负责响应对端 Ping 及执行主动关闭。心跳始终只保留一个 outstanding
 /// Ping，且每次使用连接代与递增序号组成的非空唯一 payload；只有读循环收到完全
@@ -219,6 +255,7 @@ pub(crate) async fn run_write_loop<W>(
         generation,
         cancel,
         data_frame_payload_size,
+        max_write_buffer_size,
         control_write_timeout,
         data_frame_write_timeout,
         heartbeat_config,
@@ -526,6 +563,7 @@ pub(crate) async fn run_write_loop<W>(
                     &pending_requests,
                     generation,
                     data_frame_payload_size,
+                    max_write_buffer_size,
                     first_frame_control_budget,
                     &mut control_rx,
                     control_write_timeout,
@@ -585,7 +623,7 @@ enum WriteLoopEvent {
     HeartbeatTimedOut,
     HeartbeatRecovery,
     HeartbeatRetry,
-    Heartbeat(Duration),
+    Heartbeat(HeartbeatDue),
     Request(
         Option<QueuedRequest>,
         Arc<PriorityWriteQueue>,
@@ -717,6 +755,7 @@ async fn handle_queued_request<W>(
     pending_requests: &Arc<NativePending>,
     generation: u64,
     data_frame_payload_size: Option<usize>,
+    max_write_buffer_size: usize,
     first_frame_control_budget: usize,
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     control_write_timeout: Duration,
@@ -780,6 +819,7 @@ where
         write,
         request.message.clone(),
         data_frame_payload_size,
+        max_write_buffer_size,
         first_frame_control_budget,
         write_budget,
         control_rx,
@@ -1292,7 +1332,7 @@ async fn handle_heartbeat_tick_with_recovery<W>(
     write: &mut W,
     heartbeat_state: &HeartbeatState,
     recovery: &mut HeartbeatRecovery,
-    pong_timeout: Duration,
+    due: impl Into<HeartbeatDue>,
     control_write_timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<(), NetError>
@@ -1303,7 +1343,7 @@ where
         write,
         heartbeat_state,
         recovery,
-        pong_timeout,
+        due.into(),
         control_write_timeout,
         cancel,
         None,
@@ -1315,7 +1355,7 @@ async fn handle_heartbeat_tick_with_budget<W>(
     write: &mut W,
     heartbeat_state: &HeartbeatState,
     recovery: &mut HeartbeatRecovery,
-    pong_timeout: Duration,
+    due: HeartbeatDue,
     control_write_timeout: Duration,
     cancel: &CancellationToken,
     request_budget: Option<TimeoutBudget>,
@@ -1323,6 +1363,7 @@ async fn handle_heartbeat_tick_with_budget<W>(
 where
     W: Sink<Message, Error = WsError> + Unpin,
 {
+    let pong_timeout = due.pong_timeout;
     crate::log_t!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "arg_write_present|arg_heartbeat_state_present|arg_recovery_active|pong_timeout|control_write_timeout|arg_cancel_present", true, true, recovery.active, pong_timeout, control_write_timeout, true);
     if recovery.is_active() {
         if !heartbeat_state.has_outstanding_probe() && recovery.awaiting_pong() {
@@ -1342,7 +1383,11 @@ where
         }
         return Ok(());
     }
-    let payload = match heartbeat_state.on_tick(Instant::now(), pong_timeout) {
+    #[cfg(feature = "quality-doctor")]
+    let tick = heartbeat_state.on_scheduled_tick(Instant::now(), pong_timeout, due.scheduled_at);
+    #[cfg(not(feature = "quality-doctor"))]
+    let tick = heartbeat_state.on_tick(Instant::now(), pong_timeout);
+    let payload = match tick {
         HeartbeatTick::Waiting => {
             crate::log_s!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "state", "probe_already_outstanding");
             return Ok(());
@@ -1363,6 +1408,8 @@ where
             payload
         }
     };
+    #[cfg(feature = "quality-doctor")]
+    heartbeat_state.observe_write_started(payload.as_ref());
     let send_result = send_control_frame_outcome(
         write,
         Message::Ping(payload.clone()),
@@ -1385,7 +1432,7 @@ where
             Ok(())
         }
         ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => {
-            heartbeat_state.abandon_probe(payload.as_ref());
+            heartbeat_state.fail_probe(payload.as_ref(), &error);
             crate::log_s!(LogType::WSC; "ws.write.handle_heartbeat_tick_with_recovery", "state|error", "probe_abandoned", format!("{:?}/{:?}", error.kind(), error.context().stage));
             Err(error)
         }
@@ -1465,6 +1512,8 @@ where
                 NetError::from(crate::error::ErrorKind::Internal)
                     .with_stage(crate::error::ErrorStage::Heartbeat)
             })?;
+        #[cfg(feature = "quality-doctor")]
+        heartbeat_state.observe_write_started(payload.as_ref());
         match send_control_frame_outcome(
             write,
             Message::Ping(payload.clone()),
@@ -1485,7 +1534,7 @@ where
                 Ok(())
             }
             ControlWriteOutcome::Retryable(error) => {
-                heartbeat_state.abandon_probe(payload.as_ref());
+                heartbeat_state.fail_probe(payload.as_ref(), &error);
                 recovery.awaiting_pong = false;
                 recovery.recovery_flush_pending = true;
                 recovery.arm_wait(Instant::now())?;
@@ -1493,7 +1542,7 @@ where
                 Ok(())
             }
             ControlWriteOutcome::Failed(error) => {
-                heartbeat_state.abandon_probe(payload.as_ref());
+                heartbeat_state.fail_probe(payload.as_ref(), &error);
                 Err(error)
             }
         }
@@ -1525,9 +1574,10 @@ where
     let request_deadline = request_budget.map(|budget| Instant::from_std(budget.at));
     if let Some(budget) = request_budget {
         if Instant::now() >= Instant::from_std(budget.at) {
-            heartbeat_state.abandon_probe(payload.as_ref());
+            let error = budget.timeout_error();
+            heartbeat_state.fail_probe(payload.as_ref(), &error);
             recovery.clear_normal_retry();
-            return Err(budget.timeout_error());
+            return Err(error);
         }
     }
     // WriteBufferFull means the attempted Ping was returned before acceptance. Flush the
@@ -1535,10 +1585,12 @@ where
     if let Err(error) =
         flush_sink_with_budget(write, control_write_timeout, cancel, request_budget).await
     {
-        heartbeat_state.abandon_probe(payload.as_ref());
+        heartbeat_state.fail_probe(payload.as_ref(), &error);
         recovery.clear_normal_retry();
         return Err(error);
     }
+    #[cfg(feature = "quality-doctor")]
+    heartbeat_state.observe_write_started(payload.as_ref());
     match send_control_frame_outcome(
         write,
         Message::Ping(payload.clone()),
@@ -1562,7 +1614,7 @@ where
             Ok(())
         }
         ControlWriteOutcome::Retryable(error) | ControlWriteOutcome::Failed(error) => {
-            heartbeat_state.abandon_probe(payload.as_ref());
+            heartbeat_state.fail_probe(payload.as_ref(), &error);
             recovery.clear_normal_retry();
             Err(error)
         }
@@ -1655,6 +1707,7 @@ async fn send_request_message_with_phase<W>(
     write: &mut W,
     message: Message,
     data_frame_payload_size: Option<usize>,
+    max_write_buffer_size: usize,
     first_frame_control_budget: usize,
     write_budget: TimeoutBudget,
     control_rx: &mut mpsc::Receiver<ControlMessage>,
@@ -1672,93 +1725,61 @@ where
 {
     let write_deadline = Instant::from_std(write_budget.at);
     crate::log_t!(LogType::WSC; "ws.write.send_request_message_with_phase", "arg_write_present|arg_message_type|arg_message_bytes|data_frame_payload_size|first_frame_control_budget|write_deadline|arg_control_rx_present|control_write_timeout|data_frame_write_timeout|arg_heartbeat_present|arg_heartbeat_state_present|arg_recovery_active|arg_connection_cancel_present|arg_dispatch_cancel_present|arg_dispatch_phase_present", true, match &message { Message::Text(_) => "text", Message::Binary(_) => "binary", Message::Ping(_) => "ping", Message::Pong(_) => "pong", Message::Close(_) => "close", Message::Frame(_) => "frame" }, message.len(), data_frame_payload_size, first_frame_control_budget, format!("{write_deadline:?}"), true, control_write_timeout, data_frame_write_timeout, true, true, recovery.active, true, true, true);
+    // Small messages keep their existing flush behavior. Coalescing targets
+    // large-message continuations and allocates one reusable deadline timer.
+    let fragmented = matches!(&message, Message::Binary(_) | Message::Text(_))
+        && data_frame_payload_size.is_some_and(|size| size > 0 && message.len() > size);
+    let batch_capacity = if fragmented && message.len() > 128 * 1024 {
+        max_write_buffer_size
+    } else {
+        0
+    };
+    // Detailed transport observation retains the existing per-frame Flush
+    // intervals. A deferred flush would otherwise move real drain work into a
+    // later readiness/control span. The feature alone does not disable batching.
+    #[cfg(feature = "quality-doctor")]
+    let batch_capacity = if dispatch_phase.quality().is_some() {
+        0
+    } else {
+        batch_capacity
+    };
     let mut frames = OutgoingMessageFrames::new(message, data_frame_payload_size).peekable();
+    let mut batch = DataFrameBatch::new(write, batch_capacity);
     let mut wrote_frame = false;
+    let mut fairness = DataWriteFairness::new();
     let mut next_control_budget = first_frame_control_budget.min(MAX_READY_CONTROLS_PER_BOUNDARY);
-    while let Some(frame) = frames.next() {
-        // A data-frame write cannot be safely pre-empted once it starts. Check the
-        // independent Pong deadline at every safe frame boundary; any overshoot is
-        // therefore bounded by the configured per-frame write timeout.
-        if dispatch_cancel.is_cancelled() {
-            return Err(RequestWriteFailure::cancelled(wrote_frame));
-        }
-        if Instant::now() >= write_deadline {
-            return Err(RequestWriteFailure::deadline(
-                wrote_frame,
-                wrote_frame,
-                write_budget,
-            ));
-        }
-        if connection_cancel.is_cancelled() {
-            return Err(RequestWriteFailure::connection(
-                NetError::from(crate::error::ErrorKind::Cancelled),
-                wrote_frame,
-            ));
-        }
-        let mut remaining_controls = next_control_budget;
-        next_control_budget = MAX_READY_CONTROLS_PER_BOUNDARY;
-        // 控制指令优先于已经到期的 heartbeat。
-        let control_action = drain_ready_controls_with_recovery(
-            write,
-            control_rx,
-            control_write_timeout,
-            connection_cancel,
-            heartbeat,
-            heartbeat_state,
-            recovery,
-            write_budget,
-            &mut remaining_controls,
-        )
-        .await
-        .map_err(|error| classify_boundary_failure(error, wrote_frame, write_budget))?;
-        match control_action {
-            ControlAction::Continue => {}
-            ControlAction::Stop(ControlStop::ConnectionClosed) => {
-                return Err(RequestWriteFailure::connection(
-                    NetError::from(crate::error::ErrorKind::Closed),
-                    wrote_frame,
-                ));
+    let result = async {
+        while let Some(frame) = frames.next() {
+            // A data-frame write cannot be safely pre-empted once it starts. Check the
+            // independent Pong deadline at every safe frame boundary; any overshoot is
+            // therefore bounded by the configured per-frame write timeout.
+            if dispatch_cancel.is_cancelled() {
+                return Err(RequestWriteFailure::cancelled(wrote_frame));
             }
-            ControlAction::Stop(ControlStop::LocalClose) => {
-                return Err(RequestWriteFailure::local_close(wrote_frame, None));
-            }
-            ControlAction::Failed { error, origin } => {
-                return Err(classify_control_failure(
-                    error,
-                    origin,
-                    wrote_frame,
-                    write_budget,
-                ));
-            }
-        }
-        if let Some(pong_timeout) = heartbeat.tick().now_or_never() {
-            let now = Instant::now();
-            if now >= write_deadline {
+            if Instant::now() >= write_deadline {
                 return Err(RequestWriteFailure::deadline(
                     wrote_frame,
                     wrote_frame,
                     write_budget,
                 ));
             }
-            within_request_budget(
-                write_budget,
-                handle_heartbeat_tick_with_budget(
-                    write,
-                    heartbeat_state,
-                    recovery,
-                    pong_timeout,
-                    control_write_timeout,
-                    connection_cancel,
-                    Some(write_budget),
-                ),
-            )
-            .await
-            .map_err(|error| classify_boundary_failure(error, wrote_frame, write_budget))?;
-        }
-        // heartbeat 写入期间可能又收到 Ping/Close，因此紧邻 data frame 再排空一次。
-        if remaining_controls > 0 {
+            if let Some(expired) = batch.expired_frame_budget(write_budget) {
+                return Err(RequestWriteFailure::connection(
+                    budget_delivery_unknown(expired),
+                    true,
+                ));
+            }
+            if connection_cancel.is_cancelled() {
+                return Err(RequestWriteFailure::connection(
+                    NetError::from(crate::error::ErrorKind::Cancelled),
+                    wrote_frame,
+                ));
+            }
+            let mut remaining_controls = next_control_budget;
+            next_control_budget = MAX_READY_CONTROLS_PER_BOUNDARY;
+            // 控制指令优先于已经到期的 heartbeat。
             let control_action = drain_ready_controls_with_recovery(
-                write,
+                &mut batch,
                 control_rx,
                 control_write_timeout,
                 connection_cancel,
@@ -1790,24 +1811,136 @@ where
                     ));
                 }
             }
+            if let Some(pong_timeout) = heartbeat.tick().now_or_never() {
+                let now = Instant::now();
+                if now >= write_deadline {
+                    return Err(RequestWriteFailure::deadline(
+                        wrote_frame,
+                        wrote_frame,
+                        write_budget,
+                    ));
+                }
+                within_request_budget(
+                    write_budget,
+                    handle_heartbeat_tick_with_budget(
+                        &mut batch,
+                        heartbeat_state,
+                        recovery,
+                        pong_timeout,
+                        control_write_timeout,
+                        connection_cancel,
+                        Some(write_budget),
+                    ),
+                )
+                .await
+                .map_err(|error| classify_boundary_failure(error, wrote_frame, write_budget))?;
+            }
+            // heartbeat 写入期间可能又收到 Ping/Close，因此紧邻 data frame 再排空一次。
+            if remaining_controls > 0 {
+                let control_action = drain_ready_controls_with_recovery(
+                    &mut batch,
+                    control_rx,
+                    control_write_timeout,
+                    connection_cancel,
+                    heartbeat,
+                    heartbeat_state,
+                    recovery,
+                    write_budget,
+                    &mut remaining_controls,
+                )
+                .await
+                .map_err(|error| classify_boundary_failure(error, wrote_frame, write_budget))?;
+                match control_action {
+                    ControlAction::Continue => {}
+                    ControlAction::Stop(ControlStop::ConnectionClosed) => {
+                        return Err(RequestWriteFailure::connection(
+                            NetError::from(crate::error::ErrorKind::Closed),
+                            wrote_frame,
+                        ));
+                    }
+                    ControlAction::Stop(ControlStop::LocalClose) => {
+                        return Err(RequestWriteFailure::local_close(wrote_frame, None));
+                    }
+                    ControlAction::Failed { error, origin } => {
+                        return Err(classify_control_failure(
+                            error,
+                            origin,
+                            wrote_frame,
+                            write_budget,
+                        ));
+                    }
+                }
+            }
+            if batch.needs_capacity_flush(frame.len()) {
+                flush_pending_data_with_phase(
+                    &mut batch,
+                    write_budget,
+                    connection_cancel,
+                    dispatch_cancel,
+                    dispatch_phase,
+                )
+                .await?;
+            }
+            // The enclosing request wins equal deadlines, just as TimeoutBudget::earlier.
+            // Only a strictly earlier data-frame deadline needs an independent timer.
+            let frame_deadline = Instant::now()
+                .checked_add(data_frame_write_timeout)
+                .map(|at| TimeoutBudget::new(at.into_std(), crate::ws::WsTimeoutPhase::Write))
+                .filter(|budget| budget.at < write_budget.at);
+            let frame_bytes = frame.len();
+            batch.begin_data(
+                frame.len(),
+                !wrote_frame || frames.peek().is_none(),
+                frame_deadline,
+            );
+            let data_budget = batch.effective_budget(write_budget);
+            send_data_frame_with_phase(
+                &mut batch,
+                frame,
+                wrote_frame,
+                data_budget,
+                data_frame_write_timeout,
+                connection_cancel,
+                dispatch_cancel,
+                dispatch_phase,
+            )
+            .await
+            .map_err(|failure| {
+                // This call selected the oldest data-frame deadline as its enclosing
+                // budget. Preserve that selection's retry policy at this boundary;
+                // do not infer timeout provenance from a later clock observation.
+                if failure.request_error.kind() == crate::error::ErrorKind::TimedOut
+                    && data_budget.at < write_budget.at
+                {
+                    RequestWriteFailure::connection(budget_delivery_unknown(data_budget), true)
+                } else {
+                    failure
+                }
+            })?;
+            batch.end_data();
+            wrote_frame = true;
+            if fairness.record(frame_bytes) && frames.peek().is_some() {
+                tokio::task::yield_now().await;
+                fairness = DataWriteFairness::new();
+            }
         }
-        send_data_frame_with_phase(
-            write,
-            frame,
-            wrote_frame,
-            write_budget,
-            data_frame_write_timeout,
-            connection_cancel,
-            dispatch_cancel,
-            dispatch_phase,
-        )
-        .await?;
-        wrote_frame = true;
-        if frames.peek().is_some() {
-            tokio::task::yield_now().await;
-        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    match result {
+        Err(failure) => {
+            if failure.request_error.kind() != crate::error::ErrorKind::Cancelled {
+                if let Some(expired) = batch.selected_flush_timeout(write_budget) {
+                    return Err(RequestWriteFailure::connection(
+                        budget_delivery_unknown(expired),
+                        true,
+                    ));
+                }
+            }
+            Err(failure)
+        }
+        result => result,
+    }
 }
 
 /// Preserve the TLS layer even when a partially sent frame has unknown delivery.
@@ -1916,7 +2049,9 @@ where
     let mut frame = Some(frame);
     let send = async {
         #[cfg(feature = "quality-doctor")]
-        let readiness = dispatch_phase.quality().map(|probe| probe.phase(crate::api::quality::PhaseKind::SinkReadiness));
+        let readiness = dispatch_phase
+            .quality()
+            .map(|probe| probe.phase(crate::api::quality::PhaseKind::SinkReadiness));
         std::future::poll_fn(|cx| {
             match Pin::new(&mut *write).poll_ready(cx) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
@@ -1964,7 +2099,9 @@ where
             }
         }
         #[cfg(feature = "quality-doctor")]
-        let _flush = dispatch_phase.quality().map(|probe| probe.phase(crate::api::quality::PhaseKind::Flush));
+        let _flush = dispatch_phase
+            .quality()
+            .map(|probe| probe.phase(crate::api::quality::PhaseKind::Flush));
         write.flush().await.map_err(|error| {
             crate::log_e!(LogType::WSC; "ws.write.send_data_frame_with_phase", "error|delivery", crate::common::log::summary::error(&error), "unknown");
             RequestWriteFailure::connection(unknown_delivery_error(error), true)
@@ -2035,6 +2172,7 @@ where
         write,
         message,
         data_frame_payload_size,
+        4 * 1024 * 1024,
         first_frame_control_budget,
         TimeoutBudget::new(write_deadline.into_std(), crate::ws::WsTimeoutPhase::Write),
         control_rx,
@@ -2153,6 +2291,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn send_control_frame<W>(
     write: &mut W,
     frame: Message,
@@ -2372,7 +2511,6 @@ mod tests {
         flushes: Arc<AtomicUsize>,
         fail_on_flush: Option<usize>,
         cancel_after_flush: Option<CancellationToken>,
-        control_injection: Option<tokio::task::JoinHandle<TestResult>>,
     }
 
     impl RecordingSink {
@@ -2385,7 +2523,6 @@ mod tests {
                 flushes: Arc::new(AtomicUsize::new(0)),
                 fail_on_flush: None,
                 cancel_after_flush: None,
-                control_injection: None,
             }
         }
 
@@ -2398,7 +2535,6 @@ mod tests {
                 flushes: Arc::new(AtomicUsize::new(0)),
                 fail_on_flush: None,
                 cancel_after_flush: None,
-                control_injection: None,
             }
         }
 
@@ -2414,7 +2550,6 @@ mod tests {
                 flushes: Arc::new(AtomicUsize::new(0)),
                 fail_on_flush: Some(fail_on_flush),
                 cancel_after_flush: None,
-                control_injection: None,
             }
         }
 
@@ -2424,21 +2559,6 @@ mod tests {
 
         fn flushes(&self) -> Arc<AtomicUsize> {
             Arc::clone(&self.flushes)
-        }
-
-        async fn finish_injection(&mut self) -> TestResult {
-            if let Some(injection) = self.control_injection.take() {
-                injection.await??;
-            }
-            Ok(())
-        }
-    }
-
-    impl Drop for RecordingSink {
-        fn drop(&mut self) {
-            if let Some(injection) = self.control_injection.take() {
-                injection.abort();
-            }
         }
     }
 
@@ -2469,21 +2589,18 @@ mod tests {
             if is_data_frame && !this.injected {
                 this.injected = true;
                 if let Some(control_tx) = &this.inject_control {
-                    let control_tx = control_tx.clone();
-                    let control_kind = this.injected_control_kind;
-                    this.control_injection = Some(tokio::spawn(async move {
-                        let control = match control_kind {
-                            InjectedControlKind::FlushAutomatic => ControlMessage::FlushAutomatic,
-                            InjectedControlKind::PeerClose => {
-                                let (done_tx, _done_rx) = oneshot::channel();
-                                ControlMessage::PeerClose(done_tx)
-                            }
-                        };
-                        control_tx.send(control).await.map_err(|error| {
-                            test_error(format!("inject control message: {error:?}"))
-                        })?;
-                        Ok(())
-                    }));
+                    let control = match this.injected_control_kind {
+                        InjectedControlKind::FlushAutomatic => ControlMessage::FlushAutomatic,
+                        InjectedControlKind::PeerClose => {
+                            let (done_tx, _done_rx) = oneshot::channel();
+                            ControlMessage::PeerClose(done_tx)
+                        }
+                    };
+                    control_tx.try_send(control).map_err(|error| {
+                        WsError::Io(std::io::Error::other(format!(
+                            "inject ready control: {error}"
+                        )))
+                    })?;
                 }
             }
             Ok(())
@@ -2521,19 +2638,16 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel(1);
         drop(control_rx);
         let mut sink = RecordingSink::new(Some(control_tx));
-        sink.send(Message::Frame(Frame::message(
-            Bytes::from_static(b"fragment"),
-            OpCode::Data(OpData::Binary),
-            false,
-        )))
-        .await?;
-
         let failure = sink
-            .finish_injection()
+            .send(Message::Frame(Frame::message(
+                Bytes::from_static(b"fragment"),
+                OpCode::Data(OpData::Binary),
+                false,
+            )))
             .await
             .err()
             .ok_or_else(|| test_error("closed control channel must fail the injection"))?;
-        check!(failure.to_string().contains("inject control message"))?;
+        check!(failure.to_string().contains("inject ready control"))?;
         Ok(())
     }
 
@@ -3002,7 +3116,6 @@ mod tests {
             &CancellationToken::new(),
         )
         .await;
-        sink.finish_injection().await?;
         check_eq!(result, Ok(()))?;
 
         let messages = recorded
@@ -3194,8 +3307,8 @@ mod tests {
             &dispatch_cancel,
         ));
 
-        // Each preceding frame completes and yields. The next poll reaches the
-        // final control flush after the selected frame's outer pre-send checks.
+        // Poll enough times to reach the gate under either per-frame or bounded
+        // yields. Extra polls stay inside the same explicit pending flush gate.
         for _ in 0..preceding_data_frames {
             check!(sending.as_mut().now_or_never().is_none())?;
         }
@@ -3493,7 +3606,6 @@ mod tests {
         )
         .await;
 
-        sink.finish_injection().await?;
         check_eq!(
             result.map_err(|failure| failure.request_error),
             Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
@@ -3539,7 +3651,6 @@ mod tests {
         )
         .await;
 
-        sink.finish_injection().await?;
         check_eq!(
             result.map_err(|failure| failure.request_error),
             Err(NetError::from(crate::error::ErrorKind::DeliveryUnknown))
@@ -4105,6 +4216,7 @@ mod tests {
                 generation: 34,
                 cancel: CancellationToken::new(),
                 data_frame_payload_size: Some(1024),
+                max_write_buffer_size: 4 * 1024 * 1024,
                 control_write_timeout: Duration::from_secs(1),
                 data_frame_write_timeout: Duration::from_secs(1),
                 heartbeat_config: None,
@@ -4167,6 +4279,7 @@ mod tests {
                 generation: 33,
                 cancel: CancellationToken::new(),
                 data_frame_payload_size: Some(1024),
+                max_write_buffer_size: 4 * 1024 * 1024,
                 control_write_timeout: Duration::from_secs(1),
                 data_frame_write_timeout: Duration::from_secs(1),
                 heartbeat_config: Some(crate::ws::HeartbeatConfig {
@@ -4233,6 +4346,7 @@ mod tests {
                 generation: 35,
                 cancel: CancellationToken::new(),
                 data_frame_payload_size: Some(1024),
+                max_write_buffer_size: 4 * 1024 * 1024,
                 control_write_timeout: Duration::from_secs(1),
                 data_frame_write_timeout: Duration::from_secs(1),
                 heartbeat_config: Some(crate::ws::HeartbeatConfig {
@@ -4302,6 +4416,7 @@ mod tests {
                 generation: 36,
                 cancel: cancel.clone(),
                 data_frame_payload_size: Some(1024),
+                max_write_buffer_size: 4 * 1024 * 1024,
                 control_write_timeout: Duration::from_secs(1),
                 data_frame_write_timeout: Duration::from_secs(1),
                 heartbeat_config: Some(crate::ws::HeartbeatConfig {
@@ -4383,6 +4498,7 @@ mod tests {
                     &fixture::pending(1)?,
                     1,
                     None,
+                    4 * 1024 * 1024,
                     MAX_READY_CONTROLS_PER_BOUNDARY,
                     &mut controls,
                     Duration::from_millis(25),
@@ -4476,6 +4592,7 @@ mod tests {
             pending,
             generation,
             None,
+            4 * 1024 * 1024,
             MAX_READY_CONTROLS_PER_BOUNDARY,
             &mut control_rx,
             Duration::from_secs(1),
@@ -4890,6 +5007,7 @@ mod tests {
             &mut sink,
             request.message.clone(),
             None,
+            4 * 1024 * 1024,
             MAX_READY_CONTROLS_PER_BOUNDARY,
             budget,
             &mut control_rx,

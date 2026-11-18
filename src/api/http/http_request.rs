@@ -310,7 +310,7 @@ impl HttpRequestBuilder {
         #[cfg(feature = "http-client-codecs")]
         if name == http::header::CONTENT_TYPE {
             if let Some(expected) = &self.multipart_content_type {
-                if &value != expected {
+                if value != expected {
                     return Err(NetError::input(
                         "content-type",
                         "multipart content-type is managed by the SDK",

@@ -359,6 +359,72 @@ a write timeout or unknown delivery does not permit a duplicate write on the
 same connection; that connection is retired. Recovery probes use their bounded
 recovery policy, rather than multiplying it by normal-Ping write retries.
 
+### Large messages, backpressure, and heartbeat deadlines
+
+The default outgoing fragment payload is 32 KiB. A 10 MiB message therefore
+uses 320 data frames while remaining **one application message**; 10 MB means
+10,000,000 bytes and is a different boundary. The writer checks ready control
+work and heartbeat work between fragments. Control Ping/Pong frames can occur
+before the message's final frame, as permitted by
+[RFC 6455 section 5.4](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.4).
+Another text/binary message cannot be interleaved within that message.
+
+These scheduling opportunities are not an end-to-end latency guarantee:
+
+- A started frame write or flush cannot be pre-empted safely. Data writes may be
+  coalesced in bounded batches, currently with flush thresholds of four frames
+  or about 128 KiB; a single larger configured frame can exceed that byte threshold.
+  The 250 microsecond batching check runs at safe frame boundaries; it is not an
+  independent real-time timer. The first/final frame and control boundaries
+  drain pending data. Fairness yields also use a bounded work budget, rather
+  than yielding after every frame. These are implementation details, not
+  configurable transport guarantees.
+- Ping/Pong cannot overtake application bytes already submitted to TLS/TCP.
+  `tcp.send_buffer_size = None` keeps the operating system's setting. A smaller
+  requested send buffer can reduce queued data in some environments, but the
+  effective size and throughput tradeoff are platform dependent.
+- `pong_timeout` begins after the local Ping write succeeds, not after the peer
+  receives it. It includes remaining transport queues, network and peer delays,
+  and local receive scheduling. A live peer that replies correctly can still
+  exceed a short deadline under load. Unrelated traffic does not extend it.
+- `data_frame_payload_size = None`, or a very large fragment size, removes or
+  widens the opportunities to insert controls. Outgoing fragmentation does not
+  constrain frames sent by the server. A Pong behind one large incoming frame
+  cannot be parsed until the preceding frame's bytes arrive; the server must
+  provide useful frame boundaries too.
+
+Read and write tasks make independent progress when asynchronous socket writes
+are pending. A received matching Pong is acknowledged before publishing control
+observations to application receivers. However, `ResponseProtocol::route` runs
+synchronously on the receive task: expensive parsing, sleeping, or blocking I/O
+there delays subsequent frames. Keep classification short; defer heavy work to
+application tasks or use manual response resolution. Slow application consumers
+also need adequate receive budgets; an overflow disconnect is a different cause
+from a heartbeat timeout.
+
+Application-level text/binary heartbeats use ordinary message admission and
+scheduling. They can wait behind a large message even when that message uses
+small WebSocket fragments. A protocol that needs business-message scheduling
+within a large transfer must define multiple complete messages or use a separate
+connection. Changing frame sizes must not silently change application message
+boundaries.
+
+When investigating a disconnect, retain both the connection and operation
+results. `TimedOut` at `ErrorStage::Heartbeat` identifies a missing timely
+matching Pong; an in-progress business operation may independently report
+`DeliveryUnknown`. A stalled frame/control write can also retire the connection
+with unknown delivery. Queue/receive overflow, server Close, and transport errors
+must not be labelled as Pong timeouts. The default interval (20 s), Pong timeout
+(45 s), and data/control write limits (1.5 s) remain separate budgets.
+
+Use [QualityDoctor](../quality_doctor.md#websocket-heartbeat-timeline) to inspect
+local probe stages. A server's Ping-to-client-Pong RTT measures the opposite
+direction from the SDK's client-Ping-to-server-Pong exchange; neither is pure
+network RTT. Local diagnostics do not reveal the server's receive/reply times.
+Correlate those with server-side evidence for the same probe before assigning a
+delay to a particular queue. Loopback tests with shortened deadlines do not
+establish a bound for WSS, proxies, mobile networks, or production load.
+
 ### Configure heartbeat retries
 
 `HeartbeatConfig::retry` controls recovery probes and Ping write retries. When

@@ -2,6 +2,28 @@
 use crate::net_status::{MonitorState, NetworkSnapshot};
 use crate::{LogLevel, LogType, OpenNetLogger};
 
+/// Emit one safe diagnostic for a caller-visible terminal API error. This is
+/// deliberately separate from the periodic worker's bounded FaultCycle logs.
+pub(crate) fn emit_monitor_error(boundary: &'static str, error: &crate::NetError) {
+    if !OpenNetLogger::is_enabled_for(LogType::Engine, LogLevel::Error) {
+        return;
+    }
+    let diagnostics = error.network_monitor_diagnostics().unwrap_or_else(|| {
+        // Lifecycle errors such as Closed need not have a monitoring phase.
+        // Do not infer a native operation or inspect arbitrary source text.
+        serde_json::json!({
+            "kind": format!("{:?}", error.kind()),
+            "stage": error.context().stage.map(|stage| format!("{stage:?}")),
+        })
+    });
+    crate::log_e!(LogType::Engine; "net_status.error",
+        "boundary|diagnostics", boundary, diagnostics);
+}
+
+#[cfg(test)]
+#[path = "diagnostic_logging_tests.rs"]
+mod diagnostic_logging_tests;
+
 /// No names, error sources or user-owned values survive the commit lock here.
 #[derive(Clone, Copy)]
 pub(super) struct Transition {

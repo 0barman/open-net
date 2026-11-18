@@ -27,6 +27,8 @@ pub(crate) struct MonitorRuntime {
     // 监控任务的完成信号；关闭与销毁通过它等待任务所持资源释放。
     pub(crate) finished: watch::Receiver<bool>,
     // 该代身份和发布权限；公开可观测值由统一快照源持有。
+    // Keep ownership until the runtime handle retires; tests also inspect this state.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) state: Arc<Mutex<MonitorState>>,
     // 与共享状态引用同一有效性标志，停止时先屏蔽旧代检测更新。
     pub(crate) active: Arc<AtomicBool>,

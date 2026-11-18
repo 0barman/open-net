@@ -300,6 +300,13 @@ pub enum PhaseKind {
     /// WebSocket receive interval around synchronous response classification/routing. It does
     /// not encompass later asynchronous application consumption.
     ResponseRouting,
+    /// WebSocket milestone when the writer creates a heartbeat probe after observing a due
+    /// interval or choosing a recovery probe. It is not the scheduled interval timestamp;
+    /// [`QualityReport::heartbeat_schedule_delay`] records that delay separately when known.
+    HeartbeatObserved,
+    /// WebSocket milestone immediately before each attempt to write this probe's Ping. It can
+    /// repeat for a safe write retry and does not prove sink acceptance or peer receipt.
+    HeartbeatWriteStarted,
 }
 
 /// First retained SDK result classification for an observation.
@@ -1324,6 +1331,8 @@ pub struct QualityReport {
     pub(crate) outcome: Option<QualityOutcome>,
     pub(crate) http_status: Option<u16>,
     pub(crate) http_version: Option<QualityHttpVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) heartbeat_schedule_delay: Option<Duration>,
     pub(crate) failure: Option<QualityFailure>,
     pub(crate) state: QualityObservationState,
     pub(crate) detail: QualityDetailState,
@@ -1406,6 +1415,15 @@ impl QualityReport {
     /// use this duration only from complete successful reports.
     pub fn result_duration(&self) -> Option<Duration> {
         self.result_at.map(|end| end.saturating_sub(self.started))
+    }
+    /// Returns the elapsed time from the normal heartbeat interval's scheduled tick to the
+    /// writer creating this probe, when the timing fact was retained. This includes writer
+    /// scheduling and any preceding bounded control work; it is not network RTT and does not
+    /// move [`Self::started_offset`] back to the scheduled tick. Recovery probes have no normal
+    /// interval deadline and leave this `None`. Missing instrumentation/data also yields
+    /// `None`, which must not be interpreted as zero delay. Serialized only when present.
+    pub fn heartbeat_schedule_delay(&self) -> Option<Duration> {
+        self.heartbeat_schedule_delay
     }
     /// Returns the first retained SDK result classification, or `None` if no result fact was
     /// retained. It is independent of observation state: an InProgress report can already have
@@ -2100,6 +2118,8 @@ pub enum QualityEventKind {
     Finish,
     /// The HTTP version read from a successfully received response head.
     HttpVersion,
+    /// A normal-heartbeat scheduled-to-observed delay fact.
+    HeartbeatScheduleDelay,
 }
 /// Best-effort evidence for one event lost to contention or ingress capacity.
 ///

@@ -195,6 +195,7 @@ mod tests {
                     generation: 17,
                     cancel: CancellationToken::new(),
                     data_frame_payload_size: None,
+                    max_write_buffer_size: 4 * 1024 * 1024,
                     control_write_timeout: Duration::from_secs(1),
                     data_frame_write_timeout: Duration::from_secs(1),
                     heartbeat_config: Some(crate::ws::HeartbeatConfig {

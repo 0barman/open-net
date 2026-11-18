@@ -30,7 +30,11 @@ impl NetStatusClient {
     /// Repeated calls share the active monitor and its initialization result.
     pub async fn start(&self) -> Result<NetworkSnapshot> {
         crate::log_t!(LogType::Engine; "net_status.start");
-        self.inner.start().await
+        let result = self.inner.start().await;
+        if let Err(error) = &result {
+            crate::module::net_status::logging::emit_monitor_error("start", error);
+        }
+        result
     }
 
     /// Stop monitoring while keeping subscriptions alive for a later restart.

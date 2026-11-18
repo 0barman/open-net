@@ -59,6 +59,7 @@ async fn drive<W: Sink<Message, Error = WsError> + Unpin>(
         &runtime.pending,
         1,
         None,
+        4 * 1024 * 1024,
         MAX_READY_CONTROLS_PER_BOUNDARY,
         &mut controls,
         Duration::from_secs(1),

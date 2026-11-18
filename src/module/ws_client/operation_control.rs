@@ -807,12 +807,12 @@ impl OperationControl {
             .as_ref()
             .and_then(WsSendRetryPolicy::observer)
         {
-            let attempt = std::mem::take(&mut state.retry_attempt_open).then(|| {
+            let attempt = std::mem::take(&mut state.retry_attempt_open).then_some(
                 RetryEvent::AttemptFinished {
                     attempt: report.attempts,
                     final_attempt: true,
-                }
-            });
+                },
+            );
             publication.retry = Some((observer, attempt, RetryEvent::Completed(report.clone())));
         }
         state.retry_report = Some(report);

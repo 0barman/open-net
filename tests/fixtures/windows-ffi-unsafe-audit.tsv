@@ -6,11 +6,15 @@
 # below are allowed. Panic/unwrap operations are never exempted.
 # Reviewed T06 split: connectivity and explicit name queries use separate COM entry points.
 # GetSystemDirectoryW selects netsh.exe without trusting PATH or the working directory.
-fingerprint	src/module/net_status/inner/platform/windows.rs	60f7cb628f0326b2
+# Reviewed RUST-1C: private per-call API boundary preserves COM calls and guard order;
+# reachability attaches operation/HRESULT while explicit name queries retain monitor_io.
+# Reviewed monitor progress: safe per-request phase recording around unchanged COM calls;
+# native errors retain their original source/HRESULT and gain a portable phase.
+fingerprint	src/module/net_status/inner/platform/windows.rs	0b30abcb78ea53dd
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoUninitialize() };
-1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }.map_err(monitor_io)?;
-1	src/module/net_status/inner/platform/windows.rs	unsafe	let connectivity = unsafe { manager.GetConnectivity() }.map_err(monitor_io)?;
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }
+1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { manager.GetConnectivity() }.map(|connectivity| connectivity.0 as u32)
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { manager.GetNetworks(NLM_ENUM_NETWORK_CONNECTED) }.map_err(monitor_io)?;
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { networks.Next(&mut items, Some(&mut fetched)) }.map_err(monitor_io)?;
 1	src/module/net_status/inner/platform/windows.rs	unsafe	let name = unsafe { network.GetName() }

@@ -316,51 +316,47 @@ impl BearerAuth {
     }
 
     async fn current_token(&self) -> AuthResult<(AccessToken, u64)> {
-        loop {
-            let (gate, source) = {
-                let mut state = self.inner.state.lock().await;
-                if let Some(token) = state.token.clone() {
-                    if !token.is_expired(SystemTime::now()) {
-                        return Ok((token, state.generation));
-                    }
-                }
-                if let Some(gate) = state.in_flight.as_ref() {
-                    (Arc::clone(gate), None)
-                } else {
-                    let gate = Arc::new(RefreshGate::new());
-                    state.in_flight = Some(Arc::clone(&gate));
-                    (gate, Some(Arc::clone(&self.inner.source)))
-                }
-            };
-            if let Some(source) = source {
-                let inner = Arc::clone(&self.inner);
-                let task_gate = Arc::clone(&gate);
-                let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tokio::spawn(async move {
-                        let loaded = guarded_source_load(source).await;
-                        complete_token_fetch(inner, task_gate, loaded, false, 0).await;
-                    })
-                }));
-                if spawn_result.is_err() {
-                    complete_token_fetch(
-                        Arc::clone(&self.inner),
-                        Arc::clone(&gate),
-                        Err(provider_failure()),
-                        false,
-                        0,
-                    )
-                    .await;
-                }
-            }
-            if let Err(error) = wait_for_gate(&gate).await {
-                return Err(error);
-            }
-            let state = self.inner.state.lock().await;
+        let (gate, source) = {
+            let mut state = self.inner.state.lock().await;
             if let Some(token) = state.token.clone() {
-                return Ok((token, state.generation));
+                if !token.is_expired(SystemTime::now()) {
+                    return Ok((token, state.generation));
+                }
             }
-            return Err(provider_failure());
+            if let Some(gate) = state.in_flight.as_ref() {
+                (Arc::clone(gate), None)
+            } else {
+                let gate = Arc::new(RefreshGate::new());
+                state.in_flight = Some(Arc::clone(&gate));
+                (gate, Some(Arc::clone(&self.inner.source)))
+            }
+        };
+        if let Some(source) = source {
+            let inner = Arc::clone(&self.inner);
+            let task_gate = Arc::clone(&gate);
+            let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::spawn(async move {
+                    let loaded = guarded_source_load(source).await;
+                    complete_token_fetch(inner, task_gate, loaded, false, 0).await;
+                })
+            }));
+            if spawn_result.is_err() {
+                complete_token_fetch(
+                    Arc::clone(&self.inner),
+                    Arc::clone(&gate),
+                    Err(provider_failure()),
+                    false,
+                    0,
+                )
+                .await;
+            }
         }
+        wait_for_gate(&gate).await?;
+        let state = self.inner.state.lock().await;
+        if let Some(token) = state.token.clone() {
+            return Ok((token, state.generation));
+        }
+        Err(provider_failure())
     }
 
     async fn refresh_if_needed(&self, generation: u64) -> AuthResult<AuthAction> {
@@ -404,9 +400,7 @@ impl BearerAuth {
                     .await;
                 }
             }
-            if let Err(error) = wait_for_gate(&gate).await {
-                return Err(error);
-            }
+            wait_for_gate(&gate).await?;
             let state = self.inner.state.lock().await;
             if state.generation > generation && state.token.is_some() {
                 return Ok(AuthAction::RetryWithFreshCredentials);

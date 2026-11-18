@@ -4,6 +4,11 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 
+mod network_monitor;
+pub use network_monitor::{NetworkMonitorDiagnostic, NetworkMonitorPhase};
+mod windows_reachability;
+pub use windows_reachability::{WindowsReachabilityDiagnostic, WindowsReachabilityOperation};
+
 /// An owned, thread-safe error source retained by [`NetError`].
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 /// The crate's standard result type.
@@ -153,6 +158,18 @@ pub struct ErrorContext {
     /// HTTP execution failures can leave this unset when the transport does
     /// not establish the send/receive phase. A stage is not delivery evidence.
     pub stage: Option<ErrorStage>,
+    /// The monitor step associated with a failure, with optional timing evidence.
+    ///
+    /// Available on all platforms. For a timeout, the phase is the last observed
+    /// progress, not proof that a native call returned an error. Shared ownership
+    /// keeps unrelated errors small; clones retain the same immutable evidence.
+    pub network_monitor: Option<Arc<NetworkMonitorDiagnostic>>,
+    /// Native failure details from Windows Internet-reachability sampling.
+    ///
+    /// This field is available on every platform. The SDK leaves it `None`
+    /// for other failures, including network-name queries and non-Windows
+    /// sampling. It does not indicate that the network is offline.
+    pub windows_reachability: Option<WindowsReachabilityDiagnostic>,
     #[cfg(feature = "ws-client")]
     /// WebSocket client identifier associated with the failure, when available.
     pub client_id: Option<crate::ws::ClientId>,
@@ -200,6 +217,8 @@ impl fmt::Debug for ErrorContext {
         let mut output = formatter.debug_struct("ErrorContext");
         output
             .field("stage", &self.stage)
+            .field("network_monitor", &self.network_monitor)
+            .field("windows_reachability", &self.windows_reachability)
             .field("http_status", &self.http_status);
         #[cfg(feature = "http-client")]
         output
@@ -238,6 +257,10 @@ pub struct NetError {
     #[cfg(feature = "quality-doctor")]
     quality_ref: Option<crate::quality::QualityReportRef>,
     kind: ErrorKind,
+    // WebSocket diagnostics make the context large; keep smaller feature sets inline.
+    #[cfg(feature = "ws-client")]
+    context: Box<ErrorContext>,
+    #[cfg(not(feature = "ws-client"))]
     context: ErrorContext,
     config_error: Option<Arc<ConfigError>>,
     source: Option<Arc<dyn StdError + Send + Sync + 'static>>,
@@ -267,7 +290,7 @@ impl NetError {
     /// request, owner, response payload, or network resource.
     #[cfg(feature = "quality-doctor")]
     pub fn quality_ref(&self) -> Option<crate::quality::QualityReportRef> {
-        self.quality_ref.clone()
+        self.quality_ref
     }
 
     #[cfg(feature = "quality-doctor")]
@@ -278,8 +301,10 @@ impl NetError {
 
     /// Creates an error classified from an HTTP status returned by a protocol or upgrade operation.
     pub fn from_http_status(status: http::StatusCode) -> Self {
-        let mut context = ErrorContext::default();
-        context.http_status = Some(status);
+        let context = ErrorContext {
+            http_status: Some(status),
+            ..ErrorContext::default()
+        };
         Self::new(ErrorKind::HttpStatus).with_context(context)
     }
     pub(crate) fn new(kind: ErrorKind) -> Self {
@@ -287,7 +312,7 @@ impl NetError {
             #[cfg(feature = "quality-doctor")]
             quality_ref: None,
             kind,
-            context: ErrorContext::default(),
+            context: Default::default(),
             config_error: None,
             source: None,
             retry_report: None,
@@ -305,7 +330,15 @@ impl NetError {
     }
 
     pub(crate) fn with_context(mut self, context: ErrorContext) -> Self {
-        self.context = context;
+        #[cfg(feature = "ws-client")]
+        {
+            // Reuse the allocation made when this error was constructed.
+            *self.context = context;
+        }
+        #[cfg(not(feature = "ws-client"))]
+        {
+            self.context = context;
+        }
         self
     }
 
@@ -814,6 +847,48 @@ mod tests {
         } else {
             Err(std::io::Error::other(message).into())
         }
+    }
+
+    #[cfg(feature = "ws-client")]
+    #[test]
+    fn websocket_error_stays_below_the_large_result_error_threshold() -> TestResult {
+        check(
+            std::mem::size_of::<NetError>() < 128,
+            "WebSocket context must not inflate every result past the Clippy threshold",
+        )
+    }
+
+    #[test]
+    fn cloned_error_context_updates_do_not_change_other_copies() -> TestResult {
+        let original = NetError::from(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "private-source",
+        ))
+        .with_stage(ErrorStage::Write);
+        let replaced = original.clone().with_context(ErrorContext {
+            stage: Some(ErrorStage::Receive),
+            http_status: Some(http::StatusCode::BAD_GATEWAY),
+            ..Default::default()
+        });
+        let annotated = replaced.clone().with_stage(ErrorStage::Dispatch);
+        check(
+            original.context().stage == Some(ErrorStage::Write)
+                && original.http_status().is_none()
+                && replaced.context().stage == Some(ErrorStage::Receive)
+                && replaced.http_status() == Some(http::StatusCode::BAD_GATEWAY)
+                && annotated.context().stage == Some(ErrorStage::Dispatch)
+                && annotated.http_status() == Some(http::StatusCode::BAD_GATEWAY),
+            "context replacement and annotation must only affect the selected copy",
+        )?;
+        let source = original.source().ok_or("original source missing")?;
+        for error in [&replaced, &annotated] {
+            check(
+                error.kind() == original.kind()
+                    && std::ptr::eq(source, error.source().ok_or("cloned source missing")?),
+                "updating a cloned context must preserve classification and shared source",
+            )?;
+        }
+        Ok(())
     }
 
     struct InputWithoutDebug {

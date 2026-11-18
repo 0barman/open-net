@@ -302,11 +302,20 @@ pub struct FrameConfig {
     /// Payload size, in bytes, for outgoing data-frame fragments; the default is
     /// 32 KiB and `None` disables active fragmentation.
     /// Set to at least 1024 bytes, and the write buffer limit must also accommodate the payload and frame header.
+    /// Control frames can be scheduled between fragments, but cannot pre-empt an
+    /// in-progress frame or overtake bytes already buffered by the transport.
+    /// This setting does not split one logical message into multiple messages,
+    /// and does not control the peer's outgoing frame sizes.
     pub data_frame_payload_size: Option<usize>,
     /// Maximum time for a single Ping, Pong, or Close write and for closing the
     /// underlying sender; the default is 1,500 milliseconds.
+    /// This bounds the local write operation, including any preceding buffered
+    /// data it must drain; it is not an end-to-end peer response deadline.
     pub control_write_timeout: Duration,
     /// The time limit for writing a single data frame, the default is 1500 milliseconds; it is still subject to the overall message writing deadline.
+    /// Deferred data batches retain the earliest pending frame's deadline.
+    /// Expiry after a write has started retires the connection because delivery
+    /// may be partial; it does not imply a missing heartbeat Pong.
     pub data_frame_write_timeout: Duration,
     /// The underlying WebSocket read buffer size in bytes, default 128 KiB.
     pub read_buffer_size: usize,
@@ -510,7 +519,14 @@ pub struct HeartbeatConfig {
     /// Interval for checking whether to send a heartbeat Ping; the default is
     /// 20 seconds. No new probe is created while another Ping is pending.
     pub interval: Duration,
-    /// The time limit for waiting for matching payload Pong after Ping is successfully written. The default is 45 seconds.
+    /// The time limit for waiting for a matching Pong after the local Ping write
+    /// succeeds. The default is 45 seconds.
+    ///
+    /// Local write completion does not mean the peer has received the Ping:
+    /// TCP/TLS buffering, network delay, peer processing, and local receive
+    /// scheduling can consume this budget. A responsive peer can still exceed
+    /// a short deadline under load. The deadline is not extended by unrelated
+    /// traffic or by a late matching Pong.
     pub pong_timeout: Duration,
     /// Bounded recovery and safe Ping-write retry policy. The default keeps the
     /// existing fail-fast behavior by disabling both retry paths.

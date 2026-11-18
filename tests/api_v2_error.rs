@@ -1,5 +1,7 @@
 use open_net::error::{
-    EnqueueError, ErrorContext, ErrorKind, ErrorStage, NetError, ReceiveError, TryReceiveError,
+    EnqueueError, ErrorContext, ErrorKind, ErrorStage, NetError, NetworkMonitorDiagnostic,
+    NetworkMonitorPhase, ReceiveError, TryReceiveError, WindowsReachabilityDiagnostic,
+    WindowsReachabilityOperation,
 };
 use std::error::Error as StdError;
 use std::fmt;
@@ -14,6 +16,97 @@ fn check(condition: bool, message: &str) -> TestResult {
     } else {
         Err(std::io::Error::other(message).into())
     }
+}
+
+// This test deliberately has no platform or feature gate: consumers must be
+// able to compile their diagnostic reporting code on every supported target.
+#[test]
+fn windows_reachability_diagnostics_are_portable_optional_public_context() -> TestResult {
+    for (operation, expected) in [
+        (WindowsReachabilityOperation::ComInit, "com_init"),
+        (WindowsReachabilityOperation::NlmCreate, "nlm_create"),
+        (
+            WindowsReachabilityOperation::NlmGetConnectivity,
+            "nlm_get_connectivity",
+        ),
+    ] {
+        check(
+            operation.as_str() == expected,
+            "stable Windows operation name",
+        )?;
+    }
+    let context = ErrorContext::default();
+    let diagnostic: Option<WindowsReachabilityDiagnostic> = context.windows_reachability;
+    let event_fields = diagnostic.map(|detail| {
+        (
+            detail.operation.as_str(),
+            format!("0x{:08X}", detail.hresult),
+        )
+    });
+    check(
+        event_fields.is_none(),
+        "default context must not invent diagnostics",
+    )?;
+    let unrelated = NetError::from(std::io::Error::other("unrelated I/O"));
+    check(
+        unrelated.context().windows_reachability.is_none(),
+        "ordinary I/O failures must not be labeled Windows reachability failures",
+    )
+}
+
+// Portable reporting code must build even when no networking feature is active.
+#[test]
+fn network_monitor_phases_and_safe_reporting_are_portable_public_api() -> TestResult {
+    for (phase, expected) in [
+        (
+            NetworkMonitorPhase::MonitorTaskSubmit,
+            "monitor_task_submit",
+        ),
+        (
+            NetworkMonitorPhase::MonitorThreadSpawn,
+            "monitor_thread_spawn",
+        ),
+        (NetworkMonitorPhase::RuntimeBuild, "runtime_build"),
+        (NetworkMonitorPhase::NetwatchCreate, "netwatch_create"),
+        (
+            NetworkMonitorPhase::SamplerWorkerSpawn,
+            "sampler_worker_spawn",
+        ),
+        (NetworkMonitorPhase::SampleAdmission, "sample_admission"),
+        (
+            NetworkMonitorPhase::SampleQueueSubmit,
+            "sample_queue_submit",
+        ),
+        (NetworkMonitorPhase::SampleQueueWait, "sample_queue_wait"),
+        (NetworkMonitorPhase::NativeSample, "native_sample"),
+        (NetworkMonitorPhase::ComInit, "com_init"),
+        (NetworkMonitorPhase::NlmCreate, "nlm_create"),
+        (
+            NetworkMonitorPhase::NlmGetConnectivity,
+            "nlm_get_connectivity",
+        ),
+        (NetworkMonitorPhase::SampleComplete, "sample_complete"),
+        (
+            NetworkMonitorPhase::SampleResultReceive,
+            "sample_result_receive",
+        ),
+        (
+            NetworkMonitorPhase::InitialResultReceive,
+            "initial_result_receive",
+        ),
+        (NetworkMonitorPhase::ObservationCommit, "observation_commit"),
+        (NetworkMonitorPhase::MonitorTaskExit, "monitor_task_exit"),
+    ] {
+        check(phase.as_str() == expected, "stable monitor phase")?;
+    }
+    let context = ErrorContext::default();
+    let detail: Option<&NetworkMonitorDiagnostic> = context.network_monitor.as_deref();
+    check(detail.is_none(), "default context invented a monitor phase")?;
+    let unrelated = NetError::from(std::io::Error::other("source-private-text"));
+    check(
+        unrelated.network_monitor_diagnostics().is_none(),
+        "ordinary I/O error was relabeled as a network monitor failure",
+    )
 }
 
 #[derive(Debug)]

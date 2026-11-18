@@ -31,6 +31,7 @@ impl IndexedHeap {
     }
 
     // 返回当前可调度请求数，不包含 prepared 容器或 writer 已经取走的请求。
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.items.len()
     }

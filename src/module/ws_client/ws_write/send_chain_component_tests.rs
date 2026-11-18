@@ -418,6 +418,7 @@ async fn send<W: Sink<Message, Error = WsError> + Unpin>(
         write,
         Message::Binary(payload),
         frame,
+        4 * 1024 * 1024,
         MAX_READY_CONTROLS_PER_BOUNDARY,
         super::TimeoutBudget::new(
             (Instant::now() + LIMIT).into_std(),
@@ -784,6 +785,7 @@ async fn request_and_frame_deadlines_keep_absolute_order_during_pending_flush() 
             &mut write,
             Message::Binary(body(513)?),
             None,
+            4 * 1024 * 1024,
             MAX_READY_CONTROLS_PER_BOUNDARY,
             super::TimeoutBudget::new(
                 (Instant::now() + Duration::from_millis(request_ms)).into_std(),
@@ -889,6 +891,148 @@ impl<W: Sink<Message, Error = WsError> + Unpin> Sink<Message> for CountedSink<W>
 }
 
 #[tokio::test(start_paused = true)]
+async fn ready_fragmented_send_makes_bounded_progress_per_poll() -> TestResult {
+    let payload = body(1024 * 1024)?;
+    let io = ScriptedIo::new(payload.len() + 1024, usize::MAX, None);
+    let (write, _) = socket(&io, &CancellationToken::new()).await;
+    let counts = Arc::new(SinkCounts::default());
+    let mut write = CountedSink {
+        inner: write,
+        counts: counts.clone(),
+    };
+    let (_tx, mut rx) = mpsc::channel(1);
+    let heartbeat = HeartbeatState::new(907);
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions::default(),
+        false,
+        1,
+    )?;
+    phase.enqueue()?;
+    check!(phase.mark_writing(crate::ws::ConnectionId::from_allocated(902)))?;
+    let cancel = CancellationToken::new();
+    let wakes = Arc::new(WakeCounter::default());
+    let mut sending = Box::pin(send(
+        &mut write,
+        payload.clone(),
+        Some(32768),
+        &mut rx,
+        &heartbeat,
+        &phase,
+        &cancel,
+    ));
+    check!(poll_once(sending.as_mut(), &wakes).is_pending())?;
+    let initial = io.counts()?.accepted_bytes;
+    // A ready transport should amortize scheduler work, while still giving the
+    // reader and cancellation tasks a turn before the whole message is sent.
+    check!(
+        counts.starts.load(Ordering::Relaxed) > 1,
+        "still yields for every small frame"
+    )?;
+    check!(counts.starts.load(Ordering::Relaxed) < 32)?;
+    check!(initial > 0, "the first frame never reached the transport")?;
+    check!(
+        initial < payload.len(),
+        "ready writer monopolized the whole message"
+    )?;
+    // Tokio may defer yield_now's wake until its scheduler runs again.
+    check_eq!(tokio::time::timeout(LIMIT, sending).await?, Ok(()))?;
+    validate_upload(&io.lock()?.wire, &payload, Some(32768), None)?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn byte_and_elapsed_limits_yield_before_the_frame_count_limit() -> TestResult {
+    for (frame, slow_flush) in [(256 * 1024, false), (32768, true)] {
+        let payload = body(1024 * 1024)?;
+        let first_wire_bytes = frame + header_size(frame);
+        let io = ScriptedIo::new(
+            payload.len() + 1024,
+            usize::MAX,
+            slow_flush.then_some(first_wire_bytes),
+        );
+        let (mut write, _) = socket(&io, &CancellationToken::new()).await;
+        let (_tx, mut rx) = mpsc::channel(1);
+        let heartbeat = HeartbeatState::new(909);
+        let phase = crate::module::ws_client::v2_test_support::operation(
+            &crate::ws::SendOptions::default(),
+            false,
+            1,
+        )?;
+        phase.enqueue()?;
+        check!(phase.mark_writing(crate::ws::ConnectionId::from_allocated(904)))?;
+        let cancel = CancellationToken::new();
+        let wakes = Arc::new(WakeCounter::default());
+        let mut sending = Box::pin(send(
+            &mut write,
+            payload.clone(),
+            Some(frame),
+            &mut rx,
+            &heartbeat,
+            &phase,
+            &cancel,
+        ));
+        check!(poll_once(sending.as_mut(), &wakes).is_pending())?;
+        if slow_flush {
+            check!(io.counts()?.flush_pending > 0)?;
+            tokio::time::advance(Duration::from_millis(2)).await;
+            io.release()?;
+            check!(poll_once(sending.as_mut(), &wakes).is_pending())?;
+        }
+        // A large frame or a slow completed flush must give other tasks a turn
+        // immediately at that safe boundary, even though only one frame ran.
+        check_eq!(io.counts()?.accepted_bytes, first_wire_bytes)?;
+        check_eq!(tokio::time::timeout(LIMIT, sending).await?, Ok(()))?;
+        validate_upload(&io.lock()?.wire, &payload, Some(frame), None)?;
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_after_cooperative_poll_stops_before_more_wire_bytes() -> TestResult {
+    let payload = body(1024 * 1024)?;
+    let io = ScriptedIo::new(payload.len() + 1024, usize::MAX, None);
+    let (mut write, _) = socket(&io, &CancellationToken::new()).await;
+    let (_tx, mut rx) = mpsc::channel(1);
+    let heartbeat = HeartbeatState::new(908);
+    let phase = crate::module::ws_client::v2_test_support::operation(
+        &crate::ws::SendOptions::default(),
+        false,
+        1,
+    )?;
+    phase.enqueue()?;
+    check!(phase.mark_writing(crate::ws::ConnectionId::from_allocated(903)))?;
+    let cancel = CancellationToken::new();
+    let wakes = Arc::new(WakeCounter::default());
+    let mut sending = Box::pin(send(
+        &mut write,
+        payload.clone(),
+        Some(32768),
+        &mut rx,
+        &heartbeat,
+        &phase,
+        &cancel,
+    ));
+    check!(poll_once(sending.as_mut(), &wakes).is_pending())?;
+    let before = io.counts()?.accepted_bytes;
+    check!(before > 0 && before < payload.len())?;
+    cancel.cancel();
+    let failure = sending
+        .await
+        .err()
+        .ok_or_else(|| test_error("cancelled send succeeded"))?;
+    check_eq!(
+        failure.request_error.kind(),
+        crate::error::ErrorKind::Cancelled
+    )?;
+    check_eq!(
+        request_action_key(&failure.connection_action),
+        (2, Some(crate::error::ErrorKind::DeliveryUnknown))
+    )?;
+    check_eq!(io.counts()?.accepted_bytes, before)?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn pure_send_chain_counts_separate_sink_operations_from_async_io_polls() -> TestResult {
     let payload = body(LARGE)?;
     for frame in [
@@ -942,9 +1086,10 @@ async fn pure_send_chain_counts_separate_sink_operations_from_async_io_polls() -
             let frames = LARGE.div_ceil(frame.map_or(LARGE, |value| value));
             check_eq!(counts.starts.load(Ordering::Relaxed), frames)?;
             check_eq!(counts.ready_polls.load(Ordering::Relaxed), frames)?;
-            check_eq!(counts.flush_polls.load(Ordering::Relaxed), frames)?;
+            let flushes = counts.flush_polls.load(Ordering::Relaxed);
+            check!(flushes >= frames.div_ceil(4) && flushes <= frames)?;
             check_eq!(counts.close_polls.load(Ordering::Relaxed), 0)?;
-            check_eq!(io.counts()?.flush_polls, frames)?;
+            check_eq!(io.counts()?.flush_polls, flushes)?;
             let expected_wire = LARGE
                 + (frames - 1) * header_size(frame.map_or(LARGE, |value| value))
                 + header_size(LARGE - (frames - 1) * frame.map_or(LARGE, |value| value));

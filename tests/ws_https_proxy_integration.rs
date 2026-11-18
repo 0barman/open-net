@@ -243,6 +243,7 @@ async fn serve_echo(
     while let Some(message) = websocket.next().await {
         match message? {
             WireMessage::Text(text) => websocket.send(WireMessage::Text(text)).await?,
+            WireMessage::Binary(bytes) => websocket.send(WireMessage::Binary(bytes)).await?,
             WireMessage::Close(_) => {
                 websocket.flush().await?;
                 break;
@@ -311,6 +312,49 @@ async fn connection_error(network: NetworkConfig, url: String) -> TestResult<Net
     result
         .err()
         .ok_or_else(|| "connection unexpectedly succeeded".into())
+}
+
+#[tokio::test]
+async fn wss_default_fragmentation_roundtrips_one_mib_on_both_tls_versions() -> TestResult {
+    let payload = (0..1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let (target, target_peer) =
+            start_target(Some(server_config(TARGET_CERT, TARGET_KEY, None, version)?)).await?;
+        let network = NetworkConfig::default().with_tls(tls_config(TARGET_CA, None)?);
+        let engine = OpenNet::new_with_network_config(network)?;
+        let config = open_net::ws::WebSocketClientConfig::default();
+        check(
+            config.frames.data_frame_payload_size == Some(32 * 1024),
+            "default outgoing fragment size changed",
+        )?;
+        let client =
+            bounded(engine.create_ws_client_with_config("wss-large-echo", config)).await??;
+        let mut session =
+            bounded(client.connect(options(format!("wss://{target}/large-echo")))).await??;
+        let mut messages = session.take_messages().ok_or("message receiver missing")?;
+        bounded(
+            session
+                .sender()
+                .message(Message::binary(payload.clone()))
+                .send(),
+        )
+        .await??;
+        let received = bounded(messages.recv())
+            .await??
+            .ok_or("TLS echo closed before delivering the complete message")?;
+        check(
+            matches!(received.message(), Some(Message::Binary(bytes)) if bytes.as_ref() == payload.as_slice()),
+            "TLS echo changed the binary message type, length or payload bytes",
+        )?;
+        bounded(session.close()).await??;
+        bounded(client.shutdown()).await??;
+        bounded(engine.destroy_ws_client("wss-large-echo")).await??;
+        let observed = target_peer.finish().await?;
+        check(!observed.rejected, "target rejected the TLS connection")?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

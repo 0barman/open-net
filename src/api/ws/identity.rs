@@ -23,6 +23,9 @@ macro_rules! opaque_id {
 
                 /// The owning scope supplies its last allocated value; zero starts at one.
                 /// Allocation only establishes uniqueness, not visibility of business state.
+                // Some IDs are assigned by their owning scope in production; identity
+                // tests exercise this shared allocator for every generated ID type.
+                #[cfg_attr(not(test), allow(dead_code))]
                 pub(crate) fn allocate(counter: &AtomicU64) -> Result<Self> {
                     next_value(counter).map(Self::from_allocated)
                 }
