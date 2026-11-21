@@ -940,11 +940,20 @@ impl OperationControl {
         Ok(outcome)
     }
     pub(crate) async fn written(&self) -> Result<WriteOutcome> {
+        self.written_with_connection()
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+    pub(crate) async fn written_with_connection(
+        &self,
+    ) -> Result<(WriteOutcome, Option<ConnectionId>)> {
         self.written.cancelled().await;
         let state = self.state.lock().map_err(NetError::from_poison)?;
         match state.snapshot.delivery {
-            DeliveryEvidence::ResponseConfirmed => Ok(WriteOutcome::ResponseConfirmed),
-            DeliveryEvidence::Written => Ok(WriteOutcome::Written),
+            DeliveryEvidence::ResponseConfirmed => {
+                Ok((WriteOutcome::ResponseConfirmed, state.connection))
+            }
+            DeliveryEvidence::Written => Ok((WriteOutcome::Written, state.connection)),
             _ => Err(state
                 .snapshot
                 .result

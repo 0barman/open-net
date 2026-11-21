@@ -7,9 +7,8 @@ cancellation. Sharing a policy never shares an attempt budget between requests.
 
 Every complete program on this page uses this dependency:
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false }
+```sh
+cargo add open-net --no-default-features
 ```
 
 Use a schedule inside [HTTP retry policies](http/retry.md) or

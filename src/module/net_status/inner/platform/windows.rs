@@ -400,13 +400,13 @@ fn query_nlm_name(
 #[cfg(target_os = "windows")]
 fn query_wifi_ssid(deadline: Instant, cancelled: &AtomicBool) -> Result<Option<String>, NetError> {
     check_request(deadline, cancelled)?;
-    let mut command = std::process::Command::new(system_netsh_path()?);
+    let mut command = std::process::Command::new(system_directory()?.join("netsh.exe"));
     command.args(["wlan", "show", "interfaces"]);
     parse_wifi_ssid(&command_output(command, deadline, cancelled)?)
 }
 
 #[cfg(target_os = "windows")]
-fn system_netsh_path() -> Result<std::path::PathBuf, NetError> {
+pub(crate) fn system_directory() -> Result<std::path::PathBuf, NetError> {
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 
@@ -425,7 +425,7 @@ fn system_netsh_path() -> Result<std::path::PathBuf, NetError> {
     if !directory.is_absolute() {
         return Err(NetError::from(ErrorKind::InvalidConfig).with_stage(ErrorStage::NetworkMonitor));
     }
-    Ok(directory.join("netsh.exe"))
+    Ok(directory)
 }
 
 #[cfg(target_os = "windows")]

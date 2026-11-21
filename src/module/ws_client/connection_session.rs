@@ -389,6 +389,13 @@ impl ConnectionSession {
     }
 
     pub(crate) async fn wait_connected(&self) -> Result<ConnectionInfo, NetError> {
+        self.wait_connected_after(None).await
+    }
+
+    pub(crate) async fn wait_connected_after(
+        &self,
+        previous: Option<ConnectionId>,
+    ) -> Result<ConnectionInfo, NetError> {
         loop {
             let notified = self.lifecycle_changed.notified();
             tokio::pin!(notified);
@@ -408,7 +415,11 @@ impl ConnectionSession {
                     };
                 }
                 if !state.closing {
-                    if let Some(connection) = &state.connection {
+                    if let Some(connection) = state
+                        .connection
+                        .as_ref()
+                        .filter(|connection| Some(connection.info.connection_id) != previous)
+                    {
                         return Ok(connection.info.clone());
                     }
                 }
@@ -1126,6 +1137,21 @@ impl ConnectionSession {
         self.close_requested.clone()
     }
 
+    pub(crate) fn ensure_open_for_reconnect(&self) -> Result<(), NetError> {
+        if self.close_requested.is_cancelled() {
+            return Err(NetError::from(ErrorKind::Closed));
+        }
+        if !self.cancel_requested.is_cancelled() {
+            return Ok(());
+        }
+        // Every terminal publication cancels this token, including normal closes.
+        match self.terminal_result_checked()? {
+            None => Err(NetError::from(ErrorKind::Cancelled)),
+            Some(Err(error)) if error.kind() == ErrorKind::Cancelled => Err(error),
+            Some(_) => Err(NetError::from(ErrorKind::Closed)),
+        }
+    }
+
     pub(crate) fn take_close_request(&self) -> Result<Option<SessionCloseRequest>, NetError> {
         self.close_request
             .lock()
@@ -1522,7 +1548,10 @@ impl ConnectionSession {
             | TerminationReason::PeerClose => ErrorKind::Cancelled,
             TerminationReason::EngineDropped => ErrorKind::EngineDropped,
             TerminationReason::RetryExhausted => ErrorKind::RetryExhausted,
-            TerminationReason::ConnectFailed => ErrorKind::NotConnected,
+            TerminationReason::ConnectFailed | TerminationReason::ReconnectRequested => {
+                ErrorKind::NotConnected
+            }
+            TerminationReason::ApplicationHeartbeatTimeout => ErrorKind::TimedOut,
             TerminationReason::IoFailure | TerminationReason::NetworkUnavailable => ErrorKind::Io,
         })
         .with_stage(ErrorStage::Close)

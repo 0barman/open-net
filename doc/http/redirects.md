@@ -1,6 +1,6 @@
 # Transport security and HTTP redirects
 
-`HttpTransportSecurity` and `RedirectPolicy` are introduced in 0.3.3. The
+`HttpTransportSecurity` and `RedirectPolicy` were introduced in 0.3.3. The
 0.3.2 release does not provide these configurable policies or all of the
 guarantees below; its HTTP/2-only mode already has separate HTTPS restrictions.
 
@@ -16,11 +16,10 @@ the original request's origin, and follows at most ten redirects per attempt.
 The rules apply to buffered requests, callback requests, stream opening, and SSE
 opening. SSE opens a GET request without an application request body.
 
-Every complete program on this page uses these dependencies:
+Add this dependency from the application crate directory.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
+```sh
+cargo add open-net --no-default-features --features http-client
 ```
 
 ## Independent policies

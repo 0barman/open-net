@@ -5,15 +5,28 @@
 ## Required features and example dependencies
 
 Every example on this page uses `http-client`, which also enables `net-status`.
-Use Rust 1.89 or later. Create a consumer crate with `cargo new http-example`,
-then use the following dependency configuration.
+See `package.rust-version` in the [crate manifest](../../Cargo.toml) for the
+minimum supported Rust toolchain. Create a consumer crate with `cargo new
+http-example`, then run these commands from its directory.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+```sh
+cargo add open-net --no-default-features --features http-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread,time
 ```
+
+### Try file uploads and SSE events from a checkout
+
+Follow the dependency setup on the example's page. To use the development
+checkout, point Cargo at the local `open-net` crate directory (shown here as
+`../open-net`) from your application crate.
+
+```sh
+cargo add --path ../open-net --no-default-features --features http-client
+```
+
+- Send a file in one PUT with a known `Content-Length` and track bytes read from disk. [Upload to a presigned URL](requests_and_responses.md#httpclientupload)
+- Read named events from a translation GET or a JSON POST with the same decoder. [Consume SSE events from GET and POST](streaming_and_sse.md#httpclientsse)
 
 ## Application TLS provider
 
@@ -24,7 +37,7 @@ until a client is built. Client creation requires a provider even for plain HTTP
 and otherwise returns `InvalidConfig` for `tls.provider`.
 
 The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
+Another compatible rustls provider can replace it. Install a process provider
 once in the host application, or pass an explicit per-client provider. A library
 using open-net should accept the host's choice rather than install its own global
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
@@ -70,10 +83,9 @@ opening runtime stays alive and drives I/O. A multi-thread runtime continues
 driving its workers between `block_on` calls; a current-thread runtime needs to
 keep being driven. See [stream lifetime](streaming_and_sse.md#stream-lifetime-and-deadlines).
 
-Disabling default features removes the default WebSocket selection for this
-dependency declaration. `features = ["http-client"]` without
-`default-features = false` retains that default. Neither transport feature
-selects a cryptographic provider. Configure a rustls 0.23 provider with
+The `--no-default-features` flag disables the default WebSocket selection for
+this dependency. Adding only `--features http-client` keeps the WebSocket default. Neither transport feature
+selects a cryptographic provider. Configure a rustls provider with
 `HttpTlsConfig::with_crypto_provider` or initialize it in the host application
 before client creation; see [TLS providers](../tls.md).
 Cargo features are additive across dependencies. Response JSON decoding is
@@ -225,6 +237,48 @@ async fn main() -> Result<(), open_net::NetError> {
 }
 ```
 
+## `HttpClient::quality_doctor()`
+
+### Required features
+
+`http-client` and `quality-doctor`.
+
+### Function signature
+
+```text
+pub fn quality_doctor(&self) -> Option<QualityDoctor>
+```
+
+### Steps
+
+Configure Basic or Detailed collection when constructing the client or engine.
+Call this method before submitting the first request you want to observe.
+
+### Parameters
+
+`&self` is the client whose diagnostic scope you want to read.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+`Some(doctor)` gives access to the standalone client's collector or, for a
+managed client, the engine's shared collector. `None` means diagnostics are
+Off or the inherited owner is no longer available.
+
+### Errors and behavior
+
+The first activation allocates bounded storage. Subsequent calls, including
+through client clones, share its history. Earlier operations cannot be
+reconstructed. Keeping the reader lets you inspect retained reports after
+shutdown without keeping network workers alive.
+
+### Example
+
+[Activate diagnostics before submitting an HTTP request](../quality_doctor.md#standalone-http-example).
+
 ## Engine-managed clients
 
 Use these methods when an engine should retain and name the client. Names are
@@ -279,7 +333,7 @@ async fn main() -> Result<(), open_net::NetError> {
 - [Awaiting a buffered response](requests_and_responses.md#awaiting-a-buffered-response)
 - [Requests and buffered responses](requests_and_responses.md)
 - [Owned callback requests and completion handles](callback_requests.md)
-- [Streaming and raw SSE data](streaming_and_sse.md)
+- [Streaming responses and SSE events](streaming_and_sse.md)
 - [Cancellation and shutdown](lifecycle.md)
 - [Engine shutdown and subscription lifetime](../lifecycle.md)
 - [Network observations](network_status.md)

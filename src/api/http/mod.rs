@@ -44,6 +44,7 @@ pub mod redirect;
 #[cfg(feature = "http-client-codecs")]
 mod request_codecs;
 pub mod retry;
+mod sse;
 
 #[cfg(feature = "http-client-auth")]
 pub use auth::{
@@ -85,5 +86,6 @@ pub use retry::{
     HttpRequestOptions, HttpRetryContext, HttpRetryPolicy, HttpRetryPolicyBuilder, RequestSafety,
     RetryAfterMode, RetryOn, RetryReason, TransportErrorKind,
 };
+pub use sse::{SseEvent, SseEvents};
 #[cfg(feature = "http-client-cookies")]
 pub use url::Url;

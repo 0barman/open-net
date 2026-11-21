@@ -1,11 +1,10 @@
 # Query, JSON, form and multipart requests
 
-Required feature: `http-client-codecs` (includes `http-client`). In your application's `Cargo.toml`:
+Required feature: `http-client-codecs` (includes `http-client`). Run these commands from your application crate.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client-codecs"] }
-serde = { version = "1", features = ["derive"] }
+```sh
+cargo add open-net --no-default-features --features http-client-codecs
+cargo add serde --features derive
 ```
 
 Examples construct requests offline. To send them, use the client from [requests and responses](requests_and_responses.md), with a server that accepts the specified endpoint and media type. Fallible builder and Multipart methods that take `self` consume that builder/form on both success and error; `Err(NetError)` does not return the original object. `HttpRequestBuilder` is not cloneable: retain the original input values to reconstruct it after an error. `Multipart` is cloneable, so clone a form before a fallible call if a retained copy is required. Borrowed serialization input is not consumed. These codecs encode outgoing requests. `HttpResponse::json` already works with basic `http-client`, and sending manually constructed JSON bytes also needs no codecs feature.
@@ -249,7 +248,7 @@ fn main() -> Result<(), NetError> {
 
 ## Individual function reference
 
-The examples linked below are complete programs with the dependency declaration at the top of this page. Each reference identifies the call that demonstrates the function.
+The examples linked below are complete programs using the dependencies listed at the top of this page. Each reference identifies the call that demonstrates the function.
 
 ## `Multipart::new()`
 

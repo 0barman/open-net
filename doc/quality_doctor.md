@@ -21,15 +21,16 @@ Collection requires three independent steps:
 3. Call that owner's `quality_doctor()` accessor before starting the operations
    you want to observe.
 
-For an HTTP application:
+To compile every example on this page, add both transports to your application.
+Each Rust block is a separate program that you can copy to `src/main.rs`.
 
 ```sh
-cargo add open-net --no-default-features --features http-client,quality-doctor
+cargo add open-net --no-default-features --features http-client,ws-client,quality-doctor
 cargo add tokio --features macros,rt-multi-thread,time
 ```
 
-For an application using both transports, select
-`http-client,ws-client,quality-doctor` instead. `quality-doctor` enables neither a
+For an HTTP-only application, use `http-client,quality-doctor`.
+`quality-doctor` enables neither a
 transport nor network monitoring by itself, and is not a default feature.
 `QualityProtocols` selects which compiled transports to observe; it cannot
 enable a missing Cargo feature.
@@ -47,16 +48,17 @@ even when the example endpoint uses an unencrypted connection.
 
 ### Owners and activation
 
-An engine created with `OpenNetConfig::with_quality_doctor` owns one diagnostic
-scope shared by its HTTP and WebSocket clients. Activate it with
-`OpenNet::quality_doctor()`. An engine HTTP client's accessor reaches the same
-scope. HTTP clients receive owner-allocated diagnostic IDs; WebSocket clients
+An engine owns one diagnostic scope shared by its HTTP and WebSocket clients.
+Set the policy with [`OpenNetConfig::with_quality_doctor`](net_status/README.md#opennetconfigwith_quality_doctor).
+Activate it with `OpenNet::quality_doctor()` or a managed HTTP client's
+[`HttpClient::quality_doctor`](http/README.md#httpclientquality_doctor).
+HTTP clients receive owner-allocated diagnostic IDs; WebSocket clients
 use their existing `ClientId` value. Clones retain their client's identity.
 These two ID populations can overlap numerically, so combine client and protocol
 filters when selecting one client.
 
-A standalone `HttpClient` uses
-`HttpClientConfig::with_standalone_quality_doctor` and owns its own scope. Passing
+A standalone `HttpClient` owns its own scope, configured with
+[`HttpClientConfig::with_standalone_quality_doctor`](http/configuration.md#httpclientconfigwith_standalone_quality_doctor). Passing
 this standalone setting to an engine-owned HTTP client is an `InvalidConfig`
 error. Sharing a network-status context with an engine does not make a standalone
 HTTP client share the engine's diagnostic scope.
@@ -74,10 +76,10 @@ request path.
 
 ### Standalone HTTP example
 
-This application takes a base URL as its first argument, observes a buffered GET,
-looks up the matching report if one exists, then exports a snapshot after client
-shutdown. Both a successful response and an observed `NetError` can carry a
-reference.
+Pass a base URL as the first argument. The program saves the report reference
+from a buffered GET, shuts down the client, then uses the retained doctor to
+look up the report and export a snapshot. Both a response and an observed
+`NetError` can carry a reference. See [`HttpResponse::quality_ref`](http/requests_and_responses.md#httpresponsequality_ref).
 
 ```rust,no_run
 use open_net::{
@@ -85,11 +87,12 @@ use open_net::{
     quality::{QualityDoctorConfig, QualityLookup, QualityQuery},
     BoxError,
 };
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let base_url = std::env::args().nth(1).ok_or("provide an HTTP base URL")?;
+    let base_url = std::env::args_os().nth(1).ok_or("provide an HTTP base URL")?
+        .into_string().map_err(|_| "the base URL must be valid Unicode")?;
     let tls = HttpTlsConfig::default()
         .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
     let config = HttpClientConfig::new(base_url)?
@@ -103,18 +106,19 @@ async fn main() -> Result<(), BoxError> {
         Ok(response) => response.quality_ref(),
         Err(error) => error.quality_ref(),
     };
+    client.shutdown().await?;
     if let Some(reference) = reference {
         match doctor.lookup(&reference) {
             QualityLookup::Available(report) => {
-                println!("result={:?}, elapsed={:?}", report.outcome(), report.result_duration());
+                writeln!(std::io::stdout(), "result={:?}, elapsed={:?}",
+                    report.outcome(), report.result_duration())?;
             }
-            other => println!("diagnostic availability: {other:?}"),
+            other => writeln!(std::io::stdout(), "diagnostic availability: {other:?}")?,
         }
     }
 
-    client.shutdown().await?;
     let snapshot = doctor.snapshot(QualityQuery::default())?;
-    println!("{}", snapshot.to_json()?);
+    writeln!(std::io::stdout(), "{}", snapshot.to_json()?)?;
     result?;
     Ok(())
 }
@@ -126,16 +130,19 @@ a normal response still has this outcome. Apply your application's status and
 body validation separately. `http_status()` contains the selected numeric status
 where the adapter retained it.
 
-For streams, ordinary `stream` and SSE APIs remain observed. Use
-`stream_with_quality_ref` when you also need the reference alongside the
-`HttpStreamResponse`, whose fields do not contain a quality reference:
+### Streaming HTTP example
+
+Ordinary `stream` and SSE requests are observed when HTTP collection is active.
+To receive the reference alongside the `HttpStreamResponse`, call
+[`HttpClient::stream_with_quality_ref`](http/streaming_and_sse.md#httpclientstream_with_quality_ref).
 
 ```rust,no_run
 use open_net::{
-    api::http::{HttpClient, HttpRequest},
-    quality::QualityDoctor,
+    api::http::{HttpClient, HttpClientConfig, HttpRequest, HttpTlsConfig},
+    quality::{QualityDoctor, QualityDoctorConfig},
     BoxError,
 };
+use std::{io::Write, sync::Arc};
 
 async fn consume_stream(client: &HttpClient, doctor: &QualityDoctor) -> Result<(), BoxError> {
     let request = HttpRequest::builder().path("/").build()?;
@@ -143,7 +150,7 @@ async fn consume_stream(client: &HttpClient, doctor: &QualityDoctor) -> Result<(
     let mut body_result = Ok(());
     while let Some(chunk) = response.next_chunk().await {
         match chunk {
-            Ok(bytes) => println!("consumed {} bytes", bytes.len()),
+            Ok(bytes) => writeln!(std::io::stdout(), "consumed {} bytes", bytes.len())?,
             Err(error) => {
                 body_result = Err(error);
                 break;
@@ -152,12 +159,28 @@ async fn consume_stream(client: &HttpClient, doctor: &QualityDoctor) -> Result<(
     }
     drop(response);
     if let Some(reference) = reference {
-        println!("{:?}", doctor.lookup(&reference));
+        writeln!(std::io::stdout(), "{:?}", doctor.lookup(&reference))?;
     }
     body_result?;
     Ok(())
 }
+
+#[tokio::main]
+async fn main() -> Result<(), BoxError> {
+    let base_url = std::env::var("HTTP_BASE_URL")?;
+    let tls = HttpTlsConfig::default()
+        .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    let config = HttpClientConfig::new(base_url)?.with_tls(tls)
+        .with_standalone_quality_doctor(QualityDoctorConfig::basic());
+    let client = HttpClient::new(config, "stream-quality")?;
+    let doctor = client.quality_doctor().ok_or("diagnostics are disabled")?;
+    let result = consume_stream(&client, &doctor).await;
+    client.shutdown().await?;
+    result
+}
 ```
+
+Set `HTTP_BASE_URL` to a server whose root path returns a finite response.
 
 Receiving headers does not imply that body consumption finished or that a
 diagnostic result has been selected. A transport stream normally selects its
@@ -168,24 +191,97 @@ reference follows the body through these boundaries. Observation retention can
 expire while the network stream remains open. An error before the stream opens
 is returned directly and can be inspected with `NetError::quality_ref()`.
 
+### HTTP request handle example
+
+After callback request admission, capture its reference with
+[`HttpRequestHandle::quality_ref`](http/callback_requests.md#httprequesthandlequality_ref).
+This example sends a GET to `/` on `HTTP_BASE_URL` and inspects the report after
+the callback has finished.
+
+```rust,no_run
+use open_net::{
+    api::http::{HttpClient, HttpClientConfig, HttpRequestMethod, HttpRequestTrait,
+        HttpResponseResult, HttpTlsConfig},
+    quality::QualityDoctorConfig,
+    BoxError,
+};
+use std::{io::Write, sync::Arc};
+
+struct GetRoot;
+
+#[open_net::async_trait]
+impl HttpRequestTrait for GetRoot {
+    fn get_path(&self) -> String { "/".into() }
+    fn get_method(&self) -> HttpRequestMethod { HttpRequestMethod::GET }
+    // The caller uses the completion summary instead of consuming the body.
+    async fn deal_with_response(self: Box<Self>, _: HttpResponseResult) {}
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BoxError> {
+    let tls = HttpTlsConfig::default()
+        .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    let config = HttpClientConfig::new(std::env::var("HTTP_BASE_URL")?)?
+        .with_tls(tls).with_standalone_quality_doctor(QualityDoctorConfig::basic());
+    let client = HttpClient::new(config, "callback-quality")?;
+    let doctor = client.quality_doctor().ok_or("diagnostics are disabled")?;
+    let result = async {
+        let handle = client.send_wait(GetRoot).await.map_err(|rejected| rejected.into_error())?;
+        let reference = handle.quality_ref();
+        let completion = handle.finished().await;
+        if let Some(reference) = reference {
+            writeln!(std::io::stdout(), "{:?}", doctor.lookup(&reference))?;
+        }
+        completion.callback?;
+        completion.response?;
+        Ok(())
+    }.await;
+    client.shutdown().await?;
+    result
+}
+```
+
 ### Engine-owned WebSocket example
 
-This application takes a WebSocket endpoint as its first argument. It activates
-the engine doctor before connecting, sends a message through a receipt, and
-queries only message reports. Connection attempts appear in the same scope but
-have a different operation kind.
+This application takes a WebSocket text echo endpoint as its first argument.
+It activates the engine doctor before connecting and looks up the report for
+an ordinary message using its write receipt.
+
+#### WebSocket request handle example
+
+The same program sends a logical lookup request. The peer must echo its
+`lookup:<request ID>` text unchanged so the router can resolve the attempt.
+Before awaiting the response, save the logical operation's reference with
+[`WsRequestOperationHandle::quality_ref`](websocket/retry.md#wsrequestoperationhandlequality_ref).
+The final snapshot filters for ordinary messages only.
 
 ```rust,no_run
 use open_net::{
     network::{NetworkConfig, TlsConfig},
     quality::{QualityDoctorConfig, QualityOperationKind, QualityProtocol, QualityQuery},
+    ws::{ConnectOptions, IncomingMessage, Message, RequestId, ResponseProtocol,
+        ResponseRoute, ResponseRouting},
     BoxError, OpenNet, OpenNetConfig,
 };
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
+
+struct EchoRouter;
+
+impl ResponseProtocol for EchoRouter {
+    fn route(&self, incoming: &IncomingMessage) -> Result<ResponseRoute, BoxError> {
+        match incoming.message().and_then(Message::as_text)
+            .and_then(|text| text.strip_prefix("lookup:"))
+        {
+            Some(id) => Ok(ResponseRoute::Final { request_id: RequestId::new(id)? }),
+            None => Ok(ResponseRoute::Unmatched),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let url = std::env::args().nth(1).ok_or("provide a WebSocket endpoint")?;
+    let url = std::env::args_os().nth(1).ok_or("provide a WebSocket endpoint")?
+        .into_string().map_err(|_| "the endpoint must be valid Unicode")?;
     let tls = TlsConfig::default()
         .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
     let config = OpenNetConfig::default()
@@ -194,24 +290,39 @@ async fn main() -> Result<(), BoxError> {
     let net = OpenNet::new_with_config(config)?;
     let doctor = net.quality_doctor().ok_or("diagnostics are disabled")?;
     let client = net.create_ws_client("ws-quality").await?;
-    let session = client.connect(url).await?;
+    let mut options = ConnectOptions::new(url);
+    options.routing = ResponseRouting::protocol(EchoRouter);
+    let session = client.connect(options).await?;
 
-    let receipt = session.sender().enqueue("hello").await
-        .map_err(|failure| failure.into_parts().1)?;
-    let reference = receipt.quality_ref();
-    let write_result = receipt.written().await;
-    if let Some(reference) = reference {
-        println!("{:?}", doctor.lookup(&reference));
-    }
+    let result = async {
+        let receipt = session.sender().enqueue("hello").await
+            .map_err(|failure| failure.into_error())?;
+        let reference = receipt.quality_ref();
+        let written = receipt.written().await;
+        if let Some(reference) = reference {
+            writeln!(std::io::stdout(), "message: {:?}", doctor.lookup(&reference))?;
+        }
+        written?;
+
+        let receipt = session.requests()?.request_with_factory("lookup", |attempt| {
+            Ok(Message::text(format!("lookup:{}", attempt.request_id())))
+        })?.enqueue().await.map_err(|failure| failure.into_error())?;
+        let reference = receipt.handle().quality_ref();
+        let response = receipt.response().await;
+        if let Some(reference) = reference {
+            writeln!(std::io::stdout(), "logical request: {:?}", doctor.lookup(&reference))?;
+        }
+        response?;
+        Ok::<(), BoxError>(())
+    }.await;
 
     session.close().await?;
     net.shutdown().await?;
     let query = QualityQuery::default()
         .with_protocol(QualityProtocol::WebSocket)
         .with_kind(QualityOperationKind::WsMessage);
-    println!("{}", doctor.snapshot(query)?.to_json()?);
-    write_result?;
-    Ok(())
+    writeln!(std::io::stdout(), "{}", doctor.snapshot(query)?.to_json()?)?;
+    result
 }
 ```
 
@@ -287,7 +398,7 @@ detail while retaining the default policy:
 use open_net::quality::{QualityDoctorConfig, QualityLimits, QualitySampling};
 use std::time::Duration;
 
-fn diagnostics_config() -> Result<QualityDoctorConfig, open_net::quality::QualityError> {
+fn main() -> Result<(), open_net::quality::QualityError> {
     let config = QualityDoctorConfig::detailed()
         .with_limits(QualityLimits::default()
             .with_ingress_capacity(2048)
@@ -295,8 +406,7 @@ fn diagnostics_config() -> Result<QualityDoctorConfig, open_net::quality::Qualit
             .with_retention(Duration::from_secs(120))
             .with_window(Duration::from_secs(30)))
         .with_sampling(QualitySampling::new(0.1, 1.0));
-    config.validate()?;
-    Ok(config)
+    config.validate()
 }
 ```
 
@@ -323,24 +433,36 @@ Multiple readers share one collector and its bounded storage.
 ### Snapshot filters and ordering
 
 `snapshot(QualityQuery::default())` includes all retained kinds and protocols in
-the configured default window, subject to the output limit. Use explicit filters
-for comparable statistics:
+the configured default window, subject to the output limit. This program queries
+HTTP requests after one GET to the server in `HTTP_BASE_URL`.
 
 ```rust
-use open_net::quality::{
-    QualityDoctor, QualityError, QualityOperationKind, QualityProtocol, QualityQuery,
+use open_net::{
+    api::http::{HttpClient, HttpClientConfig, HttpTlsConfig},
+    quality::{QualityDoctorConfig, QualityOperationKind, QualityProtocol, QualityQuery},
+    BoxError,
 };
-use std::time::Duration;
+use std::{io::Write, sync::Arc, time::Duration};
 
-fn inspect_http(doctor: &QualityDoctor) -> Result<(), QualityError> {
+#[tokio::main]
+async fn main() -> Result<(), BoxError> {
+    let tls = HttpTlsConfig::default()
+        .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    let config = HttpClientConfig::new(std::env::var("HTTP_BASE_URL")?)?.with_tls(tls)
+        .with_standalone_quality_doctor(QualityDoctorConfig::basic());
+    let client = HttpClient::new(config, "snapshot-quality")?;
+    let doctor = client.quality_doctor().ok_or("diagnostics are disabled")?;
+    let result = client.get("/").await;
+    client.shutdown().await?;
     let snapshot = doctor.snapshot(QualityQuery::default()
         .with_protocol(QualityProtocol::Http)
         .with_kind(QualityOperationKind::HttpRequest)
         .with_window(Duration::from_secs(30))
         .with_limit(32))?;
-    println!("retained={}, returned={}, truncated={}",
-        snapshot.summary().retained(), snapshot.reports().len(), snapshot.results_truncated());
-    println!("successful result latency: {:?}", snapshot.summary().p95());
+    writeln!(std::io::stdout(), "retained={}, returned={}, truncated={}",
+        snapshot.summary().retained(), snapshot.reports().len(), snapshot.results_truncated())?;
+    writeln!(std::io::stdout(), "successful result latency: {:?}", snapshot.summary().p95())?;
+    result?;
     Ok(())
 }
 ```
@@ -400,35 +522,56 @@ and protocols, no snapshot updates, and a 25 ms poll interval. The requested
 capacity must be positive and no greater than the configured subscription
 capacity. If you lower that configured limit below the receiver default, also
 set `with_capacity` on the subscription. The poll interval must be between 1 ms
-and 60 s, inclusive.
+and 60 s, inclusive. This example subscribes before the GET to `HTTP_BASE_URL`
+and closes the standalone owner after the request finishes.
 
 ```rust,no_run
-use open_net::quality::{
-    QualityDoctor, QualityError, QualityOperationKind, QualityQuery,
-    QualitySubscriptionOptions, QualityUpdate,
+use open_net::{
+    api::http::{HttpClient, HttpClientConfig, HttpTlsConfig},
+    quality::{QualityDoctorConfig, QualityOperationKind, QualityQuery,
+        QualitySubscriptionOptions, QualityUpdate},
+    BoxError,
 };
-use std::time::Duration;
+use std::{io::Write, sync::Arc, time::Duration};
 
-async fn watch_requests(doctor: &QualityDoctor) -> Result<(), QualityError> {
+#[tokio::main]
+async fn main() -> Result<(), BoxError> {
+    let tls = HttpTlsConfig::default()
+        .with_crypto_provider(Arc::new(rustls_openssl::default_provider()));
+    let config = HttpClientConfig::new(std::env::var("HTTP_BASE_URL")?)?.with_tls(tls)
+        .with_standalone_quality_doctor(QualityDoctorConfig::basic());
+    let client = HttpClient::new(config, "subscribe-quality")?;
+    let doctor = client.quality_doctor().ok_or("diagnostics are disabled")?;
     let options = QualitySubscriptionOptions::default()
         .with_capacity(32)
         .with_filter(QualityQuery::default().with_kind(QualityOperationKind::HttpRequest))
         .with_snapshot_updates(true)
         .with_poll_interval(Duration::from_millis(50));
     let mut updates = doctor.subscribe(options)?;
-    while let Some(update) = updates.recv().await? {
-        match update {
-            QualityUpdate::ReportCompleted(report) => {
-                println!("{:?}: {:?}", report.reference(), report.state());
+    let watch = async {
+        while let Some(update) = updates.recv().await? {
+            match update {
+                QualityUpdate::ReportCompleted(report) => {
+                    writeln!(std::io::stdout(), "{:?}: {:?}", report.reference(), report.state())?;
+                }
+                QualityUpdate::Gap(gap) => {
+                    writeln!(std::io::stdout(), "diagnostic loss: {:?}, {} items",
+                        gap.scope(), gap.dropped())?;
+                }
+                QualityUpdate::Closed => break,
+                _ => {}
             }
-            QualityUpdate::Gap(gap) => {
-                println!("diagnostic loss: {:?}, {} items", gap.scope(), gap.dropped());
-            }
-            QualityUpdate::Closed => break,
-            _ => {}
         }
-    }
-    Ok(())
+        Ok::<(), BoxError>(())
+    };
+    let request = async {
+        let result = client.get("/").await;
+        client.shutdown().await?;
+        result
+    };
+    let (result, watched) = tokio::join!(request, watch);
+    result?;
+    watched
 }
 ```
 

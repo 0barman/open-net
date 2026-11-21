@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::common::CommonEngine;
 use crate::error::{ErrorKind, NetError};
+#[cfg(any(target_os = "windows", test))]
+use crate::net_status::{IpStack, NetworkStatus};
 use crate::net_status::{
     MonitorState, NetworkEvent, NetworkEventOptions, NetworkObservation, NetworkSnapshot,
 };
-#[cfg(any(target_os = "windows", test))]
-use crate::net_status::{IpStack, NetworkStatus};
 use crate::subscription::common_executor::CommonCallbackExecutor;
 use crate::subscription::{
     CallbackContext, EventReceiver, StateReceiver, StateSource, Subscription,
@@ -64,6 +64,8 @@ pub(crate) struct NetworkObservationOwner {
     context: NetworkStatusContext,
     engine: Arc<CommonEngine>,
     names: super::names::NameScope,
+    #[cfg(windows)]
+    interface_events: super::super::interface_events::InterfaceEventScope,
     local: Mutex<LocalState>,
     view: NetworkViewHandle,
     source: StateSource<NetworkSnapshot>,
@@ -116,6 +118,8 @@ impl NetworkObservationOwner {
             context,
             engine,
             names,
+            #[cfg(windows)]
+            interface_events: super::super::interface_events::InterfaceEventScope::new(),
             view,
             source,
             bridge_stop: Mutex::new(Some(bridge_stop)),
@@ -317,6 +321,8 @@ impl NetworkObservationOwner {
     fn retire(&self, permanent: bool, source_error: Option<NetError>) -> Result<(), NetError> {
         if permanent {
             self.names.request_close();
+            #[cfg(windows)]
+            self.interface_events.request_close();
         }
         // The local bridge can be stopped before the deferred start-waiter
         // wake is submitted below. Keep its successor work registered across
@@ -404,6 +410,10 @@ impl NetworkObservationOwner {
             }
         }
         if closed {
+            #[cfg(windows)]
+            if let Err(error) = self.interface_events.wait_cleanup().await {
+                failure.get_or_insert(error);
+            }
             let mut finished = self.bridge_finished.clone();
             while !*finished.borrow_and_update() {
                 if finished.changed().await.is_err() {
@@ -434,6 +444,22 @@ impl NetworkObservationOwner {
         options.validate()?;
         self.admit_lan_query()?;
         self.names.observe(options)
+    }
+
+    pub(crate) fn subscribe_interface_events(
+        &self,
+        options: crate::net_status::InterfaceEventOptions,
+    ) -> Result<EventReceiver<crate::net_status::InterfaceEvent>, NetError> {
+        options.validate()?;
+        self.admit_lan_query()?;
+        #[cfg(windows)]
+        {
+            self.interface_events.subscribe(&self.engine, options)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(NetError::from(ErrorKind::Unsupported))
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Result<NetworkSnapshot, NetError> {

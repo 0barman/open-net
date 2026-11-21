@@ -2,11 +2,10 @@
 
 Required feature: `http-client-auth` (includes `http-client`). Manually setting an `Authorization` header needs only basic `http-client`; providers and automatic credential refresh require this feature.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client-auth"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```sh
+cargo add open-net --no-default-features --features http-client-auth
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 ## Application TLS provider
@@ -18,7 +17,7 @@ until a client is built. Client creation requires a provider even for plain HTTP
 and otherwise returns `InvalidConfig` for `tls.provider`.
 
 The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
+Another compatible rustls provider can replace it. Install a process provider
 once in the host application, or pass an explicit per-client provider. A library
 using open-net should accept the host's choice rather than install its own global
 provider. See [TLS providers](../tls.md) for build prerequisites, provider

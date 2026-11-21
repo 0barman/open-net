@@ -13,6 +13,14 @@ pub(super) enum ClientCommand {
         runtime: std::sync::Arc<crate::module::ws_client::session_runtime::SessionRuntime>,
         reply: oneshot::Sender<Result<(), NetError>>,
     },
+    /// Retire the observed physical connection if this session still owns it.
+    ReconnectIfCurrent {
+        session: std::sync::Arc<crate::module::ws_client::connection_session::ConnectionSession>,
+        expected: crate::ws::ConnectionId,
+        /// Present for timeout requests made by an application heartbeat handle.
+        heartbeat_stop: Option<tokio_util::sync::CancellationToken>,
+        reply: oneshot::Sender<Result<bool, NetError>>,
+    },
     /// Close only the session whose identity was captured by its owner.
     CloseSession {
         session: std::sync::Arc<crate::module::ws_client::connection_session::ConnectionSession>,

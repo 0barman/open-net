@@ -187,6 +187,109 @@ fn check(condition: bool, message: &str) -> TestResult {
 }
 
 #[test]
+fn timeout_streak_starts_over_on_a_different_writer() -> TestResult {
+    let first = Some(ConnectionId::from_allocated(1));
+    let second = Some(ConnectionId::from_allocated(2));
+    let mut misses = MissedResponses::default();
+    check(misses.record(first) == 1, "first timeout was lost")?;
+    check(misses.record(first) == 2, "second timeout was lost")?;
+    check(
+        misses.record(second) == 1,
+        "previous writer's misses leaked",
+    )?;
+    check(misses.record(second) == 2, "new writer's streak was lost")
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnecting_heartbeat_matches_its_actual_writer_after_connection_replacement(
+) -> TestResult {
+    use crate::module::ws_client::v2_test_support as fixture;
+    use crate::ws::{ResponseRouting, TerminationReason, WebSocketClientConfig};
+
+    let runtime = fixture::runtime(
+        WebSocketClientConfig::default(),
+        ResponseRouting::Disabled,
+        true,
+    )
+    .await?;
+    let first = ConnectionId::from_allocated(1);
+    let second = ConnectionId::from_allocated(2);
+    let config = ApplicationHeartbeatConfig::new(Duration::from_secs(1), "probe")
+        .with_response_matcher(Duration::from_secs(5), |message| {
+            message.message().and_then(Message::as_text) == Some("reply")
+        });
+    let receiver = runtime.messages.subscribe(config.receive_options.clone())?;
+    let stop = CancellationToken::new();
+    let snapshot = Arc::new(Mutex::new(ApplicationHeartbeatSnapshot::default()));
+    let heartbeat = run_heartbeat(
+        fixture::sender(&runtime),
+        Some(receiver),
+        config,
+        stop.clone(),
+        snapshot.clone(),
+        runtime.clone(),
+        Some(Weak::new()),
+    );
+    tokio::pin!(heartbeat);
+    check(
+        futures_util::poll!(heartbeat.as_mut()).is_pending(),
+        "heartbeat did not start",
+    )?;
+    time::advance(Duration::from_secs(1)).await;
+    check(
+        futures_util::poll!(heartbeat.as_mut()).is_pending(),
+        "heartbeat did not await write",
+    )?;
+    let item = runtime.queue.try_next().ok_or("missing probe")?;
+    check(
+        item.dispatch_phase.mark_writing(first),
+        "probe was not admitted for writing",
+    )?;
+    item.complete(Ok(()));
+
+    // The heartbeat task has not polled its receipt yet. Retire A and establish B.
+    runtime.lifecycle.connection_terminated_with_details(
+        TerminationReason::IoFailure,
+        None,
+        Default::default(),
+        Some(2),
+    )?;
+    runtime.connection_ended(first, NetError::from(ErrorKind::Io))?;
+    let reservation = runtime.lifecycle.reserve_attempt().await?;
+    runtime
+        .lifecycle
+        .begin_attempt(runtime.lifecycle.handshake_attempt(2, 0), reservation)?;
+    runtime
+        .lifecycle
+        .set_attempt_credential_version(2, 0, None)?;
+    runtime.lifecycle.prepare_established(2, 0)?;
+    runtime.activate_connection(second)?;
+    runtime.lifecycle.commit_established(2, 0)?;
+
+    check(
+        runtime.current_connection_id()? == Some(second),
+        "replacement did not become current",
+    )?;
+    runtime.messages.publish(fixture::incoming(2, "reply"))?;
+    check(
+        futures_util::poll!(heartbeat.as_mut()).is_pending(),
+        "heartbeat stopped on replacement",
+    )?;
+    let waiting = snapshot_copy(&snapshot);
+    check(
+        waiting.sent == 1 && waiting.state == ApplicationHeartbeatState::WaitingForResponse,
+        "heartbeat did not keep waiting for its written probe",
+    )?;
+    check(
+        waiting.matched_responses == 0,
+        "B's reply completed A's probe",
+    )?;
+    stop.cancel();
+    heartbeat.await;
+    Ok(())
+}
+
+#[test]
 fn default_configuration_is_fixed_interval_and_write_only() -> TestResult {
     let config = ApplicationHeartbeatConfig::new(Duration::from_secs(20), Message::text("ping"));
     config.validate()?;

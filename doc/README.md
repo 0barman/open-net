@@ -1,36 +1,35 @@
 # Installation and version compatibility
 
-These guides cover **open-net 0.3.3**. Use the matching package version or source
-revision, and follow the migration notes when upgrading from 0.3.2.
+Use the guides shipped with your copy of open-net. When upgrading an existing
+application, consult the migration notes for changes to public APIs and behavior.
 
 ## Library integration
 
-Use Rust 1.89 or later. For an HTTP-only application, add the
-[crates.io package](https://crates.io/crates/open-net) to your `Cargo.toml`:
+The minimum supported Rust compiler is recorded in the `rust-version` field of
+the [crate manifest](../Cargo.toml). For an HTTP-only application, run this
+command in the application crate to add the [crates.io package](https://crates.io/crates/open-net).
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
+```sh
+cargo add open-net --no-default-features --features http-client
 ```
 
 For Git integration, use the [official repository](https://github.com/0barman/open-net)
 as the dependency's `git` source and select a verified `tag` or full commit `rev`
-containing the 0.3.3 APIs. Confirm that the reference exists in the repository;
+containing the APIs you use. Confirm that the reference exists in the repository;
 do not assume the default branch matches this documentation. Preserve the
 `default-features` and `features` settings from the guide. Choose one dependency
 source. A downstream crate intended for crates.io publication needs
 registry-resolvable dependencies; see the
 [Cargo dependency rules](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html).
 
-`version = "0.3.3"` permits later 0.3.x versions under Cargo's version rules.
-Applications can retain their resolved dependency graph in `Cargo.lock`.
+Cargo records the dependency requirement in your application's `Cargo.toml`
+and the resolved versions in `Cargo.lock`.
 
 ## Changes from 0.3.2
 
-Version 0.3.3 changes some public retry APIs and privacy behavior. Follow the
-linked migration instructions when upgrading. Do not substitute 0.3.2 and expect
-the examples or security guarantees to remain valid; use the
-[0.3.2 documentation](https://docs.rs/crate/open-net/0.3.2) for that version.
+The following API and privacy changes shipped in open-net 0.3.3. Use the
+migration guides in the table when upgrading from 0.3.2. Applications still
+using that release can refer to its [archived documentation](https://docs.rs/crate/open-net/0.3.2).
 
 | Capability | open-net 0.3.3 | Published 0.3.2 boundary |
 | --- | --- | --- |

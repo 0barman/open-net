@@ -1,6 +1,6 @@
 use crate::api::error::{EnqueueError, ErrorKind, NetError};
 use crate::api::http::http_config::HttpClientConfig;
-use crate::api::http::http_request::HttpRequest;
+use crate::api::http::http_request::{HttpRequest, HttpRequestBuilder};
 use crate::api::http::http_request_trait::HttpRequestTrait;
 use crate::api::http::http_response::HttpResponse;
 use crate::api::http::retry::HttpRequestOptions;
@@ -259,6 +259,38 @@ impl HttpClient {
         self.inner.request_buffered(request, start).await
     }
 
+    /// Send exactly `content_length` bytes from an owned asynchronous reader and
+    /// return the buffered response. Configure the method, target, headers and
+    /// timeouts on a builder with an unused body. The SDK sets `Content-Length`.
+    ///
+    /// The transport pulls bounded chunks. A short source returns an I/O error
+    /// with [`std::io::ErrorKind::UnexpectedEof`]. Bytes after the declared length
+    /// are never requested. The reader is used once, including for idempotent
+    /// methods. An allowed redirect that requires replay returns its original
+    /// response. Dropping the waiting future requests cancellation.
+    ///
+    /// An early rejection can arrive before the whole body is read. Use
+    /// [`HttpResponse::check_status`] to classify the response. Middleware can
+    /// modify request metadata. Supplying nonempty buffered bytes in middleware
+    /// conflicts with the reader and returns an input error before dispatch.
+    pub async fn upload<R>(
+        &self,
+        builder: HttpRequestBuilder,
+        reader: R,
+        content_length: u64,
+    ) -> Result<HttpResponse, NetError>
+    where
+        R: tokio::io::AsyncRead + Send + 'static,
+    {
+        let start = Instant::now();
+        let request = builder.build_for_upload()?;
+        let upload =
+            crate::module::http::http_client_inner::UploadReader::new(reader, content_length);
+        self.inner
+            .request_buffered_body(request, start, Some(upload))
+            .await
+    }
+
     /// Issue a `GET` request and wait for its fully buffered response.
     ///
     /// `path` must satisfy the client's same-origin relative-path rules. The
@@ -423,8 +455,8 @@ impl HttpClient {
 
     /// Start a streaming `GET` request intended for server-sent events.
     ///
-    /// The method does not parse SSE frames; callers consume and decode chunks
-    /// from [`HttpStreamResponse::next_chunk`].
+    /// Decode events with [`HttpStreamResponse::into_sse_events`] or consume
+    /// the original bytes with [`HttpStreamResponse::next_chunk`].
     pub async fn sse(
         &self,
         path: impl Into<String>,

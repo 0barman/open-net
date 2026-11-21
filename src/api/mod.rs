@@ -40,10 +40,11 @@ pub use log::{
 };
 #[cfg(feature = "net-status")]
 pub use net_status::{
-    IpStack, MonitorState, NetStatusClient, NetworkEvent, NetworkEventKind, NetworkEventOptions,
-    NetworkIpStackSource, NetworkNameObserver, NetworkNameOptions, NetworkNameSnapshot,
-    NetworkNameSource, NetworkNameState, NetworkObservation, NetworkRefreshResult, NetworkSnapshot,
-    NetworkStatus,
+    DefaultRouteState, InterfaceAddressFamily, InterfaceEvent, InterfaceEventKind,
+    InterfaceEventOptions, InterfaceEventSource, IpStack, MonitorState, NetStatusClient,
+    NetworkEvent, NetworkEventKind, NetworkEventOptions, NetworkIpStackSource, NetworkNameObserver,
+    NetworkNameOptions, NetworkNameSnapshot, NetworkNameSource, NetworkNameState,
+    NetworkObservation, NetworkRefreshResult, NetworkSnapshot, NetworkStatus,
 };
 pub use open_net::OpenNet;
 #[cfg(feature = "ws-client")]

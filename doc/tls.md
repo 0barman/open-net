@@ -14,10 +14,10 @@ An HTTP-only consumer can use `default-features = false, features =
 cryptographic provider. open-net has no built-in provider, provider feature or
 automatic fallback. Network observation alone (`net-status`) does not need one.
 
-Applications must choose a compatible rustls **0.23** provider before
-creating HTTP or WebSocket clients. Add the chosen provider as an application
-dependency, then pass it in each TLS configuration or install it once in the
-host process. Without a provider, default constructors return a structured
+Before creating HTTP or WebSocket clients, choose a provider compatible with
+the rustls dependency in the [crate manifest](../Cargo.toml). Add it as an
+application dependency, then pass it in each TLS configuration or install it
+once in the host process. Without a provider, default constructors return a structured
 configuration error, including clients intended for plain HTTP or WS, because
 their connectors are prepared for HTTPS/WSS at creation.
 
@@ -114,11 +114,10 @@ plaintext exceptions.
 This example supplies a third-party provider directly. Use these dependency
 settings:
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["ws-client", "http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```sh
+cargo add open-net --no-default-features --features ws-client,http-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 Copy this complete
@@ -154,7 +153,7 @@ async fn main() -> Result<(), NetError> {
 ```
 
 Another provider can replace `rustls_openssl::default_provider()` if it produces
-a compatible rustls **0.23** `CryptoProvider`. Check its supported platforms,
+the `open_net::tls::CryptoProvider` type. Check its supported platforms,
 algorithms, private-key formats, TLS versions and production-use guidance.
 Passing a provider is an explicit choice; open-net does not silently supplement
 unsupported algorithms using a different cryptographic library. Keep rustls's

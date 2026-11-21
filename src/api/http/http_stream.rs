@@ -129,6 +129,19 @@ impl HttpStreamResponse {
         self.stream.next().await
     }
 
+    /// Consume this response as a sequence of UTF-8 server-sent events.
+    ///
+    /// The media type must be `text/event-stream` (parameters are accepted).
+    /// Use [`Self::check_status`] first for the desired HTTP status policy.
+    /// `max_event_bytes` is a positive limit on one event block. Each nonempty
+    /// line counts its wire bytes plus one normalized line ending. The optional
+    /// stream-opening BOM and blank separator are free. The limit also bounds an
+    /// unfinished line. Complete events already read from a chunk are yielded in order.
+    /// The decoder inherits this response's lifecycle and never reconnects.
+    pub fn into_sse_events(self, max_event_bytes: usize) -> Result<super::SseEvents, NetError> {
+        super::SseEvents::new(self, max_event_bytes)
+    }
+
     /// Check the response status against a caller-selected acceptance policy.
     pub fn check_status(&self, policy: crate::api::http::HttpStatusPolicy) -> Result<(), NetError> {
         if policy.accepts(self.status) {

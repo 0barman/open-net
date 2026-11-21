@@ -35,10 +35,13 @@ impl ContextConnectTask {
     pub(super) async fn run(self) {
         let cancel = self.cancel.clone();
         let session_cancel = self.target.session.cancel_token();
+        let session_close = self.target.session.close_token();
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {}
             _ = session_cancel.cancelled() => {}
+            _ = session_close.cancelled() => {}
+            _ = self.target.runtime.shutdown.cancelled() => {}
             result = self.run_attempts() => {
                 if let Err(error) = result {
                     let failure = ConnectionFailure::new(error, ConnectStage::EventDelivery, None, false);

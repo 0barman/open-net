@@ -46,10 +46,10 @@ requirements; see the feature table and integration guides below.
 | LAN IPv4 candidates and evidence-based recommendation | `net-status` | `network::lan_ipv4_snapshot()` or `NetStatusClient::query_lan_ipv4()`; fresh synchronous OS query |
 | Subnet-based LAN IPv4 selection | `net-status` | `network::preferred_lan_ipv4()` ranks candidates by subnet priority |
 | WebSocket client | `ws-client` | Default; enables `net-status`; select a TLS provider separately |
-| HTTP/HTTPS, GET/POST, custom methods, headers, byte request bodies | `http-client` | Enables `net-status`; import from `open_net::api::http` |
+| HTTP/HTTPS, custom methods, buffered bodies and known-length uploads | `http-client` | Enables `net-status`; import from `open_net::api::http` |
 | Lazy named HTTP clients and shared shutdown | `http-client` | `OpenNet::managed_http`; fixed configuration with SDK-owned initialization and cleanup |
 | Buffered responses, text/JSON parsing, explicit HTTP status checks | `http-client` | JSON response parsing does not require codecs |
-| Streaming response bytes and raw SSE bytes | `http-client` | No SSE event parser is included |
+| Streaming response bytes and SSE events | `http-client` | Decode events from a GET or POST response with `into_sse_events` |
 | Custom request traits, callback submission, completion handles | `http-client` | No extra feature |
 | Timeouts, retries, admission capacity, cancellation, shutdown | `http-client` | No separate timeout or retry feature |
 | HTTP proxy, custom root certificates, mutual TLS | `http-client` | Use HTTP-specific proxy and TLS configuration |

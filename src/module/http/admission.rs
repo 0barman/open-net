@@ -272,7 +272,7 @@ impl HttpClientInner {
             self.try_admission(&self.request_tx, options.request_id, resolved, start, false)
         })();
         match prepared {
-            Ok(admission) => Ok(self.publish_buffered(request, options, admission)),
+            Ok(admission) => Ok(self.publish_buffered(request, options, admission, None)),
             Err(error) => Err(EnqueueError::new(
                 request,
                 admission_report(admission_error(error, options.request_id), start),
@@ -310,7 +310,7 @@ impl HttpClientInner {
         }
         .await;
         match prepared {
-            Ok(admission) => Ok(self.publish_buffered(request, options, admission)),
+            Ok(admission) => Ok(self.publish_buffered(request, options, admission, None)),
             Err(error) => Err(EnqueueError::new(
                 request,
                 admission_report(admission_error(error, options.request_id), start),
@@ -324,12 +324,14 @@ impl HttpClientInner {
         request: R,
         options: HttpRequestOptions,
         admission: Admission<SendCommand>,
+        upload: Option<UploadReader>,
     ) -> HttpRequestHandle {
         let Admission {
             slot,
             request: admission,
         } = admission;
         let (registered, mut job, registration) = admission.into_job(request, options);
+        job.upload = upload;
         let handle = HttpRequestHandle::new(registered.id, Arc::clone(&registered.control));
         job.completion = Some(CompletionLease::new(
             self.registry(),

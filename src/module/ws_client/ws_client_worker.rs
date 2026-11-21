@@ -310,7 +310,7 @@ impl WSClientWorker {
         command: ClientCommand,
         terminal_response_deadline: &mut Option<Instant>,
     ) -> bool {
-        crate::log_t!(LogType::WSC; "ws.worker.handle_command", "arg_command_kind|terminal_response_deadline", match &command { ClientCommand::Connect { .. } => "start_session", ClientCommand::CloseSession { .. } => "close_session", ClientCommand::Shutdown => "shutdown" }, format!("{terminal_response_deadline:?}"));
+        crate::log_t!(LogType::WSC; "ws.worker.handle_command", "arg_command_kind|terminal_response_deadline", match &command { ClientCommand::Connect { .. } => "start_session", ClientCommand::ReconnectIfCurrent { .. } => "reconnect_if_current", ClientCommand::CloseSession { .. } => "close_session", ClientCommand::Shutdown => "shutdown" }, format!("{terminal_response_deadline:?}"));
         match command {
             ClientCommand::Connect {
                 options,
@@ -396,6 +396,32 @@ impl WSClientWorker {
                     }
                 }
             }
+            ClientCommand::ReconnectIfCurrent {
+                session,
+                expected,
+                heartbeat_stop,
+                reply,
+            } => {
+                let admission = self.admit_reconnect(&session, expected, heartbeat_stop.as_ref());
+                let accepted = matches!(admission, Ok(true));
+                // The reply commits admission. A caller that stopped waiting before
+                // admission leaves the connection intact. This worker retires the
+                // accepted generation before it processes another command.
+                if reply.send(admission).is_ok() && accepted {
+                    let (kind, reason) = if heartbeat_stop.is_some() {
+                        (
+                            crate::error::ErrorKind::TimedOut,
+                            TerminationReason::ApplicationHeartbeatTimeout,
+                        )
+                    } else {
+                        (
+                            crate::error::ErrorKind::NotConnected,
+                            TerminationReason::ReconnectRequested,
+                        )
+                    };
+                    self.connection_lost(NetError::from(kind), reason).await;
+                }
+            }
             ClientCommand::CloseSession {
                 session,
                 frame,
@@ -440,6 +466,36 @@ impl WSClientWorker {
             }
         }
         false
+    }
+
+    fn admit_reconnect(
+        &self,
+        session: &Arc<ConnectionSession>,
+        expected: ConnectionId,
+        heartbeat_stop: Option<&CancellationToken>,
+    ) -> Result<bool, NetError> {
+        use crate::error::ErrorKind;
+        if self.shutdown.is_cancelled() {
+            return Err(NetError::from(ErrorKind::Closed));
+        }
+        session.ensure_open_for_reconnect()?;
+        if heartbeat_stop.is_some_and(CancellationToken::is_cancelled) {
+            return Err(NetError::from(ErrorKind::Cancelled));
+        }
+        let target = self
+            .connect_target
+            .as_ref()
+            .filter(|target| Arc::ptr_eq(&target.session, session))
+            .ok_or_else(|| NetError::from(ErrorKind::Closed))?;
+        if self
+            .active_io
+            .as_ref()
+            .is_none_or(|io| io.generation != expected.as_u64())
+        {
+            return Ok(false);
+        }
+        target.runtime.ensure_reconnect_enabled()?;
+        Ok(true)
     }
 
     /// 处理连接任务或当前读写任务发回的 I/O 事件。
@@ -790,8 +846,8 @@ impl WSClientWorker {
         } else {
             reason
         };
-        let failure =
-            (!normal_peer_close).then(|| ConnectionFailure::new(error.clone(), stage, None, false));
+        let failure = (!normal_peer_close && reason != TerminationReason::ReconnectRequested)
+            .then(|| ConnectionFailure::new(error.clone(), stage, None, false));
         // A fatal alert can arrive after either TLS handshake completed. Keep
         // its nonretryable contract even when a write has unknown delivery.
         let should_reconnect = !matches!(
@@ -822,6 +878,13 @@ impl WSClientWorker {
                 session.request_cancel();
             }
         }
+        // Only the heartbeat timed out. Pending requests and queued messages have
+        // their own deadlines and must receive an ordinary connection-loss error.
+        let error = if reason == TerminationReason::ApplicationHeartbeatTimeout {
+            NetError::from(crate::error::ErrorKind::NotConnected)
+        } else {
+            error
+        };
         if let Some(runtime) = self.context_runtime() {
             if let Err(failure) = runtime
                 .connection_ended(ConnectionId::from_allocated(self.generation), error.clone())
@@ -985,17 +1048,16 @@ impl WSClientWorker {
     ///   `false` 时表示用户发起的初始连接，状态设为 `Connecting`。
     async fn start_connection(&mut self, reconnecting: bool) {
         crate::log_t!(LogType::WSC; "start_connection", "reconnecting|generation", reconnecting, self.generation);
-        if self.shutdown.is_cancelled()
-            || self
-                .context_session()
-                .is_some_and(|session| session.cancel_token().is_cancelled())
-        {
-            return;
-        }
         let Some(target) = self.connect_target.clone() else {
             crate::log_s!(LogType::WSC; "start_connection", "state", "no_connect_target");
             return;
         };
+        if self.shutdown.is_cancelled()
+            || target.session.cancel_token().is_cancelled()
+            || target.session.close_token().is_cancelled()
+        {
+            return;
+        }
         let max_elapsed = match &target.options.reconnect {
             crate::ws::ReconnectPolicy::Disabled => None,
             crate::ws::ReconnectPolicy::Backoff(backoff) => backoff.max_elapsed,

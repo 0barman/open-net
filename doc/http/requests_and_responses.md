@@ -5,15 +5,17 @@
 ## Required features and example dependencies
 
 Every example on this page uses `http-client`, which also enables `net-status`.
-Use Rust 1.89 or later. Create a consumer crate with `cargo new http-example`,
-then use the following dependency configuration.
+Create a consumer crate with `cargo new http-example`, then run these commands
+from its directory.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-serde_json = "1"
+```sh
+cargo add open-net --no-default-features --features http-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread,time,fs,sync
+cargo add serde_json
+# Used by the upload example to split the signed URL and observe file reads.
+cargo add http
+cargo add tokio-util --features io
 ```
 
 ## Application TLS provider
@@ -25,15 +27,16 @@ until a client is built. Client creation requires a provider even for plain HTTP
 and otherwise returns `InvalidConfig` for `tls.provider`.
 
 The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
+Another compatible rustls provider can replace it. Install a process provider
 once in the host application, or pass an explicit per-client provider. A library
 using open-net should accept the host's choice rather than install its own global
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
 precedence and complete examples of both approaches.
 
 Each Rust block is a separate program: copy one block to `src/main.rs` and run
-`cargo check` to compile it. Examples that send requests need an HTTP server at
-`http://127.0.0.1:8080` exposing the named route; `cargo run` executes them.
+`cargo check` to compile it. The upload example uses the storage URL supplied by
+your backend. The other network examples use `http://127.0.0.1:8080` with the
+named route. Run the selected example with `cargo run`.
 Compilation alone does not test server availability or platform monitoring.
 
 ## Shared request rules
@@ -135,6 +138,92 @@ async fn main() -> Result<(), open_net::NetError> {
     client.shutdown().await?;
     let response = result?;
     println!("{}: {} bytes", response.status(), response.body().len());
+    Ok(())
+}
+```
+
+## `HttpClient::upload()`
+
+### Required features
+
+`http-client`. For a consumer using these new APIs, see [checkout setup](README.md#try-file-uploads-and-sse-events-from-a-checkout).
+
+### Function signature
+
+```text
+pub async fn upload<R>(&self, builder: HttpRequestBuilder, reader: R, content_length: u64)
+    -> Result<HttpResponse, NetError>
+where R: tokio::io::AsyncRead + Send + 'static
+```
+
+### Steps
+
+1. Open the attachment and obtain its length from the same file handle. Keep the file contents stable for the duration of the upload.
+2. For a presigned PUT, create the client with the storage origin (scheme, host and optional port). Pass the encoded path and query from the signed URL to the builder. Preserve percent escapes, repeated query keys and their order. Supply the header values specified by the signing service, including the exact `Content-Type` if signed.
+3. Pass the builder, the file (or a reader wrapping it), and its byte length to `upload`. The SDK reads on demand and sets `Content-Length`. Check the returned storage response with `check_status`.
+
+Use a signed target compatible with the [shared request rules](#shared-request-rules). The URL resolver normalizes standalone `.` and `..` path segments, including their percent-encoded forms.
+
+### Parameters
+
+`builder` supplies the request settings. `reader` is owned by this single request. `content_length` gives the exact number of bytes to send. The SDK sets the framing header.
+
+### Callback parameters
+
+For an upload without progress reporting, use `let response = client.upload(builder, file, length).await?;`. The example below uses `InspectReader` to count bytes read from the file. A Tokio watch channel lets the UI consume the latest count while the PUT runs. Only the storage response confirms acceptance.
+
+### Return values
+
+A buffered HTTP response, including storage errors such as 403. Classify it with `check_status`.
+
+### Errors and behavior
+
+An existing body on the builder conflicts with the reader, including an explicitly empty body. Middleware can modify request headers. Its buffered byte count excludes the reader. A premature EOF or reader I/O failure returns a `NetError`. Reading stops at the declared length. A zero-length upload sends an empty body.
+
+Dropping the pending upload future requests cancellation. The headers timeout includes the time spent uploading before response headers arrive. Configure the headers, attempt and total budgets for the expected transfer time. An early rejection such as 403 releases the reader and returns the buffered storage response, even when the byte count is below the declared length.
+
+The SDK uses the reader once. Status retries and authentication refresh cannot resend it. An allowed redirect that would require the body again returns its original 3xx response. A 303 for a PUT can proceed as a GET with an empty body.
+
+### Example
+
+Place the file at `attachment.bin` and set `UPLOAD_URL` to the full presigned URL from your backend. This example assumes the signer specified `application/octet-stream`.
+
+```rust
+use open_net::api::http::{HttpClient, HttpClientConfig, HttpRequest, HttpStatusPolicy};
+use std::io::Write;
+use tokio_util::io::InspectReader;
+
+#[tokio::main]
+async fn main() -> Result<(), open_net::BoxError> {
+    rustls_openssl::default_provider().install_default()
+        .map_err(|_| std::io::Error::other("TLS provider installation failed"))?;
+    let signed: http::Uri = std::env::var("UPLOAD_URL")?.parse()?;
+    let scheme = signed.scheme().ok_or("upload URL needs a scheme")?;
+    let authority = signed.authority().ok_or("upload URL needs an authority")?;
+    let target = signed.path_and_query().ok_or("upload URL needs a request target")?;
+    let config = HttpClientConfig::new(format!("{scheme}://{authority}"))?;
+    let builder = HttpRequest::builder().method("PUT").path(target.as_str())
+        .header("content-type", "application/octet-stream")?;
+
+    let file = tokio::fs::File::open("attachment.bin").await?;
+    let length = file.metadata().await?.len();
+    let (progress, mut updates) = tokio::sync::watch::channel(0_u64);
+    let reader = InspectReader::new(file, move |chunk| {
+        progress.send_modify(|read| *read += chunk.len() as u64);
+    });
+    let display = async {
+        while updates.changed().await.is_ok() {
+            let read = *updates.borrow_and_update();
+            writeln!(std::io::stderr(), "{read}/{length} bytes read")?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+
+    let client = HttpClient::new(config, "attachments")?;
+    let (result, displayed) = tokio::join!(client.upload(builder, reader, length), display);
+    client.shutdown().await?;
+    result?.check_status(HttpStatusPolicy::Success2xx)?;
+    displayed?;
     Ok(())
 }
 ```
@@ -1244,6 +1333,47 @@ This identifier is local correlation metadata, not a server-visible ID or a reta
 ### Example
 
 [Buffered response example](#httpresponse-httpresponseresult-and-httpstatuspolicy) constructs and inspects one response with this method.
+
+## `HttpResponse::quality_ref()`
+
+### Required features
+
+`http-client` and `quality-doctor`.
+
+### Function signature
+
+```text
+pub fn quality_ref(&self) -> Option<QualityReportRef>
+```
+
+### Steps
+
+Read the reference from the buffered response, then pass it to the producing
+client's `QualityDoctor::lookup`.
+
+### Parameters
+
+`&self` is the buffered response you received.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+`Some(reference)` identifies the producing request across its retries. A
+response created with `HttpResponse::new` returns `None`, as does a response
+from a request for which collection was inactive.
+
+### Errors and behavior
+
+Reading the reference does not activate collection. A delivered response can
+still have callback or cleanup phases pending. Report retention is bounded,
+and HTTP status is available independently through `response.status()`.
+
+### Example
+
+[Look up a buffered HTTP result](../quality_doctor.md#standalone-http-example).
 
 ## `HttpResponse::content_type()`
 

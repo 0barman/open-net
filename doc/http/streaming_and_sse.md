@@ -1,19 +1,20 @@
-# Streaming responses and raw SSE data
+# Streaming responses and SSE events
 
 [HTTP guide](README.md) · [Library overview](../../README.md)
 
 ## Required features and example dependencies
 
-Use Rust 1.89 or later and the `http-client` feature (it also enables `net-status`).
-Create a consumer with `cargo new http-example` and add these dependencies.
+Enable `http-client`, which also enables `net-status`. Create a consumer with
+`cargo new http-example` and run these commands from its directory.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-futures-util = "0.3"
+```sh
+cargo add open-net --no-default-features --features http-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread,time
+cargo add futures-util
 ```
+
+For the event decoder examples, follow the [checkout dependency setup](README.md#try-file-uploads-and-sse-events-from-a-checkout).
 
 ## Application TLS provider
 
@@ -24,7 +25,7 @@ until a client is built. Client creation requires a provider even for plain HTTP
 and otherwise returns `InvalidConfig` for `tls.provider`.
 
 The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
+Another compatible rustls provider can replace it. Install a process provider
 once in the host application, or pass an explicit per-client provider. A library
 using open-net should accept the host's choice rather than install its own global
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
@@ -59,9 +60,7 @@ Tokio. A current-thread runtime must keep being driven; retaining its value alon
 does not run its I/O driver. See the [runtime requirements](README.md#start-here).
 Custom streams passed to HttpStreamResponse::new retain their own lifecycle rules.
 
-`max_response_bytes` limits buffered responses only. Streaming and SSE consumers
-that need a size bound must count delivered bytes and drop or cancel the stream
-once their application limit is reached.
+`max_response_bytes` limits buffered responses only. Raw stream consumers can count delivered bytes to limit the total response. The SSE decoder takes a separate per-event limit.
 
 Dropping the future waiting for `stream()` requests cancellation. After it
 returns, dropping the response (or its extracted stream) releases the SDK stream.
@@ -133,6 +132,53 @@ async fn main() -> Result<(), open_net::NetError> {
 }
 ```
 
+## `HttpClient::stream_with_quality_ref()`
+
+### Required features
+
+`http-client` and `quality-doctor`.
+
+### Function signature
+
+```text
+pub async fn stream_with_quality_ref(
+    &self,
+    request: HttpRequest,
+) -> Result<(HttpStreamResponse, Option<QualityReportRef>), NetError>
+```
+
+### Steps
+
+Activate the client's doctor, build a request, then await this method. Consume
+the response as usual. Use the returned reference with the same doctor's
+`lookup` to inspect the operation.
+
+### Parameters
+
+`request` is the owned `HttpRequest` to send.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+`Ok((response, reference))` returns the stream at headers. The optional
+reference identifies the `HttpStream` observation. A usable response can carry
+`None` when collection was inactive, HTTP was excluded or diagnostic capacity
+was unavailable.
+
+### Errors and behavior
+
+Admission, retries and deadlines follow [the streaming API](#httpclientstream).
+An opening failure returns a `NetError` that can carry its own reference. Body
+errors arrive while reading. The report can remain in progress until EOF, a
+terminal error or drop. Keeping the reference does not extend report retention.
+
+### Example
+
+[Read a response body and look up its stream observation](../quality_doctor.md#streaming-http-example).
+
 ## `HttpClient::sse()`
 
 Open a GET stream intended for server-sent events.
@@ -151,7 +197,9 @@ pub async fn sse(
 
 ### Steps
 
-Start a server with /events returning text/event-stream. Open the response, check status, consume chunks, then shut down.
+Open a translation GET with `sse()` or a chat POST with `stream()`.
+Set `Accept: text/event-stream` on either request and `Content-Type: application/json`
+on the JSON POST. Both return an `HttpStreamResponse` that the same event loop can consume.
 
 ### Parameters
 
@@ -170,49 +218,227 @@ Not applicable.
 
 ### Errors and behavior
 
-The normal admission, path, header, cancellation and timeout rules apply. HTTP error statuses remain successful response values until check_status(). This helper does not add an SSE event parser, reconnect, Last-Event-ID management or automatic Accept header. It simply builds a GET and calls stream().
+The normal admission, path, header, cancellation and timeout rules apply. HTTP error statuses remain successful response values until check_status(). This helper opens a GET through `stream()`. Supply the desired Accept header. Use `next_chunk()` for raw bytes or convert the response to events.
 
 ### Example
 
+With a server at `127.0.0.1:8080`, use `cargo run` for the translation GET
+or `cargo run -- chat` for the chat POST. For a translation response that
+contains the following events, the loop receives one `segment` whose data is
+`"first line\nsecond line"`, then one `end` with empty data. The blank line
+after each event completes it. Chinese text uses the same loop, even when
+a chunk ends in the middle of a UTF-8 character or a CRLF line ending.
+
+```text
+event: segment
+data: first line
+data: second line
+
+event: end
+data:
+
+```
+
 ```rust
-use open_net::api::http::{HttpClient, HttpClientConfig, HttpStatusPolicy, HeaderMap, HeaderValue};
+use open_net::api::http::{
+    HttpClient, HttpClientConfig, HttpRequest, HttpStatusPolicy, HttpStreamResponse,
+};
+use open_net::{BoxError, HeaderMap, HeaderValue};
+use std::io::Write;
+
+async fn consume_events(response: HttpStreamResponse) -> Result<(), BoxError> {
+    response.check_status(HttpStatusPolicy::Success2xx)?;
+    let mut events = response.into_sse_events(256 * 1024)?;
+    while let Some(event) = events.next_event().await.transpose()? {
+        match event.event.as_str() {
+            "message" | "segment" => writeln!(std::io::stdout(), "{}", event.data)?,
+            "end" => break,
+            "error" => return Err("server sent an application error event".into()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 #[tokio::main]
-async fn main() -> Result<(), open_net::NetError> {
-    rustls_openssl::default_provider()
-        .install_default()
-        .expect("install the application TLS provider once");
+async fn main() -> Result<(), BoxError> {
+    rustls_openssl::default_provider().install_default()
+        .map_err(|_| std::io::Error::other("TLS provider installation failed"))?;
     let client = HttpClient::new(
         HttpClientConfig::new("http://127.0.0.1:8080")?, "stream-example",
     )?;
-    let result: Result<(), open_net::NetError> = async {
+    let result = async {
         let mut headers = HeaderMap::new();
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
-        let mut response = client.sse("/events", headers).await?;
-        response.check_status(HttpStatusPolicy::Success2xx)?;
-        while let Some(chunk) = response.next_chunk().await {
-            let bytes = chunk?;
-            println!("Received {} bytes", bytes.len());
-            // Stop this demonstration after its first chunk.
-            break;
-        }
-        // Dropping the response also handles an early exit.
-        Ok(())
+        let response = if std::env::args_os().nth(1).is_some_and(|arg| arg == "chat") {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .path("/chat")
+                .headers(headers)
+                .header("content-type", "application/json")?
+                .body(r#"{"prompt":"Hello"}"#.into())
+                .build()?;
+            client.stream(request).await?
+        } else {
+            client.sse("/translation/events", headers).await?
+        };
+        consume_events(response).await
     }.await;
     client.shutdown().await?;
     result
 }
 ```
 
-## SSE framing belongs to the application
+## `HttpStreamResponse::into_sse_events()`
 
-A chunk can contain part of a UTF-8 code point, part of an SSE line, several events,
-or no complete event. Never treat each chunk as one event or call `from_utf8`
-independently on every chunk assuming success. Preserve undecoded bytes and parser
-state across chunks, recognize the SSE line/event rules, and decide reconnection
-and Last-Event-ID behavior in your application or an SSE parser. The example
-above only counts bytes and deliberately drops the response after one chunk.
-There is no separate `sse` feature.
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+pub fn into_sse_events(self, max_event_bytes: usize) -> Result<SseEvents, NetError>
+```
+
+### Steps
+
+Check the HTTP status before conversion. To cancel from another task, copy
+`response.request_id` before moving the response and call `client.cancel(id)?`
+on the same client while that request is active.
+
+### Parameters
+
+Choose a nonzero limit for one event block, including an unfinished line. Each
+nonempty line counts its wire bytes plus one normalized line ending. The optional
+stream-opening UTF-8 BOM and the blank separator are free. The example allows
+256 KiB per block and can consume any number of blocks.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+An owned decoder that accepts the text/event-stream media type and its parameters.
+
+### Errors and behavior
+
+A zero limit returns `InvalidInput`. A missing or incorrect media type returns
+`Protocol`. Exceeding the limit during decoding returns `ItemTooLarge` from
+`next_event()`. The conversion consumes the response.
+
+### Example
+
+See the [event-reading example](#httpclientsse).
+
+## `SseEvents::next_event()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+pub async fn next_event(&mut self) -> Option<Result<SseEvent, NetError>>
+```
+
+### Steps
+
+Await successive events. Handle application-specific event names and decide when to stop.
+
+### Parameters
+
+A mutable borrow of the decoder.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+Each event has a name, UTF-8 data, and the most recent event ID. Multiple data lines are joined with a newline. An empty data field delivers an empty string. A clean EOF discards an unfinished event.
+
+### Errors and behavior
+
+A named error event is delivered as data. I/O, timeout, cancellation or an oversized event yields one terminal error followed by EOF. Complete events from a previously received chunk are delivered in order before polling the transport again. Dropping the current wait preserves decoder state. Dropping the decoder releases the response.
+
+### Example
+
+See the [event-reading example](#httpclientsse).
+
+## `SseEvents::last_event_id()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+pub fn last_event_id(&self) -> &str
+```
+
+### Steps
+
+Read after polling the decoder when retaining an ID for a later request.
+
+### Parameters
+
+A shared borrow of the decoder.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The last event ID committed at an event boundary, initially the empty string. A control-only block can update it.
+
+### Errors and behavior
+
+An empty id field resets the ID. An id containing NUL is ignored.
+
+### Example
+
+See the [event-reading example](#httpclientsse).
+
+## `SseEvents::retry_delay()`
+
+### Required features
+
+`http-client`.
+
+### Function signature
+
+```text
+pub fn retry_delay(&self) -> Option<std::time::Duration>
+```
+
+### Steps
+
+Read after polling the decoder if the application handles reconnection.
+
+### Parameters
+
+A shared borrow of the decoder.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The most recent valid retry field in milliseconds, or None before one is received.
+
+### Errors and behavior
+
+A valid retry field records a delay. Reconnecting and replaying a request are application decisions.
+
+### Example
+
+See the [event-reading example](#httpclientsse).
 
 ## `HttpByteStream` and `HttpStreamResponse`
 

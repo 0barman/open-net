@@ -6,10 +6,9 @@ a host-installed process provider. HTTPS, custom
 trust roots, mutual TLS and explicit HTTP proxies need no other open-net feature.
 See [TLS providers](../tls.md) for platform setup and dependency choices.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
+```sh
+cargo add open-net --no-default-features --features http-client
+cargo add rustls-openssl --no-default-features --features tls12
 ```
 
 ## Application TLS provider
@@ -21,7 +20,7 @@ until a client is built. Client creation requires a provider even for plain HTTP
 and otherwise returns `InvalidConfig` for `tls.provider`.
 
 The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
+Another compatible rustls provider can replace it. Install a process provider
 once in the host application, or pass an explicit per-client provider. A library
 using open-net should accept the host's choice rather than install its own global
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
@@ -55,7 +54,7 @@ unavailable. `HttpTlsConfig::default()` has no explicit choice. See the
 
 ### Required features
 
-`http-client`, plus an application dependency providing compatible rustls 0.23
+`http-client`, plus an application dependency providing compatible rustls
 cryptography. open-net has no provider feature.
 
 ### Function signature
@@ -349,7 +348,7 @@ fn main() -> Result<(), NetError> {
 
 ## Individual function reference
 
-The examples linked below are complete programs with the dependency declaration at the top of this page. Each reference identifies the call that demonstrates the function.
+The examples linked below are complete programs using the dependencies listed at the top of this page. Each reference identifies the call that demonstrates the function.
 
 ## `HttpTlsConfig::default()`
 

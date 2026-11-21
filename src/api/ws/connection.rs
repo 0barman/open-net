@@ -295,6 +295,10 @@ pub enum TerminationReason {
     IoFailure,
     /// Network unavailability ended the connection or session.
     NetworkUnavailable,
+    /// The application requested recovery of this physical connection.
+    ReconnectRequested,
+    /// Consecutive application heartbeat response timeouts triggered recovery.
+    ApplicationHeartbeatTimeout,
 }
 
 impl ConnectionEvent {

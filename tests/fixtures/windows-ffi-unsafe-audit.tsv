@@ -10,7 +10,7 @@
 # reachability attaches operation/HRESULT while explicit name queries retain monitor_io.
 # Reviewed monitor progress: safe per-request phase recording around unchanged COM calls;
 # native errors retain their original source/HRESULT and gain a portable phase.
-fingerprint	src/module/net_status/inner/platform/windows.rs	0b30abcb78ea53dd
+fingerprint	src/module/net_status/inner/platform/windows.rs	97313049879efc62
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoUninitialize() };
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
 1	src/module/net_status/inner/platform/windows.rs	unsafe	unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }
