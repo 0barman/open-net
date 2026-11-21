@@ -37,6 +37,7 @@ struct ObservedRequest {
     method: Method,
     path: String,
     body: Vec<u8>,
+    content_length: Option<http::HeaderValue>,
 }
 
 struct Peer {
@@ -70,13 +71,23 @@ fn tls_acceptor(alpn: &[u8]) -> TestResult<TlsAcceptor> {
 }
 
 async fn tls_peer(status: StatusCode, location: Option<String>) -> TestResult<Peer> {
+    tls_peer_with_signal(status, location, None).await
+}
+
+async fn tls_peer_with_signal(
+    status: StatusCode,
+    location: Option<String>,
+    early_response: Option<oneshot::Sender<()>>,
+) -> TestResult<Peer> {
     let acceptor = tls_acceptor(b"h2")?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let task = tokio::spawn(async move {
         let (socket, _) = listener.accept().await?;
         let stream = acceptor.accept(socket).await?;
-        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        if stream.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+            return Err("TLS peer did not negotiate HTTP/2".into());
+        }
         let mut connection = h2::server::handshake(stream).await?;
         let (request, mut respond) = connection
             .accept()
@@ -84,12 +95,47 @@ async fn tls_peer(status: StatusCode, location: Option<String>) -> TestResult<Pe
             .ok_or_else(|| std::io::Error::other("peer closed before HTTP/2 request"))??;
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
+        let content_length = request.headers().get(header::CONTENT_LENGTH).cloned();
         let mut receive = request.into_body();
         // Reading request DATA requires concurrently polling the h2 connection.
         // Keep that driver alive through the response, then send GOAWAY so the
         // fixture does not depend on the client's connection-pool idle timeout.
         let response = async move {
             let mut body = Vec::new();
+            if path == "/reader/early-response" {
+                let first = receive
+                    .data()
+                    .await
+                    .ok_or("upload ended before its first DATA")??;
+                body.extend_from_slice(&first);
+                receive.flow_control().release_capacity(first.len())?;
+                let mut sent =
+                    respond.send_response(Response::builder().status(status).body(())?, false)?;
+                sent.send_data(Bytes::from_static(RESPONSE_BODY), true)?;
+                if let Some(notify) = early_response {
+                    notify
+                        .send(())
+                        .map_err(|_| "upload test dropped the response signal")?;
+                }
+                // Keep the request side open. Dropping it here would reset the
+                // stream from the server and mask a client-side reader leak.
+                while let Some(frame) = receive.data().await {
+                    match frame {
+                        Ok(frame) => {
+                            body.extend_from_slice(&frame);
+                            receive.flow_control().release_capacity(frame.len())?;
+                        }
+                        Err(error) if error.is_reset() || error.is_io() => break,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                return Ok(ObservedRequest {
+                    method,
+                    path,
+                    body,
+                    content_length,
+                });
+            }
             while let Some(data) = receive.data().await {
                 let data = data?;
                 body.extend_from_slice(&data);
@@ -101,11 +147,16 @@ async fn tls_peer(status: StatusCode, location: Option<String>) -> TestResult<Pe
             }
             let mut send = respond.send_response(builder.body(())?, false)?;
             send.send_data(Bytes::from_static(RESPONSE_BODY), true)?;
-            Ok::<_, Box<dyn Error + Send + Sync>>(ObservedRequest { method, path, body })
+            Ok::<_, Box<dyn Error + Send + Sync>>(ObservedRequest {
+                method,
+                path,
+                body,
+                content_length,
+            })
         };
         let drive = async move {
             connection.graceful_shutdown();
-            while let Some(incoming) = connection.accept().await {
+            if let Some(incoming) = connection.accept().await {
                 match incoming {
                     Err(error)
                         if error.get_io().is_some_and(|error| {
@@ -114,10 +165,7 @@ async fn tls_peer(status: StatusCode, location: Option<String>) -> TestResult<Pe
                                 std::io::ErrorKind::BrokenPipe
                                     | std::io::ErrorKind::ConnectionReset
                             )
-                        }) =>
-                    {
-                        break;
-                    }
+                        }) => {}
                     Err(error) => return Err(error.into()),
                     Ok(_) => return Err("unexpected additional HTTP/2 request".into()),
                 }
@@ -178,7 +226,12 @@ where
     // close. Only shutdown tolerates it; setup, reads, and writes remain strict.
     stream.write_all(&response).await?;
     allow_early_response_close(stream.shutdown().await)?;
-    Ok(ObservedRequest { method, path, body })
+    Ok(ObservedRequest {
+        method,
+        path,
+        body,
+        content_length: None,
+    })
 }
 
 fn allow_early_response_close(result: std::io::Result<()>) -> TestResult {
@@ -223,6 +276,99 @@ enum Provider {
 
 fn client_for(peer: &Peer, provider: Provider, allowed: &[String]) -> TestResult<HttpClient> {
     client_for_policy(peer, provider, HttpVersionPolicy::Http2Only, allowed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reader_upload_h2_finishes_source_after_early_success_response() -> TestResult {
+    // Exceed the server's initial 65,535 byte stream window after its response.
+    let payload: Vec<u8> = (0..=254).cycle().take(192 * 1024 + 3).collect();
+    let length = u64::try_from(payload.len())?;
+    let (first, rest) = payload
+        .split_first()
+        .ok_or("missing upload fixture bytes")?;
+    for premature_eof in [false, true] {
+        let (responded, response_ready) = oneshot::channel();
+        let peer = tls_peer_with_signal(StatusCode::CREATED, None, Some(responded)).await?;
+        let client = client_for(&peer, Provider::None, &[])?;
+        let (reader, mut writer) = tokio::io::duplex(2048);
+        writer.write_all(std::slice::from_ref(first)).await?;
+        let request = HttpRequest::builder()
+            .method(Method::PUT)
+            .path("/reader/early-response");
+        let mut upload = Box::pin(client.upload(request, reader, length));
+        tokio::select! {
+            signal = response_ready => signal?,
+            result = &mut upload => return Err(format!("upload finished before server reply: {result:?}").into()),
+        }
+        if premature_eof {
+            writer.shutdown().await?;
+            let error = upload
+                .await
+                .err()
+                .ok_or("accepted incomplete body after HTTP/2 success")?;
+            if error.kind() != ErrorKind::Io
+                || error.context().stage != Some(ErrorStage::Write)
+                || error.io_kind() != Some(std::io::ErrorKind::UnexpectedEof)
+            {
+                return Err(
+                    format!("early HTTP/2 success masked the source error: {error:?}").into(),
+                );
+            }
+        } else {
+            let (write, result) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(writer.write_all(rest), upload)
+            })
+            .await?;
+            write?;
+            let response = result?;
+            if response.protocol() != HttpProtocol::Http2
+                || response.status != StatusCode::CREATED
+                || response.body.as_ref() != RESPONSE_BODY
+            {
+                return Err("wrong buffered response for the HTTP/2 PUT".into());
+            }
+        }
+        client.shutdown().await?;
+        let observed = peer.finish().await?;
+        let expected = if premature_eof {
+            std::slice::from_ref(first)
+        } else {
+            &payload
+        };
+        if observed.method != Method::PUT
+            || observed.path != "/reader/early-response"
+            || observed.body != expected
+            || observed.content_length != Some(length.into())
+        {
+            return Err("HTTP/2 PUT changed its target, content length, or DATA payload".into());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reader_upload_h2_early_rejection_releases_pending_reader() -> TestResult {
+    let peer = tls_peer(StatusCode::FORBIDDEN, None).await?;
+    let client = client_for(&peer, Provider::None, &[])?;
+    let (reader, mut writer) = tokio::io::duplex(32);
+    writer.write_all(b"x").await?;
+    let request = HttpRequest::builder()
+        .method(Method::PUT)
+        .path("/reader/early-response");
+    let response = client.upload(request, reader, 512).await?;
+    if response.protocol() != HttpProtocol::Http2 || response.status != StatusCode::FORBIDDEN {
+        return Err("early HTTP/2 response lost its status".into());
+    }
+    let mut byte = [0];
+    if tokio::time::timeout(Duration::from_secs(2), writer.read(&mut byte)).await?? != 0 {
+        return Err("HTTP/2 uploaded reader did not close".into());
+    }
+    client.shutdown().await?;
+    let observed = peer.finish().await?;
+    if observed.body != b"x" || observed.content_length.is_none_or(|value| value != "512") {
+        return Err("early HTTP/2 response changed the admitted length or pending body".into());
+    }
+    Ok(())
 }
 
 fn client_for_policy(

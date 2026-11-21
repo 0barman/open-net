@@ -1,11 +1,10 @@
 # HTTP client configuration
 
-Required feature: `http-client`. This guide describes the checked-out source. In your application's `Cargo.toml`, use:
+Required feature: `http-client`. This guide describes the checked-out source. Run the dependency commands from your application crate.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
+```sh
+cargo add open-net --no-default-features --features http-client
+cargo add rustls-openssl --no-default-features --features tls12
 ```
 
 ## Application TLS provider
@@ -17,7 +16,7 @@ until a client is built. Client creation requires a provider even for plain HTTP
 and otherwise returns `InvalidConfig` for `tls.provider`.
 
 The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
+Another compatible rustls provider can replace it. Install a process provider
 once in the host application, or pass an explicit per-client provider. A library
 using open-net should accept the host's choice rather than install its own global
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
@@ -262,7 +261,7 @@ Every method below consumes `self` and returns an updated configuration; later i
 
 ## Individual function reference
 
-The examples linked below are complete programs with the dependency declaration at the top of this page. Each reference identifies the call that demonstrates the function.
+The examples linked below are complete programs using the dependencies listed at the top of this page. Each reference identifies the call that demonstrates the function.
 
 ## `HttpClientConfig::new()`
 
@@ -299,6 +298,47 @@ Returns `InvalidConfig` for `base_url` on invalid syntax or unsupported URL comp
 ### Example
 
 See the [complete construction program](#construct-validate-and-inspect-a-configuration), which calls `HttpClientConfig::new` and `config.validate()` after changing a public field.
+
+## `HttpClientConfig::with_standalone_quality_doctor()`
+
+### Required features
+
+`http-client` and `quality-doctor`.
+
+### Function signature
+
+```text
+pub fn with_standalone_quality_doctor(self, config: QualityDoctorConfig) -> Self
+```
+
+### Steps
+
+Set the policy before calling `HttpClient::new` or `new_with_network_status`.
+Call `client.quality_doctor()` to activate collection before submitting work.
+
+### Parameters
+
+`config` selects the mode, protocols, storage limits and sampling policy.
+Include HTTP in the protocol selection to observe HTTP requests.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The updated `HttpClientConfig`. Standalone diagnostics default to Off.
+
+### Errors and behavior
+
+The setter stores the policy. Config validation and client construction check
+it and return `InvalidConfig` for `http.quality_doctor` on failure. Engine-managed
+clients inherit their engine's policy and reject an explicit standalone policy,
+including Off.
+
+### Example
+
+[Configure a standalone HTTP client for detailed collection](../quality_doctor.md#standalone-http-example).
 
 ## `HttpClientConfig::validate()`
 

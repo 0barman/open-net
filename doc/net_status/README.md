@@ -22,20 +22,20 @@ Choose the observation contract your application needs:
 | Query from an existing synchronous interface | `refresh_reachability_blocking()` exposes the same reachability results and budgets while blocking the calling thread. |
 | Explicitly observe Windows network names | [`observe_network_names()`](#netstatusclientobserve_network_names) creates a separate owned observer. It does not start connectivity monitoring or put names in ordinary snapshots. |
 | Inspect local LAN IPv4 addresses | [`query_lan_ipv4()`](#netstatusclientquery_lan_ipv4) makes a fresh synchronous OS query, including while monitoring is stopped. It returns candidates and an optional recommendation without changing network observations. |
+| Correlate a Windows connection failure with local changes | [`subscribe_interface_events()`](#netstatusclientsubscribe_interface_events) delivers WLAN connection and disconnection records, IPv4 and IPv6 default-route observations, and collection errors. |
 
 The event guarantee begins at an SDK commit. An operating system or its monitor can merge notifications before the SDK samples them, so events are not a complete history of physical cable, Wi-Fi, VPN, or sleep/resume changes.
 
 ## Required features and prerequisites
 
-Use Rust 1.89 or later and a supported platform: macOS, Windows, or Ubuntu with Linux kernel 5.0 or later. Native build tools must be available; the macOS monitor includes a C component. Validate monitoring on the platforms and kernels your application supports.
+Check the [supported platforms and Linux kernel requirements](../../README.md#supported-platforms) and the `rust-version` field in the [crate manifest](../../Cargo.toml). Native build tools must be available because the macOS monitor includes a C component. Validate monitoring on the platforms and kernels your application supports.
 
-Create a consumer project with `cargo new network-observer`, then use this dependency configuration:
+Create a consumer project with `cargo new network-observer` and run these commands in it.
 
-```toml
-[dependencies]
+```sh
 # Network observation without the default WebSocket transport.
-open-net = { version = "0.3.3", default-features = false, features = ["net-status"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+cargo add open-net --no-default-features --features net-status
+cargo add tokio --features macros,rt-multi-thread,sync,time
 ```
 
 Every Rust block below is a separate complete `src/main.rs`. Copy one block at a time and run `cargo run`. Examples that call `start()` inspect the real operating system and can fail if monitoring cannot initialize. They need no application server. Compile checks alone do not prove live monitoring on every platform.
@@ -1034,6 +1034,162 @@ async fn main() -> Result<()> {
     observed
 }
 ```
+
+## NetStatusClient::subscribe_interface_events()
+
+Collect Windows host evidence alongside application connection logs. A Wi-Fi
+interface can disconnect while another interface keeps the machine `Available`.
+
+### Required features
+
+Enable `net-status`. On Windows, the WLAN collector uses Windows PowerShell
+and the managed Windows Event Log API. It requires read access to the enabled
+WLAN-AutoConfig Operational channel. The route collector uses managed Winsock
+notifications and Windows NetTCPIP and NetAdapter queries.
+
+### Function signature
+
+```text
+pub fn subscribe_interface_events(
+    &self,
+    options: InterfaceEventOptions,
+) -> Result<EventReceiver<InterfaceEvent>>
+```
+
+### Steps
+
+Subscribe when the application starts diagnostic logging. Read source status on
+the receiver and record each event's `sequence`, `observed_at`, and optional
+`native_time`. A subscription can start while the client is stopped. Dropping
+or unsubscribing its receiver releases demand. Client `stop()` controls the
+separate reachability monitor. Client shutdown, destruction and engine shutdown
+retire interface collection.
+
+### Parameters
+
+Start with `InterfaceEventOptions::default()` and update the public fields you need.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `wlan` | `true` | Receive new WLAN-AutoConfig records. Windows event ID 8001 indicates a successful connection and 8003 a disconnection. |
+| `default_route` | `true` | Observe the preferred IPv4 and IPv6 default routes. Each family has its own baseline. |
+| `capacity` | 256 | Maximum queued events, including source status and route baselines. |
+| `max_bytes` | 262144 | Maximum accounted bytes in this receiver's queue. |
+
+### Callback parameters
+
+The method returns a receiver. Call `into_callback()` to receive a
+`CallbackContext` and a `Result<InterfaceEvent, ReceiveError>` through the
+engine's callback pool.
+
+### Return values
+
+`recv().await` yields an event, an error or end-of-stream. `source` identifies
+the collector. `sequence` orders delivery within this subscription. Compare
+`native_time` with application log timestamps when available, keeping
+`observed_at` as the time the SDK saw the evidence. Cross-source delivery order
+can differ from the physical order of network changes.
+
+WLAN records carry the interface GUID, native event ID, and an optional numeric
+Windows reason code. Interface GUIDs use lower-case hyphenated form without
+braces. The event payload omits wireless names, access point addresses and
+profile names. Use `query_lan_ipv4()` for a separate, timestamped inventory.
+
+The route collector compares eligible IPv4 and IPv6 default routes separately
+using route metric plus interface metric. `DefaultRouteObserved` describes a
+unique interface, absence of a route, or equal-cost routes on several interfaces.
+`DefaultRouteChanged` reports two consecutive unique observations of the same
+family with different interface GUIDs. A query failure invalidates the comparison
+for that family. Repeated reads with the same error kind and native code update
+the cached observation time. The stream delivers another failure when the error
+changes or recurs after recovery or a source gap. A new subscriber to an active
+source receives the latest baseline or error for each observed family with
+that sample's original `observed_at`.
+
+IPv4 and IPv6 Winsock routing-interface notifications trigger fresh reads. The
+collector also rereads the active routes after five idle seconds. This picks
+up a persistent interface-metric change even when no route notification fires.
+CIM query duration adds to the observation delay. A switch that reverses
+between two reads can go unobserved. A failed native notification registration
+or listener produces `SourceGap`. Sampling continues, and later subscribers
+receive the latest degradation record before the family baselines.
+
+### Errors and behavior
+
+At least one source and positive supported queue limits are required.
+Invalid options return `InvalidConfig`. A closed client returns `Closed`. An
+open client on macOS or Linux returns `Unsupported`. The method returns before
+Windows registration finishes. `SourceReady` and `SourceUnavailable` describe
+the selected sources. A source failure leaves other available sources active.
+An optional native error code identifies the reported Windows failure. When all
+sources fail, the stream returns a terminal failure after its queued evidence.
+`SourceGap` identifies a known hole in a source's coverage.
+
+A slow receiver drains its retained prefix before reporting
+`ReceiveError::Failed` with `CallbackOverflow` and ending. An individual event
+that exceeds the byte limit terminates the stream with `ItemTooLarge`.
+Resubscription starts a new observation period without replay.
+
+### Example
+
+```rust
+use open_net::{InterfaceEventKind, InterfaceEventOptions, OpenNet, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let engine = OpenNet::new()?;
+    let client = engine.create_net_status_client("connection-log").await?;
+    let mut options = InterfaceEventOptions::default();
+    options.capacity = 512;
+    let mut events = client.subscribe_interface_events(options)?;
+    while let Some(event) = events.recv().await? {
+        println!("{:?} #{} {:?} {:?}", event.source, event.sequence, event.observed_at, event.native_time);
+        match event.kind {
+            InterfaceEventKind::WlanDisconnected { interface_id, reason_code, .. } => {
+                println!("disconnected {interface_id}, reason {reason_code:?}");
+            }
+            InterfaceEventKind::DefaultRouteChanged { family, previous, current } => {
+                println!("{family:?} default route changed from {previous} to {current}");
+            }
+            kind => println!("{kind:?}"),
+        }
+    }
+    engine.shutdown().await
+}
+```
+
+### Manual hardware acceptance on Windows
+
+The two ignored tests in `open-net-demo` need an operator and physical network
+adapters. They observe the public SDK APIs for up to three minutes and print
+`READY` when the operator can act. Run them from the repository root on the
+Windows computer. Use `Get-NetAdapter -Physical | Format-Table Name,InterfaceGuid,Status`
+to find the Wi-Fi and Ethernet GUIDs.
+
+```powershell
+$env:OPEN_NET_TEST_WIFI_GUID = '<physical Wi-Fi GUID>'
+cargo test --manifest-path open-net-demo/Cargo.toml --test net_status_interface_events hardware::wifi_disconnect_then_reconnect -- --ignored --exact --nocapture
+```
+
+Start connected to Wi-Fi. After `READY`, briefly disconnect that interface and
+reconnect it. The test checks the same interface GUID, Windows event IDs 8003
+then 8001, the native timestamps and the SDK delivery order.
+
+```powershell
+$env:OPEN_NET_TEST_ETHERNET_GUID = '<physical Ethernet GUID>'
+$env:OPEN_NET_TEST_ROUTE_FAMILY = '4'
+cargo test --manifest-path open-net-demo/Cargo.toml --test net_status_interface_events hardware::wifi_to_ethernet_remains_available -- --ignored --exact --nocapture
+```
+
+Start with Wi-Fi as the unique preferred default for the selected family. After
+`READY`, make the selected Ethernet adapter the preferred default while keeping
+Internet connectivity available. The test checks both ends of that switch,
+every committed reachability observation over the handoff and a fresh Windows
+reachability sample at the end. It begins monitoring the handoff once the SDK
+reports `Running` and `Available`. It records a direct switch or, if the default
+temporarily disappears or ties, the subsequent unique Ethernet baseline.
+Use `6` to repeat on a network with IPv6
+Internet access through both adapters. Both tests fail on reported evidence gaps.
 
 ## NetStatusClient::on_event()
 
@@ -2965,6 +3121,53 @@ This is the Default trait constructor. It creates no workers and cannot fail. Wi
 
 The complete [engine configuration example](#engine-configuration-example)
 calls this method and checks its result without starting any workers.
+
+## `OpenNetConfig::with_quality_doctor()`
+
+### Required features
+
+`quality-doctor`. Enable the transport features used by the engine's managed clients.
+
+### Function signature
+
+```text
+pub fn with_quality_doctor(self, config: QualityDoctorConfig) -> Self
+```
+
+### Steps
+
+Set the policy before creating the engine with `OpenNet::new_with_config`.
+In Basic or Detailed mode, call `net.quality_doctor()` before submitting the
+first operation you want to observe. A managed HTTP client's
+`quality_doctor()` accessor activates the same collector.
+
+### Parameters
+
+`config` is an owned `open_net::quality::QualityDoctorConfig`. It selects
+the mode, observed protocols, sampling policy and retention limits. The
+default mode is Off.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+The updated `OpenNetConfig`. Its policy applies to the engine's managed clients
+for the lifetime of that engine.
+
+### Errors and behavior
+
+The setter stores the policy. `OpenNetConfig::validate` and engine creation
+report invalid settings as `NetError` with kind `InvalidConfig`. To get the
+detailed `QualityError`, call `QualityDoctorConfig::validate` before moving
+the policy into the builder. Collection begins on activation and covers
+operations started afterward.
+
+### Example
+
+Configure Detailed mode and activate the collector before connecting.
+[Engine-owned WebSocket example](../quality_doctor.md#engine-owned-websocket-example)
 
 ## `OpenNetConfig::with_runtime_worker_threads()`
 

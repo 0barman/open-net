@@ -3,9 +3,8 @@
 [Back to the NetStatusClient guide](README.md)
 
 The published 0.3.2 release can collect Windows network names through connectivity
-monitoring and `refresh` / `refresh_blocking`; it has no separate name-observer
-API. The collection boundary described below applies to open-net 0.3.3 and must
-not be assumed when using 0.3.2 from crates.io.
+monitoring and `refresh` / `refresh_blocking`. It has no separate name-observer
+API.
 
 In 0.3.3, connectivity monitoring no longer collects network names. Windows Wi-Fi SSIDs
 and Network List Manager names are available only through an explicit, separately
@@ -13,7 +12,7 @@ owned `NetworkNameObserver`. Creating an engine or network-status client, starti
 connectivity monitoring, subscribing to ordinary state/events, observing HTTP
 network status, and using WebSocket network gating do not opt into name collection.
 
-This changes behavior while retaining the existing 0.3 public fields and method
+This changes behavior while retaining the existing public fields and method
 signatures. A caller that previously displayed `snapshot.network_name` must
 explicitly create a name observer; changing the refresh method alone does not
 restore the old behavior.
@@ -149,10 +148,9 @@ Applications should use `name()` only for their explicitly requested feature.
 
 Create a consumer project and use the following dependency settings:
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["net-status"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+```sh
+cargo add open-net --no-default-features --features net-status
+cargo add tokio --features macros,rt-multi-thread,sync,time
 ```
 
 ```rust

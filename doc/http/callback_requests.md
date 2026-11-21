@@ -4,14 +4,13 @@
 
 ## Required features and example dependencies
 
-Use Rust 1.89 or later and the `http-client` feature (it also enables `net-status`).
-Create a consumer with `cargo new http-example` and add these dependencies.
+Enable `http-client`, which also enables `net-status`. Create a consumer with
+`cargo new http-example` and run these commands from its directory.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+```sh
+cargo add open-net --no-default-features --features http-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread,time
 ```
 
 ## Application TLS provider
@@ -23,7 +22,7 @@ until a client is built. Client creation requires a provider even for plain HTTP
 and otherwise returns `InvalidConfig` for `tls.provider`.
 
 The examples use OpenSSL through `rustls-openssl`, an application dependency.
-Another compatible rustls 0.23 provider can replace it. Install a process provider
+Another compatible rustls provider can replace it. Install a process provider
 once in the host application, or pass an explicit per-client provider. A library
 using open-net should accept the host's choice rather than install its own global
 provider. See [TLS providers](../tls.md) for build prerequisites, provider
@@ -1237,6 +1236,47 @@ The handle remains bound to its original operation even if that numeric ID is la
 ### Example
 
 [Handle example](#httprequestid-httprequesthandle-and-completion) provides the complete cancel_and_wait helper calling this method; the send programs supply accepted handles.
+
+## `HttpRequestHandle::quality_ref()`
+
+### Required features
+
+`http-client` and `quality-doctor`.
+
+### Function signature
+
+```text
+pub fn quality_ref(&self) -> Option<QualityReportRef>
+```
+
+### Steps
+
+Activate the doctor before submission. Read the reference from an accepted
+handle, then use the same doctor's `lookup` to inspect its observation.
+
+### Parameters
+
+`&self` is the handle for the accepted request.
+
+### Callback parameters
+
+None. This accessor can be called while the callback is still pending.
+
+### Return values
+
+`Some(reference)` identifies one HTTP request across its retries and observed
+callback phases. Cloned handles return the same reference. `None` means no
+observation was allocated for that operation.
+
+### Errors and behavior
+
+This immediate lookup neither activates collection nor waits for the callback.
+Use `handle.finished().await` to wait for completion. A reference does not
+reserve a history slot, so a later lookup can find the report evicted.
+
+### Example
+
+[Correlate an accepted callback request with its report](../quality_doctor.md#http-request-handle-example).
 
 ## `HttpRequestHandle::cancel()`
 

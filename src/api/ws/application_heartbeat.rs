@@ -12,14 +12,14 @@
 //! frame fragmentation preserves the original logical message.
 
 use super::{
-    DisconnectedPolicy, IncomingMessage, Message, MessageReceiver, ReceiveOptions, ReceiveOverflow,
-    SendOptions, Sender,
+    ConnectionId, DisconnectedPolicy, IncomingMessage, Message, MessageReceiver, ReceiveOptions,
+    ReceiveOverflow, SendOptions, Sender,
 };
 use crate::error::{ErrorKind, ErrorStage, ReceiveError};
-use crate::module::ws_client::session_runtime::SessionRuntime;
+use crate::module::ws_client::{session_runtime::SessionRuntime, ws_client_inner::WSClientInner};
 use crate::{NetError, Result};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
@@ -56,7 +56,8 @@ pub struct ApplicationHeartbeatConfig {
     /// How long to wait for a matching response after a successful write.
     /// `None` disables response matching and timeout accounting.
     pub response_timeout: Option<Duration>,
-    /// Number of consecutive missed responses tolerated before `Stop` takes effect.
+    /// Number of consecutive response timeouts that trigger
+    /// `Stop` or a configured heartbeat reconnect.
     pub max_missed_responses: u32,
     /// Optional application response matcher. When absent, writes are observed only.
     pub matcher: Option<ApplicationHeartbeatMatcher>,
@@ -274,6 +275,7 @@ impl ApplicationHeartbeatHandle {
         sender: Sender,
         receiver: Option<MessageReceiver>,
         config: ApplicationHeartbeatConfig,
+        reconnect: Option<Weak<WSClientInner>>,
     ) -> Result<Self> {
         config.validate()?;
         let cancellation = CancellationToken::new();
@@ -286,6 +288,7 @@ impl ApplicationHeartbeatHandle {
             cancellation.clone(),
             snapshot.clone(),
             runtime,
+            reconnect,
         ))?;
         Ok(Self {
             cancellation,
@@ -454,6 +457,7 @@ async fn run_heartbeat(
     cancellation: CancellationToken,
     snapshot: Arc<Mutex<ApplicationHeartbeatSnapshot>>,
     runtime: Arc<SessionRuntime>,
+    reconnect: Option<Weak<WSClientInner>>,
 ) {
     let now = Instant::now();
     let first_tick = match now.checked_add(config.interval) {
@@ -462,7 +466,7 @@ async fn run_heartbeat(
     };
     let mut ticker = time::interval_at(first_tick, config.interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut consecutive_missed = 0_u32;
+    let mut missed_streak = MissedResponses::default();
     let mut stopped_by_policy = false;
     let session_closed = runtime.closed_token();
     let session_id = runtime.id.as_u64();
@@ -486,7 +490,7 @@ async fn run_heartbeat(
                         // A configuration/deadline failure is not a missed
                         // response. Keep the response-timeout streak scoped to
                         // actual response deadlines.
-                        consecutive_missed = 0;
+                        missed_streak.count = 0;
                         let should_stop = record_failure(
                             &snapshot,
                             &error,
@@ -500,31 +504,32 @@ async fn run_heartbeat(
                     }
                 };
                 let sent_at = SystemTime::now();
-                let send = sender
-                    .message(config.payload.clone())
-                    .options(options)
-                    .send();
+                let builder = sender.message(config.payload.clone()).options(options);
+                let send = async {
+                    if reconnect.is_some() {
+                        let receipt = builder.enqueue().await.map_err(crate::EnqueueError::into_error)?;
+                        receipt.written_connection().await.map(Some)
+                    } else {
+                        builder.send().await.map(|_| None)
+                    }
+                };
                 let send_result = tokio::select! {
                     _ = cancellation.cancelled() => break 'heartbeat,
                     _ = session_closed.cancelled() => break 'heartbeat,
                     result = send => result,
                 };
-                if let Err(error) = send_result {
-                    diagnostics.error(session_id, HeartbeatPhase::Send, &error);
-                    // A write failure breaks the response-timeout streak; the
-                    // next successful write starts a new response sequence.
-                    consecutive_missed = 0;
-                    let should_stop = record_failure(
-                        &snapshot,
-                        &error,
-                        config.failure_action,
-                    );
-                    if should_stop {
-                        stopped_by_policy = true;
-                        break 'heartbeat;
+                let written_connection = match send_result {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        diagnostics.error(session_id, HeartbeatPhase::Send, &error);
+                        missed_streak.count = 0;
+                        if record_failure(&snapshot, &error, config.failure_action) {
+                            stopped_by_policy = true;
+                            break 'heartbeat;
+                        }
+                        continue;
                     }
-                    continue;
-                }
+                };
                 snapshot_update(&snapshot, |current| {
                     increment(&mut current.sent);
                 });
@@ -534,47 +539,36 @@ async fn run_heartbeat(
                     diagnostics.recovered(session_id);
                     continue;
                 };
-                let connection_id = match runtime.current_connection_id() {
-                    Ok(Some(connection_id)) => connection_id,
-                    Ok(None) => {
-                        // The write completed while the physical connection
-                        // was being retired or replaced. Do not turn this
-                        // lifecycle race into a response timeout for the new
-                        // connection; retry on the next interval instead.
-                        consecutive_missed = 0;
-                        let error = NetError::from(ErrorKind::NotConnected)
-                            .with_stage(ErrorStage::Runtime);
-                        let should_stop = record_failure(
-                            &snapshot,
-                            &error,
-                            config.failure_action,
-                        );
-                        if should_stop {
-                            // The retirement race is expected, but a policy stop
-                            // still names its actual cause instead of an older fault.
-                            diagnostics.last = Some(HeartbeatFailure {
-                                phase: HeartbeatPhase::Connection,
-                                kind: ErrorKind::NotConnected,
-                                stage: Some(ErrorStage::Runtime),
-                            });
-                            diagnostics.failures = diagnostics.failures.saturating_add(1);
-                            stopped_by_policy = true;
-                            break 'heartbeat;
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        diagnostics.error(session_id, HeartbeatPhase::Connection, &error);
-                        // A connection/lifecycle lookup failure is not a
-                        // response timeout and must not carry a stale streak
-                        // into the next heartbeat.
-                        consecutive_missed = 0;
-                        let should_stop = record_failure(
-                            &snapshot,
-                            &error,
-                            config.failure_action,
-                        );
-                        if should_stop {
+                // The recovery mode uses the writer's ID even if another connection is
+                // already active. The original entry point keeps its lifecycle checks.
+                let connection = match written_connection {
+                    Some(connection) => Ok(Some(connection)),
+                    None => runtime.current_connection_id(),
+                };
+                let connection_id = match connection {
+                    Ok(Some(connection)) => connection,
+                    other => {
+                        let error = match other {
+                            Err(error) => {
+                                diagnostics.error(session_id, HeartbeatPhase::Connection, &error);
+                                error
+                            }
+                            Ok(_) => {
+                                // A retired writer is expected. Only a policy stop needs
+                                // to identify it as the last diagnostic.
+                                if config.failure_action == ApplicationHeartbeatFailureAction::Stop {
+                                    diagnostics.last = Some(HeartbeatFailure {
+                                        phase: HeartbeatPhase::Connection,
+                                        kind: ErrorKind::NotConnected,
+                                        stage: Some(ErrorStage::Runtime),
+                                    });
+                                    diagnostics.failures = diagnostics.failures.saturating_add(1);
+                                }
+                                NetError::from(ErrorKind::NotConnected).with_stage(ErrorStage::Runtime)
+                            }
+                        };
+                        missed_streak.count = 0;
+                        if record_failure(&snapshot, &error, config.failure_action) {
                             stopped_by_policy = true;
                             break 'heartbeat;
                         }
@@ -594,11 +588,11 @@ async fn run_heartbeat(
                     timeout,
                     &cancellation,
                     &session_closed,
-                    Some(connection_id),
+                    connection_id,
                     sent_at,
                 ).await {
                     ResponseWait::Matched => {
-                        consecutive_missed = 0;
+                        missed_streak.count = 0;
                         snapshot_update(&snapshot, |current| {
                             increment(&mut current.matched_responses);
                             current.state = ApplicationHeartbeatState::Running;
@@ -609,16 +603,35 @@ async fn run_heartbeat(
                         diagnostics.failed(session_id, HeartbeatFailure {
                             phase: HeartbeatPhase::ResponseWait, kind: ErrorKind::TimedOut, stage: Some(ErrorStage::Receive),
                         });
-                        consecutive_missed = consecutive_missed.saturating_add(1);
+                        let consecutive_missed = missed_streak.record(written_connection);
                         snapshot_update(&snapshot, |current| {
                             increment(&mut current.missed_responses);
                             current.last_error = Some(ErrorKind::TimedOut);
                             increment(&mut current.failures);
                             current.state = ApplicationHeartbeatState::Running;
                         });
-                        if config.failure_action == ApplicationHeartbeatFailureAction::Stop
-                            && consecutive_missed >= config.max_missed_responses
-                        {
+                        if consecutive_missed < config.max_missed_responses {
+                            continue;
+                        }
+                        if let Some(client) = &reconnect {
+                            missed_streak.count = 0;
+                            let result = tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => break 'heartbeat,
+                                _ = session_closed.cancelled() => break 'heartbeat,
+                                result = recover_connection(client, &runtime, connection_id, &cancellation) => result,
+                            };
+                            if let Err(error) = result {
+                                if runtime.is_closed() || matches!(error.kind(), ErrorKind::Cancelled | ErrorKind::Closed | ErrorKind::EngineDropped) {
+                                    break 'heartbeat;
+                                }
+                                diagnostics.error(session_id, HeartbeatPhase::Connection, &error);
+                                if record_failure(&snapshot, &error, config.failure_action) {
+                                    stopped_by_policy = true;
+                                    break 'heartbeat;
+                                }
+                            }
+                        } else if config.failure_action == ApplicationHeartbeatFailureAction::Stop {
                             stopped_by_policy = true;
                             break 'heartbeat;
                         }
@@ -628,7 +641,7 @@ async fn run_heartbeat(
                         diagnostics.failed(session_id, failure);
                         // Receiver and matcher failures are distinct from a
                         // response deadline, so they reset consecutive misses.
-                        consecutive_missed = 0;
+                        missed_streak.count = 0;
                         let should_stop = record_failure_kind(
                             &snapshot,
                             failure.kind,
@@ -654,13 +667,50 @@ async fn run_heartbeat(
     }
 }
 
+#[derive(Default)]
+struct MissedResponses {
+    connection: Option<ConnectionId>,
+    count: u32,
+}
+
+impl MissedResponses {
+    /// The legacy policy uses a session-wide streak. Recovery supplies the
+    /// connection from the write receipt and starts each writer at zero.
+    fn record(&mut self, connection: Option<ConnectionId>) -> u32 {
+        if self.connection != connection {
+            self.connection = connection;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count
+    }
+}
+
+async fn recover_connection(
+    client: &Weak<WSClientInner>,
+    runtime: &Arc<SessionRuntime>,
+    connection: ConnectionId,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    client
+        .upgrade()
+        .ok_or_else(|| NetError::from(ErrorKind::Closed))?
+        .reconnect_if_current(runtime, connection, Some(cancellation.clone()))
+        .await?;
+    runtime
+        .lifecycle
+        .wait_connected_after(Some(connection))
+        .await?;
+    Ok(())
+}
+
 async fn wait_for_response(
     receiver: &mut MessageReceiver,
     matcher: &ApplicationHeartbeatMatcher,
     timeout: Duration,
     cancellation: &CancellationToken,
     session_closed: &CancellationToken,
-    connection_id: Option<crate::ws::ConnectionId>,
+    connection_id: ConnectionId,
     sent_at: SystemTime,
 ) -> ResponseWait {
     let deadline = time::sleep(timeout);
@@ -673,7 +723,7 @@ async fn wait_for_response(
             result = receiver.recv() => {
                 match result {
                     Ok(Some(message)) => {
-                        if connection_id != Some(message.connection_id()) {
+                        if connection_id != message.connection_id() {
                             continue;
                         }
                         if message.received_at().duration_since(sent_at).is_err() {

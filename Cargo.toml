@@ -3,7 +3,7 @@ name = "open-net"
 # Development: `0.1.0-alpha.1`
 # Public beta: `0.1.0-beta.1`, with bug fixes released as `beta.2`, `beta.3`, etc.
 # Release candidate: `0.1.0-rc.1`
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 description = "A cross-platform async networking library for Rust with HTTP and WebSocket clients, network status monitoring, configurable retries, WebSocket reconnection and heartbeats, and managed client lifecycles. Reuse common networking infrastructure across applications to avoid repeated implementation and debugging, helping save development time and AI coding tokens."
@@ -61,7 +61,7 @@ quality-doctor = []
 # their existing network observation and lifecycle contracts depend on it.
 net-status = ["dep:if-addrs", "dep:n0-watcher", "dep:netwatch", "dep:windows", "dep:core-foundation", "dep:cc"]
 ws-client = ["net-status", "tokio/net", "tokio/io-util", "futures-util/sink", "dep:tokio-tungstenite", "dep:tokio-util", "dep:socket2", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:httparse", "dep:base64", "dep:uuid", "dep:getrandom"]
-http-client = ["net-status", "dep:httpdate", "dep:async-trait", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:tower-layer"]
+http-client = ["net-status", "tokio/io-util", "dep:httpdate", "dep:async-trait", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:tower-layer"]
 # Optional RFC 6265 cookie storage for the HTTP client.  The store is SDK-owned
 # and is deliberately not enabled by any default feature.
 http-client-cookies = [
@@ -131,6 +131,8 @@ tower-layer = { version = "=0.3.3", optional = true }
 
 
 [target.'cfg(windows)'.dependencies]
+# Cancellable Windows diagnostic workers use the existing Tokio runtime.
+tokio = { version = "1.53.1", default-features = false, features = ["process", "io-util"] }
 windows = { version = "0.62.2", features = ["Win32_Networking_NetworkListManager", "Win32_System_Com", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

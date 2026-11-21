@@ -121,6 +121,84 @@ async fn real_socket_backpressure_without_revocation_delivers_the_complete_reque
     run_scope_backpressure(false).await
 }
 
+#[tokio::test]
+async fn targeted_reconnect_preserves_queue_and_delivery_semantics() -> TestResult {
+    bounded("targeted reconnect under backpressure", async {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let net = OpenNet::new()?;
+        let mut config = WebSocketClientConfig::default();
+        config.heartbeat = None;
+        config.queues.normal.max_bytes = BODY_BYTES + 1024;
+        config.frames.data_frame_payload_size = Some(FRAME_BYTES);
+        config.frames.write_buffer_size = 0;
+        config.tcp.send_buffer_size = Some(4096);
+        let client = net
+            .create_ws_client_with_config("targeted-reconnect", config)
+            .await?;
+        let url = format!("ws://{}", listener.local_addr()?);
+        let options = session::session_options(url, ReconnectPolicy::default());
+        let session = client.start_session(options, None).await?;
+        let (stream, _) = listener.accept().await?;
+        SockRef::from(&stream).set_recv_buffer_size(4096)?;
+        let mut old_peer = tokio_tungstenite::accept_async(stream).await?;
+        let old_id = session.wait_connected().await?.connection_id;
+        let sender = session.sender();
+        let partial = sender
+            .enqueue(DataMessage::binary(vec![0x5a; BODY_BYTES]))
+            .await?;
+        let mut prefix = [0; 64];
+        old_peer.get_mut().read_exact(&mut prefix).await?;
+        check(
+            prefix.first() == Some(&0x02) && partial.state()?.phase == OperationPhase::Writing,
+            "expected a partially written binary message on the old connection",
+        )?;
+
+        let queued = |message, disconnected, deadline| {
+            sender
+                .message(message)
+                .options(SendOptions { disconnected, deadline, ..SendOptions::default() })
+                .enqueue()
+        };
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_millis(250))
+            .ok_or("unrepresentable send deadline")?;
+        let expiring = queued("expires on A", DisconnectedPolicy::WaitForReconnect, Some(deadline)).await?;
+        let rejected = queued("reject on disconnect", DisconnectedPolicy::Reject, None).await?;
+        let retained = queued(FRESH_MESSAGE, DisconnectedPolicy::WaitForReconnect, None).await?;
+        check(
+            session.reconnect_if_current(old_id).await?,
+            "active connection was not retired",
+        )?;
+        check(
+            matches!(partial.written().await, Err(e) if e.kind() == open_net::error::ErrorKind::DeliveryUnknown),
+            "partially written signal lost its delivery evidence",
+        )?;
+        check(
+            matches!(rejected.written().await, Err(e) if e.kind() == open_net::error::ErrorKind::NotConnected),
+            "queued Reject message did not report the disconnect",
+        )?;
+
+        // A is gone. Hold B's Upgrade until the original send deadline passes.
+        tokio::time::sleep_until(deadline.into()).await;
+        let (stream, _) = listener.accept().await?;
+        let mut new_peer = tokio_tungstenite::accept_async(stream).await?;
+        check(
+            matches!(expiring.written().await, Err(e) if e.kind() == open_net::error::ErrorKind::TimedOut),
+            "recovery renewed the send deadline",
+        )?;
+        retained.written().await?;
+        let message = new_peer.next().await.ok_or("replacement socket closed")??;
+        check(
+            matches!(message, Message::Text(text) if text.as_str() == FRESH_MESSAGE),
+            "replacement socket did not receive the retained message first",
+        )?;
+        session.cancel();
+        client.shutdown().await?;
+        net.shutdown().await?;
+        Ok::<(), TestError>(())
+    }).await?
+}
+
 async fn run_scope_backpressure(revoke_while_blocked: bool) -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("ws://{}", listener.local_addr()?);

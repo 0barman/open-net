@@ -128,6 +128,25 @@ impl NetStatusClient {
         self.inner.subscribe_events(options)
     }
 
+    /// Start an independent, bounded subscription to Windows interface diagnostics.
+    ///
+    /// Each selected source reports whether it can collect evidence. If all
+    /// sources fail, the receiver returns a terminal error after source diagnostics.
+    /// A slow consumer drains its retained prefix and receives a terminal overflow
+    /// error. Subscribing again starts a fresh observation period without replay.
+    ///
+    /// Subscriptions can start on a stopped client. `stop()` affects only connectivity.
+    /// Dropping or unsubscribing the receiver ends its demand. Client shutdown,
+    /// destruction and engine shutdown retire the collection work. Closed clients
+    /// reject new subscriptions. Other platforms return `Unsupported`. Invalid
+    /// options return a configuration error before those checks.
+    pub fn subscribe_interface_events(
+        &self,
+        options: super::InterfaceEventOptions,
+    ) -> Result<EventReceiver<super::InterfaceEvent>> {
+        self.inner.subscribe_interface_events(options)
+    }
+
     /// Observe the same ordered events with a serial callback on the shared
     /// callback pool. Retain the returned Subscription while observing events.
     pub fn on_event<F>(&self, options: NetworkEventOptions, callback: F) -> Result<Subscription>

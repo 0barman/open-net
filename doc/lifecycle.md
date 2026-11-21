@@ -11,14 +11,12 @@ for a new lifecycle.
 ## Required features and prerequisites
 
 The two engine shutdown methods require no Cargo feature. The examples below
-also create network-status clients, so they enable `net-status`. Use Rust 1.89
-or later, create a project with `cargo new engine-lifecycle-example`, and add
-these dependency settings to its `Cargo.toml`.
+also create network-status clients, so they enable `net-status`. Create a
+project with `cargo new engine-lifecycle-example` and run these commands in it.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["net-status"] }
-futures = "0.3.34"
+```sh
+cargo add open-net --no-default-features --features net-status
+cargo add futures
 ```
 
 Every Rust block is a separate complete `src/main.rs`. Copy one at a time and

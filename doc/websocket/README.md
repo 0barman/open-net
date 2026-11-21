@@ -6,12 +6,12 @@ See [message and request retries](retry.md) for shared schedules, per-operation
 policies, wire request identity and factory-backed replay.
 
 `ws-client` uses rustls for `wss://` connections, but `open-net` does not select
-or install a cryptographic provider. The application must add a rustls 0.23
+or install a cryptographic provider. The application must add a compatible rustls
 provider and inject it into the WebSocket `NetworkConfig` before creating the
 engine, or install its chosen process provider first.
 
-Use Rust 1.89 or later. Create a consumer with `cargo new websocket-example`,
-use the dependency settings below. Each Rust block is a complete independent `src/main.rs` program.
+Create a consumer with `cargo new websocket-example` and run the dependency
+commands below in that crate. Each Rust block is a complete independent `src/main.rs` program.
 `cargo check` verifies compilation; `cargo run` executes the selected example.
 Only examples calling `connect` need a reachable WebSocket server. Configuration
 validation and named-client creation alone do not connect to a server.
@@ -22,11 +22,10 @@ The provider is application-owned. The example below uses `rustls-openssl`; a
 ring or AWS-LC provider can be supplied through the same
 `Arc<open_net::tls::CryptoProvider>` API.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["ws-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```sh
+cargo add open-net --no-default-features --features ws-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 Install the chosen provider's build prerequisites; the OpenSSL example's setup
@@ -326,6 +325,31 @@ async fn main() -> open_net::Result<()> {
     net.shutdown().await
 }
 ```
+
+## Recovering an active connection
+
+When an application detects a fault, keep the `ConnectionId` on which it
+occurred and call `session.reconnect_if_current(id).await?`. A `true` result
+means the worker accepted recovery for that connection. A duplicate request or
+a late notification for a replaced connection returns `false`. An active
+connection with `ReconnectPolicy::Disabled` yields `InvalidPolicy`.
+
+The session keeps its senders, inbox and subscriptions across recovery. To
+catch up after reconnecting, consume connection events from the start of the
+session and act on `Established` with a new ID. Use a continuously drained
+journal when the application needs a complete sequence. Pending messages
+follow their original deadlines, disconnected policies and write retry options.
+
+For application-level probes, call
+`session.start_application_heartbeat_with_reconnect(config)?` and keep the
+returned handle. Configure a response matcher, a response timeout and the
+consecutive-miss threshold. Each successful local write starts a response
+wait for the connection that carried it. A matching reply clears its streak.
+When the threshold is reached, the worker accepts at most one recovery for
+that ID. The handle resumes on the next connection with a fresh streak and
+retains its cumulative counters. Write and matcher errors follow the
+configured `failure_action`. Use `start_application_heartbeat` for a loop
+whose `Stop` action ends probing while the session stays active.
 
 ## Control heartbeats and bounded recovery
 

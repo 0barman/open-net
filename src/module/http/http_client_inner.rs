@@ -26,6 +26,8 @@ pub(crate) use request_completion::CompletionLease;
 use worker_shutdown::{WorkerJoin, WorkerShutdown};
 #[path = "http_stream_body.rs"]
 mod stream_body;
+#[path = "upload.rs"]
+mod upload;
 #[cfg(feature = "http-client-auth")]
 use crate::api::http::auth::{AuthAction, AuthRequestContext, AuthResponseContext};
 #[cfg(feature = "http-client-cookies")]
@@ -63,6 +65,8 @@ use tokio::sync::oneshot;
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+pub(crate) use upload::UploadReader;
+use upload::UploadTransfer;
 #[cfg(feature = "http-client-cookies")]
 #[path = "cookie_hooks.rs"]
 mod cookie_hooks;
@@ -148,6 +152,7 @@ pub(crate) fn create_http_client_with_quality(
 
 pub(crate) struct SendJob {
     pub(crate) request: Box<dyn HttpRequestTrait>,
+    pub(crate) upload: Option<UploadReader>,
     pub(crate) options: HttpRequestOptions,
     pub(crate) request_id: HttpRequestId,
     pub(crate) control: Arc<CancellationSignal>,
@@ -601,6 +606,7 @@ impl RequestAdmission {
         };
         let job = SendJob {
             request: Box::new(request),
+            upload: None,
             options,
             request_id: registered.id,
             control,
@@ -1040,9 +1046,21 @@ impl HttpClientInner {
         request: HttpRequest,
         operation_start: Instant,
     ) -> Result<HttpResponse, NetError> {
+        self.request_buffered_body(request, operation_start, None)
+            .await
+    }
+
+    pub(crate) async fn request_buffered_body(
+        self: &Arc<Self>,
+        request: HttpRequest,
+        operation_start: Instant,
+        upload: Option<UploadReader>,
+    ) -> Result<HttpResponse, NetError> {
         #[cfg(feature = "http-client-middleware")]
         if self.has_middleware() {
-            return self.request_with_middleware(request, operation_start).await;
+            return self
+                .request_with_middleware(request, operation_start, upload)
+                .await;
         }
         let (admission, resolved) = self
             .admit_buffered_future_at(&request, operation_start)
@@ -1051,7 +1069,12 @@ impl HttpClientInner {
         let options = HttpRequestOptions::new()
             .with_retry_setting(request.retry_setting())
             .with_timeouts(resolved.as_overrides())?;
-        let handle = self.publish_buffered(ResultRequest::new(request, sender), options, admission);
+        let handle = self.publish_buffered(
+            ResultRequest::new(request, sender),
+            options,
+            admission,
+            upload,
+        );
         let wait_guard = RequestWaitGuard::new(Arc::clone(self), handle.control());
         let result = receiver.await.map_err(|_| {
             NetError::from(ErrorKind::Internal)
@@ -1077,6 +1100,7 @@ impl HttpClientInner {
         self: &Arc<Self>,
         request: HttpRequest,
         operation_start: Instant,
+        upload: Option<UploadReader>,
     ) -> Result<HttpResponse, NetError> {
         let policy = request.retry_setting().resolve(
             &self.config.default_retry_policy,
@@ -1101,7 +1125,11 @@ impl HttpClientInner {
         let inner = Arc::clone(self);
         let terminal: crate::api::http::middleware::MiddlewareRunner = Box::new(move |call| {
             let inner = Arc::clone(&inner);
-            Box::pin(async move { inner.run_buffered_terminal(admission, call, resolved).await })
+            Box::pin(async move {
+                inner
+                    .run_buffered_terminal(admission, call, resolved, upload)
+                    .await
+            })
         });
         let runner = build_middleware_runner(chain, 0, terminal);
         let result = run_middleware_runner(runner, call, control, total, lease, None).await?;
@@ -1121,8 +1149,15 @@ impl HttpClientInner {
         admission: Admission<SendCommand>,
         call: HttpCall,
         resolved: ResolvedTimeouts,
+        upload: Option<UploadReader>,
     ) -> Result<HttpMiddlewareResponse, NetError> {
         let (request, request_id, mode) = call.into_parts();
+        if upload.is_some() && !request.body.is_empty() {
+            return Err(
+                NetError::input("body", "middleware supplied a second upload body")
+                    .with_http_request_id(request_id),
+            );
+        }
         if mode != HttpResponseMode::Buffered {
             return Err(middleware_mode_error(
                 request_id,
@@ -1145,6 +1180,7 @@ impl HttpClientInner {
         )?;
         let (_, mut job, registration) =
             admission.into_job(ResultRequest::new(request, sender), options);
+        job.upload = upload;
         // ResultRequest only delivers an owned result through a oneshot. Keeping
         // it on the user callback lane would charge unrelated callback backlog
         // to the outer middleware budget after networking has already finished.
@@ -2228,7 +2264,8 @@ async fn run_request(
     config: &HttpClientConfig,
     initial_attempt: u32,
 ) -> HttpResponseResult {
-    let replayable = job.options.replayable_body;
+    let mut upload = job.upload.take();
+    let replayable = upload.is_none() && job.options.replayable_body;
     let policy = job.options.retry_setting().resolve(
         &config.default_retry_policy,
         crate::api::http::HttpRetryPolicy::no_retry(),
@@ -2294,7 +2331,8 @@ async fn run_request(
         let request_path = job.request.get_path();
         let request_headers = job.request.headers();
         let request_body = job.request.get_req_body();
-        let request_body_present = !request_body.is_empty() || job.request.has_req_body();
+        let request_body_present =
+            upload.is_some() || !request_body.is_empty() || job.request.has_req_body();
         #[cfg(feature = "quality-doctor")]
         drop(getters);
         #[cfg(feature = "quality-doctor")]
@@ -2323,11 +2361,17 @@ async fn run_request(
             budget.with_phase(Instant::now(), resolved.headers, TimeoutPhase::Headers)?;
         // Preparation and transport failures share the existing retry policy, while
         // every stage keeps the one absolute attempt deadline.
+        let mut transfer = UploadTransfer::default();
         let (response, _auth_generation) = match prepared {
-            Ok((request, _has_body, generation)) => (
+            Ok((mut request, _has_body, generation)) => (
                 run_budget(headers_budget, &job.control, ErrorStage::Response, async {
+                    if let Some(reader) = upload.take() {
+                        transfer = reader.attach(&mut request);
+                    }
                     job.control.record_transport_send()?;
-                    execute_request(client, request, &job.control, 0).await
+                    transfer
+                        .headers(execute_request(client, request, &job.control, 0))
+                        .await
                 })
                 .await,
                 generation,
@@ -2375,7 +2419,7 @@ async fn run_request(
             .and_then(|response| parse_retry_after(response.headers()));
         let result = match response {
             Ok(response) => {
-                read_response(
+                let reading = read_response(
                     response,
                     attempt,
                     job.request_id,
@@ -2385,8 +2429,8 @@ async fn run_request(
                     config.http2(),
                     budget,
                     resolved.idle_read,
-                )
-                .await
+                );
+                transfer.finish_with(reading, budget, &job.control).await
             }
             Err(error) => Err(error),
         };
@@ -2761,6 +2805,12 @@ fn arbitrate_result<T>(
     }
     let candidate = result.as_ref().err().and_then(|error| {
         crate::module::http::http_timeout::timeout_deadline(error).or_else(|| {
+            // Only an error classified by this operation's connector can
+            // donate a connect deadline. An upload source may wrap a timeout
+            // from an unrelated request inside its own I/O error.
+            if error.timeout_phase() != Some(TimeoutPhase::Connect) {
+                return None;
+            }
             crate::module::http::http_failure::connect_timeout_deadline(error)
                 .map(|deadline| (deadline, TimeoutPhase::Connect))
         })
@@ -2826,7 +2876,7 @@ async fn receive_loop(
 }
 
 async fn read_response(
-    response: Response,
+    mut response: Response,
     attempts: u32,
     request_id: HttpRequestId,
     max_response_bytes: usize,
@@ -2837,6 +2887,8 @@ async fn read_response(
 ) -> HttpResponseResult {
     #[cfg(feature = "quality-doctor")]
     let _body_phase = control.quality_phase(PhaseKind::ResponseBody);
+    // bytes_stream consumes the response head and its extensions immediately.
+    let _rejected_upload = response.extensions_mut().remove::<upload::RejectedUpload>();
     let status = response.status();
     let headers = response.headers().clone();
     #[cfg(feature = "http-client-http2")]
@@ -3024,6 +3076,39 @@ async fn run_callback(job: CallbackJob) {
 mod tests {
     use super::*;
     use crate::api::http::HttpRequestMethod;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_io_failure_cannot_arbitrate_using_a_different_requests_deadline(
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        let start = Instant::now();
+        let earlier = StreamBudget::default().with_phase(
+            start,
+            Some(Duration::from_secs(1)),
+            TimeoutPhase::Attempt,
+        )?;
+        let active = StreamBudget::total(start, Some(Duration::from_secs(2)))?;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let previous_error = earlier
+            .expired(Instant::now(), ErrorStage::Receive)
+            .ok_or("fixture timer did not expire")?;
+        // A reader may be backed by a different HTTP operation and propagate
+        // that operation's timeout as the source of its own I/O error.
+        let reader_error =
+            NetError::from(std::io::Error::other(previous_error)).with_stage(ErrorStage::Write);
+        let result: HttpResponseResult = arbitrate_result(
+            active,
+            &CancellationSignal::new(),
+            ErrorStage::Write,
+            Err(reader_error),
+        );
+        check(
+            result.is_err_and(|error| {
+                error.kind() == ErrorKind::DeadlineExceeded
+                    && error.timeout_phase() == Some(TimeoutPhase::Total)
+            }),
+            "an unrelated source deadline overrode the active request's total budget",
+        )
+    }
 
     #[tokio::test(start_paused = true)]
     async fn final_deadline_arbitration_retains_this_attempts_body_failure_head(
@@ -3773,6 +3858,7 @@ mod tests {
         Ok((
             SendJob {
                 request: Box::new(NoopRequest),
+                upload: None,
                 options: HttpRequestOptions::default(),
                 request_id,
                 control,

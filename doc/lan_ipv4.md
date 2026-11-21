@@ -21,21 +21,19 @@ that integration.
 
 ## Required features and prerequisites
 
-Use Rust 1.89 or later on a supported platform. Enable `net-status`, which is
-also enabled by either transport. Create a consumer crate:
+Use a [supported platform](../README.md#supported-platforms) and enable
+`net-status`, which either transport also enables. Create a consumer crate:
 
 ```sh
 cargo new lan-address-example
 cd lan-address-example
 ```
 
-Use the following dependency configuration. No
-async runtime, TLS provider or remote server is needed for the standalone
-examples.
+Add the dependency from the new crate. The standalone examples run without an
+async runtime, TLS provider or remote server.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["net-status"] }
+```sh
+cargo add open-net --no-default-features --features net-status
 ```
 
 Each Rust block below is a complete, separate `src/main.rs`. Copy one block

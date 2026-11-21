@@ -108,6 +108,7 @@ pub(crate) fn unconnected(
         messages,
         tasks,
         routing,
+        &crate::ws::ReconnectPolicy::default(),
         PriorityWriteQueue::new(
             config.queues.normal.max_items,
             config.queues.normal.max_bytes,

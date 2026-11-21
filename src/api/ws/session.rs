@@ -111,6 +111,37 @@ impl Session {
         &self,
         config: ApplicationHeartbeatConfig,
     ) -> Result<ApplicationHeartbeatHandle> {
+        self.start_heartbeat(config, None)
+    }
+    /// Starts a heartbeat that requests session recovery after consecutive response
+    /// timeouts on the same physical connection. A successful local write starts
+    /// each response wait. A matched reply or another kind of failure resets the streak.
+    ///
+    /// At the configured threshold the task waits for a different connection, then
+    /// continues using the same handle. Other failures (such as a write or matcher
+    /// error) retain the configured failure action. A response matcher, response
+    /// timeout and an enabled session reconnect policy are required.
+    ///
+    /// The matcher uses the same dedicated subscription as
+    /// [`Self::start_application_heartbeat`].
+    pub fn start_application_heartbeat_with_reconnect(
+        &self,
+        config: ApplicationHeartbeatConfig,
+    ) -> Result<ApplicationHeartbeatHandle> {
+        self.runtime.ensure_reconnect_enabled()?;
+        if config.matcher.is_none() {
+            return Err(NetError::config(
+                "application_heartbeat.matcher",
+                "is required to reconnect after missed responses",
+            ));
+        }
+        self.start_heartbeat(config, Some(Arc::downgrade(&self.inner)))
+    }
+    fn start_heartbeat(
+        &self,
+        config: ApplicationHeartbeatConfig,
+        reconnect: Option<std::sync::Weak<WSClientInner>>,
+    ) -> Result<ApplicationHeartbeatHandle> {
         config.validate()?;
         let receiver = if config.matcher.is_some() {
             Some(
@@ -121,7 +152,7 @@ impl Session {
         } else {
             None
         };
-        ApplicationHeartbeatHandle::new(self.sender(), receiver, config)
+        ApplicationHeartbeatHandle::new(self.sender(), receiver, config, reconnect)
     }
     /// Subscribes to connection lifecycle events.
     pub fn subscribe_events(&self) -> Result<ConnectionEvents> {
@@ -194,6 +225,22 @@ impl Session {
         if !self.runtime.is_closed() {
             self.inner.notify_network_available();
         }
+    }
+    /// Requests recovery if `expected` is still this session's active connection.
+    ///
+    /// Pass the ID observed on this session when the problem occurred. Returns
+    /// `true` when the worker accepts the request, or `false` if the physical
+    /// connection has already changed or recovery is in progress. The same
+    /// senders and subscriptions continue across recovery. Observe a new
+    /// [`Established`](super::ConnectionEventKind::Established) event for success.
+    ///
+    /// With [`ReconnectPolicy::Disabled`](super::ReconnectPolicy::Disabled), a
+    /// matching active connection is preserved and the result is
+    /// [`ErrorKind::InvalidPolicy`]. Closing or cancelled sessions return an error.
+    pub async fn reconnect_if_current(&self, expected: super::ConnectionId) -> Result<bool> {
+        self.inner
+            .reconnect_if_current(&self.runtime, expected, None)
+            .await
     }
     /// Requests cancellation and returns whether this call won the request race.
     ///

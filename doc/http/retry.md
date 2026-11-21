@@ -14,13 +14,12 @@ does not install the library's examples into that application.
 cargo run --manifest-path Cargo.toml --no-default-features --features http-client --example http_retry -- http://127.0.0.1:8080 /status
 ```
 
-Every complete program on this page uses these dependency settings:
+Add these dependencies from the application crate directory.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["http-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+```sh
+cargo add open-net --no-default-features --features http-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 Client examples initialize an application-selected TLS provider, including for

@@ -56,6 +56,85 @@ async fn connected_worker() -> TestResult<(Arc<WSClientInner>, WSClientWorker, C
 }
 
 #[tokio::test]
+async fn stopped_or_abandoned_reconnect_request_preserves_active_io() -> TestResult {
+    let (_inner, mut worker, _events) = connected_worker().await?;
+    let _controls = install_reader(&mut worker, true)?;
+    let target = worker
+        .connect_target
+        .as_mut()
+        .ok_or_else(|| test_error("target missing"))?;
+    target.options.reconnect = ReconnectPolicy::default();
+    let session = Arc::clone(&target.session);
+    let expected = ConnectionId::from_allocated(GENERATION);
+    let stopped = CancellationToken::new();
+    let (reply, received) = oneshot::channel();
+    let command = ClientCommand::ReconnectIfCurrent {
+        session: Arc::clone(&session),
+        expected,
+        heartbeat_stop: Some(stopped.clone()),
+        reply,
+    };
+    stopped.cancel();
+    worker.handle_command(command, &mut None).await;
+    check_eq!(
+        received.await?,
+        Err(NetError::from(crate::error::ErrorKind::Cancelled))
+    )?;
+
+    let (reply, received) = oneshot::channel();
+    drop(received);
+    worker
+        .handle_command(
+            ClientCommand::ReconnectIfCurrent {
+                session,
+                expected,
+                heartbeat_stop: None,
+                reply,
+            },
+            &mut None,
+        )
+        .await;
+    check!(worker.active_io.is_some())?;
+    check_eq!(worker.current_status(), ConnectionStatus::Connected)?;
+    worker.stop_active_io(false).await;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_during_reconnect_retirement_prevents_the_next_handshake() -> TestResult {
+    let (_inner, mut worker, _events) = connected_worker().await?;
+    let _controls = install_reader(&mut worker, true)?;
+    let target = worker
+        .connect_target
+        .as_mut()
+        .ok_or_else(|| test_error("target missing"))?;
+    target.options.reconnect = ReconnectPolicy::default();
+    let session = Arc::clone(&target.session);
+    let (reply, received) = oneshot::channel();
+    let command = ClientCommand::ReconnectIfCurrent {
+        session: Arc::clone(&session),
+        expected: ConnectionId::from_allocated(GENERATION),
+        heartbeat_stop: None,
+        reply,
+    };
+    let mut terminal_deadline = None;
+    let (_, close) = tokio::join!(
+        biased;
+        worker.handle_command(command, &mut terminal_deadline),
+        async {
+            check!(received.await??)?;
+            check!(session.request_close(None, Instant::now())?)?;
+            Ok::<(), crate::module::ws_client::test_support::TestError>(())
+        }
+    );
+    close?;
+    check!(worker.active_io.is_none())?;
+    check_eq!(worker.generation, GENERATION)?;
+    check!(worker.connect_handle.is_none())?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn fatal_tls_io_ends_session_without_advertising_or_starting_reconnect() -> TestResult {
     use crate::error::{ErrorKind, ErrorStage};
 

@@ -1,6 +1,7 @@
 //! Shared network monitoring with versioned snapshots and owned subscriptions.
 
 mod events;
+mod interface_events;
 mod ip_stack;
 mod names;
 mod net_status_client;
@@ -14,6 +15,10 @@ pub use crate::network::{
 };
 use crate::NetError;
 pub use events::{NetworkEvent, NetworkEventKind, NetworkEventOptions, NetworkObservation};
+pub use interface_events::{
+    DefaultRouteState, InterfaceAddressFamily, InterfaceEvent, InterfaceEventKind,
+    InterfaceEventOptions, InterfaceEventSource,
+};
 pub use ip_stack::IpStack;
 pub use names::{NetworkNameObserver, NetworkNameOptions, NetworkNameSnapshot, NetworkNameState};
 pub use net_status_client::NetStatusClient;

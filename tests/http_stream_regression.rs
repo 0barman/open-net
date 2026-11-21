@@ -547,3 +547,170 @@ async fn dropped_stream_opening_cleans_before_completed_observer() -> TestResult
 
 #[path = "support/crypto_provider.rs"]
 mod crypto_provider;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SseEnding {
+    End,
+    Cancel,
+    Drop,
+    Truncate,
+    Timeout,
+}
+
+async fn sse_exchange(method: &str, ending: SseEnding) -> TestResult {
+    use open_net::api::http::{HeaderMap, HeaderValue, HttpTimeouts};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut config = HttpClientConfig::new(format!("http://{}", listener.local_addr()?))?;
+    config.request_queue_capacity = 1;
+    let client = HttpClient::new(config, "sse-events-wire")?;
+    let (first_seen, first_consumed) = oneshot::channel();
+    let serve = async {
+        let (mut socket, _) = listener.accept().await?;
+        let mut input = BufReader::new(&mut socket);
+        let mut line = String::new();
+        input.read_line(&mut line).await?;
+        check(
+            line == format!("{method} /events HTTP/1.1\r\n"),
+            "unexpected SSE request",
+        )?;
+        loop {
+            line.clear();
+            check(
+                input.read_line(&mut line).await? > 0,
+                "incomplete request headers",
+            )?;
+            if line == "\r\n" {
+                break;
+            }
+        }
+        if method == "POST" {
+            let mut body = [0; 2];
+            input.read_exact(&mut body).await?;
+            check(&body == b"{}", "POST body changed")?;
+        }
+        let segment = "event: segment\r\ndata: 第一行\r\ndata: 第二行\r\n\r\n";
+        let end = "event: end\ndata:\n\n";
+        let length = segment.len() + end.len();
+        let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
+        socket.write_all(headers.as_bytes()).await?;
+        socket.write_all(segment.as_bytes()).await?;
+        first_consumed.await?;
+        match ending {
+            SseEnding::End => socket.write_all(end.as_bytes()).await?,
+            SseEnding::Truncate => socket.shutdown().await?,
+            SseEnding::Cancel | SseEnding::Drop | SseEnding::Timeout => {
+                let mut byte = [0];
+                check(
+                    socket.read(&mut byte).await? == 0,
+                    "connection still active",
+                )?;
+            }
+        }
+        TestResult::Ok(())
+    };
+    let consume = async {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        let response = if method == "GET" {
+            client.sse("/events", headers).await?
+        } else {
+            let mut request = HttpRequest::builder()
+                .method("POST")
+                .path("/events")
+                .headers(headers)
+                .header("content-type", "application/json")?
+                .body(open_net::Bytes::from_static(b"{}"));
+            if ending == SseEnding::Timeout {
+                request = request.timeouts(
+                    HttpTimeouts::new().with_idle_read_timeout(Duration::from_millis(500)),
+                );
+            }
+            client.stream(request.build()?).await?
+        };
+        check(
+            response.status == http::StatusCode::OK,
+            "unexpected SSE status",
+        )?;
+        let id = response.request_id;
+        let mut events = response.into_sse_events(256)?;
+        let first = events.next_event().await.transpose()?;
+        check(
+            first.is_some_and(|e| e.event == "segment" && e.data == "第一行\n第二行"),
+            "invalid segment event",
+        )?;
+        first_seen
+            .send(())
+            .map_err(|_| std::io::Error::other("SSE peer stopped"))?;
+        if ending == SseEnding::Cancel {
+            client.cancel(id)?;
+        }
+        match ending {
+            SseEnding::Drop => drop(events),
+            SseEnding::End => {
+                let last = events.next_event().await.transpose()?;
+                check(
+                    last.is_some_and(|e| e.event == "end" && e.data.is_empty()),
+                    "invalid end event",
+                )?;
+                check(events.next_event().await.is_none(), "expected clean EOF")?;
+            }
+            SseEnding::Cancel | SseEnding::Timeout | SseEnding::Truncate => {
+                let error = match events.next_event().await {
+                    Some(Err(error)) => error,
+                    _ => return Err(std::io::Error::other("missing terminal stream error").into()),
+                };
+                if ending == SseEnding::Cancel {
+                    check(
+                        error.kind() == ErrorKind::Cancelled,
+                        "cancellation cause lost",
+                    )?;
+                } else if ending == SseEnding::Timeout {
+                    check(
+                        error.context().http_timeout_phase
+                            == Some(open_net::api::http::TimeoutPhase::IdleRead),
+                        "idle timeout cause lost",
+                    )?;
+                }
+                check(
+                    events.next_event().await.is_none(),
+                    "expected EOF after error",
+                )?;
+            }
+        }
+        client.drain().await?;
+        client.shutdown().await?;
+        TestResult::Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::try_join!(serve, consume)
+    })
+    .await??;
+    use futures_util::FutureExt;
+    check(
+        listener.accept().now_or_never().is_none(),
+        "SSE request was repeated",
+    )
+}
+
+#[tokio::test]
+async fn sse_events_get_and_post_deliver_named_events() -> TestResult {
+    for method in ["GET", "POST"] {
+        sse_exchange(method, SseEnding::End).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sse_events_release_cancelled_dropped_truncated_and_expired_post() -> TestResult {
+    for ending in [
+        SseEnding::Cancel,
+        SseEnding::Drop,
+        SseEnding::Truncate,
+        SseEnding::Timeout,
+    ] {
+        sse_exchange("POST", ending).await?;
+    }
+    Ok(())
+}

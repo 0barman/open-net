@@ -35,6 +35,7 @@ pub(crate) struct SessionRuntime {
     pub(crate) messages: Arc<MessageSource>,
     pub(crate) tasks: Arc<NativeTaskObserver>,
     pub(crate) routing: ResponseRouting,
+    reconnect_enabled: bool,
     pub(crate) queue: Arc<PriorityWriteQueue>,
     pub(crate) urgent_queue: Arc<PriorityWriteQueue>,
     pub(crate) shutdown: CancellationToken,
@@ -62,6 +63,7 @@ impl SessionRuntime {
         messages: Arc<MessageSource>,
         tasks: Arc<NativeTaskObserver>,
         routing: ResponseRouting,
+        reconnect: &crate::ws::ReconnectPolicy,
         queue: Arc<PriorityWriteQueue>,
         urgent_queue: Arc<PriorityWriteQueue>,
         shutdown: CancellationToken,
@@ -78,6 +80,7 @@ impl SessionRuntime {
             messages,
             tasks,
             routing,
+            reconnect_enabled: matches!(reconnect, crate::ws::ReconnectPolicy::Backoff(_)),
             queue,
             urgent_queue,
             shutdown,
@@ -141,6 +144,14 @@ impl SessionRuntime {
         }
         Ok(())
     }
+    pub(crate) fn ensure_reconnect_enabled(&self) -> Result<()> {
+        if self.reconnect_enabled {
+            Ok(())
+        } else {
+            Err(NetError::from(ErrorKind::InvalidPolicy))
+        }
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.is_cancelled()
             || self.forced_closed.is_cancelled()

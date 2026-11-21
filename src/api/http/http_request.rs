@@ -101,7 +101,6 @@ pub struct HttpRequestBuilder {
     admission_policy: Option<HttpAdmissionPolicy>,
     #[cfg(feature = "http-client-cookies")]
     cookie_context: CookieRequestContext,
-    #[cfg(feature = "http-client-codecs")]
     body_configured: bool,
     #[cfg(feature = "http-client-codecs")]
     body_encoding: Option<BodyEncoding>,
@@ -126,7 +125,6 @@ impl HttpRequest {
             admission_policy: None,
             #[cfg(feature = "http-client-cookies")]
             cookie_context: CookieRequestContext::default(),
-            #[cfg(feature = "http-client-codecs")]
             body_configured: false,
             #[cfg(feature = "http-client-codecs")]
             body_encoding: None,
@@ -206,9 +204,9 @@ impl HttpRequestBuilder {
                 self.body_conflict = true;
             }
             self.body_encoding = Some(BodyEncoding::Raw);
-            self.body_configured = true;
             self.multipart_content_type = None;
         }
+        self.body_configured = true;
         self.body = body;
         self
     }
@@ -320,6 +318,16 @@ impl HttpRequestBuilder {
         }
         self.headers.insert(name, value);
         Ok(self)
+    }
+
+    pub(crate) fn build_for_upload(self) -> Result<HttpRequest, NetError> {
+        if self.body_configured {
+            return Err(NetError::input(
+                "body",
+                "upload requires an unused request body",
+            ));
+        }
+        self.build()
     }
 
     /// Validate the method and path and produce an owned request value.

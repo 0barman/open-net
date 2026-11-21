@@ -950,6 +950,11 @@ impl MessageReceipt {
     pub async fn written(&self) -> Result<()> {
         self.core.written().await.map(|_| ())
     }
+    /// The writer binds the connection on each attempt, including after a requeue.
+    pub(super) async fn written_connection(&self) -> Result<super::ConnectionId> {
+        let (_, connection) = self.core.written_with_connection().await?;
+        connection.ok_or_else(|| crate::NetError::from(crate::error::ErrorKind::Internal))
+    }
 }
 impl fmt::Debug for MessageReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

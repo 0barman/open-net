@@ -309,6 +309,7 @@ impl WSClientInner {
                 messages,
                 tasks,
                 options.routing.clone(),
+                &options.reconnect,
                 Arc::clone(&self.queue),
                 Arc::clone(&self.urgent_queue),
                 self.shutdown.clone(),
@@ -358,6 +359,31 @@ impl WSClientInner {
             .await
             .map_err(|error| NetError::with_source(ErrorKind::EngineDropped, error))??;
         Ok(session)
+    }
+
+    pub(crate) async fn reconnect_if_current(
+        &self,
+        runtime: &Arc<SessionRuntime>,
+        expected: crate::ws::ConnectionId,
+        heartbeat_stop: Option<CancellationToken>,
+    ) -> Result<bool, NetError> {
+        if self.is_shutdown() {
+            return Err(NetError::from(ErrorKind::Closed));
+        }
+        runtime.lifecycle.ensure_open_for_reconnect()?;
+        let (reply, received) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::ReconnectIfCurrent {
+                session: Arc::clone(&runtime.lifecycle),
+                expected,
+                heartbeat_stop,
+                reply,
+            })
+            .await
+            .map_err(|_| NetError::from(ErrorKind::Closed))?;
+        received
+            .await
+            .map_err(|_| NetError::from(ErrorKind::Closed))?
     }
 
     pub(crate) fn notify_network_available(&self) {

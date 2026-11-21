@@ -21,12 +21,11 @@ cargo run --manifest-path Cargo.toml --no-default-features --features ws-client 
 
 Every complete program below uses these dependency settings:
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["ws-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-serde_json = "1"
+```sh
+cargo add open-net --no-default-features --features ws-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread
+cargo add serde_json
 ```
 
 Client examples explicitly select their TLS provider. Configuration-only
@@ -2372,6 +2371,52 @@ Compare the incoming wire ID with this registration. Retirement after a snapshot
 ### Example
 
 See the complete [example](#manual-routing-and-cancellation).
+
+## `WsRequestOperationHandle::quality_ref()`
+
+### Required features
+
+`ws-client` and `quality-doctor`.
+
+### Function signature
+
+```text
+pub fn quality_ref(&self) -> Option<QualityReportRef>
+```
+
+### Steps
+
+Activate the engine's doctor before submitting the logical request. Read the
+reference from the returned operation handle. When it is present, pass it to
+`doctor.lookup(&reference)` on the same engine's doctor.
+
+### Parameters
+
+A shared borrow of the operation handle.
+
+### Callback parameters
+
+None.
+
+### Return values
+
+`Some(QualityReportRef)` identifies the logical `WsRequestOperation` across
+retries and backoff. Clones of the handle and the selected final response or
+error share this reference. Each instrumented attempt has its own `WsRequest`
+report. `None` means no logical observation was allocated.
+
+### Errors and behavior
+
+The accessor can be called while the request is in flight. Collection can be
+inactive, filtered by protocol or limited by diagnostic capacity. The request
+continues in each case. Bounded retention can evict a report while its
+reference is still held. Looking it up on a different doctor's scope yields
+`QualityLookup::WrongScope`.
+
+### Example
+
+Inspect the logical operation's report through its handle.
+[WebSocket request handle example](../quality_doctor.md#websocket-request-handle-example)
 
 ## `WsRequestOperationHandle::retry_report()`
 

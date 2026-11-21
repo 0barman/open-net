@@ -1,8 +1,8 @@
 # WebSocket HTTPS proxies and authentication migration
 
-The HTTPS CONNECT constructor and proxy authentication transport policy described
-here are introduced in 0.3.3. Version 0.3.2 has no `https_connect` or `RequireTls`
-policy and accepts Basic credentials with an HTTP proxy. These are WebSocket
+The HTTPS CONNECT constructor and proxy authentication transport policy shipped
+in open-net 0.3.3. Version 0.3.2 accepted Basic credentials with an HTTP proxy
+and had no `https_connect` or `RequireTls` policy. These are WebSocket
 proxy contracts; they do not extend the HTTP client's separate proxy API.
 
 This guide covers `open_net::network::ProxyConfig` with the `ws-client` feature.
@@ -49,7 +49,7 @@ each limited to 4096 ASCII bytes without control characters. Usernames cannot
 contain colons. Neither constructor reads proxy environment variables.
 
 This is a behavioral compatibility change: existing source can still compile
-while authenticated `http_connect` calls now return an error in 0.3.3.
+while authenticated `http_connect` calls now return an error.
 
 ## Recommended migration: HTTPS CONNECT
 
@@ -60,11 +60,10 @@ Use the application's provider for both roles explicitly, while keeping their
 TLS configurations separate. This complete program constructs clients without
 connecting. Use these dependency settings:
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false, features = ["ws-client"] }
-rustls-openssl = { version = "=0.4.2", default-features = false, features = ["tls12"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```sh
+cargo add open-net --no-default-features --features ws-client
+cargo add rustls-openssl --no-default-features --features tls12
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 The examples use a third-party provider;

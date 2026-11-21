@@ -32,10 +32,11 @@ pub use api::tls;
 pub use api::{config, error, network, retry, subscription};
 #[cfg(feature = "net-status")]
 pub use api::{
-    net_status, IpStack, MonitorState, NetStatusClient, NetworkEvent, NetworkEventKind,
-    NetworkEventOptions, NetworkIpStackSource, NetworkNameObserver, NetworkNameOptions,
-    NetworkNameSnapshot, NetworkNameSource, NetworkNameState, NetworkObservation,
-    NetworkRefreshResult, NetworkSnapshot, NetworkStatus,
+    net_status, DefaultRouteState, InterfaceAddressFamily, InterfaceEvent, InterfaceEventKind,
+    InterfaceEventOptions, InterfaceEventSource, IpStack, MonitorState, NetStatusClient,
+    NetworkEvent, NetworkEventKind, NetworkEventOptions, NetworkIpStackSource, NetworkNameObserver,
+    NetworkNameOptions, NetworkNameSnapshot, NetworkNameSource, NetworkNameState,
+    NetworkObservation, NetworkRefreshResult, NetworkSnapshot, NetworkStatus,
 };
 #[cfg(feature = "ws-client")]
 pub use api::{ws, WebSocketClient};

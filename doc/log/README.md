@@ -15,13 +15,11 @@ individual [engine shutdown](../lifecycle.md).
 
 ## Required features and prerequisites
 
-No Cargo feature, engine, TLS provider or async runtime is required. Use Rust
-1.89 or later, create a project with `cargo new logging-example`, and add this
-dependency configuration to its `Cargo.toml`.
+No Cargo feature, engine, TLS provider or async runtime is required. Create a
+project with `cargo new logging-example` and run this command in it.
 
-```toml
-[dependencies]
-open-net = { version = "0.3.3", default-features = false }
+```sh
+cargo add open-net --no-default-features
 ```
 
 Each Rust block is a complete, separate `src/main.rs`. Copy one block at a time
@@ -46,8 +44,7 @@ thread-safe shared handles into them instead of borrowing stack variables.
 
 ## Record fields and filters
 
-The omissions described in this section apply to open-net 0.3.3.
-Published 0.3.2 records can still contain raw HTTP request paths and
+In open-net 0.3.2, records can contain raw HTTP request paths and
 caller-supplied client/thread names. Review and sanitize those records before
 forwarding them to a logger or telemetry service when integrating that release.
 
@@ -96,11 +93,10 @@ interest check.
 
 ## Default Debug privacy boundary
 
-This is the open-net 0.3.3 contract. Published 0.3.2 has some
-redacted summaries, but not this complete boundary: `HttpRequest` is summarized
-only with `http-client-cookies` enabled, and several WebSocket values still use
-derived `Debug` output that can include their contents. Do not apply the table
-below to 0.3.2 or treat arbitrary `Debug` formatting as a general redaction tool.
+In open-net 0.3.2, `HttpRequest` used a redacted summary only with
+`http-client-cookies` enabled, and several WebSocket values used derived
+`Debug` output that could include their contents. Review those values before
+logging them when maintaining an application on that release.
 
 `HttpRequest` uses the same privacy boundary in every HTTP feature combination,
 including builds without `http-client-cookies`. Its `Debug` output reports the

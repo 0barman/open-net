@@ -18,16 +18,11 @@ impl std::fmt::Display for BudgetExpired {
 }
 impl std::error::Error for BudgetExpired {}
 
-/// The typed source survives cloning and nested SDK boundary checks.
+/// Budget expiry installs this private marker directly on the error. Cloning
+/// or enriching that error with HTTP metadata retains the same source.
 pub(crate) fn timeout_deadline(error: &NetError) -> Option<(Instant, TimeoutPhase)> {
-    let mut source = std::error::Error::source(error);
-    while let Some(cause) = source {
-        if let Some(expired) = cause.downcast_ref::<BudgetExpired>() {
-            return Some((expired.deadline, expired.phase));
-        }
-        source = cause.source();
-    }
-    None
+    let expired = std::error::Error::source(error)?.downcast_ref::<BudgetExpired>()?;
+    Some((expired.deadline, expired.phase))
 }
 
 /// Only the earliest deadline matters; adding a budget can never extend a lease.
